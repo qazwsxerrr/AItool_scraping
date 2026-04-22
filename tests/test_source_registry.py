@@ -61,10 +61,11 @@ def test_default_registry_includes_linux_do_sources():
     source_by_id = {source.id: source for source in result.sources}
 
     expected_sources = {
-        "linux_do_latest": ("LINUX DO Latest Topics", "https://linux.do/latest.rss"),
         "linux_do_top": ("LINUX DO Top Topics", "https://linux.do/top.rss"),
         "linux_do_hot": ("LINUX DO Hot Topics", "https://linux.do/hot.rss"),
     }
+    assert "linux_do_latest" not in source_by_id
+
     for source_id, (name, url) in expected_sources.items():
         linux_source = source_by_id[source_id]
         assert linux_source.name == name

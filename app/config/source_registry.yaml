@@ -36,15 +36,6 @@ sources:
     fetch_interval: 3600
     parser_type: feedparser
 
-  - id: linux_do_latest
-    name: LINUX DO Latest Topics
-    type: rss
-    url: https://linux.do/latest.rss
-    enabled: true
-    priority: 50
-    fetch_interval: 1800
-    parser_type: feedparser
-
   - id: linux_do_top
     name: LINUX DO Top Topics
     type: rss
