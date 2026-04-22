@@ -56,12 +56,18 @@ def test_load_registry_interpolates_rsshub_base_url_when_present(tmp_path):
     assert rsshub_source.url == "https://rsshub.example.com/github/trending/daily/python"
 
 
-def test_default_registry_includes_linux_do_latest_source():
+def test_default_registry_includes_linux_do_sources():
     result = load_source_registry(env={})
     source_by_id = {source.id: source for source in result.sources}
 
-    linux_source = source_by_id["linux_do_latest"]
-    assert linux_source.name == "LINUX DO Latest Topics"
-    assert linux_source.type == "rss"
-    assert linux_source.url == "https://linux.do/latest.rss"
-    assert linux_source.parser_type == "feedparser"
+    expected_sources = {
+        "linux_do_latest": ("LINUX DO Latest Topics", "https://linux.do/latest.rss"),
+        "linux_do_top": ("LINUX DO Top Topics", "https://linux.do/top.rss"),
+        "linux_do_hot": ("LINUX DO Hot Topics", "https://linux.do/hot.rss"),
+    }
+    for source_id, (name, url) in expected_sources.items():
+        linux_source = source_by_id[source_id]
+        assert linux_source.name == name
+        assert linux_source.type == "rss"
+        assert linux_source.url == url
+        assert linux_source.parser_type == "feedparser"

@@ -26,6 +26,8 @@
 | `huggingface_blog` | Hugging Face Blog | `https://huggingface.co/blog/feed.xml` |
 | `producthunt_feed` | Product Hunt | `https://www.producthunt.com/feed` |
 | `linux_do_latest` | LINUX DO 最新话题 | `https://linux.do/latest.rss` |
+| `linux_do_top` | LINUX DO Top 话题 | `https://linux.do/top.rss` |
+| `linux_do_hot` | LINUX DO Hot 话题 | `https://linux.do/hot.rss` |
 
 ## 安装
 
