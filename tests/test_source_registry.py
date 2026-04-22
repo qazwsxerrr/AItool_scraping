@@ -54,3 +54,14 @@ def test_load_registry_interpolates_rsshub_base_url_when_present(tmp_path):
     assert [source.id for source in result.sources] == ["native_blog", "rsshub_route"]
     rsshub_source = result.sources[1]
     assert rsshub_source.url == "https://rsshub.example.com/github/trending/daily/python"
+
+
+def test_default_registry_includes_linux_do_latest_source():
+    result = load_source_registry(env={})
+    source_by_id = {source.id: source for source in result.sources}
+
+    linux_source = source_by_id["linux_do_latest"]
+    assert linux_source.name == "LINUX DO Latest Topics"
+    assert linux_source.type == "rss"
+    assert linux_source.url == "https://linux.do/latest.rss"
+    assert linux_source.parser_type == "feedparser"

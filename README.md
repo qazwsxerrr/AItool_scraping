@@ -17,6 +17,16 @@
 
 暂不包含 AI 分析、canonical tool 聚合、Notion、Telegram、Markdown 日报、HTML 爬虫。
 
+## 当前默认信息源
+
+| source_id | 来源 | Feed |
+|---|---|---|
+| `openai_news` | OpenAI News | `https://openai.com/news/rss.xml` |
+| `google_deepmind_blog` | Google DeepMind Blog | `https://deepmind.google/blog/rss.xml` |
+| `huggingface_blog` | Hugging Face Blog | `https://huggingface.co/blog/feed.xml` |
+| `producthunt_feed` | Product Hunt | `https://www.producthunt.com/feed` |
+| `linux_do_latest` | LINUX DO 最新话题 | `https://linux.do/latest.rss` |
+
 ## 安装
 
 推荐 Python 3.11+。

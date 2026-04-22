@@ -36,6 +36,15 @@ sources:
     fetch_interval: 3600
     parser_type: feedparser
 
+  - id: linux_do_latest
+    name: LINUX DO Latest Topics
+    type: rss
+    url: https://linux.do/latest.rss
+    enabled: true
+    priority: 50
+    fetch_interval: 1800
+    parser_type: feedparser
+
   # RSSHub feeds are enabled only when RSSHUB_BASE_URL is configured.
   # Source-level failures are isolated, so an unavailable route will not stop other feeds.
   - id: anthropic_news_rsshub
