@@ -57,3 +57,27 @@ class RawItem(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="new")
 
     source: Mapped[Source] = relationship(back_populates="raw_items")
+    normalized_item: Mapped["NormalizedItem | None"] = relationship(back_populates="raw_item")
+
+
+class NormalizedItem(Base):
+    __tablename__ = "normalized_items"
+    __table_args__ = (
+        UniqueConstraint("raw_item_id", name="uq_normalized_items_raw_item_id"),
+        UniqueConstraint("dedupe_key", name="uq_normalized_items_dedupe_key"),
+        Index("ix_normalized_items_published_at", "published_at"),
+        Index("ix_normalized_items_language", "language"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_item_id: Mapped[int] = mapped_column(ForeignKey("raw_items.id"), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    author: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    language: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    raw_item: Mapped[RawItem] = relationship(back_populates="normalized_item")

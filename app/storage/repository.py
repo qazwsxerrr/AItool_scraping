@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 
 from app.config.source_registry import SourceConfig
 from app.parsers.feed_parser import ParsedFeedItem
-from app.storage.models import RawItem, Source
+from app.pipeline.normalize import NormalizedItemData
+from app.storage.models import NormalizedItem, RawItem, Source
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,51 @@ class RawItemRepository:
         stmt = select(RawItem.id).where(RawItem.content_hash == item.content_hash)
         if self.session.execute(stmt).first():
             return "duplicate_content_hash"
+        return None
+
+    def list_pending_for_normalization(self, *, limit: int | None = None) -> list[RawItem]:
+        stmt = select(RawItem).where(RawItem.status == "new").order_by(RawItem.id.asc())
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def mark_status(self, raw_item_id: int, status: str) -> None:
+        raw_item = self.session.get(RawItem, raw_item_id)
+        if raw_item is not None:
+            raw_item.status = status
+
+
+class NormalizedItemRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def insert_if_new(self, item: NormalizedItemData) -> InsertResult:
+        duplicate_reason = self._find_duplicate_reason(item)
+        if duplicate_reason:
+            return InsertResult(inserted=False, reason=duplicate_reason)
+
+        normalized_item = NormalizedItem(
+            raw_item_id=item.raw_item_id,
+            title=item.title,
+            body_text=item.body_text,
+            url=item.url,
+            author=item.author,
+            published_at=_as_utc(item.published_at),
+            language=item.language,
+            dedupe_key=item.dedupe_key,
+        )
+        self.session.add(normalized_item)
+        self.session.flush()
+        return InsertResult(inserted=True, item_id=normalized_item.id)
+
+    def _find_duplicate_reason(self, item: NormalizedItemData) -> str | None:
+        stmt = select(NormalizedItem.id).where(NormalizedItem.raw_item_id == item.raw_item_id)
+        if self.session.execute(stmt).first():
+            return "duplicate_raw_item"
+
+        stmt = select(NormalizedItem.id).where(NormalizedItem.dedupe_key == item.dedupe_key)
+        if self.session.execute(stmt).first():
+            return "duplicate_dedupe_key"
         return None
 
 

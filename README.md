@@ -12,8 +12,10 @@
 - 使用 SQLite + SQLAlchemy 保存 `sources` 与 `raw_items`。
 - 对 `source_id + external_id`、`source_id + link`、`content_hash` 做幂等去重。
 - 单个 source 抓取失败只记录失败，不中断其他 source。
+- 将 `raw_items` 标准化为 `normalized_items`。
+- 对标准化 URL / 标题生成 `dedupe_key`，避免同一条内容因追踪参数重复进入后续流程。
 
-暂不包含 AI 分析、normalize、canonical tool 聚合、Notion、Telegram、Markdown 日报、HTML 爬虫。
+暂不包含 AI 分析、canonical tool 聚合、Notion、Telegram、Markdown 日报、HTML 爬虫。
 
 ## 安装
 
@@ -103,6 +105,21 @@ CLI 会输出每个 source 的：
 
 重复执行同一个 source 时，已入库条目会显示为 `skipped`。
 
+标准化待处理 `raw_items`：
+
+```bash
+python scripts/run_normalize_once.py --limit 100
+```
+
+标准化会：
+
+- 清理 HTML 标签与多余空白
+- 规范化 URL 的 scheme / host
+- 移除 `utm_*`、`ref`、`gclid`、`fbclid` 等常见追踪参数
+- 生成 `dedupe_key`
+- 将成功标准化的原始条目标记为 `normalized`
+- 将同一标准化内容的重复条目标记为 `duplicate`
+
 ## 测试
 
 ```bash
@@ -122,12 +139,16 @@ uv run --extra test pytest
 - RSSHub 环境变量插值与缺失跳过
 - `raw_items` 幂等去重
 - 单 source 抓取失败不影响其他 source
+- 标准化清洗与 URL 去追踪参数
+- `normalized_items` 幂等去重
+- normalize job 重跑不重复入库
 
 ## 数据表
 
-当前阶段创建两张表：
+当前阶段创建三张表：
 
 - `sources`：来源配置与 `last_fetched_at`
 - `raw_items`：原始抓取条目、原始 payload、内容 hash 与处理状态
+- `normalized_items`：标准化后的标题、正文、URL、语言与 `dedupe_key`
 
 默认数据库路径：`data/ai_tool_intel.db`。
