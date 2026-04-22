@@ -1,0 +1,103 @@
+sources:
+  # Native RSS / Atom feeds verified by direct HTTP access on 2026-04-22.
+  - id: openai_news
+    name: OpenAI News
+    type: rss
+    url: https://openai.com/news/rss.xml
+    enabled: true
+    priority: 10
+    fetch_interval: 3600
+    parser_type: feedparser
+
+  - id: google_deepmind_blog
+    name: Google DeepMind Blog
+    type: rss
+    url: https://deepmind.google/blog/rss.xml
+    enabled: true
+    priority: 20
+    fetch_interval: 3600
+    parser_type: feedparser
+
+  - id: huggingface_blog
+    name: Hugging Face Blog
+    type: rss
+    url: https://huggingface.co/blog/feed.xml
+    enabled: true
+    priority: 30
+    fetch_interval: 3600
+    parser_type: feedparser
+
+  - id: producthunt_feed
+    name: Product Hunt Feed
+    type: atom
+    url: https://www.producthunt.com/feed
+    enabled: true
+    priority: 40
+    fetch_interval: 3600
+    parser_type: feedparser
+
+  # RSSHub feeds are enabled only when RSSHUB_BASE_URL is configured.
+  # Source-level failures are isolated, so an unavailable route will not stop other feeds.
+  - id: anthropic_news_rsshub
+    name: Anthropic News via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/anthropic/news
+    enabled: true
+    priority: 110
+    fetch_interval: 3600
+    parser_type: feedparser
+
+  - id: anthropic_research_rsshub
+    name: Anthropic Research via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/anthropic/research
+    enabled: true
+    priority: 120
+    fetch_interval: 3600
+    parser_type: feedparser
+
+  - id: anthropic_engineering_rsshub
+    name: Anthropic Engineering via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/anthropic/engineering
+    enabled: true
+    priority: 130
+    fetch_interval: 3600
+    parser_type: feedparser
+
+  - id: github_trending_python_daily
+    name: GitHub Trending Python Daily via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/github/trending/daily/python
+    enabled: true
+    priority: 210
+    fetch_interval: 86400
+    parser_type: feedparser
+
+  - id: github_trending_typescript_daily
+    name: GitHub Trending TypeScript Daily via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/github/trending/daily/typescript
+    enabled: true
+    priority: 220
+    fetch_interval: 86400
+    parser_type: feedparser
+
+  # Disabled until stable RSS/RSSHub routes are confirmed.
+  - id: mistral_news_disabled
+    name: Mistral News (disabled placeholder)
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/mistral/news
+    enabled: false
+    priority: 900
+    fetch_interval: 3600
+    parser_type: feedparser
+
+  - id: perplexity_updates_disabled
+    name: Perplexity Updates (disabled placeholder)
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/perplexity/updates
+    enabled: false
+    priority: 910
+    fetch_interval: 3600
+    parser_type: feedparser
