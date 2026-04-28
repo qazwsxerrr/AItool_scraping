@@ -150,3 +150,35 @@ def test_ai_review_client_supports_openai_chat_completions_payload_and_json_cont
     assert response.keep is True
     assert response.score == 91
     assert response.summary_cn == "这是一个模型发布候选。"
+
+
+def test_openai_chat_prompt_states_strict_scope_and_exclusions():
+    settings = Settings(
+        ai_review_api_url="https://api.deepseek.com",
+        ai_review_api_key="secret-key",
+        ai_review_model="deepseek-v4-flash",
+        ai_review_api_style="openai_chat",
+    )
+    http_client = FakeHttpClient(FakeResponse({"choices": [{"message": {"content": '{"keep": false, "score": 20}'}}]}))
+    client = AIReviewClient.from_settings(settings, http_client=http_client)
+
+    client.review(
+        AIReviewRequest(
+            candidate_id=9,
+            title="The 4B class of 2026 benchmark",
+            url="https://example.com",
+            source_group="reddit_local_llama",
+            candidate_score=80,
+            body_preview="generic benchmark and opinions",
+            matched_keywords=["benchmark", "model"],
+        )
+    )
+
+    system_prompt = http_client.calls[0]["json"]["messages"][0]["content"]
+    assert "MCP" in system_prompt
+    assert "2API" in system_prompt
+    assert "反代" in system_prompt
+    assert "skill" in system_prompt
+    assert "明确排除" in system_prompt
+    assert "泛 benchmark" in system_prompt
+    assert "观点讨论" in system_prompt

@@ -105,8 +105,18 @@ class AIReviewClient:
                     {
                         "role": "system",
                         "content": (
-                            "你是 AI 工具情报初筛器。只返回 JSON，不要 Markdown。"
-                            "判断候选是否值得进入后续工具分析流程。"
+                            "你是严格的 AI 工具情报初筛器。只返回 JSON，不要 Markdown。"
+                            "目标只保留两类内容："
+                            "1) 好用的 AI 工具、agent 工作流、MCP server/client、skill/skills、"
+                            "prompt/workflow、OpenAI-compatible API、2API、反代/中转/API gateway、"
+                            "模型部署或调用工具；"
+                            "2) 明确的新 AI 进展，例如新模型发布、开源权重发布、重要产品/能力发布。"
+                            "明确排除：泛 benchmark、纯模型横评、硬件功耗/VRAM/吞吐调优、"
+                            "观点讨论、吐槽、社区新闻、融资故事、个人经历、问题求推荐、"
+                            "个人部署踩坑/性能瓶颈复盘、没有可复用工具或明确发布的教程。"
+                            "即使包含 LLM/model/benchmark/Qwen/Claude 等词，只要不是工具/工作流/MCP/2API/反代"
+                            "或明确新模型/新能力发布，也必须 keep=false 且 score<=40。"
+                            "category 只能使用：ai_tool, workflow, mcp, skill, api_proxy, model_release, product_release, tutorial, other。"
                             "返回字段：keep(boolean), score(integer 0-100), "
                             "category(string|null), reason(string|null), summary_cn(string|null)。"
                         ),

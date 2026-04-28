@@ -218,11 +218,11 @@ python scripts/run_prefilter_once.py --limit 100
 
 预筛会根据以下信号生成 `candidate_items`：
 
-- AI / agent / workflow / model / open weights / gguf / benchmark 等关键词
-- GitHub / Hugging Face / Product Hunt 等外链（会从原始 HTML 中识别，不依赖 feed 主链接）
-- LINUX DO / Reddit / X 来源组
-- 对 LINUX DO 会额外要求更强信号，尽量过滤社区公告、抽奖、治理帖等非 AI 工具情报
-- 噪声关键词与低分内容会标记为 `dropped`
+- 目标保留：AI 工具、agent 工作流、MCP、skill、OpenAI-compatible API、2API、反代/中转/API gateway、模型部署/调用工具。
+- 目标保留：明确的新模型、新开源权重、新产品或新能力发布。
+- GitHub / Hugging Face / Product Hunt 等外链会从原始 HTML 中识别，但单独出现不再自动视为强保留信号。
+- 明确丢弃：泛 benchmark、纯模型横评、硬件功耗 / VRAM / 吞吐调优、观点讨论、问题求推荐、个人部署踩坑、社区公告、抽奖、治理帖。
+- 噪声关键词、个人体验类和低分内容会标记为 `dropped`。
 
 导出 AI 初筛前人工审阅文件：
 
