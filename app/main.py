@@ -6,6 +6,7 @@ from app.config.settings import Settings
 from app.jobs.fetch_job import run_fetch_from_registry
 from app.jobs.normalize_job import run_normalize_from_settings
 from app.jobs.prefilter_job import run_prefilter_from_settings
+from app.jobs.review_export_job import run_review_export_from_settings
 from app.logging_config import configure_logging
 
 app = typer.Typer(help="AI tool intelligence ingestion CLI")
@@ -58,6 +59,24 @@ def prefilter(
         f"processed={result.processed} kept={result.kept} "
         f"dropped={result.dropped} failed={result.failed}"
     )
+
+
+@app.command("review-export")
+def review_export(
+    limit: int = typer.Option(50, min=1, help="Maximum candidate_items to export."),
+    output_dir: str = typer.Option("output", help="Directory for Markdown and JSONL review files."),
+    status: str = typer.Option("kept", help="Candidate status to export, usually kept or dropped."),
+) -> None:
+    configure_logging()
+    result = run_review_export_from_settings(
+        settings=Settings.from_env(),
+        output_dir=output_dir,
+        limit=limit,
+        status=status,
+    )
+    typer.echo(f"exported={result.exported}")
+    typer.echo(f"markdown={result.markdown_path}")
+    typer.echo(f"jsonl={result.jsonl_path}")
 
 
 if __name__ == "__main__":

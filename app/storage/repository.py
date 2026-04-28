@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.config.source_registry import SourceConfig
 from app.parsers.feed_parser import ParsedFeedItem
@@ -187,6 +187,21 @@ class CandidateItemRepository:
         self.session.add(candidate)
         self.session.flush()
         return InsertResult(inserted=True, item_id=candidate.id)
+
+    def list_for_review_export(self, *, status: str = "kept", limit: int | None = 50) -> list[CandidateItem]:
+        stmt = (
+            select(CandidateItem)
+            .options(
+                joinedload(CandidateItem.normalized_item)
+                .joinedload(NormalizedItem.raw_item)
+                .joinedload(RawItem.source)
+            )
+            .where(CandidateItem.status == status)
+            .order_by(CandidateItem.candidate_score.desc(), CandidateItem.id.asc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
 
 
 def _as_utc(value: datetime | None) -> datetime | None:

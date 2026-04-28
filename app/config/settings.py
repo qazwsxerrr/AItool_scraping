@@ -33,6 +33,10 @@ class Settings:
     request_timeout_seconds: float = 20.0
     request_retries: int = 2
     user_agent: str = DEFAULT_USER_AGENT
+    ai_review_api_url: str | None = None
+    ai_review_api_key: str | None = None
+    ai_review_model: str | None = None
+    ai_review_timeout_seconds: float = 30.0
 
     @classmethod
     def from_env(cls, dotenv_path: str | Path = ".env") -> "Settings":
@@ -47,4 +51,8 @@ class Settings:
             request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
             request_retries=int(os.getenv("REQUEST_RETRIES", "2")),
             user_agent=os.getenv("USER_AGENT", DEFAULT_USER_AGENT),
+            ai_review_api_url=os.getenv("AI_REVIEW_API_URL") or None,
+            ai_review_api_key=os.getenv("AI_REVIEW_API_KEY") or None,
+            ai_review_model=os.getenv("AI_REVIEW_MODEL") or None,
+            ai_review_timeout_seconds=float(os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "30")),
         )

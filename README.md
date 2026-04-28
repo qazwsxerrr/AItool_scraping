@@ -15,8 +15,10 @@
 - 将 `raw_items` 标准化为 `normalized_items`。
 - 对标准化 URL / 标题生成 `dedupe_key`，避免同一条内容因追踪参数重复进入后续流程。
 - 按规则预筛生成 `candidate_items` 候选池，先过滤低信号闲聊，再进入后续 AI 初筛。
+- 将 `candidate_items` 中保留的候选导出为 Markdown / JSONL，便于 AI 初筛前人工审阅。
+- 已预留通用 AI 初筛 API 客户端框架，调用地址和 key 通过环境变量配置。
 
-暂不包含 AI 分析、canonical tool 聚合、Notion、Telegram、Markdown 日报、HTML 爬虫。
+暂不包含 canonical tool 聚合、Notion、Telegram、Markdown 日报、HTML 爬虫。
 
 ## 当前默认信息源
 
@@ -118,6 +120,27 @@ RSSHUB_BASE_URL=https://rsshub.example.com
 > `export DATABASE_URL=...` 或 `export RSSHUB_BASE_URL=...` 这类环境变量可能不会透传给
 > Windows Python。此时请优先把配置写入 `.env` 后再运行脚本。
 
+AI 初筛 API 框架配置项：
+
+```env
+AI_REVIEW_API_URL=https://your-ai-endpoint.example/review
+AI_REVIEW_API_KEY=your-key
+AI_REVIEW_MODEL=your-model-name
+AI_REVIEW_TIMEOUT_SECONDS=30
+```
+
+当前只搭建 API 调用框架，不会在人工审阅导出时默认调用 AI。预期接口接受候选 JSON，返回：
+
+```json
+{
+  "keep": true,
+  "score": 80,
+  "category": "model_release",
+  "reason": "why this should continue",
+  "summary_cn": "中文摘要"
+}
+```
+
 ## 运行
 
 初始化数据库：
@@ -192,6 +215,23 @@ python scripts/run_prefilter_once.py --limit 100
 - 对 LINUX DO 会额外要求更强信号，尽量过滤社区公告、抽奖、治理帖等非 AI 工具情报
 - 噪声关键词与低分内容会标记为 `dropped`
 
+导出 AI 初筛前人工审阅文件：
+
+```bash
+python scripts/run_review_export_once.py --limit 50
+```
+
+会在 `output/` 下生成两份文件：
+
+- `review_candidates_YYYYMMDD_HHMMSS.md`：适合人工快速阅读和标注
+- `review_candidates_YYYYMMDD_HHMMSS.jsonl`：适合后续接入 AI 初筛 API 或批处理
+
+也可以通过 Typer CLI 执行：
+
+```bash
+python -m app.main review-export --limit 50
+```
+
 ## 测试
 
 ```bash
@@ -216,6 +256,8 @@ uv run --extra test pytest
 - normalize job 重跑不重复入库
 - source group 抓取与 source 默认条数
 - 规则预筛与 `candidate_items` 幂等入库
+- AI 初筛前人工审阅 Markdown / JSONL 导出
+- AI 初筛 API 客户端配置、请求载荷和响应解析
 
 ## 数据表
 
