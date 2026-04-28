@@ -79,6 +79,11 @@ def test_default_registry_contains_main_site_metadata_and_x_is_env_gated():
     assert source_by_id["reddit_local_llama_new"].default_limit == 40
     assert source_by_id["reddit_local_llama_search_agent"].source_subtype == "search"
     assert source_by_id["reddit_local_llama_search_agent"].search_query == "agent"
+    assert source_by_id["reddit_local_llama_search_mcp"].search_query == "mcp"
+    assert source_by_id["reddit_local_llama_search_workflow"].search_query == "workflow"
+    assert source_by_id["reddit_local_llama_search_2api"].search_query == "2api"
+    assert source_by_id["reddit_local_llama_search_claude_code"].search_query == "claude code"
+    assert source_by_id["reddit_local_llama_search_comfyui"].search_query == "comfyui workflow"
 
     skipped_ids = {item.source_id for item in result.skipped}
     assert "x_account_openai" in skipped_ids

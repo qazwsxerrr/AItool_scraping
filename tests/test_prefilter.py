@@ -300,3 +300,48 @@ def test_evaluate_candidate_drops_funding_story_even_if_open_source_project_is_m
 
     assert decision.keep is False
     assert "personal_experience_or_question" in decision.drop_reasons
+
+
+def test_evaluate_candidate_keeps_n8n_ai_workflow_template():
+    decision = evaluate_candidate(
+        make_normalized_item(
+            source_id="reddit_local_llama_search_workflow",
+            title="Released n8n AI agent workflow template for triage automation",
+            body_text="Reusable workflow with OpenAI-compatible model routing and deployment guide.",
+            url="https://www.reddit.com/r/LocalLLaMA/comments/example/n8n-workflow",
+            raw_html='<a href="https://github.com/example/n8n-ai-workflow">GitHub repo</a>',
+        )
+    )
+
+    assert decision.keep is True
+    assert "target_tool_signal" in decision.keep_reasons
+
+
+def test_evaluate_candidate_keeps_comfyui_workflow_release():
+    decision = evaluate_candidate(
+        make_normalized_item(
+            source_id="reddit_local_llama_search_workflow",
+            title="Open-sourced ComfyUI workflow for image-to-video agent pipeline",
+            body_text="Includes reusable nodes, prompts, and setup guide.",
+            url="https://www.reddit.com/r/LocalLLaMA/comments/example/comfyui",
+            raw_html='<a href="https://github.com/example/comfyui-workflow">GitHub repo</a>',
+        )
+    )
+
+    assert decision.keep is True
+    assert "target_tool_signal" in decision.keep_reasons
+
+
+def test_evaluate_candidate_keeps_claude_code_codex_workflow_release():
+    decision = evaluate_candidate(
+        make_normalized_item(
+            source_id="reddit_local_llama_search_claude_code",
+            title="Released Claude Code + Codex workflow for autonomous repo maintenance",
+            body_text="Reusable workflow template with skills and MCP server integration.",
+            url="https://www.reddit.com/r/LocalLLaMA/comments/example/claude-codex",
+            raw_html='<a href="https://github.com/example/claude-codex-workflow">GitHub repo</a>',
+        )
+    )
+
+    assert decision.keep is True
+    assert "target_tool_signal" in decision.keep_reasons

@@ -172,6 +172,84 @@ sources:
     search_query: benchmark
     default_limit: 10
 
+  - id: reddit_local_llama_search_mcp
+    name: Reddit LocalLLaMA Search MCP
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=mcp&restrict_sr=1&sort=new&t=week
+    enabled: true
+    priority: 94
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: search
+    search_query: mcp
+    default_limit: 8
+
+  - id: reddit_local_llama_search_workflow
+    name: Reddit LocalLLaMA Search workflow
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=workflow&restrict_sr=1&sort=new&t=week
+    enabled: true
+    priority: 95
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: search
+    search_query: workflow
+    default_limit: 8
+
+  - id: reddit_local_llama_search_2api
+    name: Reddit LocalLLaMA Search 2API
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=2api%20OR%20%22openai-compatible%22%20OR%20proxy&restrict_sr=1&sort=new&t=week
+    enabled: true
+    priority: 96
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: search
+    search_query: 2api
+    default_limit: 8
+
+  - id: reddit_local_llama_search_claude_code
+    name: Reddit LocalLLaMA Search Claude Code workflow
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=%22claude%20code%22%20workflow&restrict_sr=1&sort=new&t=week
+    enabled: true
+    priority: 97
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: search
+    search_query: claude code
+    default_limit: 8
+
+  - id: reddit_local_llama_search_comfyui
+    name: Reddit LocalLLaMA Search ComfyUI workflow
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=comfyui%20workflow&restrict_sr=1&sort=new&t=week
+    enabled: true
+    priority: 98
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: search
+    search_query: comfyui workflow
+    default_limit: 8
+
+  - id: reddit_local_llama_search_n8n_dify
+    name: Reddit LocalLLaMA Search n8n Dify
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=n8n%20OR%20dify&restrict_sr=1&sort=new&t=week
+    enabled: true
+    priority: 99
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: search
+    search_query: n8n dify
+    default_limit: 8
+
   - id: x_account_openai
     name: X OpenAI via RSSHub
     type: rsshub
