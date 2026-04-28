@@ -81,3 +81,27 @@ class NormalizedItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
     raw_item: Mapped[RawItem] = relationship(back_populates="normalized_item")
+    candidate_item: Mapped["CandidateItem | None"] = relationship(back_populates="normalized_item")
+
+
+class CandidateItem(Base):
+    __tablename__ = "candidate_items"
+    __table_args__ = (
+        UniqueConstraint("normalized_item_id", name="uq_candidate_items_normalized_item_id"),
+        Index("ix_candidate_items_source_group", "source_group"),
+        Index("ix_candidate_items_status", "status"),
+        Index("ix_candidate_items_score", "candidate_score"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    normalized_item_id: Mapped[int] = mapped_column(ForeignKey("normalized_items.id"), nullable=False)
+    source_group: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_subtype: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    matched_keywords: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    keep_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    drop_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="kept")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    normalized_item: Mapped[NormalizedItem] = relationship(back_populates="candidate_item")

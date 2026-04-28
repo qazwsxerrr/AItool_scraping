@@ -8,6 +8,9 @@ sources:
     priority: 10
     fetch_interval: 3600
     parser_type: feedparser
+    source_group: official_blog
+    source_subtype: fixed_news
+    default_limit: 10
 
   - id: google_deepmind_blog
     name: Google DeepMind Blog
@@ -17,6 +20,9 @@ sources:
     priority: 20
     fetch_interval: 3600
     parser_type: feedparser
+    source_group: official_blog
+    source_subtype: fixed_blog
+    default_limit: 10
 
   - id: huggingface_blog
     name: Hugging Face Blog
@@ -26,6 +32,9 @@ sources:
     priority: 30
     fetch_interval: 3600
     parser_type: feedparser
+    source_group: official_blog
+    source_subtype: fixed_blog
+    default_limit: 10
 
   - id: producthunt_feed
     name: Product Hunt Feed
@@ -35,6 +44,9 @@ sources:
     priority: 40
     fetch_interval: 3600
     parser_type: feedparser
+    source_group: producthunt
+    source_subtype: fixed_feed
+    default_limit: 20
 
   - id: linux_do_top
     name: LINUX DO Top Topics
@@ -44,6 +56,9 @@ sources:
     priority: 55
     fetch_interval: 3600
     parser_type: feedparser
+    source_group: linux_do
+    source_subtype: fixed_top
+    default_limit: 20
 
   - id: linux_do_hot
     name: LINUX DO Hot Topics
@@ -53,6 +68,174 @@ sources:
     priority: 60
     fetch_interval: 1800
     parser_type: feedparser
+    source_group: linux_do
+    source_subtype: fixed_hot
+    default_limit: 20
+
+  - id: reddit_local_llama_new
+    name: Reddit LocalLLaMA New
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/new/.rss
+    enabled: true
+    priority: 70
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: fixed_new
+    default_limit: 40
+
+  - id: reddit_local_llama_hot
+    name: Reddit LocalLLaMA Hot
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/hot/.rss
+    enabled: true
+    priority: 75
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: fixed_hot
+    default_limit: 25
+
+  - id: reddit_local_llama_top_day
+    name: Reddit LocalLLaMA Top Day
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day
+    enabled: true
+    priority: 80
+    fetch_interval: 14400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: fixed_top_day
+    default_limit: 20
+
+  - id: reddit_local_llama_top_week
+    name: Reddit LocalLLaMA Top Week
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week
+    enabled: true
+    priority: 85
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: fixed_top_week
+    default_limit: 20
+
+  - id: reddit_local_llama_search_agent
+    name: Reddit LocalLLaMA Search agent
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=agent&restrict_sr=1&sort=new&t=day
+    enabled: true
+    priority: 90
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: search
+    search_query: agent
+    default_limit: 10
+
+  - id: reddit_local_llama_search_open_weights
+    name: Reddit LocalLLaMA Search open weights
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=open%20weights&restrict_sr=1&sort=new&t=day
+    enabled: true
+    priority: 91
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: search
+    search_query: open weights
+    default_limit: 10
+
+  - id: reddit_local_llama_search_gguf
+    name: Reddit LocalLLaMA Search gguf
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=gguf&restrict_sr=1&sort=new&t=day
+    enabled: true
+    priority: 92
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: search
+    search_query: gguf
+    default_limit: 10
+
+  - id: reddit_local_llama_search_benchmark
+    name: Reddit LocalLLaMA Search benchmark
+    type: atom
+    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=benchmark&restrict_sr=1&sort=new&t=day
+    enabled: true
+    priority: 93
+    fetch_interval: 86400
+    parser_type: feedparser
+    source_group: reddit_local_llama
+    source_subtype: search
+    search_query: benchmark
+    default_limit: 10
+
+  - id: x_account_openai
+    name: X OpenAI via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/OpenAI
+    enabled: true
+    priority: 100
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: OpenAI
+    default_limit: 5
+
+  - id: x_account_huggingface
+    name: X Hugging Face via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/huggingface
+    enabled: true
+    priority: 101
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: huggingface
+    default_limit: 5
+
+  - id: x_account_local_llama
+    name: X LocalLLaMA via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/LocalLLaMA
+    enabled: true
+    priority: 102
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: LocalLLaMA
+    default_limit: 5
+
+  - id: x_search_github_launch
+    name: X Search GitHub Launch via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/search/url%3Agithub.com%20%28launch%20OR%20released%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
+    enabled: true
+    priority: 150
+    fetch_interval: 14400
+    parser_type: feedparser
+    source_group: x
+    source_subtype: search
+    search_query: 'url:github.com ("launch" OR "released" OR "open source") -is:retweet -is:reply'
+    default_limit: 20
+
+  - id: x_search_huggingface_model
+    name: X Search Hugging Face Model via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/search/url%3Ahuggingface.co%20%28model%20OR%20weights%20OR%20gguf%29%20-is%3Aretweet%20-is%3Areply
+    enabled: true
+    priority: 151
+    fetch_interval: 14400
+    parser_type: feedparser
+    source_group: x
+    source_subtype: search
+    search_query: 'url:huggingface.co ("model" OR "weights" OR "gguf") -is:retweet -is:reply'
+    default_limit: 20
 
   # RSSHub feeds are enabled only when RSSHUB_BASE_URL is configured.
   # Source-level failures are isolated, so an unavailable route will not stop other feeds.

@@ -15,14 +15,20 @@ from app.logging_config import configure_logging
 
 
 def main(
-    limit_per_source: int = typer.Option(30, min=1, help="Maximum items to process per source."),
+    limit_per_source: int | None = typer.Option(
+        None,
+        min=1,
+        help="Maximum items to process per source. Defaults to each source's configured default_limit.",
+    ),
     source: str | None = typer.Option(None, help="Only fetch one source id, e.g. openai_news."),
+    group: str | None = typer.Option(None, help="Only fetch one source group, e.g. reddit_local_llama."),
 ) -> None:
     configure_logging()
     result = run_fetch_from_registry(
         settings=Settings.from_env(),
         limit_per_source=limit_per_source,
         source_filter=source,
+        source_group_filter=group,
     )
 
     if result.skipped_sources:
@@ -32,6 +38,10 @@ def main(
 
     if source and source not in result.stats:
         typer.echo(f"No enabled source matched: {source}")
+        raise typer.Exit(code=1)
+
+    if group and not result.stats:
+        typer.echo(f"No enabled source group matched: {group}")
         raise typer.Exit(code=1)
 
     typer.echo("Fetch stats:")

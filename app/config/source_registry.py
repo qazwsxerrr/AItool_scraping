@@ -27,6 +27,10 @@ class SourceConfig(BaseModel):
     priority: int = 100
     fetch_interval: int = 3600
     parser_type: Literal["feedparser"] = "feedparser"
+    source_group: str = "general"
+    source_subtype: str = "fixed"
+    default_limit: int = 30
+    search_query: str | None = None
 
     @field_validator("id")
     @classmethod
@@ -55,6 +59,20 @@ class SourceConfig(BaseModel):
     def validate_fetch_interval(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("fetch_interval must be positive")
+        return value
+
+    @field_validator("source_group", "source_subtype")
+    @classmethod
+    def validate_source_metadata(cls, value: str) -> str:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_\-]*", value):
+            raise ValueError("source metadata must contain lowercase letters, numbers, underscore or dash")
+        return value
+
+    @field_validator("default_limit")
+    @classmethod
+    def validate_default_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("default_limit must be positive")
         return value
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import subprocess
 
 import httpx
 
@@ -44,9 +45,44 @@ class HTTPFeedCollector:
                     return response.content
             except (httpx.HTTPError, httpx.TimeoutException) as exc:
                 last_error = exc
+                if _should_try_curl_fallback(url, exc):
+                    fallback = _fetch_with_curl(url, self.timeout_seconds, self.user_agent)
+                    if fallback:
+                        return fallback
                 if attempt >= self.retries:
                     break
                 sleep_seconds = min(0.5 * (attempt + 1), 2.0)
                 LOGGER.warning("Feed request failed, retrying in %.1fs: %s", sleep_seconds, exc)
                 time.sleep(sleep_seconds)
         raise RuntimeError(f"failed to fetch feed {url}: {last_error}")
+
+
+def _should_try_curl_fallback(url: str, exc: Exception) -> bool:
+    return "reddit.com" in url and "403" in str(exc)
+
+
+def _fetch_with_curl(url: str, timeout_seconds: float, user_agent: str) -> bytes | None:
+    """Fallback for Reddit RSS, which can block httpx while allowing curl-like clients."""
+    try:
+        completed = subprocess.run(
+            [
+                "curl",
+                "-L",
+                "--max-time",
+                str(int(timeout_seconds)),
+                "-A",
+                user_agent,
+                "-H",
+                "Accept: application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+                "-s",
+                url,
+            ],
+            check=False,
+            capture_output=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode == 0 and completed.stdout.strip().startswith((b"<?xml", b"<feed", b"<rss")):
+        LOGGER.warning("Fetched %s with curl fallback after HTTP client was blocked", url)
+        return completed.stdout
+    return None

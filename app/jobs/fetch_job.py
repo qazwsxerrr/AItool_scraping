@@ -52,11 +52,17 @@ def run_fetch_job(
     session_factory: sessionmaker[Session],
     sources: Iterable[SourceConfig],
     collector: FeedCollector | None = None,
-    limit_per_source: int | None = 30,
+    limit_per_source: int | None = None,
     source_filter: str | None = None,
+    source_group_filter: str | None = None,
 ) -> FetchJobResult:
     """Fetch enabled sources and persist new raw_items; source failures are isolated."""
-    selected_sources = [source for source in sources if source_filter in {None, source.id}]
+    selected_sources = [
+        source
+        for source in sources
+        if source_filter in {None, source.id}
+        and source_group_filter in {None, source.source_group}
+    ]
     result = FetchJobResult()
     feed_collector = collector or HTTPFeedCollector()
 
@@ -70,7 +76,8 @@ def run_fetch_job(
         stats = SourceFetchStats()
         result.stats[source.id] = stats
         try:
-            items = feed_collector.collect(source, limit=limit_per_source)
+            effective_limit = limit_per_source if limit_per_source is not None else source.default_limit
+            items = feed_collector.collect(source, limit=effective_limit)
             stats.fetched = len(items)
             with session_factory() as session:
                 raw_repo = RawItemRepository(session)
@@ -101,8 +108,9 @@ def run_fetch_from_registry(
     *,
     settings: Settings,
     registry_path=DEFAULT_REGISTRY_PATH,
-    limit_per_source: int | None = 30,
+    limit_per_source: int | None = None,
     source_filter: str | None = None,
+    source_group_filter: str | None = None,
 ) -> FetchJobResult:
     registry = load_source_registry(registry_path, env={"RSSHUB_BASE_URL": settings.rsshub_base_url or ""})
     engine = create_engine_from_url(settings.database_url)
@@ -119,6 +127,7 @@ def run_fetch_from_registry(
         collector=collector,
         limit_per_source=limit_per_source,
         source_filter=source_filter,
+        source_group_filter=source_group_filter,
     )
     result.skipped_sources.extend(f"{item.source_id}: {item.reason}" for item in registry.skipped)
     return result

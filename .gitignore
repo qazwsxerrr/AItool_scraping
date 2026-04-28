@@ -15,4 +15,5 @@ venv/
 # Local runtime artifacts
 data/*.db
 data/*.sqlite*
+output/
 output/BACKUP/
