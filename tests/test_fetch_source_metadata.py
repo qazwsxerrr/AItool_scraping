@@ -72,7 +72,9 @@ def test_default_registry_contains_main_site_metadata_and_x_is_env_gated():
 
     assert source_by_id["linux_do_top"].source_group == "linux_do"
     assert source_by_id["linux_do_top"].source_subtype == "fixed_top"
+    assert source_by_id["linux_do_top"].default_limit == 30
     assert source_by_id["linux_do_hot"].source_subtype == "fixed_hot"
+    assert source_by_id["linux_do_hot"].default_limit == 30
 
     assert source_by_id["reddit_local_llama_new"].source_group == "reddit_local_llama"
     assert source_by_id["reddit_local_llama_new"].source_subtype == "fixed_new"

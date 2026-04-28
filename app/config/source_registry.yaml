@@ -58,7 +58,7 @@ sources:
     parser_type: feedparser
     source_group: linux_do
     source_subtype: fixed_top
-    default_limit: 20
+    default_limit: 30
 
   - id: linux_do_hot
     name: LINUX DO Hot Topics
@@ -70,7 +70,7 @@ sources:
     parser_type: feedparser
     source_group: linux_do
     source_subtype: fixed_hot
-    default_limit: 20
+    default_limit: 30
 
   - id: reddit_local_llama_new
     name: Reddit LocalLLaMA New
