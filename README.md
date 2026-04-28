@@ -126,6 +126,7 @@ AI 初筛 API 框架配置项：
 AI_REVIEW_API_URL=https://your-ai-endpoint.example/review
 AI_REVIEW_API_KEY=your-key
 AI_REVIEW_MODEL=your-model-name
+AI_REVIEW_API_STYLE=generic_json
 AI_REVIEW_TIMEOUT_SECONDS=30
 ```
 
@@ -139,6 +140,14 @@ AI_REVIEW_TIMEOUT_SECONDS=30
   "reason": "why this should continue",
   "summary_cn": "中文摘要"
 }
+```
+
+如果使用 DeepSeek / OpenAI-compatible Chat Completions，把 URL 写为 base URL，并指定：
+
+```env
+AI_REVIEW_API_URL=https://api.deepseek.com
+AI_REVIEW_MODEL=deepseek-v4-flash
+AI_REVIEW_API_STYLE=openai_chat
 ```
 
 ## 运行
@@ -232,6 +241,20 @@ python scripts/run_review_export_once.py --limit 50
 python -m app.main review-export --limit 50
 ```
 
+调用 AI API 对 `kept` 候选做初筛：
+
+```bash
+python scripts/run_ai_review_once.py --limit 5
+```
+
+或：
+
+```bash
+python -m app.main ai-review --limit 5
+```
+
+AI 初筛结果会写入 `ai_review_items` 表；重复运行不会重复审同一个 `candidate_item_id`。
+
 ## 测试
 
 ```bash
@@ -258,6 +281,7 @@ uv run --extra test pytest
 - 规则预筛与 `candidate_items` 幂等入库
 - AI 初筛前人工审阅 Markdown / JSONL 导出
 - AI 初筛 API 客户端配置、请求载荷和响应解析
+- AI 初筛 job 幂等入库
 
 ## 数据表
 
@@ -267,5 +291,6 @@ uv run --extra test pytest
 - `raw_items`：原始抓取条目、原始 payload、内容 hash 与处理状态
 - `normalized_items`：标准化后的标题、正文、URL、语言与 `dedupe_key`
 - `candidate_items`：规则预筛后的候选池，保存分数、命中关键词、保留/丢弃理由
+- `ai_review_items`：AI 初筛结果，保存 AI 是否保留、评分、分类、原因、中文摘要和原始响应
 
 默认数据库路径：`data/ai_tool_intel.db`。

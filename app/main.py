@@ -3,6 +3,7 @@ from __future__ import annotations
 import typer
 
 from app.config.settings import Settings
+from app.jobs.ai_review_job import run_ai_review_from_settings
 from app.jobs.fetch_job import run_fetch_from_registry
 from app.jobs.normalize_job import run_normalize_from_settings
 from app.jobs.prefilter_job import run_prefilter_from_settings
@@ -77,6 +78,18 @@ def review_export(
     typer.echo(f"exported={result.exported}")
     typer.echo(f"markdown={result.markdown_path}")
     typer.echo(f"jsonl={result.jsonl_path}")
+
+
+@app.command("ai-review")
+def ai_review(
+    limit: int = typer.Option(5, min=1, help="Maximum kept candidate_items to review with AI."),
+) -> None:
+    configure_logging()
+    result = run_ai_review_from_settings(settings=Settings.from_env(), limit=limit)
+    typer.echo(
+        f"processed={result.processed} inserted={result.inserted} "
+        f"skipped={result.skipped} failed={result.failed}"
+    )
 
 
 if __name__ == "__main__":

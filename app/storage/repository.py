@@ -9,9 +9,10 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.config.source_registry import SourceConfig
 from app.parsers.feed_parser import ParsedFeedItem
+from app.ai.review_client import AIReviewResponse
 from app.pipeline.normalize import NormalizedItemData
 from app.pipeline.prefilter import CandidateDecision
-from app.storage.models import CandidateItem, NormalizedItem, RawItem, Source
+from app.storage.models import AIReviewItem, CandidateItem, NormalizedItem, RawItem, Source
 
 
 @dataclass(frozen=True)
@@ -202,6 +203,52 @@ class CandidateItemRepository:
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
+
+    def list_pending_for_ai_review(self, *, limit: int | None = 50) -> list[CandidateItem]:
+        stmt = (
+            select(CandidateItem)
+            .options(
+                joinedload(CandidateItem.normalized_item)
+                .joinedload(NormalizedItem.raw_item)
+                .joinedload(RawItem.source)
+            )
+            .outerjoin(AIReviewItem, AIReviewItem.candidate_item_id == CandidateItem.id)
+            .where(CandidateItem.status == "kept", AIReviewItem.id.is_(None))
+            .order_by(CandidateItem.candidate_score.desc(), CandidateItem.id.asc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+
+class AIReviewItemRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def insert_if_new(
+        self,
+        *,
+        candidate_item_id: int,
+        model: str | None,
+        response: AIReviewResponse,
+    ) -> InsertResult:
+        stmt = select(AIReviewItem.id).where(AIReviewItem.candidate_item_id == candidate_item_id)
+        if self.session.execute(stmt).first():
+            return InsertResult(inserted=False, reason="duplicate_candidate_item")
+
+        item = AIReviewItem(
+            candidate_item_id=candidate_item_id,
+            model=model,
+            ai_keep=response.keep,
+            ai_score=response.score,
+            category=response.category,
+            reason=response.reason,
+            summary_cn=response.summary_cn,
+            raw_response=json.dumps(response.raw_response or {}, ensure_ascii=False, default=str),
+        )
+        self.session.add(item)
+        self.session.flush()
+        return InsertResult(inserted=True, item_id=item.id)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:

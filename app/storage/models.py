@@ -105,3 +105,26 @@ class CandidateItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
     normalized_item: Mapped[NormalizedItem] = relationship(back_populates="candidate_item")
+    ai_review_item: Mapped["AIReviewItem | None"] = relationship(back_populates="candidate_item")
+
+
+class AIReviewItem(Base):
+    __tablename__ = "ai_review_items"
+    __table_args__ = (
+        UniqueConstraint("candidate_item_id", name="uq_ai_review_items_candidate_item_id"),
+        Index("ix_ai_review_items_ai_keep", "ai_keep"),
+        Index("ix_ai_review_items_ai_score", "ai_score"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    candidate_item_id: Mapped[int] = mapped_column(ForeignKey("candidate_items.id"), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    ai_keep: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    ai_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    category: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_response: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    candidate_item: Mapped[CandidateItem] = relationship(back_populates="ai_review_item")

@@ -96,3 +96,57 @@ def test_ai_review_client_requires_configuration_before_review():
                 matched_keywords=[],
             )
         )
+
+
+def test_ai_review_client_supports_openai_chat_completions_payload_and_json_content():
+    settings = Settings(
+        ai_review_api_url="https://api.deepseek.com",
+        ai_review_api_key="secret-key",
+        ai_review_model="deepseek-v4-flash",
+        ai_review_api_style="openai_chat",
+    )
+    http_client = FakeHttpClient(
+        FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "keep": True,
+                                    "score": 91,
+                                    "category": "model_release",
+                                    "reason": "包含模型发布和代码链接",
+                                    "summary_cn": "这是一个模型发布候选。",
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+    )
+    client = AIReviewClient.from_settings(settings, http_client=http_client)
+
+    response = client.review(
+        AIReviewRequest(
+            candidate_id=7,
+            title="Qwen model release",
+            url="https://example.com",
+            source_group="reddit_local_llama",
+            candidate_score=88,
+            body_preview="model release with benchmark",
+            matched_keywords=["model", "benchmark"],
+        )
+    )
+
+    call = http_client.calls[0]
+    assert call["url"] == "https://api.deepseek.com/chat/completions"
+    assert call["json"]["model"] == "deepseek-v4-flash"
+    assert call["json"]["response_format"] == {"type": "json_object"}
+    assert call["json"]["messages"][0]["role"] == "system"
+    assert "candidate_id" in call["json"]["messages"][1]["content"]
+    assert response.keep is True
+    assert response.score == 91
+    assert response.summary_cn == "这是一个模型发布候选。"

@@ -36,6 +36,7 @@ class Settings:
     ai_review_api_url: str | None = None
     ai_review_api_key: str | None = None
     ai_review_model: str | None = None
+    ai_review_api_style: str = "generic_json"
     ai_review_timeout_seconds: float = 30.0
 
     @classmethod
@@ -54,5 +55,6 @@ class Settings:
             ai_review_api_url=os.getenv("AI_REVIEW_API_URL") or None,
             ai_review_api_key=os.getenv("AI_REVIEW_API_KEY") or None,
             ai_review_model=os.getenv("AI_REVIEW_MODEL") or None,
+            ai_review_api_style=os.getenv("AI_REVIEW_API_STYLE", "generic_json"),
             ai_review_timeout_seconds=float(os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "30")),
         )
