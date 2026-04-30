@@ -28,6 +28,7 @@ def run_ai_review_job(
     session_factory: sessionmaker[Session],
     client: AIReviewClient,
     limit: int | None = 20,
+    min_candidate_score: int = 70,
 ) -> AIReviewJobResult:
     result = AIReviewJobResult()
     if not client.is_configured:
@@ -36,7 +37,7 @@ def run_ai_review_job(
     with session_factory() as session:
         candidate_repo = CandidateItemRepository(session)
         ai_review_repo = AIReviewItemRepository(session)
-        candidates = candidate_repo.list_pending_for_ai_review(limit=limit)
+        candidates = candidate_repo.list_pending_for_ai_review(limit=limit, min_score=min_candidate_score)
 
         for candidate in candidates:
             result.processed += 1
@@ -61,12 +62,25 @@ def run_ai_review_job(
     return result
 
 
-def run_ai_review_from_settings(*, settings: Settings, limit: int | None = 20) -> AIReviewJobResult:
+def run_ai_review_from_settings(
+    *,
+    settings: Settings,
+    limit: int | None = 20,
+    min_candidate_score: int | None = None,
+) -> AIReviewJobResult:
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
     session_factory = create_session_factory(engine)
     client = AIReviewClient.from_settings(settings)
-    return run_ai_review_job(session_factory=session_factory, client=client, limit=limit)
+    effective_min_score = (
+        settings.ai_review_min_candidate_score if min_candidate_score is None else min_candidate_score
+    )
+    return run_ai_review_job(
+        session_factory=session_factory,
+        client=client,
+        limit=limit,
+        min_candidate_score=effective_min_score,
+    )
 
 
 def _candidate_to_request(candidate) -> AIReviewRequest:

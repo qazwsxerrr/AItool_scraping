@@ -1,5 +1,9 @@
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
+import httpx
+
+from app.collectors.rss_collector import HTTPFeedCollector
 from app.config.source_registry import SourceConfig
 from app.jobs.fetch_job import run_fetch_job
 from app.parsers.feed_parser import ParsedFeedItem
@@ -60,3 +64,42 @@ def test_fetch_job_continues_when_one_source_fails(tmp_path):
 
     with session_factory() as session:
         assert session.query(RawItem).count() == 1
+
+
+def test_http_feed_collector_uses_curl_fallback_when_httpx_times_out(monkeypatch):
+    rss_body = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <item>
+      <guid>linux-do-1</guid>
+      <title>Linux DO AI Tool</title>
+      <link>https://linux.do/t/topic/1</link>
+    </item>
+  </channel>
+</rss>
+"""
+
+    class TimeoutClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def get(self, url):
+            raise httpx.TimeoutException("timed out")
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=rss_body, stderr=b"")
+
+    monkeypatch.setattr("app.collectors.rss_collector.httpx.Client", TimeoutClient)
+    monkeypatch.setattr("app.collectors.rss_collector.subprocess.run", fake_run)
+
+    collector = HTTPFeedCollector(timeout_seconds=1, retries=0)
+    items = collector.collect(source("linux_do_top", "https://linux.do/top.rss"), limit=30)
+
+    assert len(items) == 1
+    assert items[0].title == "Linux DO AI Tool"

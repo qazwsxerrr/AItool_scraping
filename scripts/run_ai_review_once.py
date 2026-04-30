@@ -15,10 +15,20 @@ from app.logging_config import configure_logging
 
 
 def main(
-    limit: int = typer.Option(5, min=1, help="Maximum kept candidate_items to review with AI."),
+    limit: int = typer.Option(5, min=1, help="Maximum high-score candidate_items to review with AI."),
+    min_score: int | None = typer.Option(
+        None,
+        min=0,
+        max=100,
+        help="Minimum candidate_score to send to AI. Defaults to AI_REVIEW_MIN_CANDIDATE_SCORE.",
+    ),
 ) -> None:
     configure_logging()
-    result = run_ai_review_from_settings(settings=Settings.from_env(), limit=limit)
+    result = run_ai_review_from_settings(
+        settings=Settings.from_env(),
+        limit=limit,
+        min_candidate_score=min_score,
+    )
     typer.echo(
         f"AI review stats: processed={result.processed} inserted={result.inserted} "
         f"skipped={result.skipped} failed={result.failed}"

@@ -2,7 +2,7 @@
 
 本仓库用于构建面向 AI 工具发现、筛选、聚合、归档与文字分发的工程化情报系统。
 
-当前阶段目标：实现 RSS/Atom/RSSHub 信息源抓取，解析后幂等写入 `raw_items`。
+当前阶段目标：实现“抓取 → 标准化 → 规则预筛 → AI 二次筛选 → 人工审阅导出”的最小闭环。
 
 ## 当前实现范围
 
@@ -12,11 +12,12 @@
 - 使用 SQLite + SQLAlchemy 保存 `sources` 与 `raw_items`。
 - 对 `source_id + external_id`、`source_id + link`、`content_hash` 做幂等去重。
 - 单个 source 抓取失败只记录失败，不中断其他 source。
+- 抓取层内置有限重试；当 `httpx` 遇到 timeout / 403 / 429 时会尝试 `curl` fallback。
 - 将 `raw_items` 标准化为 `normalized_items`。
 - 对标准化 URL / 标题生成 `dedupe_key`，避免同一条内容因追踪参数重复进入后续流程。
 - 按规则预筛生成 `candidate_items` 候选池，先过滤低信号闲聊，再进入后续 AI 初筛。
 - 将 `candidate_items` 中保留的候选导出为 Markdown / JSONL，便于 AI 初筛前人工审阅。
-- 已预留通用 AI 初筛 API 客户端框架，调用地址和 key 通过环境变量配置。
+- 已支持通用 JSON API 与 OpenAI-compatible Chat Completions 风格 AI 初筛，调用地址、key 和模型通过环境变量配置。
 
 暂不包含 canonical tool 聚合、Notion、Telegram、Markdown 日报、HTML 爬虫。
 
@@ -38,6 +39,18 @@
 | `reddit_local_llama_search_open_weights` | Reddit r/LocalLLaMA search | `open weights` |
 | `reddit_local_llama_search_gguf` | Reddit r/LocalLLaMA search | `gguf` |
 | `reddit_local_llama_search_benchmark` | Reddit r/LocalLLaMA search | `benchmark` |
+| `reddit_local_llama_search_mcp` | Reddit r/LocalLLaMA search | `mcp` |
+| `reddit_local_llama_search_workflow` | Reddit r/LocalLLaMA search | `workflow` |
+| `reddit_local_llama_search_2api` | Reddit r/LocalLLaMA search | `2api / openai-compatible / proxy` |
+| `reddit_local_llama_search_claude_code` | Reddit r/LocalLLaMA search | `claude code workflow` |
+| `reddit_local_llama_search_comfyui` | Reddit r/LocalLLaMA search | `comfyui workflow` |
+| `reddit_local_llama_search_n8n_dify` | Reddit r/LocalLLaMA search | `n8n / dify` |
+
+默认条数说明：
+
+- `linux_do_top`：默认抓取 30 条。
+- `linux_do_hot`：默认抓取 30 条。
+- Reddit `new/hot/top/search` 源各自有独立默认条数，详见 `app/config/source_registry.yaml`。
 
 ## X / RSSHub 来源
 
@@ -128,6 +141,7 @@ AI_REVIEW_API_KEY=your-key
 AI_REVIEW_MODEL=your-model-name
 AI_REVIEW_API_STYLE=generic_json
 AI_REVIEW_TIMEOUT_SECONDS=30
+AI_REVIEW_MIN_CANDIDATE_SCORE=70
 ```
 
 当前只搭建 API 调用框架，不会在人工审阅导出时默认调用 AI。预期接口接受候选 JSON，返回：
@@ -152,38 +166,60 @@ AI_REVIEW_API_STYLE=openai_chat
 
 ## 运行
 
-初始化数据库：
+以下命令默认在项目根目录执行：
+
+```powershell
+cd D:\ai_code\ai_vibecode\AItool_scraping
+```
+
+如果在 WSL 中执行，则路径通常是：
+
+```bash
+cd /mnt/d/ai_code/ai_vibecode/AItool_scraping
+```
+
+### 1. 初始化数据库
+
+PowerShell / Windows：
+
+```powershell
+./.conda/python.exe scripts/init_db.py
+```
+
+WSL / Linux 原生 Python：
 
 ```bash
 python scripts/init_db.py
 ```
 
+### 2. 抓取信息源
+
 抓取单个源：
 
-```bash
-python scripts/run_fetch_once.py --source openai_news --limit-per-source 5
+```powershell
+./.conda/python.exe scripts/run_fetch_once.py --source openai_news --limit-per-source 5
 ```
 
 抓取所有启用源：
 
-```bash
-python scripts/run_fetch_once.py
+```powershell
+./.conda/python.exe scripts/run_fetch_once.py
 ```
 
 按来源组抓取：
 
-```bash
-python scripts/run_fetch_once.py --group linux_do
-python scripts/run_fetch_once.py --group reddit_local_llama
-python scripts/run_fetch_once.py --group x
+```powershell
+./.conda/python.exe scripts/run_fetch_once.py --group linux_do
+./.conda/python.exe scripts/run_fetch_once.py --group reddit_local_llama
+./.conda/python.exe scripts/run_fetch_once.py --group x
 ```
 
 如不传 `--limit-per-source`，会使用每个 source 在 registry 中配置的 `default_limit`。
 
 手动覆盖每源条数：
 
-```bash
-python scripts/run_fetch_once.py --group reddit_local_llama --limit-per-source 10
+```powershell
+./.conda/python.exe scripts/run_fetch_once.py --group reddit_local_llama --limit-per-source 10
 ```
 
 CLI 会输出每个 source 的：
@@ -195,10 +231,10 @@ CLI 会输出每个 source 的：
 
 重复执行同一个 source 时，已入库条目会显示为 `skipped`。
 
-标准化待处理 `raw_items`：
+### 3. 标准化待处理 `raw_items`
 
-```bash
-python scripts/run_normalize_once.py --limit 100
+```powershell
+./.conda/python.exe scripts/run_normalize_once.py --limit 300
 ```
 
 标准化会：
@@ -210,10 +246,10 @@ python scripts/run_normalize_once.py --limit 100
 - 将成功标准化的原始条目标记为 `normalized`
 - 将同一标准化内容的重复条目标记为 `duplicate`
 
-规则预筛生成候选池：
+### 4. 规则预筛生成候选池
 
-```bash
-python scripts/run_prefilter_once.py --limit 100
+```powershell
+./.conda/python.exe scripts/run_prefilter_once.py --limit 300
 ```
 
 预筛会根据以下信号生成 `candidate_items`：
@@ -224,10 +260,46 @@ python scripts/run_prefilter_once.py --limit 100
 - 明确丢弃：泛 benchmark、纯模型横评、硬件功耗 / VRAM / 吞吐调优、观点讨论、问题求推荐、个人部署踩坑、社区公告、抽奖、治理帖。
 - 噪声关键词、个人体验类和低分内容会标记为 `dropped`。
 
-导出 AI 初筛前人工审阅文件：
+### 5. 调用 AI API 对 `kept` 候选做二次筛选
 
-```bash
-python scripts/run_review_export_once.py --limit 50
+```powershell
+./.conda/python.exe scripts/run_ai_review_once.py --limit 50
+```
+
+这里的 `--limit 50` 只是本次 AI 审阅的最大上限，不代表一定会审 50 条。AI 阶段会先筛选：
+
+```text
+status = kept
+candidate_score >= AI_REVIEW_MIN_CANDIDATE_SCORE
+尚未写入 ai_review_items
+```
+
+然后按以下优先级选择：
+
+```text
+candidate_score 降序 → published_at 降序 → candidate_id 升序
+```
+
+因此如果本轮只有 12 条达到最低分，即使传 `--limit 50` 也只会审 12 条，不会为了凑满 50 条把低质量候选送给 AI。
+
+可以临时覆盖最低分：
+
+```powershell
+./.conda/python.exe scripts/run_ai_review_once.py --limit 50 --min-score 80
+```
+
+或：
+
+```powershell
+./.conda/python.exe -m app.main ai-review --limit 50 --min-score 80
+```
+
+AI 初筛结果会写入 `ai_review_items` 表；重复运行不会重复审同一个 `candidate_item_id`。
+
+### 6. 导出人工审阅文件
+
+```powershell
+./.conda/python.exe scripts/run_review_export_once.py --limit 100
 ```
 
 会在 `output/` 下生成两份文件：
@@ -237,23 +309,108 @@ python scripts/run_review_export_once.py --limit 50
 
 也可以通过 Typer CLI 执行：
 
-```bash
-python -m app.main review-export --limit 50
+```powershell
+./.conda/python.exe -m app.main review-export --limit 100
 ```
 
-调用 AI API 对 `kept` 候选做初筛：
+### 7. 一键顺序执行完整流程
 
-```bash
-python scripts/run_ai_review_once.py --limit 5
+推荐先跑重点来源，避免某些国外源网络超时拖慢全量流程：
+
+```powershell
+./.conda/python.exe scripts/init_db.py
+
+./.conda/python.exe scripts/run_fetch_once.py --group linux_do
+./.conda/python.exe scripts/run_fetch_once.py --group reddit_local_llama
+
+./.conda/python.exe scripts/run_normalize_once.py --limit 300
+./.conda/python.exe scripts/run_prefilter_once.py --limit 300
+./.conda/python.exe scripts/run_ai_review_once.py --limit 50
+./.conda/python.exe scripts/run_review_export_once.py --limit 100
 ```
 
-或：
+如果要抓所有启用来源：
 
-```bash
-python -m app.main ai-review --limit 5
+```powershell
+./.conda/python.exe scripts/init_db.py
+
+./.conda/python.exe scripts/run_fetch_once.py
+./.conda/python.exe scripts/run_normalize_once.py --limit 500
+./.conda/python.exe scripts/run_prefilter_once.py --limit 500
+./.conda/python.exe scripts/run_ai_review_once.py --limit 80
+./.conda/python.exe scripts/run_review_export_once.py --limit 150
 ```
 
-AI 初筛结果会写入 `ai_review_items` 表；重复运行不会重复审同一个 `candidate_item_id`。
+## 网络、代理与超时处理
+
+### RSSHub warning 是否正常
+
+未配置 `RSSHUB_BASE_URL` 时，会看到类似 warning：
+
+```text
+Skipping source x_account_openai: missing env: RSSHUB_BASE_URL
+```
+
+这是正常行为，表示 X / Anthropic / GitHub Trending 等 RSSHub 源被跳过；不会影响 LINUX DO、Reddit、OpenAI、DeepMind、Product Hunt 等原生 RSS / Atom 源。
+
+### 如果抓取一直 timeout
+
+PowerShell 下先测试系统 `curl.exe` 是否能访问：
+
+```powershell
+curl.exe -L --max-time 20 https://linux.do/top.rss -o $env:TEMP\linux_top.rss
+Get-Item $env:TEMP\linux_top.rss
+```
+
+再测试 Python/httpx：
+
+```powershell
+./.conda/python.exe -c "import httpx; r=httpx.get('https://linux.do/top.rss', timeout=20, follow_redirects=True); print(r.status_code, len(r.content))"
+```
+
+判断方式：
+
+- `curl.exe` 成功、Python/httpx 超时：程序会自动尝试 `curl` fallback；也可以缩短超时加快 fallback。
+- `curl.exe` 和 Python/httpx 都超时：通常是当前 PowerShell 网络/代理未配置，需要先配置代理。
+
+常见 Clash / Mihomo HTTP 代理示例：
+
+```powershell
+$env:HTTP_PROXY="http://127.0.0.1:7890"
+$env:HTTPS_PROXY="http://127.0.0.1:7890"
+```
+
+如果你的代理端口不是 `7890`，请改成实际端口。
+
+临时缩短抓取超时与重试次数：
+
+```powershell
+$env:REQUEST_TIMEOUT_SECONDS="10"
+$env:REQUEST_RETRIES="1"
+./.conda/python.exe scripts/run_fetch_once.py --group linux_do
+```
+
+## limit 参数怎么理解
+
+不同阶段的 `limit` 含义不同：
+
+| 阶段 | 参数 | 选择方式 |
+|---|---|---|
+| 抓取 | `--limit-per-source` | 每个 source 最多取多少条 feed item；不传则使用 `source_registry.yaml` 的 `default_limit`。 |
+| 标准化 | `--limit` | 从待标准化 `raw_items` 中按入库顺序处理最多 N 条，成本低，目标是清空库存。 |
+| 规则预筛 | `--limit` | 从未预筛 `normalized_items` 中按入库顺序处理最多 N 条，成本低，目标是生成候选池。 |
+| AI 二次筛选 | `--limit` + `--min-score` | `limit` 是最大上限；只处理高于最低分的候选，并按分数/时间优先级排序，允许不足 N 条。 |
+| 人工审阅导出 | `--limit` | 从候选池按分数降序导出最多 N 条，便于人工检查。 |
+
+### 为什么重复运行显示 skipped
+
+例如：
+
+```text
+linux_do_top: fetched=30 inserted=0 skipped=30 failed=0
+```
+
+表示实际抓到了 30 条，但这些条目已在数据库中，因此被幂等去重跳过。不是抓取失败。
 
 ## 测试
 

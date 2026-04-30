@@ -58,11 +58,20 @@ class HTTPFeedCollector:
 
 
 def _should_try_curl_fallback(url: str, exc: Exception) -> bool:
-    return "reddit.com" in url and "403" in str(exc)
+    """Use curl as a second transport when httpx is blocked or unstable.
+
+    Some feeds are intermittently reachable from Windows curl but time out in
+    httpx due to network/proxy/DNS path differences. Reddit can also return 403
+    to httpx while accepting curl-like clients. The fallback still validates
+    that the returned body looks like XML before accepting it.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    return "403" in str(exc) or "429" in str(exc)
 
 
 def _fetch_with_curl(url: str, timeout_seconds: float, user_agent: str) -> bytes | None:
-    """Fallback for Reddit RSS, which can block httpx while allowing curl-like clients."""
+    """Fallback for feeds where httpx is blocked or times out but curl works."""
     try:
         completed = subprocess.run(
             [
@@ -83,6 +92,6 @@ def _fetch_with_curl(url: str, timeout_seconds: float, user_agent: str) -> bytes
     except OSError:
         return None
     if completed.returncode == 0 and completed.stdout.strip().startswith((b"<?xml", b"<feed", b"<rss")):
-        LOGGER.warning("Fetched %s with curl fallback after HTTP client was blocked", url)
+        LOGGER.warning("Fetched %s with curl fallback after HTTP client failed", url)
         return completed.stdout
     return None

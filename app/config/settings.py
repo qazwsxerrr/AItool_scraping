@@ -38,6 +38,7 @@ class Settings:
     ai_review_model: str | None = None
     ai_review_api_style: str = "generic_json"
     ai_review_timeout_seconds: float = 30.0
+    ai_review_min_candidate_score: int = 70
 
     @classmethod
     def from_env(cls, dotenv_path: str | Path = ".env") -> "Settings":
@@ -57,4 +58,5 @@ class Settings:
             ai_review_model=os.getenv("AI_REVIEW_MODEL") or None,
             ai_review_api_style=os.getenv("AI_REVIEW_API_STYLE", "generic_json"),
             ai_review_timeout_seconds=float(os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "30")),
+            ai_review_min_candidate_score=int(os.getenv("AI_REVIEW_MIN_CANDIDATE_SCORE", "70")),
         )

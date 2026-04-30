@@ -204,17 +204,31 @@ class CandidateItemRepository:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
 
-    def list_pending_for_ai_review(self, *, limit: int | None = 50) -> list[CandidateItem]:
+    def list_pending_for_ai_review(
+        self,
+        *,
+        limit: int | None = 50,
+        min_score: int = 70,
+    ) -> list[CandidateItem]:
         stmt = (
             select(CandidateItem)
+            .join(NormalizedItem, NormalizedItem.id == CandidateItem.normalized_item_id)
             .options(
                 joinedload(CandidateItem.normalized_item)
                 .joinedload(NormalizedItem.raw_item)
                 .joinedload(RawItem.source)
             )
             .outerjoin(AIReviewItem, AIReviewItem.candidate_item_id == CandidateItem.id)
-            .where(CandidateItem.status == "kept", AIReviewItem.id.is_(None))
-            .order_by(CandidateItem.candidate_score.desc(), CandidateItem.id.asc())
+            .where(
+                CandidateItem.status == "kept",
+                CandidateItem.candidate_score >= min_score,
+                AIReviewItem.id.is_(None),
+            )
+            .order_by(
+                CandidateItem.candidate_score.desc(),
+                NormalizedItem.published_at.desc(),
+                CandidateItem.id.asc(),
+            )
         )
         if limit is not None:
             stmt = stmt.limit(limit)
