@@ -51,6 +51,10 @@ class Settings:
     tavily_max_results: int = 5
     tavily_include_raw_content: bool = False
     tavily_timeout_seconds: float = 20.0
+    evidence_search_max_attempts: int = 3
+    evidence_search_cache_ttl_hours: int = 24
+    evidence_fetch_timeout_seconds: float = 20.0
+    evidence_fetch_max_bytes: int = 524288
     ai_verify_api_url: str | None = None
     ai_verify_api_key: str | None = None
     ai_verify_model: str | None = None
@@ -91,6 +95,10 @@ class Settings:
             tavily_max_results=int(os.getenv("TAVILY_MAX_RESULTS", "5")),
             tavily_include_raw_content=_env_bool("TAVILY_INCLUDE_RAW_CONTENT", False),
             tavily_timeout_seconds=float(os.getenv("TAVILY_TIMEOUT_SECONDS", "20")),
+            evidence_search_max_attempts=int(os.getenv("EVIDENCE_SEARCH_MAX_ATTEMPTS", "3")),
+            evidence_search_cache_ttl_hours=int(os.getenv("EVIDENCE_SEARCH_CACHE_TTL_HOURS", "24")),
+            evidence_fetch_timeout_seconds=float(os.getenv("EVIDENCE_FETCH_TIMEOUT_SECONDS", "20")),
+            evidence_fetch_max_bytes=int(os.getenv("EVIDENCE_FETCH_MAX_BYTES", "524288")),
             ai_verify_api_url=os.getenv("AI_VERIFY_API_URL") or os.getenv("AI_REVIEW_API_URL") or None,
             ai_verify_api_key=os.getenv("AI_VERIFY_API_KEY") or os.getenv("AI_REVIEW_API_KEY") or None,
             ai_verify_model=os.getenv("AI_VERIFY_MODEL") or os.getenv("AI_REVIEW_MODEL") or None,

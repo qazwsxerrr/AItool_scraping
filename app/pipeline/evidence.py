@@ -10,7 +10,8 @@ class EvidenceSeed:
     evidence_type: str
     title: str | None
     snippet: str | None
-    confidence: int
+    retrieval_score: int
+    evidence_confidence: int
     raw_payload: dict
 
 
@@ -71,7 +72,8 @@ def build_direct_evidence_seeds(
                 evidence_type=evidence_type,
                 title=label,
                 snippet=None,
-                confidence=70 if label != "source_url" else 55,
+                retrieval_score=100,
+                evidence_confidence=40 if label != "source_url" else 25,
                 raw_payload={"source": "direct_claim_url", "field": label},
             )
         )

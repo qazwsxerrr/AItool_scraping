@@ -45,6 +45,20 @@ def source_quality_for_group(source_group: str) -> dict[str, object]:
     return dict(SOURCE_QUALITY_DEFAULTS.get(source_group, default))
 
 
+def source_quality_for_source(source, *, fallback_group: str = "general") -> dict[str, object]:
+    group = getattr(source, "source_group", None) or fallback_group
+    quality = source_quality_for_group(group)
+    if getattr(source, "quality_weight", None) is not None:
+        quality["quality_weight"] = float(source.quality_weight)
+    if getattr(source, "source_role", None) is not None:
+        quality["source_role"] = source.source_role
+    if getattr(source, "spam_risk", None) is not None:
+        quality["spam_risk"] = source.spam_risk
+    if getattr(source, "requires_verification", None) is not None:
+        quality["requires_verification"] = bool(source.requires_verification)
+    return quality
+
+
 def source_quality_score(source_group: str) -> int:
     quality = source_quality_for_group(source_group)
     return int(round(float(quality["quality_weight"]) * 100))

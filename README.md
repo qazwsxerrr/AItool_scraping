@@ -307,6 +307,10 @@ TAVILY_BASE_URL=https://api.tavily.com
 TAVILY_API_KEY=your-local-key
 TAVILY_SEARCH_DEPTH=basic
 TAVILY_MAX_RESULTS=5
+EVIDENCE_SEARCH_MAX_ATTEMPTS=3
+EVIDENCE_SEARCH_CACHE_TTL_HOURS=24
+EVIDENCE_FETCH_TIMEOUT_SECONDS=20
+EVIDENCE_FETCH_MAX_BYTES=524288
 ```
 
 `CLAIM_EXTRACT_*` 与 `AI_VERIFY_*` 默认可复用 `AI_REVIEW_*`；如果要使用不同模型或 endpoint，可以单独配置。
@@ -316,8 +320,14 @@ TAVILY_MAX_RESULTS=5
 ```powershell
 ./.conda/python.exe scripts/run_claim_extract_once.py --limit 50
 ./.conda/python.exe scripts/run_evidence_search_once.py --limit 30
+./.conda/python.exe scripts/run_evidence_fetch_once.py --limit 50
+./.conda/python.exe scripts/run_evidence_classify_once.py --limit 100
+./.conda/python.exe scripts/run_claim_verify_once.py --limit 100
 ./.conda/python.exe scripts/run_ai_verify_once.py --limit 30
+./.conda/python.exe scripts/run_entity_resolve_once.py --limit 100
+./.conda/python.exe scripts/run_recommendation_write_once.py --limit 100
 ./.conda/python.exe scripts/run_recommendation_export_once.py --limit 20
+./.conda/python.exe scripts/run_audit_export_once.py --limit 100
 ```
 
 或使用 Typer CLI：
@@ -325,15 +335,50 @@ TAVILY_MAX_RESULTS=5
 ```powershell
 ./.conda/python.exe -m app.main claim-extract --limit 50
 ./.conda/python.exe -m app.main evidence-search --limit 30
+./.conda/python.exe -m app.main evidence-fetch --limit 50
+./.conda/python.exe -m app.main evidence-classify --limit 100
+./.conda/python.exe -m app.main claim-verify --limit 100
 ./.conda/python.exe -m app.main ai-verify --limit 30
+./.conda/python.exe -m app.main entity-resolve --limit 100
+./.conda/python.exe -m app.main recommendation-write --limit 100
 ./.conda/python.exe -m app.main recommendation-export --limit 20
+./.conda/python.exe -m app.main audit-export --limit 100
 ```
 
 新增表：
 
 - `extracted_claims`：候选实体、类型、关键 claim、抽取出的官网/GitHub/Hugging Face/Product Hunt 链接。
 - `evidence_items`：Tavily 搜索结果和直接证据 URL，包含证据类型、域名、置信度、原始 payload。
-- `verification_items`：基于证据的最终保留判断、多维评分、推荐等级、风险标签和推荐理由。
+- `claim_verification_items`：逐条 claim 的 support / contradict / neutral 判断、证据 ID、置信度和风险标签。
+- `verification_items`：基于证据与 claim 级核实的最终保留判断、多维评分、推荐等级、风险标签、`freshness_score` 和推荐理由。
+- `canonical_entities` / `entity_mentions`：将多个来源提到的同一个工具实体聚合，推荐导出会按实体去重。
+- `recommendation_cards`：面向用户阅读的推荐卡片字段，包括为什么推荐、怎么试和证据说明。
+- `pipeline_runs`：记录 `run-daily` 每阶段统计、状态和错误。
+
+注意：
+
+- Tavily `score` 只作为 `retrieval_score`（搜索相关性），不直接视为事实可信度。
+- `evidence_confidence` 表示系统当前认为该 URL 作为证据的可信度；Tavily 搜索结果初始较低，后续可由 `evidence-fetch / evidence-classify` 提升。
+- `extracted_claims.evidence_status` 会记录 `pending / searching / partial / completed / failed`，避免 direct URL 入库后 Tavily 失败导致下次误判为已完成。
+- Tavily 查询会写入 `search_cache_items`，默认 24 小时内复用，降低重复搜索成本。
+- `evidence-fetch` 会真实 GET 普通 URL；GitHub repo 和 Hugging Face model 会走轻量专用 verifier，提取 README / license / 权重文件等质量信号。
+- `evidence-classify` 会在 AI verify 前用规则填充 `supports_claim`、`risk_flags`、`quality_flags` 和更新 `evidence_confidence`。
+- `claim-verify` 会把 `claims_json` 中的每条 claim 与已分类证据对应起来，生成 claim 级核实记录，供 AI verify 和导出使用。
+- `entity-resolve` 会基于 GitHub / Hugging Face / Product Hunt / official URL 强匹配合并实体，减少重复推荐。
+- `recommendation-write` 会基于最终核实结果生成用户可读推荐卡片；`recommendation-export` 会结合 `freshness_score`、实体更新信号和用户反馈计算 `rerank_score`。
+- `source_registry.yaml` 支持 `quality_weight / source_role / spam_risk / requires_verification`，这些字段会持久化到 `sources` 表；计算 source quality 时优先使用 source 级配置。
+
+如果希望顺序执行每日链路，可以使用：
+
+```powershell
+./.conda/python.exe scripts/run_daily_once.py
+```
+
+或：
+
+```powershell
+./.conda/python.exe -m app.main run-daily
+```
 
 最终推荐条件默认：
 
@@ -351,7 +396,50 @@ evidence_items >= 1
 - `recommendations_YYYYMMDD_HHMMSS.md`
 - `recommendations_YYYYMMDD_HHMMSS.jsonl`
 
-### 7. 导出人工审阅文件
+`recommendation-export` 默认只导出 `final_keep=true` 且推荐等级为 `S/A/B` 的内容；如果需要内部审阅所有核实结果，使用 `audit-export`。
+
+### 7. 用户反馈闭环
+
+当你在推荐结果中看到 `entity_id` 后，可以记录反馈：
+
+```powershell
+./.conda/python.exe -m app.main feedback-add save --entity-id 1 --reason "值得试用"
+./.conda/python.exe -m app.main feedback-add hide --entity-id 2 --reason "营销味太重"
+```
+
+支持的 action：
+
+```text
+like / dislike / save / hide / click / report
+```
+
+查看反馈汇总：
+
+```powershell
+./.conda/python.exe -m app.main feedback-summary --entity-id 1
+```
+
+或使用脚本：
+
+```powershell
+./.conda/python.exe scripts/run_feedback_add.py save --entity-id 1 --reason "值得试用"
+./.conda/python.exe scripts/run_feedback_summary.py --entity-id 1
+```
+
+`recommendation-export` 会附带每个实体的反馈统计：
+
+```json
+{
+  "feedback": {
+    "total": 2,
+    "positive": 1,
+    "negative": 1,
+    "actions": {"like": 1, "hide": 1}
+  }
+}
+```
+
+### 8. 导出人工审阅文件
 
 ```powershell
 ./.conda/python.exe scripts/run_review_export_once.py --limit 100
@@ -368,7 +456,7 @@ evidence_items >= 1
 ./.conda/python.exe -m app.main review-export --limit 100
 ```
 
-### 8. 一键顺序执行完整流程
+### 9. 一键顺序执行完整流程
 
 推荐先跑重点来源，避免某些国外源网络超时拖慢全量流程：
 
@@ -383,8 +471,14 @@ evidence_items >= 1
 ./.conda/python.exe scripts/run_ai_review_once.py --limit 50
 ./.conda/python.exe scripts/run_claim_extract_once.py --limit 50
 ./.conda/python.exe scripts/run_evidence_search_once.py --limit 30
+./.conda/python.exe scripts/run_evidence_fetch_once.py --limit 50
+./.conda/python.exe scripts/run_evidence_classify_once.py --limit 100
+./.conda/python.exe scripts/run_claim_verify_once.py --limit 100
 ./.conda/python.exe scripts/run_ai_verify_once.py --limit 30
+./.conda/python.exe scripts/run_entity_resolve_once.py --limit 100
+./.conda/python.exe scripts/run_recommendation_write_once.py --limit 100
 ./.conda/python.exe scripts/run_recommendation_export_once.py --limit 20
+./.conda/python.exe scripts/run_audit_export_once.py --limit 100
 ./.conda/python.exe scripts/run_review_export_once.py --limit 100
 ```
 
@@ -399,7 +493,13 @@ evidence_items >= 1
 ./.conda/python.exe scripts/run_ai_review_once.py --limit 80
 ./.conda/python.exe scripts/run_claim_extract_once.py --limit 80
 ./.conda/python.exe scripts/run_evidence_search_once.py --limit 50
+./.conda/python.exe scripts/run_evidence_fetch_once.py --limit 80
+./.conda/python.exe scripts/run_evidence_classify_once.py --limit 120
+./.conda/python.exe scripts/run_claim_verify_once.py --limit 120
 ./.conda/python.exe scripts/run_ai_verify_once.py --limit 50
+./.conda/python.exe scripts/run_entity_resolve_once.py --limit 100
+./.conda/python.exe scripts/run_recommendation_write_once.py --limit 100
+./.conda/python.exe scripts/run_recommendation_export_once.py --limit 20
 ./.conda/python.exe scripts/run_review_export_once.py --limit 150
 ```
 
@@ -462,6 +562,13 @@ $env:REQUEST_RETRIES="1"
 | 标准化 | `--limit` | 从待标准化 `raw_items` 中按入库顺序处理最多 N 条，成本低，目标是清空库存。 |
 | 规则预筛 | `--limit` | 从未预筛 `normalized_items` 中按入库顺序处理最多 N 条，成本低，目标是生成候选池。 |
 | AI 二次筛选 | `--limit` + `--min-score` | `limit` 是最大上限；只处理高于最低分的候选，并按分数/时间优先级排序，允许不足 N 条。 |
+| 证据搜索 | `--limit` + `--max-attempts` | 从 `extracted_claims` 中处理待搜索 / 部分失败的 claim；Tavily query 会优先复用缓存。 |
+| 证据抓取 | `--limit` | 从 `evidence_items` 中抓取待验证 URL；GitHub / Hugging Face 走专用 verifier。 |
+| 证据分类 | `--limit` | 对已抓取证据做规则分类，更新 support/contradict、风险标签和证据可信度。 |
+| claim 级核实 | `--limit` | 从 `extracted_claims.claims_json` 逐条核实 claim，并记录对应证据 ID 与风险标签。 |
+| 推荐卡片生成 | `--limit` | 为最终保留项生成用户可读的 why/how/risk/evidence 推荐卡片。 |
+| 推荐导出 | `--limit` | 默认只导出 `final_keep=true` 且等级为 `S/A/B` 的结果，并按 `rerank_score` 排序。 |
+| 审计导出 | `--limit` | 导出所有核实结果，包括 rejected / D 档，便于排查。 |
 | 人工审阅导出 | `--limit` | 从候选池按分数降序导出最多 N 条，便于人工检查。 |
 
 ### 为什么重复运行显示 skipped
@@ -502,7 +609,14 @@ uv run --extra test pytest
 - AI 初筛 API 客户端配置、请求载荷和响应解析
 - AI 初筛 job 幂等入库
 - Tavily evidence search 请求载荷、Bearer 鉴权和响应解析
-- claim 抽取、证据搜索、AI 核实与推荐导出 job 幂等入库
+- claim 抽取、证据搜索、证据抓取、证据分类、AI 核实与推荐导出 job 幂等入库
+- claim 级核实、`freshness_score`、实体更新信号、推荐卡片生成和反馈重排
+- Tavily search cache 复用
+- GitHub / Hugging Face 轻量 verifier 信号抽取
+- source quality 持久化与 source 级覆盖
+- canonical entity 聚合、同实体推荐去重
+- pipeline_runs / run-daily 运行记录
+- 用户反馈记录、汇总和推荐导出反馈统计
 - final_score 多维公式、无证据降分和 hard negative 拦截
 
 ## 数据表
@@ -516,6 +630,13 @@ uv run --extra test pytest
 - `ai_review_items`：AI 初筛结果，保存 AI 是否保留、评分、分类、原因、中文摘要和原始响应
 - `extracted_claims`：AI 从候选中抽取出的实体、类型、claim 和关键外链
 - `evidence_items`：Tavily 搜索结果与直接证据链接
+- `claim_verification_items`：逐条 claim 的证据支持/反驳判断
+- `search_cache_items`：Tavily query 缓存，默认 24 小时内复用
 - `verification_items`：基于证据的最终核实结果、评分、推荐等级和风险标签
+- `canonical_entities`：聚合后的工具 / 模型 / MCP / workflow 实体
+- `entity_mentions`：候选条目、核实结果与 canonical entity 的映射
+- `recommendation_cards`：面向用户展示的推荐卡片内容
+- `pipeline_runs`：每日链路运行状态、统计与错误
+- `user_feedback`：用户对 entity 或 candidate 的 like / save / hide / report 等反馈
 
 默认数据库路径：`data/ai_tool_intel.db`。

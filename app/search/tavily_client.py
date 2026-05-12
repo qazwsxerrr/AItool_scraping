@@ -18,8 +18,13 @@ class TavilySearchResult:
     title: str | None
     url: str
     content: str | None
-    confidence: int
+    retrieval_score: int
     raw_payload: dict[str, Any]
+
+    @property
+    def confidence(self) -> int:
+        """Backward-compatible alias for retrieval relevance, not evidence confidence."""
+        return self.retrieval_score
 
 
 @dataclass(frozen=True)
@@ -95,7 +100,7 @@ class TavilyClient:
 
         response.raise_for_status()
         data = response.json()
-        return _parse_tavily_response(data, fallback_query=query)
+        return parse_tavily_response(data, fallback_query=query)
 
     def _endpoint_url(self) -> str:
         if self.base_url.endswith("/search"):
@@ -103,7 +108,7 @@ class TavilyClient:
         return f"{self.base_url}/search"
 
 
-def _parse_tavily_response(data: dict[str, Any], *, fallback_query: str) -> TavilySearchResponse:
+def parse_tavily_response(data: dict[str, Any], *, fallback_query: str) -> TavilySearchResponse:
     raw_results = data.get("results") if isinstance(data.get("results"), list) else []
     results: list[TavilySearchResult] = []
     for raw in raw_results:
@@ -117,7 +122,7 @@ def _parse_tavily_response(data: dict[str, Any], *, fallback_query: str) -> Tavi
                 title=_optional_str(raw.get("title")),
                 url=url,
                 content=_optional_str(raw.get("content")) or _optional_str(raw.get("raw_content")),
-                confidence=_score_to_confidence(raw.get("score")),
+                retrieval_score=_score_to_confidence(raw.get("score")),
                 raw_payload=raw,
             )
         )

@@ -9,7 +9,7 @@ from app.config.source_registry import SourceConfig
 from app.jobs.ai_verify_job import run_ai_verify_job
 from app.jobs.claim_extract_job import run_claim_extract_job
 from app.jobs.evidence_search_job import run_evidence_search_job
-from app.jobs.recommendation_export_job import run_recommendation_export_job
+from app.jobs.recommendation_export_job import run_audit_export_job, run_recommendation_export_job
 from app.parsers.feed_parser import ParsedFeedItem
 from app.pipeline.normalize import normalize_raw_item
 from app.search.tavily_client import TavilySearchResponse, TavilySearchResult
@@ -59,11 +59,40 @@ class FakeTavilyClient:
                     title="Example MCP GitHub",
                     url="https://github.com/example/mcp",
                     content="README contains MCP install instructions.",
-                    confidence=92,
+                    retrieval_score=92,
                     raw_payload={"score": 0.92},
                 )
             ],
             raw_response={"query": query, "results": [{"url": "https://github.com/example/mcp"}]},
+        )
+
+
+class FlakyTavilyClient:
+    is_configured = True
+
+    def __init__(self):
+        self.calls = []
+        self.fail_once = True
+
+    def search(self, query):
+        self.calls.append(query)
+        if "github" in query and self.fail_once:
+            self.fail_once = False
+            raise RuntimeError("temporary Tavily failure")
+        return TavilySearchResponse(
+            query=query,
+            request_id="req_flaky",
+            usage={"credits": 1},
+            results=[
+                TavilySearchResult(
+                    title=f"Result for {query}",
+                    url=f"https://example.com/{len(self.calls)}",
+                    content="Evidence page",
+                    retrieval_score=80,
+                    raw_payload={"score": 0.8},
+                )
+            ],
+            raw_response={"query": query},
         )
 
 
@@ -141,6 +170,67 @@ def test_evidence_search_job_uses_tavily_and_is_idempotent(tmp_path):
         github = [item for item in evidence if item.url == "https://github.com/example/mcp"][0]
         assert github.evidence_type == "github_repo"
         assert github.source_domain == "github.com"
+        assert github.retrieval_score in {92, 100}
+        assert github.evidence_confidence <= github.retrieval_score
+
+        claim = session.query(ExtractedClaim).one()
+        assert claim.evidence_status == "completed"
+        assert claim.evidence_attempts == 1
+        assert claim.evidence_error is None
+        assert claim.evidence_searched_at is not None
+
+
+def test_evidence_search_partial_state_retries_after_tavily_failure(tmp_path):
+    session_factory = _seed_reviewed_candidate(tmp_path / "evidence_retry.db")
+    run_claim_extract_job(session_factory=session_factory, client=FakeClaimClient(), limit=10)
+    client = FlakyTavilyClient()
+
+    first = run_evidence_search_job(session_factory=session_factory, client=client, limit=10, max_attempts=3)
+    second = run_evidence_search_job(session_factory=session_factory, client=client, limit=10, max_attempts=3)
+
+    assert first.processed == 1
+    assert first.failed == 0
+    assert second.processed == 1
+    assert second.failed == 0
+
+    with session_factory() as session:
+        claim = session.query(ExtractedClaim).one()
+        assert claim.evidence_status == "completed"
+        assert claim.evidence_attempts == 2
+        assert claim.evidence_error is None
+
+
+def test_evidence_search_stops_after_max_attempts(tmp_path):
+    session_factory = _seed_reviewed_candidate(tmp_path / "evidence_max_attempts.db")
+    run_claim_extract_job(session_factory=session_factory, client=FakeClaimClient(), limit=10)
+
+    class AlwaysFailingTavilyClient:
+        is_configured = True
+
+        def search(self, query):
+            raise RuntimeError("permanent Tavily failure")
+
+    first = run_evidence_search_job(
+        session_factory=session_factory,
+        client=AlwaysFailingTavilyClient(),
+        limit=10,
+        max_attempts=1,
+    )
+    second = run_evidence_search_job(
+        session_factory=session_factory,
+        client=AlwaysFailingTavilyClient(),
+        limit=10,
+        max_attempts=1,
+    )
+
+    assert first.processed == 1
+    assert second.processed == 0
+
+    with session_factory() as session:
+        claim = session.query(ExtractedClaim).one()
+        assert claim.evidence_status == "partial"
+        assert claim.evidence_attempts == 1
+        assert "permanent Tavily failure" in claim.evidence_error
 
 
 def test_ai_verify_job_inserts_final_verification_idempotently(tmp_path):
@@ -158,6 +248,9 @@ def test_ai_verify_job_inserts_final_verification_idempotently(tmp_path):
     assert second.processed == 0
     assert client.calls[0].candidate["title"] == "Example MCP server released"
     assert client.calls[0].evidence_items
+    assert "evidence_confidence" in client.calls[0].evidence_items[0]
+    assert "retrieval_score" in client.calls[0].evidence_items[0]
+    assert "confidence" not in client.calls[0].evidence_items[0]
 
     with session_factory() as session:
         verification = session.query(VerificationItem).one()
@@ -186,6 +279,37 @@ def test_recommendation_export_writes_ranked_markdown_and_jsonl(tmp_path):
     assert "Example MCP server released" in markdown
     assert "final_score" in jsonl
     assert json.loads(jsonl.splitlines()[0])["recommendation_level"] == "A"
+
+
+def test_recommendation_export_defaults_to_final_keep_only_and_audit_exports_all(tmp_path):
+    session_factory = _seed_reviewed_candidate(tmp_path / "export_filter.db")
+    run_claim_extract_job(session_factory=session_factory, client=FakeClaimClient(), limit=10)
+    run_evidence_search_job(session_factory=session_factory, client=FakeTavilyClient(), limit=10)
+    run_ai_verify_job(session_factory=session_factory, client=FakeVerifyClient(), limit=10)
+
+    with session_factory() as session:
+        verification = session.query(VerificationItem).one()
+        verification.final_keep = False
+        verification.final_score = 30
+        verification.recommendation_level = "D"
+        verification.risk_flags = '["pure_marketing"]'
+        session.commit()
+
+    recommendation = run_recommendation_export_job(
+        session_factory=session_factory,
+        output_dir=tmp_path / "recommendation",
+        limit=10,
+    )
+    audit = run_audit_export_job(
+        session_factory=session_factory,
+        output_dir=tmp_path / "audit",
+        limit=10,
+    )
+
+    assert recommendation.exported == 0
+    assert recommendation.jsonl_path.read_text(encoding="utf-8") == ""
+    assert audit.exported == 1
+    assert "被剔除的高风险内容" in audit.markdown_path.read_text(encoding="utf-8")
 
 
 def _seed_reviewed_candidate(db_path):

@@ -8,7 +8,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.verify_client import AIVerifyClient, AIVerifyRequest
 from app.config.settings import Settings
-from app.pipeline.source_quality import source_quality_for_group
+from app.pipeline.freshness import calculate_freshness_score
+from app.pipeline.source_quality import source_quality_for_source
 from app.pipeline.verification import finalize_verification
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import VerificationItemRepository
@@ -53,10 +54,12 @@ def run_ai_verify_job(
                     min_credibility=min_credibility,
                     max_spam_risk=max_spam_risk,
                 )
+                freshness_score = calculate_freshness_score(candidate)
                 insert_result = repo.insert_if_new(
                     candidate_item_id=candidate.id,
                     model=getattr(client, "model", None),
                     verification=final,
+                    freshness_score=freshness_score,
                 )
                 if insert_result.inserted:
                     result.inserted += 1
@@ -139,12 +142,37 @@ def _candidate_to_request(candidate) -> AIVerifyRequest:
                 "snippet": evidence.snippet,
                 "source_domain": evidence.source_domain,
                 "supports_claim": evidence.supports_claim,
-                "confidence": evidence.confidence,
+                "retrieval_score": evidence.retrieval_score,
+                "evidence_confidence": evidence.evidence_confidence,
+                "url_validation_status": evidence.url_validation_status,
+                "http_status": evidence.http_status,
+                "final_url": evidence.final_url,
+                "fetched_title": evidence.fetched_title,
+                "fetched_text_preview": _truncate(evidence.fetched_text_preview or "", 800),
+                "risk_flags": _loads_json_list(evidence.risk_flags),
+                "quality_flags": _loads_json_list(evidence.quality_flags),
                 "query": evidence.query,
             }
-            for evidence in sorted(candidate.evidence_items, key=lambda row: (-row.confidence, row.id))
+            for evidence in sorted(
+                candidate.evidence_items,
+                key=lambda row: (-row.evidence_confidence, -row.retrieval_score, row.id),
+            )
         ],
-        source_quality=source_quality_for_group(candidate.source_group),
+        source_quality=source_quality_for_source(raw_item.source, fallback_group=candidate.source_group),
+        claim_verifications=[
+            {
+                "claim_index": row.claim_index,
+                "claim_text": row.claim_text,
+                "supports_claim": row.supports_claim,
+                "evidence_item_ids": _loads_json_int_list(row.evidence_item_ids_json),
+                "confidence": row.confidence,
+                "risk_flags": _loads_json_list(row.risk_flags),
+            }
+            for row in sorted(
+                getattr(claim, "claim_verification_items", None) or candidate.claim_verification_items,
+                key=lambda item: (item.claim_index, item.id),
+            )
+        ],
     )
 
 
@@ -158,6 +186,24 @@ def _loads_json_list(value: str | None) -> list[str]:
     if not isinstance(data, list):
         return []
     return [str(item) for item in data]
+
+
+def _loads_json_int_list(value: str | None) -> list[int]:
+    if not value:
+        return []
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    result: list[int] = []
+    for item in data:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def _truncate(value: str, max_chars: int) -> str:

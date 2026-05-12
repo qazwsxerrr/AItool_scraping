@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.repository import VerificationItemRepository
+from app.storage.repository import EntityRepository, UserFeedbackRepository, VerificationItemRepository
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ def run_recommendation_export_job(
     session_factory: sessionmaker[Session],
     output_dir: str | Path = "output",
     limit: int | None = 20,
+    final_keep_only: bool = True,
 ) -> RecommendationExportResult:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -31,12 +32,34 @@ def run_recommendation_export_job(
     markdown_path = output_path / f"recommendations_{timestamp}.md"
     jsonl_path = output_path / f"recommendations_{timestamp}.jsonl"
 
+    query_limit = limit * 5 if limit is not None and final_keep_only else limit
     with session_factory() as session:
-        rows = VerificationItemRepository(session).list_for_recommendation_export(limit=limit)
+        rows = VerificationItemRepository(session).list_for_recommendation_export(
+            limit=query_limit,
+            final_keep_only=final_keep_only,
+        )
 
     records = [_verification_to_record(row) for row in rows]
+    records.sort(
+        key=lambda row: (
+            -int(row["rerank_score"]),
+            -int(row["final_score"]),
+            -int(row["credibility_score"]),
+            row["candidate_id"],
+        )
+    )
+    if final_keep_only:
+        records = _dedupe_records_by_entity(records)
+    if limit is not None:
+        records = records[:limit]
     _write_jsonl(jsonl_path, records)
     _write_markdown(markdown_path, records)
+    if final_keep_only:
+        with session_factory() as session:
+            EntityRepository(session).mark_entities_recommended(
+                [int(row["entity_id"]) for row in records if row.get("entity_id")]
+            )
+            session.commit()
     return RecommendationExportResult(exported=len(records), markdown_path=markdown_path, jsonl_path=jsonl_path)
 
 
@@ -52,12 +75,48 @@ def run_recommendation_export_from_settings(
     return run_recommendation_export_job(session_factory=session_factory, output_dir=output_dir, limit=limit)
 
 
+def run_audit_export_job(
+    *,
+    session_factory: sessionmaker[Session],
+    output_dir: str | Path = "output",
+    limit: int | None = 100,
+) -> RecommendationExportResult:
+    return run_recommendation_export_job(
+        session_factory=session_factory,
+        output_dir=output_dir,
+        limit=limit,
+        final_keep_only=False,
+    )
+
+
+def run_audit_export_from_settings(
+    *,
+    settings: Settings,
+    output_dir: str | Path = "output",
+    limit: int | None = 100,
+) -> RecommendationExportResult:
+    engine = create_engine_from_url(settings.database_url)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+    return run_audit_export_job(session_factory=session_factory, output_dir=output_dir, limit=limit)
+
+
 def _verification_to_record(verification) -> dict:
     candidate = verification.candidate_item
     item = candidate.normalized_item
     raw_item = item.raw_item
     claim = candidate.extracted_claim
     evidence = candidate.evidence_items
+    entity = candidate.entity_mentions[0].entity if candidate.entity_mentions else None
+    feedback_summary = _feedback_summary_from_loaded(
+        list(entity.feedback_items if entity else []) + list(candidate.feedback_items)
+    )
+    card = verification.recommendation_card
+    update_reason = entity.last_update_reason if entity else None
+    feedback_adjustment = _feedback_adjustment(feedback_summary)
+    freshness_bonus = _freshness_bonus(verification.freshness_score)
+    update_bonus = 4 if entity and entity.major_update_detected else 0
+    rerank_score = _clamp_score(verification.final_score + feedback_adjustment + freshness_bonus + update_bonus)
     return {
         "candidate_id": candidate.id,
         "title": item.title,
@@ -66,10 +125,18 @@ def _verification_to_record(verification) -> dict:
         "source_group": candidate.source_group,
         "source_subtype": candidate.source_subtype,
         "published_at": item.published_at.isoformat() if item.published_at else None,
-        "entity_name": claim.entity_name if claim else None,
-        "entity_type": claim.entity_type if claim else None,
+        "entity_id": entity.id if entity else None,
+        "entity_name": entity.name if entity else (claim.entity_name if claim else None),
+        "entity_type": entity.entity_type if entity else (claim.entity_type if claim else None),
+        "mention_count": entity.mention_count if entity else 1,
+        "source_count": entity.source_count if entity else 1,
+        "feedback": feedback_summary,
         "final_keep": verification.final_keep,
         "final_score": verification.final_score,
+        "freshness_score": verification.freshness_score,
+        "feedback_adjustment": feedback_adjustment,
+        "freshness_bonus": freshness_bonus,
+        "rerank_score": rerank_score,
         "recommendation_level": verification.recommendation_level,
         "credibility_score": verification.credibility_score,
         "novelty_score": verification.novelty_score,
@@ -89,6 +156,30 @@ def _verification_to_record(verification) -> dict:
         },
         "evidence_count": len(evidence),
         "evidence_domains": sorted({row.source_domain for row in evidence if row.source_domain}),
+        "evidence_status": claim.evidence_status if claim else None,
+        "claim_verifications": [
+            {
+                "claim_text": row.claim_text,
+                "supports_claim": row.supports_claim,
+                "confidence": row.confidence,
+                "risk_flags": _loads_json_list(row.risk_flags),
+            }
+            for row in sorted(candidate.claim_verification_items, key=lambda item: (item.claim_index, item.id))
+        ],
+        "major_update_detected": bool(entity.major_update_detected) if entity else False,
+        "update_reason": update_reason,
+        "recommendation_card": (
+            {
+                "title": card.title,
+                "summary_cn": card.summary_cn,
+                "why_recommend": card.why_recommend,
+                "how_to_try": card.how_to_try,
+                "risk_note": card.risk_note,
+                "evidence_note": card.evidence_note,
+            }
+            if card
+            else None
+        ),
     }
 
 
@@ -96,6 +187,18 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     with path.open("w", encoding="utf-8") as file:
         for record in records:
             file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+
+def _dedupe_records_by_entity(records: list[dict]) -> list[dict]:
+    result: list[dict] = []
+    seen: set[str] = set()
+    for record in records:
+        key = f"entity:{record['entity_id']}" if record.get("entity_id") else f"candidate:{record['candidate_id']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(record)
+    return result
 
 
 def _write_markdown(path: Path, records: list[dict]) -> None:
@@ -128,10 +231,15 @@ def _write_markdown(path: Path, records: list[dict]) -> None:
                     f"- 标题：{record['title']}",
                     f"- 分类：`{record['category'] or record['entity_type'] or 'unknown'}`",
                     f"- 推荐分：`{record['final_score']}` / `{record['recommendation_level']}`",
+                    f"- 推荐排序分：`{record['rerank_score']}`（反馈调整 `{record['feedback_adjustment']}`；新鲜度 `{record['freshness_score']}`）",
                     f"- 可信度：`{record['credibility_score']}`；垃圾风险：`{record['spam_risk_score']}`",
+                    f"- 证据状态：`{record['evidence_status'] or 'unknown'}`",
                     f"- 证据数：`{record['evidence_count']}`；证据域名：`{', '.join(record['evidence_domains'])}`",
+                    f"- 更新信号：`{record['update_reason'] or 'none'}`",
                     f"- 摘要：{record['summary_cn'] or ''}",
                     f"- 推荐理由：{record['recommendation_reason'] or ''}",
+                    f"- 怎么试：{(record.get('recommendation_card') or {}).get('how_to_try') or ''}",
+                    f"- 证据说明：{(record.get('recommendation_card') or {}).get('evidence_note') or ''}",
                     f"- 风险提示：{record['risk_reason'] or ''}",
                     f"- 风险标签：`{', '.join(record['risk_flags'])}`",
                     f"- 链接：{_format_links(record['links'])}",
@@ -156,3 +264,43 @@ def _loads_json_list(value: str | None) -> list[str]:
     if not isinstance(data, list):
         return []
     return [str(item) for item in data]
+
+
+def _feedback_summary_from_loaded(rows) -> dict:
+    actions: dict[str, int] = {}
+    for row in rows:
+        actions[row.action] = actions.get(row.action, 0) + 1
+    positive = sum(actions.get(action, 0) for action in UserFeedbackRepository.POSITIVE_ACTIONS)
+    negative = sum(actions.get(action, 0) for action in UserFeedbackRepository.NEGATIVE_ACTIONS)
+    return {"total": len(rows), "positive": positive, "negative": negative, "actions": actions}
+
+
+def _feedback_adjustment(summary: dict) -> int:
+    actions = summary.get("actions") or {}
+    adjustment = (
+        int(actions.get("like", 0)) * 4
+        + int(actions.get("save", 0)) * 6
+        + int(actions.get("click", 0)) * 2
+        - int(actions.get("dislike", 0)) * 6
+        - int(actions.get("hide", 0)) * 12
+        - int(actions.get("report", 0)) * 20
+    )
+    return max(-30, min(30, adjustment))
+
+
+def _freshness_bonus(score: int) -> int:
+    if score >= 90:
+        return 8
+    if score >= 80:
+        return 6
+    if score >= 65:
+        return 3
+    if score >= 45:
+        return 0
+    if score >= 25:
+        return -3
+    return -6
+
+
+def _clamp_score(value: int | float) -> int:
+    return max(0, min(int(value), 100))

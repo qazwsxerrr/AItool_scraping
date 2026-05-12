@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -12,9 +13,9 @@ from app.pipeline.evidence import (
     classify_evidence_type,
     extract_domain,
 )
-from app.search.tavily_client import TavilyClient
+from app.search.tavily_client import TavilyClient, parse_tavily_response
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.repository import EvidenceItemRepository, ExtractedClaimRepository
+from app.storage.repository import EvidenceItemRepository, ExtractedClaimRepository, SearchCacheRepository
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,6 +34,8 @@ def run_evidence_search_job(
     session_factory: sessionmaker[Session],
     client: TavilyClient,
     limit: int | None = 30,
+    max_attempts: int = 3,
+    cache_ttl_hours: int = 24,
 ) -> EvidenceSearchJobResult:
     result = EvidenceSearchJobResult()
     if not client.is_configured:
@@ -41,9 +44,13 @@ def run_evidence_search_job(
     with session_factory() as session:
         claim_repo = ExtractedClaimRepository(session)
         evidence_repo = EvidenceItemRepository(session)
-        claims = claim_repo.list_pending_for_evidence_search(limit=limit)
+        cache_repo = SearchCacheRepository(session)
+        claims = claim_repo.list_pending_for_evidence_search(limit=limit, max_attempts=max_attempts)
         for claim in claims:
             result.processed += 1
+            claim_repo.mark_evidence_search_started(claim.id)
+            session.flush()
+            query_failures: list[str] = []
             try:
                 candidate = claim.candidate_item
                 normalized = candidate.normalized_item
@@ -62,7 +69,9 @@ def run_evidence_search_job(
                         snippet=seed.snippet,
                         source_domain=extract_domain(seed.url),
                         supports_claim="unknown",
-                        confidence=seed.confidence,
+                        confidence=seed.evidence_confidence,
+                        retrieval_score=seed.retrieval_score,
+                        evidence_confidence=seed.evidence_confidence,
                         raw_payload=seed.raw_payload,
                     )
                     if inserted.inserted:
@@ -74,7 +83,30 @@ def run_evidence_search_job(
                     entity_name=claim.entity_name,
                     entity_type=claim.entity_type,
                 ):
-                    search_response = client.search(query)
+                    try:
+                        cached = cache_repo.get_fresh(provider="tavily", query=query)
+                        if cached is not None:
+                            search_response = parse_tavily_response(
+                                json.loads(cached.raw_response),
+                                fallback_query=query,
+                            )
+                        else:
+                            search_response = client.search(query)
+                            cache_repo.upsert(
+                                provider="tavily",
+                                query=query,
+                                raw_response=search_response.raw_response,
+                                result_count=len(search_response.results),
+                                ttl_hours=cache_ttl_hours,
+                            )
+                    except Exception as exc:
+                        query_failures.append(f"{query}: {exc}")
+                        LOGGER.exception(
+                            "Failed Tavily query for candidate item %s: %s",
+                            claim.candidate_item_id,
+                            query,
+                        )
+                        continue
                     for item in search_response.results:
                         inserted = evidence_repo.insert_if_new(
                             candidate_item_id=claim.candidate_item_id,
@@ -84,7 +116,9 @@ def run_evidence_search_job(
                             snippet=item.content,
                             source_domain=extract_domain(item.url),
                             supports_claim="unknown",
-                            confidence=item.confidence,
+                            confidence=40,
+                            retrieval_score=item.retrieval_score,
+                            evidence_confidence=40,
                             raw_payload={
                                 "provider": "tavily",
                                 "query": search_response.query,
@@ -98,9 +132,18 @@ def run_evidence_search_job(
                             result.inserted += 1
                         else:
                             result.skipped += 1
+                if query_failures:
+                    claim_repo.mark_evidence_search_finished(
+                        claim.id,
+                        status="partial",
+                        error="; ".join(query_failures),
+                    )
+                else:
+                    claim_repo.mark_evidence_search_finished(claim.id, status="completed")
             except Exception as exc:
-                result.failed += 1
                 error = f"candidate_item_id={claim.candidate_item_id}: {exc}"
+                claim_repo.mark_evidence_search_finished(claim.id, status="failed", error=str(exc))
+                result.failed += 1
                 result.errors.append(error)
                 LOGGER.exception("Failed to search evidence for candidate item %s", claim.candidate_item_id)
         session.commit()
@@ -111,9 +154,16 @@ def run_evidence_search_from_settings(
     *,
     settings: Settings,
     limit: int | None = 30,
+    max_attempts: int | None = None,
 ) -> EvidenceSearchJobResult:
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
     session_factory = create_session_factory(engine)
     client = TavilyClient.from_settings(settings)
-    return run_evidence_search_job(session_factory=session_factory, client=client, limit=limit)
+    return run_evidence_search_job(
+        session_factory=session_factory,
+        client=client,
+        limit=limit,
+        max_attempts=settings.evidence_search_max_attempts if max_attempts is None else max_attempts,
+        cache_ttl_hours=settings.evidence_search_cache_ttl_hours,
+    )

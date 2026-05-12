@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, selectinload
@@ -17,11 +18,18 @@ from app.pipeline.prefilter import CandidateDecision
 from app.storage.models import (
     AIReviewItem,
     CandidateItem,
+    CanonicalEntity,
+    ClaimVerificationItem,
+    EntityMention,
     EvidenceItem,
     ExtractedClaim,
     NormalizedItem,
+    PipelineRun,
     RawItem,
+    RecommendationCard,
+    SearchCacheItem,
     Source,
+    UserFeedback,
     VerificationItem,
 )
 
@@ -50,6 +58,12 @@ class SourceRepository:
         existing.priority = source.priority
         existing.fetch_interval = source.fetch_interval
         existing.parser_type = source.parser_type
+        existing.source_group = source.source_group
+        existing.source_subtype = source.source_subtype
+        existing.quality_weight = source.quality_weight
+        existing.source_role = source.source_role
+        existing.spam_risk = source.spam_risk
+        existing.requires_verification = source.requires_verification
         return existing
 
     def mark_fetched(self, source_id: str, fetched_at: datetime | None = None) -> None:
@@ -62,7 +76,7 @@ class SourceRepository:
         source = self.session.get(Source, source_id)
         if source is None:
             return "general", "fixed"
-        return infer_source_group(source.id), infer_source_subtype(source.id)
+        return source.source_group, source.source_subtype
 
 
 class RawItemRepository:
@@ -339,28 +353,58 @@ class ExtractedClaimRepository:
             actionable_signal=response.actionable_signal,
             confidence=response.confidence,
             raw_response=json.dumps(response.raw_response or {}, ensure_ascii=False, default=str),
+            evidence_status="pending",
+            evidence_attempts=0,
+            evidence_error=None,
+            evidence_searched_at=None,
         )
         self.session.add(item)
         self.session.flush()
         return InsertResult(inserted=True, item_id=item.id)
 
-    def list_pending_for_evidence_search(self, *, limit: int | None = 30) -> list[ExtractedClaim]:
+    def list_pending_for_evidence_search(
+        self,
+        *,
+        limit: int | None = 30,
+        max_attempts: int = 3,
+    ) -> list[ExtractedClaim]:
         stmt = (
             select(ExtractedClaim)
-            .join(CandidateItem, CandidateItem.id == ExtractedClaim.candidate_item_id)
             .options(
                 joinedload(ExtractedClaim.candidate_item)
                 .joinedload(CandidateItem.normalized_item)
                 .joinedload(NormalizedItem.raw_item)
                 .joinedload(RawItem.source)
             )
-            .outerjoin(EvidenceItem, EvidenceItem.candidate_item_id == ExtractedClaim.candidate_item_id)
-            .where(EvidenceItem.id.is_(None))
-            .order_by(ExtractedClaim.confidence.desc(), ExtractedClaim.id.asc())
+            .where(
+                ExtractedClaim.evidence_status.in_(["pending", "partial", "failed"]),
+                ExtractedClaim.evidence_attempts < max_attempts,
+            )
+            .order_by(
+                ExtractedClaim.evidence_attempts.asc(),
+                ExtractedClaim.confidence.desc(),
+                ExtractedClaim.id.asc(),
+            )
         )
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
+
+    def mark_evidence_search_started(self, claim_id: int) -> None:
+        claim = self.session.get(ExtractedClaim, claim_id)
+        if claim is None:
+            return
+        claim.evidence_status = "searching"
+        claim.evidence_attempts += 1
+        claim.evidence_error = None
+
+    def mark_evidence_search_finished(self, claim_id: int, *, status: str, error: str | None = None) -> None:
+        claim = self.session.get(ExtractedClaim, claim_id)
+        if claim is None:
+            return
+        claim.evidence_status = status
+        claim.evidence_error = error
+        claim.evidence_searched_at = datetime.now(timezone.utc)
 
 
 class EvidenceItemRepository:
@@ -378,6 +422,8 @@ class EvidenceItemRepository:
         source_domain: str | None,
         supports_claim: str = "unknown",
         confidence: int = 0,
+        retrieval_score: int | None = None,
+        evidence_confidence: int | None = None,
         raw_payload: dict | str | None = None,
         query: str | None = None,
     ) -> InsertResult:
@@ -402,6 +448,8 @@ class EvidenceItemRepository:
             source_domain=source_domain,
             supports_claim=supports_claim,
             confidence=max(0, min(int(confidence), 100)),
+            retrieval_score=_clamp_score(confidence if retrieval_score is None else retrieval_score),
+            evidence_confidence=_clamp_score(confidence if evidence_confidence is None else evidence_confidence),
             raw_payload=raw_text,
         )
         self.session.add(item)
@@ -412,9 +460,188 @@ class EvidenceItemRepository:
         stmt = (
             select(EvidenceItem)
             .where(EvidenceItem.candidate_item_id == candidate_item_id)
-            .order_by(EvidenceItem.confidence.desc(), EvidenceItem.id.asc())
+            .order_by(EvidenceItem.evidence_confidence.desc(), EvidenceItem.retrieval_score.desc(), EvidenceItem.id.asc())
         )
         return list(self.session.scalars(stmt).all())
+
+    def list_pending_for_fetch(self, *, limit: int | None = 50) -> list[EvidenceItem]:
+        stmt = (
+            select(EvidenceItem)
+            .options(joinedload(EvidenceItem.candidate_item).joinedload(CandidateItem.extracted_claim))
+            .where(EvidenceItem.fetch_status.in_(["pending", "failed"]))
+            .order_by(EvidenceItem.id.asc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def list_pending_for_classify(self, *, limit: int | None = 100) -> list[EvidenceItem]:
+        stmt = (
+            select(EvidenceItem)
+            .options(joinedload(EvidenceItem.candidate_item).joinedload(CandidateItem.extracted_claim))
+            .where(EvidenceItem.fetch_status == "completed")
+            .order_by(EvidenceItem.id.asc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def update_fetch_result(
+        self,
+        *,
+        evidence_id: int,
+        http_status: int | None,
+        final_url: str | None,
+        url_validation_status: str,
+        fetched_title: str | None,
+        fetched_description: str | None,
+        fetched_text_preview: str | None,
+        raw_payload: dict | str | None,
+        fetch_status: str = "completed",
+        fetch_error: str | None = None,
+    ) -> None:
+        item = self.session.get(EvidenceItem, evidence_id)
+        if item is None:
+            return
+        item.http_status = http_status
+        item.final_url = final_url
+        item.url_validation_status = url_validation_status
+        item.fetched_title = fetched_title
+        item.fetched_description = fetched_description
+        item.fetched_text_preview = fetched_text_preview
+        item.fetch_status = fetch_status
+        item.fetch_error = fetch_error
+        item.fetched_at = datetime.now(timezone.utc)
+        if raw_payload is not None:
+            item.raw_payload = raw_payload if isinstance(raw_payload, str) else json.dumps(raw_payload, ensure_ascii=False, default=str)
+
+    def update_classification(
+        self,
+        *,
+        evidence_id: int,
+        supports_claim: str,
+        evidence_confidence: int,
+        risk_flags: list[str],
+        quality_flags: list[str],
+    ) -> None:
+        item = self.session.get(EvidenceItem, evidence_id)
+        if item is None:
+            return
+        item.supports_claim = supports_claim
+        item.evidence_confidence = _clamp_score(evidence_confidence)
+        item.confidence = _clamp_score(evidence_confidence)
+        item.risk_flags = json.dumps(list(dict.fromkeys(risk_flags)), ensure_ascii=False)
+        item.quality_flags = json.dumps(list(dict.fromkeys(quality_flags)), ensure_ascii=False)
+
+
+class ClaimVerificationRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def list_pending_claims(self, *, limit: int | None = 100) -> list[ExtractedClaim]:
+        stmt = (
+            select(ExtractedClaim)
+            .join(CandidateItem, CandidateItem.id == ExtractedClaim.candidate_item_id)
+            .options(
+                joinedload(ExtractedClaim.candidate_item)
+                .selectinload(CandidateItem.evidence_items),
+                joinedload(ExtractedClaim.candidate_item)
+                .joinedload(CandidateItem.normalized_item)
+                .joinedload(NormalizedItem.raw_item)
+                .joinedload(RawItem.source),
+            )
+            .outerjoin(ClaimVerificationItem, ClaimVerificationItem.extracted_claim_id == ExtractedClaim.id)
+            .where(ClaimVerificationItem.id.is_(None))
+            .order_by(ExtractedClaim.confidence.desc(), ExtractedClaim.id.asc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def insert_if_new(
+        self,
+        *,
+        candidate_item_id: int,
+        extracted_claim_id: int,
+        claim_index: int,
+        claim_text: str,
+        supports_claim: str,
+        evidence_item_ids: list[int],
+        confidence: int,
+        risk_flags: list[str],
+        raw_response: dict | str | None = None,
+    ) -> InsertResult:
+        stmt = select(ClaimVerificationItem.id).where(
+            ClaimVerificationItem.extracted_claim_id == extracted_claim_id,
+            ClaimVerificationItem.claim_index == claim_index,
+        )
+        if self.session.execute(stmt).first():
+            return InsertResult(inserted=False, reason="duplicate_claim_index")
+        raw_text = raw_response if isinstance(raw_response, str) else json.dumps(raw_response or {}, ensure_ascii=False, default=str)
+        item = ClaimVerificationItem(
+            candidate_item_id=candidate_item_id,
+            extracted_claim_id=extracted_claim_id,
+            claim_index=claim_index,
+            claim_text=claim_text,
+            supports_claim=supports_claim,
+            evidence_item_ids_json=json.dumps(evidence_item_ids, ensure_ascii=False),
+            confidence=_clamp_score(confidence),
+            risk_flags=json.dumps(list(dict.fromkeys(risk_flags)), ensure_ascii=False),
+            raw_response=raw_text,
+        )
+        self.session.add(item)
+        self.session.flush()
+        return InsertResult(inserted=True, item_id=item.id)
+
+
+class SearchCacheRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get_fresh(self, *, provider: str, query: str) -> SearchCacheItem | None:
+        query_hash = _query_hash(query)
+        now = datetime.now(timezone.utc)
+        stmt = select(SearchCacheItem).where(
+            SearchCacheItem.provider == provider,
+            SearchCacheItem.query_hash == query_hash,
+        )
+        item = self.session.scalars(stmt).first()
+        if item is None:
+            return None
+        expires_at = item.expires_at
+        if expires_at is None:
+            return item
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= now:
+            return None
+        return item
+
+    def upsert(
+        self,
+        *,
+        provider: str,
+        query: str,
+        raw_response: dict,
+        result_count: int,
+        ttl_hours: int = 24,
+    ) -> SearchCacheItem:
+        query_hash = _query_hash(query)
+        stmt = select(SearchCacheItem).where(
+            SearchCacheItem.provider == provider,
+            SearchCacheItem.query_hash == query_hash,
+        )
+        item = self.session.scalars(stmt).first()
+        if item is None:
+            item = SearchCacheItem(provider=provider, query=query, query_hash=query_hash)
+            self.session.add(item)
+        item.query = query
+        item.raw_response = json.dumps(raw_response, ensure_ascii=False, default=str)
+        item.result_count = result_count
+        item.created_at = datetime.now(timezone.utc)
+        item.expires_at = item.created_at + timedelta(hours=ttl_hours)
+        self.session.flush()
+        return item
 
 
 class VerificationItemRepository:
@@ -428,11 +655,12 @@ class VerificationItemRepository:
             .join(ExtractedClaim, ExtractedClaim.candidate_item_id == CandidateItem.id)
             .options(
                 joinedload(CandidateItem.ai_review_item),
-                joinedload(CandidateItem.extracted_claim),
+                joinedload(CandidateItem.extracted_claim).selectinload(ExtractedClaim.claim_verification_items),
                 selectinload(CandidateItem.evidence_items),
                 joinedload(CandidateItem.normalized_item)
                 .joinedload(NormalizedItem.raw_item)
                 .joinedload(RawItem.source),
+                selectinload(CandidateItem.claim_verification_items),
             )
             .outerjoin(VerificationItem, VerificationItem.candidate_item_id == CandidateItem.id)
             .where(
@@ -456,6 +684,7 @@ class VerificationItemRepository:
         candidate_item_id: int,
         model: str | None,
         verification: FinalVerification,
+        freshness_score: int = 0,
     ) -> InsertResult:
         stmt = select(VerificationItem.id).where(VerificationItem.candidate_item_id == candidate_item_id)
         if self.session.execute(stmt).first():
@@ -467,6 +696,7 @@ class VerificationItemRepository:
             verified=verification.verified,
             final_keep=verification.final_keep,
             final_score=verification.final_score,
+            freshness_score=_clamp_score(freshness_score),
             recommendation_level=verification.recommendation_level,
             relevance_score=verification.relevance_score,
             usefulness_score=verification.usefulness_score,
@@ -488,7 +718,12 @@ class VerificationItemRepository:
         self.session.flush()
         return InsertResult(inserted=True, item_id=item.id)
 
-    def list_for_recommendation_export(self, *, limit: int | None = 20) -> list[VerificationItem]:
+    def list_for_recommendation_export(
+        self,
+        *,
+        limit: int | None = 20,
+        final_keep_only: bool = True,
+    ) -> list[VerificationItem]:
         stmt = (
             select(VerificationItem)
             .join(CandidateItem, CandidateItem.id == VerificationItem.candidate_item_id)
@@ -499,6 +734,16 @@ class VerificationItemRepository:
                 .joinedload(RawItem.source),
                 joinedload(VerificationItem.candidate_item).joinedload(CandidateItem.extracted_claim),
                 joinedload(VerificationItem.candidate_item).selectinload(CandidateItem.evidence_items),
+                joinedload(VerificationItem.candidate_item).selectinload(CandidateItem.claim_verification_items),
+                joinedload(VerificationItem.candidate_item).selectinload(CandidateItem.feedback_items),
+                selectinload(VerificationItem.recommendation_card),
+                joinedload(VerificationItem.candidate_item)
+                .selectinload(CandidateItem.entity_mentions)
+                .joinedload(EntityMention.entity),
+                joinedload(VerificationItem.candidate_item)
+                .selectinload(CandidateItem.entity_mentions)
+                .joinedload(EntityMention.entity)
+                .selectinload(CanonicalEntity.feedback_items),
             )
             .order_by(
                 VerificationItem.final_keep.desc(),
@@ -509,9 +754,307 @@ class VerificationItemRepository:
                 CandidateItem.id.asc(),
             )
         )
+        if final_keep_only:
+            stmt = stmt.where(
+                VerificationItem.final_keep.is_(True),
+                VerificationItem.recommendation_level.in_(["S", "A", "B"]),
+            )
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
+
+
+class EntityRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def list_unmentioned_verifications(self, *, limit: int | None = 100) -> list[VerificationItem]:
+        stmt = (
+            select(VerificationItem)
+            .join(CandidateItem, CandidateItem.id == VerificationItem.candidate_item_id)
+            .options(
+                joinedload(VerificationItem.candidate_item)
+                .joinedload(CandidateItem.normalized_item)
+                .joinedload(NormalizedItem.raw_item)
+                .joinedload(RawItem.source),
+                joinedload(VerificationItem.candidate_item).joinedload(CandidateItem.extracted_claim),
+            )
+            .outerjoin(EntityMention, EntityMention.verification_item_id == VerificationItem.id)
+            .where(VerificationItem.final_keep.is_(True), EntityMention.id.is_(None))
+            .order_by(VerificationItem.final_score.desc(), VerificationItem.id.asc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def resolve_verification(self, verification: VerificationItem) -> tuple[CanonicalEntity, bool, bool]:
+        candidate = verification.candidate_item
+        claim = candidate.extracted_claim
+        entity = self._find_entity(claim)
+        created_entity = False
+        previous_last_seen = entity.last_seen_at if entity is not None else None
+        if entity is None:
+            entity = CanonicalEntity(
+                entity_type=(claim.entity_type if claim else verification.category) or "other",
+                name=(claim.entity_name if claim and claim.entity_name else candidate.normalized_item.title),
+                normalized_name=_normalize_entity_name(claim.entity_name if claim and claim.entity_name else candidate.normalized_item.title),
+                canonical_url=claim.official_url if claim else candidate.normalized_item.url,
+                github_url=claim.github_url if claim else None,
+                huggingface_url=claim.huggingface_url if claim else None,
+                producthunt_url=claim.producthunt_url if claim else None,
+                first_seen_at=candidate.normalized_item.published_at,
+                last_seen_at=candidate.normalized_item.published_at,
+                best_score=verification.final_score,
+                status="active",
+            )
+            self.session.add(entity)
+            self.session.flush()
+            created_entity = True
+        else:
+            self._fill_entity_links(entity, claim)
+
+        mention_exists = self.session.execute(
+            select(EntityMention.id).where(
+                EntityMention.entity_id == entity.id,
+                EntityMention.candidate_item_id == candidate.id,
+            )
+        ).first()
+        created_mention = False
+        if not mention_exists:
+            raw_item = candidate.normalized_item.raw_item
+            mention = EntityMention(
+                entity_id=entity.id,
+                candidate_item_id=candidate.id,
+                verification_item_id=verification.id,
+                source_id=raw_item.source_id,
+                mention_url=candidate.normalized_item.url,
+                mention_type="strong" if _strong_key(claim) else "name",
+                confidence=95 if _strong_key(claim) else 70,
+            )
+            self.session.add(mention)
+            self.session.flush()
+            created_mention = True
+
+        self._refresh_entity_stats(entity)
+        is_major_update, update_reason = _detect_entity_update(
+            verification=verification,
+            previous_last_seen=previous_last_seen,
+            created_entity=created_entity,
+        )
+        entity.major_update_detected = is_major_update
+        if update_reason:
+            entity.last_update_reason = update_reason
+        return entity, created_entity, created_mention
+
+    def mark_entities_recommended(self, entity_ids: list[int], *, recommended_at: datetime | None = None) -> int:
+        if not entity_ids:
+            return 0
+        unique_ids = list(dict.fromkeys(entity_ids))
+        recommended_time = recommended_at or datetime.now(timezone.utc)
+        rows = list(self.session.scalars(select(CanonicalEntity).where(CanonicalEntity.id.in_(unique_ids))).all())
+        for entity in rows:
+            entity.last_recommended_at = recommended_time
+        return len(rows)
+
+    def _fill_entity_links(self, entity: CanonicalEntity, claim: ExtractedClaim | None) -> None:
+        if claim is None:
+            return
+        if not entity.canonical_url and claim.official_url:
+            entity.canonical_url = claim.official_url
+        if not entity.github_url and claim.github_url:
+            entity.github_url = claim.github_url
+        if not entity.huggingface_url and claim.huggingface_url:
+            entity.huggingface_url = claim.huggingface_url
+        if not entity.producthunt_url and claim.producthunt_url:
+            entity.producthunt_url = claim.producthunt_url
+
+    def _find_entity(self, claim: ExtractedClaim | None) -> CanonicalEntity | None:
+        if claim is None:
+            return None
+        if claim.github_url:
+            entity = self.session.scalars(select(CanonicalEntity).where(CanonicalEntity.github_url == claim.github_url)).first()
+            if entity:
+                return entity
+        if claim.huggingface_url:
+            entity = self.session.scalars(select(CanonicalEntity).where(CanonicalEntity.huggingface_url == claim.huggingface_url)).first()
+            if entity:
+                return entity
+        if claim.producthunt_url:
+            entity = self.session.scalars(select(CanonicalEntity).where(CanonicalEntity.producthunt_url == claim.producthunt_url)).first()
+            if entity:
+                return entity
+        if claim.official_url:
+            entity = self.session.scalars(select(CanonicalEntity).where(CanonicalEntity.canonical_url == claim.official_url)).first()
+            if entity:
+                return entity
+        if claim.entity_name:
+            return self.session.scalars(
+                select(CanonicalEntity).where(CanonicalEntity.normalized_name == _normalize_entity_name(claim.entity_name))
+            ).first()
+        return None
+
+    def _refresh_entity_stats(self, entity: CanonicalEntity) -> None:
+        mentions = list(
+            self.session.scalars(
+                select(EntityMention)
+                .options(
+                    joinedload(EntityMention.verification_item),
+                    joinedload(EntityMention.candidate_item).joinedload(CandidateItem.normalized_item),
+                )
+                .where(EntityMention.entity_id == entity.id)
+            ).all()
+        )
+        verification_scores = [
+            mention.verification_item.final_score
+            for mention in mentions
+            if mention.verification_item is not None
+        ]
+        source_ids = {mention.source_id for mention in mentions}
+        published_values = [
+            mention.candidate_item.normalized_item.published_at
+            for mention in mentions
+            if mention.candidate_item and mention.candidate_item.normalized_item.published_at
+        ]
+        entity.best_score = max(verification_scores or [entity.best_score])
+        entity.source_count = len(source_ids)
+        entity.mention_count = len(mentions)
+        if published_values:
+            entity.first_seen_at = min(published_values)
+            entity.last_seen_at = max(published_values)
+
+
+class PipelineRunRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def start(self, *, run_type: str) -> PipelineRun:
+        item = PipelineRun(run_type=run_type, status="running", started_at=datetime.now(timezone.utc), stats_json="{}")
+        self.session.add(item)
+        self.session.flush()
+        return item
+
+    def finish(self, run_id: int, *, status: str, stats: dict, error: str | None = None) -> None:
+        item = self.session.get(PipelineRun, run_id)
+        if item is None:
+            return
+        item.status = status
+        item.finished_at = datetime.now(timezone.utc)
+        item.stats_json = json.dumps(stats, ensure_ascii=False, default=str)
+        item.error = error
+
+
+class UserFeedbackRepository:
+    POSITIVE_ACTIONS = {"like", "save", "click"}
+    NEGATIVE_ACTIONS = {"dislike", "hide", "report"}
+    VALID_ACTIONS = POSITIVE_ACTIONS | NEGATIVE_ACTIONS
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def add(
+        self,
+        *,
+        entity_id: int | None = None,
+        candidate_item_id: int | None = None,
+        action: str,
+        reason: str | None = None,
+    ) -> UserFeedback:
+        normalized_action = action.strip().lower()
+        if normalized_action not in self.VALID_ACTIONS:
+            raise ValueError(f"unsupported feedback action: {action}")
+        if entity_id is None and candidate_item_id is None:
+            raise ValueError("entity_id or candidate_item_id is required")
+        item = UserFeedback(
+            entity_id=entity_id,
+            candidate_item_id=candidate_item_id,
+            action=normalized_action,
+            reason=reason,
+        )
+        self.session.add(item)
+        self.session.flush()
+        return item
+
+    def summary(self, *, entity_id: int | None = None, candidate_item_id: int | None = None) -> dict:
+        stmt = select(UserFeedback)
+        if entity_id is not None:
+            stmt = stmt.where(UserFeedback.entity_id == entity_id)
+        if candidate_item_id is not None:
+            stmt = stmt.where(UserFeedback.candidate_item_id == candidate_item_id)
+        rows = list(self.session.scalars(stmt).all())
+        actions: dict[str, int] = {}
+        for row in rows:
+            actions[row.action] = actions.get(row.action, 0) + 1
+        positive = sum(actions.get(action, 0) for action in self.POSITIVE_ACTIONS)
+        negative = sum(actions.get(action, 0) for action in self.NEGATIVE_ACTIONS)
+        return {"total": len(rows), "positive": positive, "negative": negative, "actions": actions}
+
+
+class RecommendationCardRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def list_pending_for_write(self, *, limit: int | None = 100) -> list[VerificationItem]:
+        stmt = (
+            select(VerificationItem)
+            .join(CandidateItem, CandidateItem.id == VerificationItem.candidate_item_id)
+            .options(
+                joinedload(VerificationItem.candidate_item)
+                .joinedload(CandidateItem.normalized_item)
+                .joinedload(NormalizedItem.raw_item)
+                .joinedload(RawItem.source),
+                joinedload(VerificationItem.candidate_item).joinedload(CandidateItem.extracted_claim),
+                joinedload(VerificationItem.candidate_item).selectinload(CandidateItem.evidence_items),
+                joinedload(VerificationItem.candidate_item).selectinload(CandidateItem.claim_verification_items),
+                joinedload(VerificationItem.candidate_item)
+                .selectinload(CandidateItem.entity_mentions)
+                .joinedload(EntityMention.entity),
+            )
+            .outerjoin(RecommendationCard, RecommendationCard.verification_item_id == VerificationItem.id)
+            .where(
+                VerificationItem.final_keep.is_(True),
+                RecommendationCard.id.is_(None),
+            )
+            .order_by(
+                VerificationItem.final_score.desc(),
+                VerificationItem.freshness_score.desc(),
+                VerificationItem.id.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def insert_if_new(
+        self,
+        *,
+        verification_item_id: int,
+        entity_id: int | None,
+        title: str,
+        summary_cn: str | None,
+        why_recommend: str | None,
+        how_to_try: str | None,
+        risk_note: str | None,
+        evidence_note: str | None,
+        raw_response: dict | str | None = None,
+    ) -> InsertResult:
+        stmt = select(RecommendationCard.id).where(RecommendationCard.verification_item_id == verification_item_id)
+        if self.session.execute(stmt).first():
+            return InsertResult(inserted=False, reason="duplicate_verification_item")
+        raw_text = raw_response if isinstance(raw_response, str) else json.dumps(raw_response or {}, ensure_ascii=False, default=str)
+        item = RecommendationCard(
+            verification_item_id=verification_item_id,
+            entity_id=entity_id,
+            title=title,
+            summary_cn=summary_cn,
+            why_recommend=why_recommend,
+            how_to_try=how_to_try,
+            risk_note=risk_note,
+            evidence_note=evidence_note,
+            raw_response=raw_text,
+        )
+        self.session.add(item)
+        self.session.flush()
+        return InsertResult(inserted=True, item_id=item.id)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -520,6 +1063,67 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _clamp_score(value: int | float | None) -> int:
+    if value is None:
+        return 0
+    return max(0, min(int(value), 100))
+
+
+def _query_hash(query: str) -> str:
+    return hashlib.sha256(" ".join(query.split()).lower().encode("utf-8")).hexdigest()
+
+
+def _normalize_entity_name(value: str | None) -> str:
+    return " ".join((value or "").strip().lower().split())[:255] or "unknown"
+
+
+def _strong_key(claim: ExtractedClaim | None) -> str | None:
+    if claim is None:
+        return None
+    return claim.github_url or claim.huggingface_url or claim.producthunt_url or claim.official_url
+
+
+def _detect_entity_update(
+    *,
+    verification: VerificationItem,
+    previous_last_seen: datetime | None,
+    created_entity: bool,
+) -> tuple[bool, str | None]:
+    candidate = verification.candidate_item
+    claim = candidate.extracted_claim
+    reasons: list[str] = []
+    if created_entity:
+        reasons.append("new_entity")
+    published_at = _as_utc(candidate.normalized_item.published_at if candidate.normalized_item else None)
+    previous_seen = _as_utc(previous_last_seen)
+    if previous_seen and published_at and published_at > previous_seen:
+        reasons.append("new_mention")
+    if claim and claim.release_signal:
+        reasons.append("release_signal")
+    claim_text = " ".join(_loads_json_list(claim.claims_json) if claim else []).lower()
+    if any(keyword in claim_text for keyword in ["release", "released", "update", "updated", "version", "mcp", "gguf", "open weights", "开源", "发布", "更新"]):
+        reasons.append("claim_update_keyword")
+    if verification.freshness_score >= 80:
+        reasons.append("fresh_verification")
+    reasons = list(dict.fromkeys(reasons))
+    if not reasons:
+        return False, None
+    major = any(reason in reasons for reason in ["new_entity", "new_mention", "release_signal", "claim_update_keyword", "fresh_verification"])
+    return major, ";".join(reasons)
+
+
+def _loads_json_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data]
 
 
 def infer_source_group(source_id: str) -> str:

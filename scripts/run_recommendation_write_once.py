@@ -10,20 +10,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config.settings import Settings
-from app.jobs.evidence_search_job import run_evidence_search_from_settings
+from app.jobs.recommendation_write_job import run_recommendation_write_from_settings
 from app.logging_config import configure_logging
 
 
 def main(
-    limit: int = typer.Option(30, min=1, help="Maximum extracted_claims to search evidence for."),
-    max_attempts: int | None = typer.Option(
-        None,
-        min=1,
-        help="Maximum evidence-search attempts per claim. Defaults to EVIDENCE_SEARCH_MAX_ATTEMPTS.",
-    ),
+    limit: int = typer.Option(100, min=1, help="Maximum final_keep verification_items to turn into recommendation cards."),
 ) -> None:
     configure_logging()
-    result = run_evidence_search_from_settings(settings=Settings.from_env(), limit=limit, max_attempts=max_attempts)
+    result = run_recommendation_write_from_settings(settings=Settings.from_env(), limit=limit)
     typer.echo(
         f"processed={result.processed} inserted={result.inserted} "
         f"skipped={result.skipped} failed={result.failed}"

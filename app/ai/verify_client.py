@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
 import httpx
@@ -20,6 +20,7 @@ class AIVerifyRequest:
     extracted_claim: dict[str, Any] | None
     evidence_items: list[dict[str, Any]]
     source_quality: dict[str, Any]
+    claim_verifications: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,7 @@ class AIVerifyClient:
                         "content": (
                             "你是严格的 AI 工具情报核实器。只返回 JSON，不要 Markdown。"
                             "必须基于 evidence_items 判断，不得只根据标题或关键词推荐。"
+                            "claim_verifications 是逐条 claim 的本地核实结果，应优先用于判断可信度。"
                             "无证据时 credibility_score 不得高于 50；只有 Product Hunt/X 且无官网/文档/仓库时 final_score 不得高于 65。"
                             "纯社区讨论、求推荐、泛 benchmark、营销列表、虚假开源或空仓库必须降低分数并添加 risk_flags。"
                         ),

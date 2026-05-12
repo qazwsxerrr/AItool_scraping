@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import json
+
 import typer
 
 from app.config.settings import Settings
 from app.jobs.ai_review_job import run_ai_review_from_settings
 from app.jobs.ai_verify_job import run_ai_verify_from_settings
 from app.jobs.claim_extract_job import run_claim_extract_from_settings
+from app.jobs.claim_verify_job import run_claim_verify_from_settings
 from app.jobs.evidence_search_job import run_evidence_search_from_settings
+from app.jobs.evidence_fetch_job import run_evidence_fetch_from_settings
+from app.jobs.evidence_classify_job import run_evidence_classify_from_settings
+from app.jobs.entity_resolve_job import run_entity_resolve_from_settings
+from app.jobs.feedback_job import add_feedback_from_settings, feedback_summary_from_settings
 from app.jobs.fetch_job import run_fetch_from_registry
 from app.jobs.normalize_job import run_normalize_from_settings
+from app.jobs.pipeline_run_job import run_daily_from_settings
 from app.jobs.prefilter_job import run_prefilter_from_settings
-from app.jobs.recommendation_export_job import run_recommendation_export_from_settings
+from app.jobs.recommendation_export_job import run_audit_export_from_settings, run_recommendation_export_from_settings
+from app.jobs.recommendation_write_job import run_recommendation_write_from_settings
 from app.jobs.review_export_job import run_review_export_from_settings
 from app.logging_config import configure_logging
 
@@ -131,13 +140,36 @@ def claim_extract(
 @app.command("evidence-search")
 def evidence_search(
     limit: int = typer.Option(30, min=1, help="Maximum extracted_claims to search evidence for."),
+    max_attempts: int | None = typer.Option(
+        None,
+        min=1,
+        help="Maximum evidence-search attempts per claim. Defaults to EVIDENCE_SEARCH_MAX_ATTEMPTS.",
+    ),
 ) -> None:
     configure_logging()
-    result = run_evidence_search_from_settings(settings=Settings.from_env(), limit=limit)
+    result = run_evidence_search_from_settings(settings=Settings.from_env(), limit=limit, max_attempts=max_attempts)
     typer.echo(
         f"processed={result.processed} inserted={result.inserted} "
         f"skipped={result.skipped} failed={result.failed}"
     )
+
+
+@app.command("evidence-fetch")
+def evidence_fetch(
+    limit: int = typer.Option(50, min=1, help="Maximum evidence_items to fetch or verify."),
+) -> None:
+    configure_logging()
+    result = run_evidence_fetch_from_settings(settings=Settings.from_env(), limit=limit)
+    typer.echo(f"processed={result.processed} updated={result.updated} failed={result.failed}")
+
+
+@app.command("evidence-classify")
+def evidence_classify(
+    limit: int = typer.Option(100, min=1, help="Maximum fetched evidence_items to classify."),
+) -> None:
+    configure_logging()
+    result = run_evidence_classify_from_settings(settings=Settings.from_env(), limit=limit)
+    typer.echo(f"processed={result.processed} updated={result.updated} failed={result.failed}")
 
 
 @app.command("ai-verify")
@@ -146,6 +178,30 @@ def ai_verify(
 ) -> None:
     configure_logging()
     result = run_ai_verify_from_settings(settings=Settings.from_env(), limit=limit)
+    typer.echo(
+        f"processed={result.processed} inserted={result.inserted} "
+        f"skipped={result.skipped} failed={result.failed}"
+    )
+
+
+@app.command("claim-verify")
+def claim_verify(
+    limit: int = typer.Option(100, min=1, help="Maximum extracted_claims to verify at claim level."),
+) -> None:
+    configure_logging()
+    result = run_claim_verify_from_settings(settings=Settings.from_env(), limit=limit)
+    typer.echo(
+        f"processed_claims={result.processed_claims} inserted={result.inserted} "
+        f"skipped={result.skipped} failed={result.failed}"
+    )
+
+
+@app.command("recommendation-write")
+def recommendation_write(
+    limit: int = typer.Option(100, min=1, help="Maximum final_keep verification_items to turn into recommendation cards."),
+) -> None:
+    configure_logging()
+    result = run_recommendation_write_from_settings(settings=Settings.from_env(), limit=limit)
     typer.echo(
         f"processed={result.processed} inserted={result.inserted} "
         f"skipped={result.skipped} failed={result.failed}"
@@ -166,6 +222,75 @@ def recommendation_export(
     typer.echo(f"exported={result.exported}")
     typer.echo(f"markdown={result.markdown_path}")
     typer.echo(f"jsonl={result.jsonl_path}")
+
+
+@app.command("audit-export")
+def audit_export(
+    limit: int = typer.Option(100, min=1, help="Maximum verification_items to export for audit."),
+    output_dir: str = typer.Option("output", help="Directory for Markdown and JSONL audit files."),
+) -> None:
+    configure_logging()
+    result = run_audit_export_from_settings(
+        settings=Settings.from_env(),
+        output_dir=output_dir,
+        limit=limit,
+    )
+    typer.echo(f"exported={result.exported}")
+    typer.echo(f"markdown={result.markdown_path}")
+    typer.echo(f"jsonl={result.jsonl_path}")
+
+
+@app.command("entity-resolve")
+def entity_resolve(
+    limit: int = typer.Option(100, min=1, help="Maximum verification_items to resolve into canonical entities."),
+) -> None:
+    configure_logging()
+    result = run_entity_resolve_from_settings(settings=Settings.from_env(), limit=limit)
+    typer.echo(
+        f"processed={result.processed} entities_created={result.entities_created} "
+        f"mentions_created={result.mentions_created} failed={result.failed}"
+    )
+
+
+@app.command("run-daily")
+def run_daily() -> None:
+    configure_logging()
+    result = run_daily_from_settings(settings=Settings.from_env())
+    typer.echo(f"run_id={result.run_id} status={result.status}")
+    if result.error:
+        typer.echo(f"error={result.error}")
+
+
+@app.command("feedback-add")
+def feedback_add(
+    action: str = typer.Argument(..., help="Feedback action: like/dislike/save/hide/click/report."),
+    entity_id: int | None = typer.Option(None, help="Canonical entity id."),
+    candidate_item_id: int | None = typer.Option(None, help="Candidate item id."),
+    reason: str | None = typer.Option(None, help="Optional feedback reason."),
+) -> None:
+    configure_logging()
+    result = add_feedback_from_settings(
+        settings=Settings.from_env(),
+        entity_id=entity_id,
+        candidate_item_id=candidate_item_id,
+        action=action,
+        reason=reason,
+    )
+    typer.echo(f"inserted={result.inserted} feedback_id={result.feedback_id}")
+
+
+@app.command("feedback-summary")
+def feedback_summary_cmd(
+    entity_id: int | None = typer.Option(None, help="Canonical entity id."),
+    candidate_item_id: int | None = typer.Option(None, help="Candidate item id."),
+) -> None:
+    configure_logging()
+    summary = feedback_summary_from_settings(
+        settings=Settings.from_env(),
+        entity_id=entity_id,
+        candidate_item_id=candidate_item_id,
+    )
+    typer.echo(json.dumps(summary, ensure_ascii=False))
 
 
 if __name__ == "__main__":

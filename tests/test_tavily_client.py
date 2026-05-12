@@ -67,7 +67,7 @@ def test_tavily_client_posts_search_request_and_parses_results():
     assert response.request_id == "req_123"
     assert response.usage == {"credits": 1}
     assert response.results[0].url == "https://github.com/example/mcp"
-    assert response.results[0].confidence == 91
+    assert response.results[0].retrieval_score == 91
 
     call = http_client.calls[0]
     assert call["url"] == "https://api.tavily.com/search"
