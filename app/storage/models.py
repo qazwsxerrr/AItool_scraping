@@ -106,6 +106,9 @@ class CandidateItem(Base):
 
     normalized_item: Mapped[NormalizedItem] = relationship(back_populates="candidate_item")
     ai_review_item: Mapped["AIReviewItem | None"] = relationship(back_populates="candidate_item")
+    extracted_claim: Mapped["ExtractedClaim | None"] = relationship(back_populates="candidate_item")
+    evidence_items: Mapped[list["EvidenceItem"]] = relationship(back_populates="candidate_item")
+    verification_item: Mapped["VerificationItem | None"] = relationship(back_populates="candidate_item")
 
 
 class AIReviewItem(Base):
@@ -128,3 +131,93 @@ class AIReviewItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
     candidate_item: Mapped[CandidateItem] = relationship(back_populates="ai_review_item")
+
+
+class ExtractedClaim(Base):
+    __tablename__ = "extracted_claims"
+    __table_args__ = (
+        UniqueConstraint("candidate_item_id", name="uq_extracted_claims_candidate_item_id"),
+        Index("ix_extracted_claims_entity_name", "entity_name"),
+        Index("ix_extracted_claims_entity_type", "entity_type"),
+        Index("ix_extracted_claims_confidence", "confidence"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    candidate_item_id: Mapped[int] = mapped_column(ForeignKey("candidate_items.id"), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    entity_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    entity_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    official_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    github_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    huggingface_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    producthunt_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claims_json: Mapped[str] = mapped_column(Text, nullable=False)
+    release_signal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    actionable_signal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    raw_response: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    candidate_item: Mapped[CandidateItem] = relationship(back_populates="extracted_claim")
+
+
+class EvidenceItem(Base):
+    __tablename__ = "evidence_items"
+    __table_args__ = (
+        UniqueConstraint("candidate_item_id", "url", name="uq_evidence_items_candidate_url"),
+        Index("ix_evidence_items_candidate_item_id", "candidate_item_id"),
+        Index("ix_evidence_items_type", "evidence_type"),
+        Index("ix_evidence_items_supports_claim", "supports_claim"),
+        Index("ix_evidence_items_confidence", "confidence"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    candidate_item_id: Mapped[int] = mapped_column(ForeignKey("candidate_items.id"), nullable=False)
+    query: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    supports_claim: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    raw_payload: Mapped[str] = mapped_column(Text, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    candidate_item: Mapped[CandidateItem] = relationship(back_populates="evidence_items")
+
+
+class VerificationItem(Base):
+    __tablename__ = "verification_items"
+    __table_args__ = (
+        UniqueConstraint("candidate_item_id", name="uq_verification_items_candidate_item_id"),
+        Index("ix_verification_items_final_keep", "final_keep"),
+        Index("ix_verification_items_final_score", "final_score"),
+        Index("ix_verification_items_level", "recommendation_level"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    candidate_item_id: Mapped[int] = mapped_column(ForeignKey("candidate_items.id"), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    final_keep: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    final_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    recommendation_level: Mapped[str] = mapped_column(String(32), nullable=False)
+    relevance_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    usefulness_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    credibility_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    novelty_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reproducibility_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    audience_fit_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source_quality_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    spam_risk_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    category: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recommendation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    risk_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_summary: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    risk_flags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    raw_response: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    candidate_item: Mapped[CandidateItem] = relationship(back_populates="verification_item")

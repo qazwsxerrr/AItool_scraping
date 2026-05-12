@@ -4,9 +4,13 @@ import typer
 
 from app.config.settings import Settings
 from app.jobs.ai_review_job import run_ai_review_from_settings
+from app.jobs.ai_verify_job import run_ai_verify_from_settings
+from app.jobs.claim_extract_job import run_claim_extract_from_settings
+from app.jobs.evidence_search_job import run_evidence_search_from_settings
 from app.jobs.fetch_job import run_fetch_from_registry
 from app.jobs.normalize_job import run_normalize_from_settings
 from app.jobs.prefilter_job import run_prefilter_from_settings
+from app.jobs.recommendation_export_job import run_recommendation_export_from_settings
 from app.jobs.review_export_job import run_review_export_from_settings
 from app.logging_config import configure_logging
 
@@ -100,6 +104,68 @@ def ai_review(
         f"processed={result.processed} inserted={result.inserted} "
         f"skipped={result.skipped} failed={result.failed}"
     )
+
+
+@app.command("claim-extract")
+def claim_extract(
+    limit: int = typer.Option(50, min=1, help="Maximum AI-reviewed candidate_items to extract claims from."),
+    min_ai_score: int | None = typer.Option(
+        None,
+        min=0,
+        max=100,
+        help="Minimum ai_score to extract claims. Defaults to CLAIM_EXTRACT_MIN_AI_SCORE.",
+    ),
+) -> None:
+    configure_logging()
+    result = run_claim_extract_from_settings(
+        settings=Settings.from_env(),
+        limit=limit,
+        min_ai_score=min_ai_score,
+    )
+    typer.echo(
+        f"processed={result.processed} inserted={result.inserted} "
+        f"skipped={result.skipped} failed={result.failed}"
+    )
+
+
+@app.command("evidence-search")
+def evidence_search(
+    limit: int = typer.Option(30, min=1, help="Maximum extracted_claims to search evidence for."),
+) -> None:
+    configure_logging()
+    result = run_evidence_search_from_settings(settings=Settings.from_env(), limit=limit)
+    typer.echo(
+        f"processed={result.processed} inserted={result.inserted} "
+        f"skipped={result.skipped} failed={result.failed}"
+    )
+
+
+@app.command("ai-verify")
+def ai_verify(
+    limit: int = typer.Option(30, min=1, help="Maximum evidence-backed candidates to verify with AI."),
+) -> None:
+    configure_logging()
+    result = run_ai_verify_from_settings(settings=Settings.from_env(), limit=limit)
+    typer.echo(
+        f"processed={result.processed} inserted={result.inserted} "
+        f"skipped={result.skipped} failed={result.failed}"
+    )
+
+
+@app.command("recommendation-export")
+def recommendation_export(
+    limit: int = typer.Option(20, min=1, help="Maximum verification_items to export."),
+    output_dir: str = typer.Option("output", help="Directory for Markdown and JSONL recommendation files."),
+) -> None:
+    configure_logging()
+    result = run_recommendation_export_from_settings(
+        settings=Settings.from_env(),
+        output_dir=output_dir,
+        limit=limit,
+    )
+    typer.echo(f"exported={result.exported}")
+    typer.echo(f"markdown={result.markdown_path}")
+    typer.echo(f"jsonl={result.jsonl_path}")
 
 
 if __name__ == "__main__":

@@ -296,7 +296,62 @@ candidate_score 降序 → published_at 降序 → candidate_id 升序
 
 AI 初筛结果会写入 `ai_review_items` 表；重复运行不会重复审同一个 `candidate_item_id`。
 
-### 6. 导出人工审阅文件
+### 6. 抽取 claim、Tavily 搜索证据、AI 核实与推荐导出
+
+AI 初筛之后可以进入情报核实层。该层不会只根据标题/摘要推荐，而是先抽取实体与 claim，再用 Tavily 搜索外部证据，最后让 AI 基于证据做多维评分。
+
+需要在本地 `.env` 配置：
+
+```env
+TAVILY_BASE_URL=https://api.tavily.com
+TAVILY_API_KEY=your-local-key
+TAVILY_SEARCH_DEPTH=basic
+TAVILY_MAX_RESULTS=5
+```
+
+`CLAIM_EXTRACT_*` 与 `AI_VERIFY_*` 默认可复用 `AI_REVIEW_*`；如果要使用不同模型或 endpoint，可以单独配置。
+
+运行顺序：
+
+```powershell
+./.conda/python.exe scripts/run_claim_extract_once.py --limit 50
+./.conda/python.exe scripts/run_evidence_search_once.py --limit 30
+./.conda/python.exe scripts/run_ai_verify_once.py --limit 30
+./.conda/python.exe scripts/run_recommendation_export_once.py --limit 20
+```
+
+或使用 Typer CLI：
+
+```powershell
+./.conda/python.exe -m app.main claim-extract --limit 50
+./.conda/python.exe -m app.main evidence-search --limit 30
+./.conda/python.exe -m app.main ai-verify --limit 30
+./.conda/python.exe -m app.main recommendation-export --limit 20
+```
+
+新增表：
+
+- `extracted_claims`：候选实体、类型、关键 claim、抽取出的官网/GitHub/Hugging Face/Product Hunt 链接。
+- `evidence_items`：Tavily 搜索结果和直接证据 URL，包含证据类型、域名、置信度、原始 payload。
+- `verification_items`：基于证据的最终保留判断、多维评分、推荐等级、风险标签和推荐理由。
+
+最终推荐条件默认：
+
+```text
+final_keep = true
+final_score >= 75
+credibility_score >= 60
+spam_risk_score <= 40
+evidence_items >= 1
+无 hard negative flag
+```
+
+`recommendation-export` 会在 `output/` 下生成：
+
+- `recommendations_YYYYMMDD_HHMMSS.md`
+- `recommendations_YYYYMMDD_HHMMSS.jsonl`
+
+### 7. 导出人工审阅文件
 
 ```powershell
 ./.conda/python.exe scripts/run_review_export_once.py --limit 100
@@ -313,7 +368,7 @@ AI 初筛结果会写入 `ai_review_items` 表；重复运行不会重复审同�
 ./.conda/python.exe -m app.main review-export --limit 100
 ```
 
-### 7. 一键顺序执行完整流程
+### 8. 一键顺序执行完整流程
 
 推荐先跑重点来源，避免某些国外源网络超时拖慢全量流程：
 
@@ -326,6 +381,10 @@ AI 初筛结果会写入 `ai_review_items` 表；重复运行不会重复审同�
 ./.conda/python.exe scripts/run_normalize_once.py --limit 300
 ./.conda/python.exe scripts/run_prefilter_once.py --limit 300
 ./.conda/python.exe scripts/run_ai_review_once.py --limit 50
+./.conda/python.exe scripts/run_claim_extract_once.py --limit 50
+./.conda/python.exe scripts/run_evidence_search_once.py --limit 30
+./.conda/python.exe scripts/run_ai_verify_once.py --limit 30
+./.conda/python.exe scripts/run_recommendation_export_once.py --limit 20
 ./.conda/python.exe scripts/run_review_export_once.py --limit 100
 ```
 
@@ -338,6 +397,9 @@ AI 初筛结果会写入 `ai_review_items` 表；重复运行不会重复审同�
 ./.conda/python.exe scripts/run_normalize_once.py --limit 500
 ./.conda/python.exe scripts/run_prefilter_once.py --limit 500
 ./.conda/python.exe scripts/run_ai_review_once.py --limit 80
+./.conda/python.exe scripts/run_claim_extract_once.py --limit 80
+./.conda/python.exe scripts/run_evidence_search_once.py --limit 50
+./.conda/python.exe scripts/run_ai_verify_once.py --limit 50
 ./.conda/python.exe scripts/run_review_export_once.py --limit 150
 ```
 
@@ -439,15 +501,21 @@ uv run --extra test pytest
 - AI 初筛前人工审阅 Markdown / JSONL 导出
 - AI 初筛 API 客户端配置、请求载荷和响应解析
 - AI 初筛 job 幂等入库
+- Tavily evidence search 请求载荷、Bearer 鉴权和响应解析
+- claim 抽取、证据搜索、AI 核实与推荐导出 job 幂等入库
+- final_score 多维公式、无证据降分和 hard negative 拦截
 
 ## 数据表
 
-当前阶段创建四张表：
+当前阶段创建以下表：
 
 - `sources`：来源配置与 `last_fetched_at`
 - `raw_items`：原始抓取条目、原始 payload、内容 hash 与处理状态
 - `normalized_items`：标准化后的标题、正文、URL、语言与 `dedupe_key`
 - `candidate_items`：规则预筛后的候选池，保存分数、命中关键词、保留/丢弃理由
 - `ai_review_items`：AI 初筛结果，保存 AI 是否保留、评分、分类、原因、中文摘要和原始响应
+- `extracted_claims`：AI 从候选中抽取出的实体、类型、claim 和关键外链
+- `evidence_items`：Tavily 搜索结果与直接证据链接
+- `verification_items`：基于证据的最终核实结果、评分、推荐等级和风险标签
 
 默认数据库路径：`data/ai_tool_intel.db`。

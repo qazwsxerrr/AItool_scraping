@@ -29,6 +29,10 @@ class SourceConfig(BaseModel):
     parser_type: Literal["feedparser"] = "feedparser"
     source_group: str = "general"
     source_subtype: str = "fixed"
+    quality_weight: float | None = None
+    source_role: Literal["official", "community", "launch_platform", "social", "forum", "search", "code_hosting", "unknown"] | None = None
+    spam_risk: Literal["low", "medium", "high"] | None = None
+    requires_verification: bool | None = None
     default_limit: int = 30
     search_query: str | None = None
 
@@ -73,6 +77,15 @@ class SourceConfig(BaseModel):
     def validate_default_limit(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("default_limit must be positive")
+        return value
+
+    @field_validator("quality_weight")
+    @classmethod
+    def validate_quality_weight(cls, value: float | None) -> float | None:
+        if value is None:
+            return value
+        if value < 0 or value > 1:
+            raise ValueError("quality_weight must be between 0 and 1")
         return value
 
 

@@ -5,14 +5,25 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
+from app.ai.claim_client import ClaimExtractResponse
 from app.config.source_registry import SourceConfig
 from app.parsers.feed_parser import ParsedFeedItem
 from app.ai.review_client import AIReviewResponse
+from app.pipeline.verification import FinalVerification
 from app.pipeline.normalize import NormalizedItemData
 from app.pipeline.prefilter import CandidateDecision
-from app.storage.models import AIReviewItem, CandidateItem, NormalizedItem, RawItem, Source
+from app.storage.models import (
+    AIReviewItem,
+    CandidateItem,
+    EvidenceItem,
+    ExtractedClaim,
+    NormalizedItem,
+    RawItem,
+    Source,
+    VerificationItem,
+)
 
 
 @dataclass(frozen=True)
@@ -234,6 +245,40 @@ class CandidateItemRepository:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
 
+    def list_pending_for_claim_extract(
+        self,
+        *,
+        limit: int | None = 50,
+        min_ai_score: int = 70,
+    ) -> list[CandidateItem]:
+        stmt = (
+            select(CandidateItem)
+            .join(AIReviewItem, AIReviewItem.candidate_item_id == CandidateItem.id)
+            .join(NormalizedItem, NormalizedItem.id == CandidateItem.normalized_item_id)
+            .options(
+                joinedload(CandidateItem.ai_review_item),
+                joinedload(CandidateItem.normalized_item)
+                .joinedload(NormalizedItem.raw_item)
+                .joinedload(RawItem.source),
+            )
+            .outerjoin(ExtractedClaim, ExtractedClaim.candidate_item_id == CandidateItem.id)
+            .where(
+                CandidateItem.status == "kept",
+                AIReviewItem.ai_keep.is_(True),
+                AIReviewItem.ai_score >= min_ai_score,
+                ExtractedClaim.id.is_(None),
+            )
+            .order_by(
+                AIReviewItem.ai_score.desc(),
+                CandidateItem.candidate_score.desc(),
+                NormalizedItem.published_at.desc(),
+                CandidateItem.id.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
 
 class AIReviewItemRepository:
     def __init__(self, session: Session) -> None:
@@ -263,6 +308,210 @@ class AIReviewItemRepository:
         self.session.add(item)
         self.session.flush()
         return InsertResult(inserted=True, item_id=item.id)
+
+
+class ExtractedClaimRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def insert_if_new(
+        self,
+        *,
+        candidate_item_id: int,
+        model: str | None,
+        response: ClaimExtractResponse,
+    ) -> InsertResult:
+        stmt = select(ExtractedClaim.id).where(ExtractedClaim.candidate_item_id == candidate_item_id)
+        if self.session.execute(stmt).first():
+            return InsertResult(inserted=False, reason="duplicate_candidate_item")
+
+        item = ExtractedClaim(
+            candidate_item_id=candidate_item_id,
+            model=model,
+            entity_name=response.entity_name,
+            entity_type=response.entity_type,
+            official_url=response.official_url,
+            github_url=response.github_url,
+            huggingface_url=response.huggingface_url,
+            producthunt_url=response.producthunt_url,
+            claims_json=json.dumps(response.main_claims, ensure_ascii=False),
+            release_signal=response.release_signal,
+            actionable_signal=response.actionable_signal,
+            confidence=response.confidence,
+            raw_response=json.dumps(response.raw_response or {}, ensure_ascii=False, default=str),
+        )
+        self.session.add(item)
+        self.session.flush()
+        return InsertResult(inserted=True, item_id=item.id)
+
+    def list_pending_for_evidence_search(self, *, limit: int | None = 30) -> list[ExtractedClaim]:
+        stmt = (
+            select(ExtractedClaim)
+            .join(CandidateItem, CandidateItem.id == ExtractedClaim.candidate_item_id)
+            .options(
+                joinedload(ExtractedClaim.candidate_item)
+                .joinedload(CandidateItem.normalized_item)
+                .joinedload(NormalizedItem.raw_item)
+                .joinedload(RawItem.source)
+            )
+            .outerjoin(EvidenceItem, EvidenceItem.candidate_item_id == ExtractedClaim.candidate_item_id)
+            .where(EvidenceItem.id.is_(None))
+            .order_by(ExtractedClaim.confidence.desc(), ExtractedClaim.id.asc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+
+class EvidenceItemRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def insert_if_new(
+        self,
+        *,
+        candidate_item_id: int,
+        url: str,
+        evidence_type: str,
+        title: str | None,
+        snippet: str | None,
+        source_domain: str | None,
+        supports_claim: str = "unknown",
+        confidence: int = 0,
+        raw_payload: dict | str | None = None,
+        query: str | None = None,
+    ) -> InsertResult:
+        stmt = select(EvidenceItem.id).where(
+            EvidenceItem.candidate_item_id == candidate_item_id,
+            EvidenceItem.url == url,
+        )
+        if self.session.execute(stmt).first():
+            return InsertResult(inserted=False, reason="duplicate_candidate_url")
+
+        if isinstance(raw_payload, str):
+            raw_text = raw_payload
+        else:
+            raw_text = json.dumps(raw_payload or {}, ensure_ascii=False, default=str)
+        item = EvidenceItem(
+            candidate_item_id=candidate_item_id,
+            query=query,
+            evidence_type=evidence_type,
+            url=url,
+            title=title,
+            snippet=snippet,
+            source_domain=source_domain,
+            supports_claim=supports_claim,
+            confidence=max(0, min(int(confidence), 100)),
+            raw_payload=raw_text,
+        )
+        self.session.add(item)
+        self.session.flush()
+        return InsertResult(inserted=True, item_id=item.id)
+
+    def list_by_candidate(self, candidate_item_id: int) -> list[EvidenceItem]:
+        stmt = (
+            select(EvidenceItem)
+            .where(EvidenceItem.candidate_item_id == candidate_item_id)
+            .order_by(EvidenceItem.confidence.desc(), EvidenceItem.id.asc())
+        )
+        return list(self.session.scalars(stmt).all())
+
+
+class VerificationItemRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def list_pending_for_ai_verify(self, *, limit: int | None = 30) -> list[CandidateItem]:
+        stmt = (
+            select(CandidateItem)
+            .join(AIReviewItem, AIReviewItem.candidate_item_id == CandidateItem.id)
+            .join(ExtractedClaim, ExtractedClaim.candidate_item_id == CandidateItem.id)
+            .options(
+                joinedload(CandidateItem.ai_review_item),
+                joinedload(CandidateItem.extracted_claim),
+                selectinload(CandidateItem.evidence_items),
+                joinedload(CandidateItem.normalized_item)
+                .joinedload(NormalizedItem.raw_item)
+                .joinedload(RawItem.source),
+            )
+            .outerjoin(VerificationItem, VerificationItem.candidate_item_id == CandidateItem.id)
+            .where(
+                CandidateItem.status == "kept",
+                AIReviewItem.ai_keep.is_(True),
+                VerificationItem.id.is_(None),
+            )
+            .order_by(
+                AIReviewItem.ai_score.desc(),
+                CandidateItem.candidate_score.desc(),
+                CandidateItem.id.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def insert_if_new(
+        self,
+        *,
+        candidate_item_id: int,
+        model: str | None,
+        verification: FinalVerification,
+    ) -> InsertResult:
+        stmt = select(VerificationItem.id).where(VerificationItem.candidate_item_id == candidate_item_id)
+        if self.session.execute(stmt).first():
+            return InsertResult(inserted=False, reason="duplicate_candidate_item")
+
+        item = VerificationItem(
+            candidate_item_id=candidate_item_id,
+            model=model,
+            verified=verification.verified,
+            final_keep=verification.final_keep,
+            final_score=verification.final_score,
+            recommendation_level=verification.recommendation_level,
+            relevance_score=verification.relevance_score,
+            usefulness_score=verification.usefulness_score,
+            credibility_score=verification.credibility_score,
+            novelty_score=verification.novelty_score,
+            reproducibility_score=verification.reproducibility_score,
+            audience_fit_score=verification.audience_fit_score,
+            source_quality_score=verification.source_quality_score,
+            spam_risk_score=verification.spam_risk_score,
+            category=verification.category,
+            summary_cn=verification.summary_cn,
+            recommendation_reason=verification.recommendation_reason,
+            risk_reason=verification.risk_reason,
+            evidence_summary=json.dumps(verification.evidence_summary, ensure_ascii=False),
+            risk_flags=json.dumps(verification.risk_flags, ensure_ascii=False),
+            raw_response=json.dumps(verification.raw_response or {}, ensure_ascii=False, default=str),
+        )
+        self.session.add(item)
+        self.session.flush()
+        return InsertResult(inserted=True, item_id=item.id)
+
+    def list_for_recommendation_export(self, *, limit: int | None = 20) -> list[VerificationItem]:
+        stmt = (
+            select(VerificationItem)
+            .join(CandidateItem, CandidateItem.id == VerificationItem.candidate_item_id)
+            .options(
+                joinedload(VerificationItem.candidate_item)
+                .joinedload(CandidateItem.normalized_item)
+                .joinedload(NormalizedItem.raw_item)
+                .joinedload(RawItem.source),
+                joinedload(VerificationItem.candidate_item).joinedload(CandidateItem.extracted_claim),
+                joinedload(VerificationItem.candidate_item).selectinload(CandidateItem.evidence_items),
+            )
+            .order_by(
+                VerificationItem.final_keep.desc(),
+                VerificationItem.final_score.desc(),
+                VerificationItem.credibility_score.desc(),
+                VerificationItem.novelty_score.desc(),
+                VerificationItem.source_quality_score.desc(),
+                CandidateItem.id.asc(),
+            )
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
