@@ -2,7 +2,7 @@
 
 本仓库用于构建面向 AI 工具发现、筛选、聚合、归档与文字分发的工程化情报系统。
 
-当前阶段目标：实现“抓取 → 标准化 → 规则预筛 → AI 二次筛选 → 人工审阅导出”的最小闭环。
+当前阶段目标：实现“多源抓取 → 标准化 → 规则预筛 → AI 初筛 → claim 抽取 → Tavily 证据搜索 → 证据抓取/分类 → claim 级核实 → AI 最终核实 → 推荐卡片/审计导出”的可复跑闭环。
 
 ## 当前实现范围
 
@@ -19,7 +19,76 @@
 - 将 `candidate_items` 中保留的候选导出为 Markdown / JSONL，便于 AI 初筛前人工审阅。
 - 已支持通用 JSON API 与 OpenAI-compatible Chat Completions 风格 AI 初筛，调用地址、key 和模型通过环境变量配置。
 
-暂不包含 canonical tool 聚合、Notion、Telegram、Markdown 日报、HTML 爬虫。
+当前仍未接入 Notion / Telegram 分发；输出以 Markdown / JSONL 文字归档为主。项目不做视频、TTS、截图或前端渲染。
+
+## 项目构成
+
+本项目不是单个 RSS 抓取脚本，而是一条分阶段、可复跑、可审计的 AI 工具情报流水线。核心代码在 `app/`：
+
+```text
+app/
+├─ main.py                 # Typer CLI 入口，注册 fetch / normalize / verify / export 等命令
+├─ config/                 # 环境配置、source_registry.yaml 信息源注册与元数据
+├─ collectors/             # RSS / Atom / RSSHub 抓取器
+├─ parsers/                # feedparser 解析与原始条目抽取
+├─ storage/                # SQLAlchemy models、数据库初始化、Repository 幂等写入
+├─ pipeline/               # 纯业务逻辑：normalize、prefilter、证据 query、claim/最终评分规则
+├─ ai/                     # AI review / claim extract / AI verify 客户端与响应解析
+├─ search/                 # Tavily 搜索客户端与搜索结果解析
+├─ evidence/               # evidence URL 抓取、GitHub/Hugging Face 专用 verifier、证据分类
+└─ jobs/                   # 每个流水线阶段的 job，负责数据库读写与阶段编排
+```
+
+辅助目录：
+
+```text
+scripts/      # CLI 的薄封装脚本，便于 Windows/定时任务直接调用
+docs/         # 项目文档、后续计划与 RSSHub/X 接入说明
+data/         # 本地 SQLite 数据库，已忽略，不提交
+output/       # Markdown / JSONL / 日志输出，已忽略，不提交
+tests/        # 针对各阶段的单元/集成测试
+rsshub-local/ # 本地 RSSHub Docker 部署配置
+```
+
+典型数据流：
+
+```text
+source_registry.yaml
+  ↓
+fetch_job → raw_items
+  ↓
+normalize_job → normalized_items
+  ↓
+prefilter_job → candidate_items
+  ↓
+ai_review_job → ai_review_items
+  ↓
+claim_extract_job → extracted_claims
+  ↓
+evidence_search_job / Tavily → evidence_items
+  ↓
+evidence_fetch_job → evidence_items.fetch_status / URL 内容预览
+  ↓
+evidence_classify_job → supports_claim / risk_flags / quality_flags
+  ↓
+claim_verify_job → claim_verification_items
+  ↓
+ai_verify_job → verification_items
+  ↓
+entity_resolve_job → canonical_entities / entity_mentions
+  ↓
+recommendation_write_job → recommendation_cards
+  ↓
+recommendation_export_job / audit_export → Markdown / JSONL
+```
+
+设计原则：
+
+- 每个阶段可以单独执行，也可以重复执行。
+- 数据库写入尽量幂等，重复内容会 `skipped` 或更新已有记录。
+- 上游证据或 claim 变化时，下游 verification / recommendation 可标记 stale 并重算。
+- 原始条目、标准化条目、候选、claim、证据和最终推荐都保留，方便追溯。
+- AI 输出不直接当事实；必须经过 evidence / claim verification / deterministic guard。
 
 ## 当前默认信息源
 
@@ -592,6 +661,37 @@ pytest
 ```bash
 uv run --extra test pytest
 ```
+
+### 为什么 `tests/` 文件比较多
+
+`tests/` 文件多是刻意拆分的结果。这个项目现在由采集、解析、存储、AI 初筛、证据搜索、证据抓取、claim 核实、最终验证、实体聚合、推荐导出等多个阶段组成；每个阶段都需要保证可复跑、幂等、可追溯，不能只靠一次端到端运行判断是否正确。
+
+可以按层理解：
+
+```text
+test_feed_parser / test_fetch_job / test_source_registry
+  → 采集层：RSS/RSSHub 解析、source 配置、抓取失败隔离
+
+test_normalize / test_prefilter / test_repository
+  → 数据处理层：标准化、去重、候选池规则、Repository 幂等写入
+
+test_ai_review_client / test_ai_verify_client / test_intelligence_jobs
+  → AI 客户端与 job：请求 payload、OpenAI-compatible 响应解析、重复运行不重复入库
+
+test_tavily_client / test_evidence_* / test_claim_support_strength
+  → 证据层：Tavily 搜索、证据抓取、证据分类、claim 支持/反驳判断
+
+test_verification_scoring / test_deterministic_guard
+  → 准确性门禁：final_score 公式、无证据降分、hard negative 拦截
+
+test_downstream_staleness / test_invalidate_downstream
+  → 下游一致性：上游证据变化后，verification/recommendation 标记 stale 并重算
+
+test_recommendation_intelligence_layer / test_review_export_job / test_feedback_loop
+  → 输出层：推荐卡片、审计导出、实体反馈和重排
+```
+
+`tests/__pycache__/` 是 Python/pytest 自动生成的缓存，不是项目源码，已被 `.gitignore` 忽略。
 
 当前测试覆盖：
 
