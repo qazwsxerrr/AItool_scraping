@@ -89,4 +89,78 @@ def test_default_registry_contains_main_site_metadata_and_x_is_env_gated():
 
     skipped_ids = {item.source_id for item in result.skipped}
     assert "x_account_openai" in skipped_ids
-    assert "x_search_github_launch" in skipped_ids
+    assert "x_account_anthropic" in skipped_ids
+    assert "x_account_deepseek" in skipped_ids
+    assert "x_account_mistral_ai" in skipped_ids
+
+
+def test_x_search_sources_use_rsshub_keyword_routes_when_enabled():
+    base_url = "http://127.0.0.1:1200"
+    result = load_source_registry(env={"RSSHUB_BASE_URL": base_url})
+    source_by_id = {source.id: source for source in result.sources}
+
+    expected_queries = {
+        "x_search_github_launch": 'url:github.com ("launch" OR "released" OR "open source") -is:retweet -is:reply',
+        "x_search_huggingface_model": 'url:huggingface.co (model OR space OR dataset OR gguf OR weights) -is:retweet -is:reply',
+        "x_search_ai_tool_launch": '("AI tool" OR "AI app" OR agent OR workflow) (launch OR released OR introducing OR "open source") -is:retweet -is:reply',
+        "x_search_github_ai_tool": 'url:github.com (agent OR LLM OR MCP OR "AI tool" OR "open source") -is:retweet -is:reply',
+        "x_search_mcp_agent": '(MCP OR "model context protocol" OR "AI agent" OR "agent workflow") (github OR release OR launch OR tool) -is:retweet -is:reply',
+    }
+
+    for source_id, search_query in expected_queries.items():
+        source = source_by_id[source_id]
+        assert source.type == "rsshub"
+        assert source.source_group == "x"
+        assert source.source_subtype == "search"
+        assert source.default_limit == 20
+        assert source.search_query == search_query
+        assert source.url.startswith(f"{base_url}/twitter/keyword/")
+        assert "/twitter/search/" not in source.url
+
+
+def test_x_account_sources_track_mainstream_model_official_accounts():
+    base_url = "http://127.0.0.1:1200"
+    result = load_source_registry(env={"RSSHUB_BASE_URL": base_url})
+    source_by_id = {source.id: source for source in result.sources}
+
+    expected_accounts = {
+        "x_account_openai": "OpenAI",
+        "x_account_chatgpt": "ChatGPTapp",
+        "x_account_anthropic": "AnthropicAI",
+        "x_account_claude": "claudeai",
+        "x_account_google_deepmind": "GoogleDeepMind",
+        "x_account_gemini": "GeminiApp",
+        "x_account_xai": "xai",
+        "x_account_grok": "grok",
+        "x_account_ai_at_meta": "AIatMeta",
+        "x_account_mistral_ai": "MistralAI",
+        "x_account_cohere": "cohere",
+        "x_account_perplexity_ai": "perplexity_ai",
+        "x_account_msft_copilot": "Copilot",
+        "x_account_deepseek": "deepseek_ai",
+        "x_account_qwen": "Alibaba_Qwen",
+        "x_account_huggingface": "huggingface",
+        "x_account_ollama": "ollama",
+        "x_account_replicate": "replicate",
+        "x_account_sam_altman": "sama",
+        "x_account_tibo": "thsottiaux",
+        "x_account_together_ai": "togethercompute",
+    }
+
+    disabled_or_inactive_accounts = {
+        "x_account_meta_ai",
+        "x_account_local_llama",
+    }
+
+    for source_id, handle in expected_accounts.items():
+        source = source_by_id[source_id]
+        assert source.type == "rsshub"
+        assert source.enabled is True
+        assert source.source_group == "x"
+        assert source.source_subtype == "account"
+        assert source.default_limit == 5
+        assert source.url == f"{base_url}/twitter/user/{handle}"
+        assert source.search_query == handle
+
+    for source_id in disabled_or_inactive_accounts:
+        assert source_id not in source_by_id

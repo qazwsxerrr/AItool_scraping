@@ -250,6 +250,7 @@ sources:
     search_query: n8n dify
     default_limit: 8
 
+  # X account feeds via local RSSHub. Handles were selected from official model/company/product accounts.
   - id: x_account_openai
     name: X OpenAI via RSSHub
     type: rsshub
@@ -263,12 +264,207 @@ sources:
     search_query: OpenAI
     default_limit: 5
 
+  - id: x_account_chatgpt
+    name: X ChatGPT via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/ChatGPTapp
+    enabled: true
+    priority: 101
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: ChatGPTapp
+    default_limit: 5
+
+  - id: x_account_anthropic
+    name: X Anthropic via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/AnthropicAI
+    enabled: true
+    priority: 102
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: AnthropicAI
+    default_limit: 5
+
+  - id: x_account_claude
+    name: X Claude via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/claudeai
+    enabled: true
+    priority: 103
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: claudeai
+    default_limit: 5
+
+  - id: x_account_google_deepmind
+    name: X Google DeepMind via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/GoogleDeepMind
+    enabled: true
+    priority: 104
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: GoogleDeepMind
+    default_limit: 5
+
+  - id: x_account_gemini
+    name: X Gemini via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/GeminiApp
+    enabled: true
+    priority: 105
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: GeminiApp
+    default_limit: 5
+
+  - id: x_account_xai
+    name: X xAI via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/xai
+    enabled: true
+    priority: 106
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: xai
+    default_limit: 5
+
+  - id: x_account_grok
+    name: X Grok via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/grok
+    enabled: true
+    priority: 107
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: grok
+    default_limit: 5
+
+  - id: x_account_meta_ai
+    name: X Meta AI via RSSHub (moved to AIatMeta)
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/MetaAI
+    enabled: false
+    priority: 108
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: MetaAI
+    default_limit: 5
+
+  - id: x_account_ai_at_meta
+    name: X AI at Meta via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/AIatMeta
+    enabled: true
+    priority: 109
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: AIatMeta
+    default_limit: 5
+
+  - id: x_account_mistral_ai
+    name: X Mistral AI via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/MistralAI
+    enabled: true
+    priority: 110
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: MistralAI
+    default_limit: 5
+
+  - id: x_account_cohere
+    name: X Cohere via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/cohere
+    enabled: true
+    priority: 111
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: cohere
+    default_limit: 5
+
+  - id: x_account_perplexity_ai
+    name: X Perplexity via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/perplexity_ai
+    enabled: true
+    priority: 112
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: perplexity_ai
+    default_limit: 5
+
+  - id: x_account_msft_copilot
+    name: X Microsoft Copilot via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/Copilot
+    enabled: true
+    priority: 113
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: Copilot
+    default_limit: 5
+
+  - id: x_account_deepseek
+    name: X DeepSeek via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/deepseek_ai
+    enabled: true
+    priority: 114
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: deepseek_ai
+    default_limit: 5
+
+  - id: x_account_qwen
+    name: X Qwen via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/Alibaba_Qwen
+    enabled: true
+    priority: 115
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: Alibaba_Qwen
+    default_limit: 5
+
   - id: x_account_huggingface
     name: X Hugging Face via RSSHub
     type: rsshub
     url: ${RSSHUB_BASE_URL}/twitter/user/huggingface
     enabled: true
-    priority: 101
+    priority: 116
     fetch_interval: 7200
     parser_type: feedparser
     source_group: x
@@ -276,12 +472,77 @@ sources:
     search_query: huggingface
     default_limit: 5
 
+  - id: x_account_ollama
+    name: X Ollama via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/ollama
+    enabled: true
+    priority: 117
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: ollama
+    default_limit: 5
+
+  - id: x_account_replicate
+    name: X Replicate via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/replicate
+    enabled: true
+    priority: 118
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: replicate
+    default_limit: 5
+
+  - id: x_account_sam_altman
+    name: X Sam Altman via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/sama
+    enabled: true
+    priority: 119
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: sama
+    default_limit: 5
+
+  - id: x_account_tibo
+    name: X Tibo via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/thsottiaux
+    enabled: true
+    priority: 120
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: thsottiaux
+    default_limit: 5
+
+  - id: x_account_together_ai
+    name: X Together AI via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/user/togethercompute
+    enabled: true
+    priority: 121
+    fetch_interval: 7200
+    parser_type: feedparser
+    source_group: x
+    source_subtype: account
+    search_query: togethercompute
+    default_limit: 5
+
   - id: x_account_local_llama
-    name: X LocalLLaMA via RSSHub
+    name: X LocalLLaMA via RSSHub (inactive)
     type: rsshub
     url: ${RSSHUB_BASE_URL}/twitter/user/LocalLLaMA
-    enabled: true
-    priority: 102
+    enabled: false
+    priority: 122
     fetch_interval: 7200
     parser_type: feedparser
     source_group: x
@@ -292,7 +553,7 @@ sources:
   - id: x_search_github_launch
     name: X Search GitHub Launch via RSSHub
     type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/search/url%3Agithub.com%20%28launch%20OR%20released%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
+    url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Agithub.com%20%28launch%20OR%20released%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
     enabled: true
     priority: 150
     fetch_interval: 14400
@@ -305,14 +566,53 @@ sources:
   - id: x_search_huggingface_model
     name: X Search Hugging Face Model via RSSHub
     type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/search/url%3Ahuggingface.co%20%28model%20OR%20weights%20OR%20gguf%29%20-is%3Aretweet%20-is%3Areply
+    url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Ahuggingface.co%20%28model%20OR%20space%20OR%20dataset%20OR%20gguf%20OR%20weights%29%20-is%3Aretweet%20-is%3Areply
     enabled: true
     priority: 151
     fetch_interval: 14400
     parser_type: feedparser
     source_group: x
     source_subtype: search
-    search_query: 'url:huggingface.co ("model" OR "weights" OR "gguf") -is:retweet -is:reply'
+    search_query: 'url:huggingface.co (model OR space OR dataset OR gguf OR weights) -is:retweet -is:reply'
+    default_limit: 20
+
+  - id: x_search_ai_tool_launch
+    name: X Search AI Tool Launch via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/keyword/%28%22AI%20tool%22%20OR%20%22AI%20app%22%20OR%20agent%20OR%20workflow%29%20%28launch%20OR%20released%20OR%20introducing%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
+    enabled: true
+    priority: 152
+    fetch_interval: 14400
+    parser_type: feedparser
+    source_group: x
+    source_subtype: search
+    search_query: '("AI tool" OR "AI app" OR agent OR workflow) (launch OR released OR introducing OR "open source") -is:retweet -is:reply'
+    default_limit: 20
+
+  - id: x_search_github_ai_tool
+    name: X Search GitHub AI Tool via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Agithub.com%20%28agent%20OR%20LLM%20OR%20MCP%20OR%20%22AI%20tool%22%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
+    enabled: true
+    priority: 153
+    fetch_interval: 14400
+    parser_type: feedparser
+    source_group: x
+    source_subtype: search
+    search_query: 'url:github.com (agent OR LLM OR MCP OR "AI tool" OR "open source") -is:retweet -is:reply'
+    default_limit: 20
+
+  - id: x_search_mcp_agent
+    name: X Search MCP Agent via RSSHub
+    type: rsshub
+    url: ${RSSHUB_BASE_URL}/twitter/keyword/%28MCP%20OR%20%22model%20context%20protocol%22%20OR%20%22AI%20agent%22%20OR%20%22agent%20workflow%22%29%20%28github%20OR%20release%20OR%20launch%20OR%20tool%29%20-is%3Aretweet%20-is%3Areply
+    enabled: true
+    priority: 155
+    fetch_interval: 14400
+    parser_type: feedparser
+    source_group: x
+    source_subtype: search
+    search_query: '(MCP OR "model context protocol" OR "AI agent" OR "agent workflow") (github OR release OR launch OR tool) -is:retweet -is:reply'
     default_limit: 20
 
   # RSSHub feeds are enabled only when RSSHUB_BASE_URL is configured.

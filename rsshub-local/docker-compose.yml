@@ -1,0 +1,17 @@
+services:
+  rsshub:
+    image: diygod/rsshub:latest
+    container_name: rsshub
+    restart: unless-stopped
+    ports:
+      - "1200:1200"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      CACHE_TYPE: memory
+      CACHE_EXPIRE: "600"
+      REQUEST_TIMEOUT: "30000"
+      REQUEST_RETRY: "2"
+      # If X is not reachable directly, copy this file to .env and set:
+      # PROXY_URI=http://host.docker.internal:2080
