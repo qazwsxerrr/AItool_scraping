@@ -261,6 +261,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: OpenAI
     default_limit: 5
 
@@ -274,6 +278,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: ChatGPTapp
     default_limit: 5
 
@@ -287,6 +295,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: AnthropicAI
     default_limit: 5
 
@@ -300,6 +312,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: claudeai
     default_limit: 5
 
@@ -313,6 +329,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: GoogleDeepMind
     default_limit: 5
 
@@ -326,6 +346,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: GeminiApp
     default_limit: 5
 
@@ -339,6 +363,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: xai
     default_limit: 5
 
@@ -352,6 +380,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: grok
     default_limit: 5
 
@@ -365,6 +397,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.35
+    source_role: social
+    spam_risk: high
+    requires_verification: true
     search_query: MetaAI
     default_limit: 5
 
@@ -378,6 +414,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: AIatMeta
     default_limit: 5
 
@@ -391,6 +431,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: MistralAI
     default_limit: 5
 
@@ -404,6 +448,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: cohere
     default_limit: 5
 
@@ -417,6 +465,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: perplexity_ai
     default_limit: 5
 
@@ -430,6 +482,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: Copilot
     default_limit: 5
 
@@ -443,6 +499,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: deepseek_ai
     default_limit: 5
 
@@ -456,6 +516,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: Alibaba_Qwen
     default_limit: 5
 
@@ -469,6 +533,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: huggingface
     default_limit: 5
 
@@ -482,6 +550,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: ollama
     default_limit: 5
 
@@ -495,6 +567,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: replicate
     default_limit: 5
 
@@ -508,6 +584,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.35
+    source_role: social
+    spam_risk: high
+    requires_verification: true
     search_query: sama
     default_limit: 5
 
@@ -521,6 +601,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.35
+    source_role: social
+    spam_risk: high
+    requires_verification: true
     search_query: thsottiaux
     default_limit: 5
 
@@ -534,6 +618,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.75
+    source_role: official
+    spam_risk: medium
+    requires_verification: true
     search_query: togethercompute
     default_limit: 5
 
@@ -547,6 +635,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: account
+    quality_weight: 0.35
+    source_role: social
+    spam_risk: high
+    requires_verification: true
     search_query: LocalLLaMA
     default_limit: 5
 
@@ -560,6 +652,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: search
+    quality_weight: 0.45
+    source_role: social_search
+    spam_risk: high
+    requires_verification: true
     search_query: 'url:github.com ("launch" OR "released" OR "open source") -is:retweet -is:reply'
     default_limit: 20
 
@@ -573,6 +669,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: search
+    quality_weight: 0.45
+    source_role: social_search
+    spam_risk: high
+    requires_verification: true
     search_query: 'url:huggingface.co (model OR space OR dataset OR gguf OR weights) -is:retweet -is:reply'
     default_limit: 20
 
@@ -586,6 +686,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: search
+    quality_weight: 0.45
+    source_role: social_search
+    spam_risk: high
+    requires_verification: true
     search_query: '("AI tool" OR "AI app" OR agent OR workflow) (launch OR released OR introducing OR "open source") -is:retweet -is:reply'
     default_limit: 20
 
@@ -599,6 +703,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: search
+    quality_weight: 0.45
+    source_role: social_search
+    spam_risk: high
+    requires_verification: true
     search_query: 'url:github.com (agent OR LLM OR MCP OR "AI tool" OR "open source") -is:retweet -is:reply'
     default_limit: 20
 
@@ -612,6 +720,10 @@ sources:
     parser_type: feedparser
     source_group: x
     source_subtype: search
+    quality_weight: 0.45
+    source_role: social_search
+    spam_risk: high
+    requires_verification: true
     search_query: '(MCP OR "model context protocol" OR "AI agent" OR "agent workflow") (github OR release OR launch OR tool) -is:retweet -is:reply'
     default_limit: 20
 

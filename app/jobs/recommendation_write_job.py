@@ -26,16 +26,18 @@ def run_recommendation_write_job(
     *,
     session_factory: sessionmaker[Session],
     limit: int | None = 100,
+    force: bool = False,
+    writer_version: str = "recommendation_writer_v1",
 ) -> RecommendationWriteJobResult:
     result = RecommendationWriteJobResult()
     with session_factory() as session:
         repo = RecommendationCardRepository(session)
-        rows = repo.list_pending_for_write(limit=limit)
+        rows = repo.list_pending_for_write(limit=limit, force=force)
         for verification in rows:
             result.processed += 1
             try:
                 card = _build_recommendation_card(verification)
-                inserted = repo.insert_if_new(
+                inserted = repo.upsert(
                     verification_item_id=verification.id,
                     entity_id=card["entity_id"],
                     title=card["title"],
@@ -45,8 +47,12 @@ def run_recommendation_write_job(
                     risk_note=card["risk_note"],
                     evidence_note=card["evidence_note"],
                     raw_response=card,
+                    writer_version=writer_version,
+                    source_verification_updated_at=verification.updated_at or verification.created_at,
                 )
                 if inserted.inserted:
+                    result.inserted += 1
+                elif inserted.reason == "updated":
                     result.inserted += 1
                 else:
                     result.skipped += 1
@@ -62,11 +68,18 @@ def run_recommendation_write_from_settings(
     *,
     settings: Settings,
     limit: int | None = 100,
+    force: bool = False,
+    writer_version: str = "recommendation_writer_v1",
 ) -> RecommendationWriteJobResult:
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
     session_factory = create_session_factory(engine)
-    return run_recommendation_write_job(session_factory=session_factory, limit=limit)
+    return run_recommendation_write_job(
+        session_factory=session_factory,
+        limit=limit,
+        force=force,
+        writer_version=writer_version,
+    )
 
 
 def _build_recommendation_card(verification) -> dict:

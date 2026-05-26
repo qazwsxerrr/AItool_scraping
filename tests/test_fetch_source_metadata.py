@@ -164,3 +164,25 @@ def test_x_account_sources_track_mainstream_model_official_accounts():
 
     for source_id in disabled_or_inactive_accounts:
         assert source_id not in source_by_id
+
+def test_x_sources_are_leads_with_tiered_quality_metadata():
+    result = load_source_registry(env={"RSSHUB_BASE_URL": "http://127.0.0.1:1200"})
+    by_id = {source.id: source for source in result.sources}
+
+    official = by_id["x_account_openai"]
+    assert official.source_role == "official"
+    assert official.quality_weight == 0.75
+    assert official.spam_risk == "medium"
+    assert official.requires_verification is True
+
+    individual = by_id["x_account_sam_altman"]
+    assert individual.source_role == "social"
+    assert individual.quality_weight == 0.35
+    assert individual.spam_risk == "high"
+    assert individual.requires_verification is True
+
+    search = by_id["x_search_github_launch"]
+    assert search.source_role == "social_search"
+    assert search.quality_weight == 0.45
+    assert search.spam_risk == "high"
+    assert search.requires_verification is True

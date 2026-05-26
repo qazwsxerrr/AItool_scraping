@@ -126,6 +126,7 @@ class AIVerifyClient:
             "risk_flags": "array<string>",
         }
         if self.api_style == "openai_chat":
+            schema_text = json.dumps(schema, ensure_ascii=False)
             return {
                 "model": self.model,
                 "messages": [
@@ -133,6 +134,9 @@ class AIVerifyClient:
                         "role": "system",
                         "content": (
                             "你是严格的 AI 工具情报核实器。只返回 JSON，不要 Markdown。"
+                            "必须返回且只能返回包含以下字段的 JSON 对象："
+                            f"{schema_text}。"
+                            "不要使用 recommendation、verdict、ai_score 等替代字段。"
                             "必须基于 evidence_items 判断，不得只根据标题或关键词推荐。"
                             "claim_verifications 是逐条 claim 的本地核实结果，应优先用于判断可信度。"
                             "无证据时 credibility_score 不得高于 50；只有 Product Hunt/X 且无官网/文档/仓库时 final_score 不得高于 65。"
@@ -153,7 +157,7 @@ class AIVerifyClient:
 
 
 def _parse_verify_response(data: dict[str, Any]) -> AIVerifyResponse:
-    result = _unwrap_response(data)
+    result = _normalize_verify_result(_unwrap_response(data))
     return AIVerifyResponse(
         verified=bool(result.get("verified", False)),
         final_keep=bool(result.get("final_keep", False)),
@@ -175,6 +179,57 @@ def _parse_verify_response(data: dict[str, Any]) -> AIVerifyResponse:
         risk_flags=_string_list(result.get("risk_flags")),
         raw_response=data,
     )
+
+
+def _normalize_verify_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Normalize older/loose LLM JSON shapes into the strict verification schema."""
+    normalized = dict(result)
+
+    if "final_keep" not in normalized:
+        recommendation = _lower_str(
+            result.get("recommendation")
+            or result.get("verdict")
+            or result.get("decision")
+            or result.get("keep")
+        )
+        if recommendation in {"keep", "accept", "accepted", "recommend", "recommended", "true", "yes", "保留", "推荐"}:
+            normalized["final_keep"] = True
+        elif recommendation in {"reject", "drop", "discard", "false", "no", "不推荐", "拒绝", "丢弃"}:
+            normalized["final_keep"] = False
+
+    fallback_score = result.get("final_score", result.get("ai_score", result.get("score")))
+    if "final_score" not in normalized and fallback_score is not None:
+        normalized["final_score"] = fallback_score
+
+    if "verified" not in normalized:
+        final_keep = bool(normalized.get("final_keep", False))
+        credibility_score = _clamp_int(normalized.get("credibility_score"))
+        normalized["verified"] = final_keep or credibility_score >= 70
+
+    if "recommendation_level" not in normalized and normalized.get("final_score") is not None:
+        normalized["recommendation_level"] = _level_for_score(_clamp_int(normalized.get("final_score")))
+
+    if "relevance_score" not in normalized:
+        normalized["relevance_score"] = fallback_score
+    if "usefulness_score" not in normalized:
+        normalized["usefulness_score"] = fallback_score
+    if "novelty_score" not in normalized:
+        normalized["novelty_score"] = fallback_score
+    if "reproducibility_score" not in normalized:
+        normalized["reproducibility_score"] = fallback_score
+    if "audience_fit_score" not in normalized:
+        normalized["audience_fit_score"] = fallback_score
+    if "source_quality_score" not in normalized:
+        normalized["source_quality_score"] = normalized.get("credibility_score", fallback_score)
+    if "spam_risk_score" not in normalized:
+        normalized["spam_risk_score"] = 0
+
+    if "recommendation_reason" not in normalized:
+        normalized["recommendation_reason"] = result.get("reason")
+    if "risk_reason" not in normalized:
+        normalized["risk_reason"] = result.get("risk") or result.get("risk_note")
+
+    return normalized
 
 
 def _unwrap_response(data: dict[str, Any]) -> dict[str, Any]:
@@ -222,3 +277,21 @@ def _clamp_int(value: Any, *, default: int = 0) -> int:
     except (TypeError, ValueError):
         number = default
     return max(0, min(number, 100))
+
+
+def _lower_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def _level_for_score(score: int) -> str:
+    if score >= 90:
+        return "S"
+    if score >= 80:
+        return "A"
+    if score >= 65:
+        return "B"
+    if score >= 45:
+        return "C"
+    return "D"

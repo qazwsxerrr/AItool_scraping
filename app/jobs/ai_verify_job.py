@@ -10,7 +10,7 @@ from app.ai.verify_client import AIVerifyClient, AIVerifyRequest
 from app.config.settings import Settings
 from app.pipeline.freshness import calculate_freshness_score
 from app.pipeline.source_quality import source_quality_for_source
-from app.pipeline.verification import finalize_verification
+from app.pipeline.verification import EvidenceGuardStats, finalize_verification
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import VerificationItemRepository
 
@@ -34,6 +34,8 @@ def run_ai_verify_job(
     min_score: int = 75,
     min_credibility: int = 60,
     max_spam_risk: int = 40,
+    force: bool = False,
+    verification_version: str = "ai_verify_v1",
 ) -> AIVerifyJobResult:
     result = AIVerifyJobResult()
     if not client.is_configured:
@@ -41,27 +43,33 @@ def run_ai_verify_job(
 
     with session_factory() as session:
         repo = VerificationItemRepository(session)
-        candidates = repo.list_pending_for_ai_verify(limit=limit)
+        candidates = repo.list_pending_for_ai_verify(limit=limit, force=force)
         for candidate in candidates:
             result.processed += 1
             try:
                 request = _candidate_to_request(candidate)
                 response = client.verify(request)
+                guard_stats = _guard_stats_for_candidate(candidate)
                 final = finalize_verification(
                     response,
                     evidence_count=len(candidate.evidence_items),
+                    guard_stats=guard_stats,
                     min_score=min_score,
                     min_credibility=min_credibility,
                     max_spam_risk=max_spam_risk,
                 )
                 freshness_score = calculate_freshness_score(candidate)
-                insert_result = repo.insert_if_new(
+                insert_result = repo.upsert(
                     candidate_item_id=candidate.id,
                     model=getattr(client, "model", None),
                     verification=final,
                     freshness_score=freshness_score,
+                    verification_version=verification_version,
+                    source_claim_verification_updated_at=_source_claim_verification_updated_at(candidate),
                 )
                 if insert_result.inserted:
+                    result.inserted += 1
+                elif insert_result.reason == "updated":
                     result.inserted += 1
                 else:
                     result.skipped += 1
@@ -78,6 +86,8 @@ def run_ai_verify_from_settings(
     *,
     settings: Settings,
     limit: int | None = 30,
+    force: bool = False,
+    verification_version: str = "ai_verify_v1",
 ) -> AIVerifyJobResult:
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
@@ -90,6 +100,8 @@ def run_ai_verify_from_settings(
         min_score=settings.final_review_min_score,
         min_credibility=settings.final_review_min_credibility,
         max_spam_risk=settings.final_review_max_spam_risk,
+        force=force,
+        verification_version=verification_version,
     )
 
 
@@ -164,6 +176,7 @@ def _candidate_to_request(candidate) -> AIVerifyRequest:
                 "claim_index": row.claim_index,
                 "claim_text": row.claim_text,
                 "supports_claim": row.supports_claim,
+                "support_strength": getattr(row, "support_strength", "none"),
                 "evidence_item_ids": _loads_json_int_list(row.evidence_item_ids_json),
                 "confidence": row.confidence,
                 "risk_flags": _loads_json_list(row.risk_flags),
@@ -211,3 +224,54 @@ def _truncate(value: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 1].rstrip() + "…"
+
+
+def _guard_stats_for_candidate(candidate) -> EvidenceGuardStats:
+    evidence_items = list(getattr(candidate, "evidence_items", []) or [])
+    claim_rows = list(getattr(candidate, "claim_verification_items", []) or [])
+    claim = getattr(candidate, "extracted_claim", None)
+    if claim is not None:
+        claim_rows.extend(list(getattr(claim, "claim_verification_items", []) or []))
+    unique_claim_rows = {getattr(row, "id", index): row for index, row in enumerate(claim_rows)}
+    claim_rows = list(unique_claim_rows.values())
+
+    broken_primary_link_count = 0
+    broken_github_count = 0
+    broken_huggingface_count = 0
+    for evidence in evidence_items:
+        flags = _loads_json_list(getattr(evidence, "risk_flags", None))
+        if "broken_primary_link" in flags:
+            broken_primary_link_count += 1
+        if "broken_github_repo" in flags or evidence.evidence_type == "github_repo" and evidence.supports_claim == "contradict":
+            broken_github_count += 1
+        if "broken_huggingface_model" in flags or evidence.evidence_type == "huggingface_model" and evidence.supports_claim == "contradict":
+            broken_huggingface_count += 1
+
+    return EvidenceGuardStats(
+        support_evidence_count=sum(1 for item in evidence_items if item.supports_claim == "support"),
+        contradict_evidence_count=sum(1 for item in evidence_items if item.supports_claim == "contradict"),
+        high_confidence_contradict_count=sum(
+            1 for item in evidence_items if item.supports_claim == "contradict" and item.evidence_confidence >= 80
+        ),
+        supported_claim_count=sum(1 for row in claim_rows if row.supports_claim == "support"),
+        contradicted_claim_count=sum(1 for row in claim_rows if row.supports_claim == "contradict"),
+        unknown_claim_count=sum(1 for row in claim_rows if row.supports_claim == "unknown"),
+        neutral_claim_count=sum(1 for row in claim_rows if row.supports_claim == "neutral"),
+        broken_primary_link_count=broken_primary_link_count,
+        broken_github_count=broken_github_count,
+        broken_huggingface_count=broken_huggingface_count,
+        entity_only_support_count=sum(1 for row in claim_rows if getattr(row, "support_strength", "none") == "entity_only"),
+        direct_support_count=sum(1 for row in claim_rows if getattr(row, "support_strength", "none") == "direct"),
+    )
+
+
+def _source_claim_verification_updated_at(candidate):
+    values = []
+    rows = list(getattr(candidate, "claim_verification_items", []) or [])
+    claim = getattr(candidate, "extracted_claim", None)
+    if claim is not None:
+        rows.extend(list(getattr(claim, "claim_verification_items", []) or []))
+    for row in rows:
+        values.append(getattr(row, "updated_at", None) or getattr(row, "created_at", None))
+    values = [value for value in values if value is not None]
+    return max(values) if values else None

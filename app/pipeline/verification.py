@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from app.ai.verify_client import AIVerifyResponse
 
@@ -39,10 +39,36 @@ class FinalVerification:
     raw_response: dict | None
 
 
+@dataclass(frozen=True)
+class EvidenceGuardStats:
+    support_evidence_count: int = 0
+    contradict_evidence_count: int = 0
+    high_confidence_contradict_count: int = 0
+    supported_claim_count: int = 0
+    contradicted_claim_count: int = 0
+    unknown_claim_count: int = 0
+    neutral_claim_count: int = 0
+    broken_primary_link_count: int = 0
+    broken_github_count: int = 0
+    broken_huggingface_count: int = 0
+    entity_only_support_count: int = 0
+    direct_support_count: int = 0
+
+    @property
+    def claim_count(self) -> int:
+        return (
+            self.supported_claim_count
+            + self.contradicted_claim_count
+            + self.unknown_claim_count
+            + self.neutral_claim_count
+        )
+
+
 def finalize_verification(
     response: AIVerifyResponse,
     *,
     evidence_count: int,
+    guard_stats: EvidenceGuardStats | None = None,
     min_score: int = 75,
     min_credibility: int = 60,
     max_spam_risk: int = 40,
@@ -53,6 +79,11 @@ def finalize_verification(
         credibility_score = min(credibility_score, 50)
         if "weak_evidence" not in risk_flags:
             risk_flags.append("weak_evidence")
+
+    if guard_stats is not None and guard_stats.support_evidence_count == 0:
+        credibility_score = min(credibility_score, 50)
+        if "no_support_evidence" not in risk_flags:
+            risk_flags.append("no_support_evidence")
 
     relevance_score = _clamp(response.relevance_score)
     usefulness_score = _clamp(response.usefulness_score)
@@ -77,6 +108,36 @@ def finalize_verification(
     if evidence_count <= 0:
         final_score = min(final_score, 65)
 
+    force_reject = False
+    if guard_stats is not None:
+        if guard_stats.support_evidence_count == 0:
+            final_score = min(final_score, 65)
+            force_reject = True
+        if guard_stats.high_confidence_contradict_count >= 1:
+            final_score = min(final_score, 44)
+            force_reject = True
+            if "high_confidence_contradiction" not in risk_flags:
+                risk_flags.append("high_confidence_contradiction")
+        if guard_stats.contradicted_claim_count >= 1:
+            final_score = min(final_score, 59)
+            force_reject = True
+            if "contradicted_claim" not in risk_flags:
+                risk_flags.append("contradicted_claim")
+        if guard_stats.broken_github_count >= 1 or guard_stats.broken_huggingface_count >= 1:
+            final_score = min(final_score, 44)
+            force_reject = True
+            if "broken_primary_artifact" not in risk_flags:
+                risk_flags.append("broken_primary_artifact")
+        if guard_stats.claim_count > 0 and guard_stats.supported_claim_count == 0 and guard_stats.contradicted_claim_count == 0:
+            final_score = min(final_score, 65)
+            if "all_claims_unknown" not in risk_flags:
+                risk_flags.append("all_claims_unknown")
+        if guard_stats.direct_support_count == 0 and guard_stats.entity_only_support_count > 0:
+            credibility_score = min(credibility_score, 60)
+            final_score = min(final_score, 70)
+            if "entity_only_support" not in risk_flags:
+                risk_flags.append("entity_only_support")
+
     has_hard_negative = bool(HARD_NEGATIVE_FLAGS.intersection(risk_flags))
     if has_hard_negative:
         final_score = min(final_score, 44)
@@ -88,8 +149,13 @@ def finalize_verification(
         and credibility_score >= min_credibility
         and spam_risk_score <= max_spam_risk
         and evidence_count >= 1
+        and not force_reject
         and not has_hard_negative
     )
+
+    raw_response = dict(response.raw_response or {})
+    if guard_stats is not None:
+        raw_response["guard_stats"] = asdict(guard_stats)
 
     return FinalVerification(
         verified=bool(response.verified),
@@ -110,7 +176,7 @@ def finalize_verification(
         risk_reason=response.risk_reason,
         evidence_summary=response.evidence_summary,
         risk_flags=risk_flags,
-        raw_response=response.raw_response,
+        raw_response=raw_response,
     )
 
 

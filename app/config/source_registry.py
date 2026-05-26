@@ -30,7 +30,17 @@ class SourceConfig(BaseModel):
     source_group: str = "general"
     source_subtype: str = "fixed"
     quality_weight: float | None = None
-    source_role: Literal["official", "community", "launch_platform", "social", "forum", "search", "code_hosting", "unknown"] | None = None
+    source_role: Literal[
+        "official",
+        "community",
+        "launch_platform",
+        "social",
+        "social_search",
+        "forum",
+        "search",
+        "code_hosting",
+        "unknown",
+    ] | None = None
     spam_risk: Literal["low", "medium", "high"] | None = None
     requires_verification: bool | None = None
     default_limit: int = 30

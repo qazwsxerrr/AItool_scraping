@@ -15,6 +15,7 @@ from app.jobs.evidence_classify_job import run_evidence_classify_from_settings
 from app.jobs.entity_resolve_job import run_entity_resolve_from_settings
 from app.jobs.feedback_job import add_feedback_from_settings, feedback_summary_from_settings
 from app.jobs.fetch_job import run_fetch_from_registry
+from app.jobs.invalidate_downstream_job import run_invalidate_downstream_from_settings
 from app.jobs.normalize_job import run_normalize_from_settings
 from app.jobs.pipeline_run_job import run_daily_from_settings
 from app.jobs.prefilter_job import run_prefilter_from_settings
@@ -166,18 +167,32 @@ def evidence_fetch(
 @app.command("evidence-classify")
 def evidence_classify(
     limit: int = typer.Option(100, min=1, help="Maximum fetched evidence_items to classify."),
+    force: bool = typer.Option(False, "--force", help="Reclassify completed evidence_items as well."),
+    version: str = typer.Option("rules_v1", "--version", help="Evidence classification rule version."),
 ) -> None:
     configure_logging()
-    result = run_evidence_classify_from_settings(settings=Settings.from_env(), limit=limit)
+    result = run_evidence_classify_from_settings(
+        settings=Settings.from_env(),
+        limit=limit,
+        force=force,
+        classification_version=version,
+    )
     typer.echo(f"processed={result.processed} updated={result.updated} failed={result.failed}")
 
 
 @app.command("ai-verify")
 def ai_verify(
     limit: int = typer.Option(30, min=1, help="Maximum evidence-backed candidates to verify with AI."),
+    force: bool = typer.Option(False, "--force", help="Recompute existing AI verification_items."),
+    version: str = typer.Option("ai_verify_v1", "--version", help="AI verification version."),
 ) -> None:
     configure_logging()
-    result = run_ai_verify_from_settings(settings=Settings.from_env(), limit=limit)
+    result = run_ai_verify_from_settings(
+        settings=Settings.from_env(),
+        limit=limit,
+        force=force,
+        verification_version=version,
+    )
     typer.echo(
         f"processed={result.processed} inserted={result.inserted} "
         f"skipped={result.skipped} failed={result.failed}"
@@ -187,9 +202,16 @@ def ai_verify(
 @app.command("claim-verify")
 def claim_verify(
     limit: int = typer.Option(100, min=1, help="Maximum extracted_claims to verify at claim level."),
+    force: bool = typer.Option(False, "--force", help="Recompute existing claim_verification_items."),
+    version: str = typer.Option("claim_rules_v1", "--version", help="Claim verification rule version."),
 ) -> None:
     configure_logging()
-    result = run_claim_verify_from_settings(settings=Settings.from_env(), limit=limit)
+    result = run_claim_verify_from_settings(
+        settings=Settings.from_env(),
+        limit=limit,
+        force=force,
+        verification_version=version,
+    )
     typer.echo(
         f"processed_claims={result.processed_claims} inserted={result.inserted} "
         f"skipped={result.skipped} failed={result.failed}"
@@ -199,12 +221,38 @@ def claim_verify(
 @app.command("recommendation-write")
 def recommendation_write(
     limit: int = typer.Option(100, min=1, help="Maximum final_keep verification_items to turn into recommendation cards."),
+    force: bool = typer.Option(False, "--force", help="Rewrite existing recommendation_cards."),
+    version: str = typer.Option("recommendation_writer_v1", "--version", help="Recommendation writer version."),
 ) -> None:
     configure_logging()
-    result = run_recommendation_write_from_settings(settings=Settings.from_env(), limit=limit)
+    result = run_recommendation_write_from_settings(
+        settings=Settings.from_env(),
+        limit=limit,
+        force=force,
+        writer_version=version,
+    )
     typer.echo(
         f"processed={result.processed} inserted={result.inserted} "
         f"skipped={result.skipped} failed={result.failed}"
+    )
+
+
+@app.command("invalidate-downstream")
+def invalidate_downstream(
+    from_stage: str = typer.Option(
+        ...,
+        "--from",
+        help="Invalidate downstream stages from: evidence, claim-verification, or verification.",
+    ),
+) -> None:
+    configure_logging()
+    result = run_invalidate_downstream_from_settings(
+        settings=Settings.from_env(),
+        from_stage=from_stage,
+    )
+    typer.echo(
+        f"from={result.from_stage} claim_verifications={result.claim_verifications} "
+        f"verification_items={result.verification_items} recommendation_cards={result.recommendation_cards}"
     )
 
 

@@ -5,7 +5,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.ai.claim_client import ClaimExtractResponse
@@ -475,13 +475,24 @@ class EvidenceItemRepository:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
 
-    def list_pending_for_classify(self, *, limit: int | None = 100) -> list[EvidenceItem]:
+    def list_pending_for_classify(
+        self,
+        *,
+        limit: int | None = 100,
+        force: bool = False,
+        classification_version: str | None = None,
+    ) -> list[EvidenceItem]:
         stmt = (
             select(EvidenceItem)
             .options(joinedload(EvidenceItem.candidate_item).joinedload(CandidateItem.extracted_claim))
             .where(EvidenceItem.fetch_status == "completed")
             .order_by(EvidenceItem.id.asc())
         )
+        if not force:
+            predicates = [EvidenceItem.classify_status.in_(["pending", "failed"])]
+            if classification_version:
+                predicates.append(EvidenceItem.classification_version != classification_version)
+            stmt = stmt.where(or_(*predicates))
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
@@ -512,8 +523,13 @@ class EvidenceItemRepository:
         item.fetch_status = fetch_status
         item.fetch_error = fetch_error
         item.fetched_at = datetime.now(timezone.utc)
+        item.updated_at = item.fetched_at
         if raw_payload is not None:
             item.raw_payload = raw_payload if isinstance(raw_payload, str) else json.dumps(raw_payload, ensure_ascii=False, default=str)
+        if fetch_status == "completed":
+            item.classify_status = "pending"
+            item.classified_at = None
+            item.classify_error = None
 
     def update_classification(
         self,
@@ -523,26 +539,42 @@ class EvidenceItemRepository:
         evidence_confidence: int,
         risk_flags: list[str],
         quality_flags: list[str],
+        classification_version: str = "rules_v1",
     ) -> None:
         item = self.session.get(EvidenceItem, evidence_id)
         if item is None:
             return
+        now = datetime.now(timezone.utc)
         item.supports_claim = supports_claim
         item.evidence_confidence = _clamp_score(evidence_confidence)
         item.confidence = _clamp_score(evidence_confidence)
         item.risk_flags = json.dumps(list(dict.fromkeys(risk_flags)), ensure_ascii=False)
         item.quality_flags = json.dumps(list(dict.fromkeys(quality_flags)), ensure_ascii=False)
+        item.classify_status = "completed"
+        item.classified_at = now
+        item.classify_error = None
+        item.classification_version = classification_version
+        item.updated_at = now
+
+    def mark_classification_failed(self, evidence_id: int, error: str) -> None:
+        item = self.session.get(EvidenceItem, evidence_id)
+        if item is None:
+            return
+        item.classify_status = "failed"
+        item.classify_error = error
+        item.updated_at = datetime.now(timezone.utc)
 
 
 class ClaimVerificationRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def list_pending_claims(self, *, limit: int | None = 100) -> list[ExtractedClaim]:
+    def list_pending_claims(self, *, limit: int | None = 100, force: bool = False) -> list[ExtractedClaim]:
         stmt = (
             select(ExtractedClaim)
             .join(CandidateItem, CandidateItem.id == ExtractedClaim.candidate_item_id)
             .options(
+                selectinload(ExtractedClaim.claim_verification_items),
                 joinedload(ExtractedClaim.candidate_item)
                 .selectinload(CandidateItem.evidence_items),
                 joinedload(ExtractedClaim.candidate_item)
@@ -550,13 +582,13 @@ class ClaimVerificationRepository:
                 .joinedload(NormalizedItem.raw_item)
                 .joinedload(RawItem.source),
             )
-            .outerjoin(ClaimVerificationItem, ClaimVerificationItem.extracted_claim_id == ExtractedClaim.id)
-            .where(ClaimVerificationItem.id.is_(None))
             .order_by(ExtractedClaim.confidence.desc(), ExtractedClaim.id.asc())
         )
+        rows = list(self.session.scalars(stmt).all())
+        pending = [claim for claim in rows if force or _claim_needs_verification(claim)]
         if limit is not None:
-            stmt = stmt.limit(limit)
-        return list(self.session.scalars(stmt).all())
+            pending = pending[:limit]
+        return pending
 
     def insert_if_new(
         self,
@@ -566,10 +598,13 @@ class ClaimVerificationRepository:
         claim_index: int,
         claim_text: str,
         supports_claim: str,
+        support_strength: str = "none",
         evidence_item_ids: list[int],
         confidence: int,
         risk_flags: list[str],
         raw_response: dict | str | None = None,
+        verification_version: str = "claim_rules_v1",
+        source_evidence_updated_at: datetime | None = None,
     ) -> InsertResult:
         stmt = select(ClaimVerificationItem.id).where(
             ClaimVerificationItem.extracted_claim_id == extracted_claim_id,
@@ -584,14 +619,67 @@ class ClaimVerificationRepository:
             claim_index=claim_index,
             claim_text=claim_text,
             supports_claim=supports_claim,
+            support_strength=support_strength,
             evidence_item_ids_json=json.dumps(evidence_item_ids, ensure_ascii=False),
             confidence=_clamp_score(confidence),
             risk_flags=json.dumps(list(dict.fromkeys(risk_flags)), ensure_ascii=False),
             raw_response=raw_text,
+            verification_version=verification_version,
+            source_evidence_updated_at=source_evidence_updated_at,
+            stale=False,
         )
         self.session.add(item)
         self.session.flush()
         return InsertResult(inserted=True, item_id=item.id)
+
+    def upsert(
+        self,
+        *,
+        candidate_item_id: int,
+        extracted_claim_id: int,
+        claim_index: int,
+        claim_text: str,
+        supports_claim: str,
+        support_strength: str,
+        evidence_item_ids: list[int],
+        confidence: int,
+        risk_flags: list[str],
+        raw_response: dict | str | None = None,
+        verification_version: str = "claim_rules_v1",
+        source_evidence_updated_at: datetime | None = None,
+    ) -> InsertResult:
+        stmt = select(ClaimVerificationItem).where(
+            ClaimVerificationItem.extracted_claim_id == extracted_claim_id,
+            ClaimVerificationItem.claim_index == claim_index,
+        )
+        item = self.session.scalars(stmt).first()
+        created = False
+        if item is None:
+            item = ClaimVerificationItem(
+                candidate_item_id=candidate_item_id,
+                extracted_claim_id=extracted_claim_id,
+                claim_index=claim_index,
+            )
+            self.session.add(item)
+            created = True
+        raw_text = raw_response if isinstance(raw_response, str) else json.dumps(raw_response or {}, ensure_ascii=False, default=str)
+        now = datetime.now(timezone.utc)
+        item.candidate_item_id = candidate_item_id
+        item.extracted_claim_id = extracted_claim_id
+        item.claim_index = claim_index
+        item.claim_text = claim_text
+        item.supports_claim = supports_claim
+        item.support_strength = support_strength
+        item.evidence_item_ids_json = json.dumps(evidence_item_ids, ensure_ascii=False)
+        item.confidence = _clamp_score(confidence)
+        item.risk_flags = json.dumps(list(dict.fromkeys(risk_flags)), ensure_ascii=False)
+        item.raw_response = raw_text
+        item.verification_version = verification_version
+        item.source_evidence_updated_at = source_evidence_updated_at
+        item.stale = False
+        item.updated_at = now
+        self.session.flush()
+        return InsertResult(inserted=created, reason=None if created else "updated", item_id=item.id)
 
 
 class SearchCacheRepository:
@@ -648,7 +736,7 @@ class VerificationItemRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def list_pending_for_ai_verify(self, *, limit: int | None = 30) -> list[CandidateItem]:
+    def list_pending_for_ai_verify(self, *, limit: int | None = 30, force: bool = False) -> list[CandidateItem]:
         stmt = (
             select(CandidateItem)
             .join(AIReviewItem, AIReviewItem.candidate_item_id == CandidateItem.id)
@@ -656,17 +744,16 @@ class VerificationItemRepository:
             .options(
                 joinedload(CandidateItem.ai_review_item),
                 joinedload(CandidateItem.extracted_claim).selectinload(ExtractedClaim.claim_verification_items),
+                selectinload(CandidateItem.verification_item),
                 selectinload(CandidateItem.evidence_items),
                 joinedload(CandidateItem.normalized_item)
                 .joinedload(NormalizedItem.raw_item)
                 .joinedload(RawItem.source),
                 selectinload(CandidateItem.claim_verification_items),
             )
-            .outerjoin(VerificationItem, VerificationItem.candidate_item_id == CandidateItem.id)
             .where(
                 CandidateItem.status == "kept",
                 AIReviewItem.ai_keep.is_(True),
-                VerificationItem.id.is_(None),
             )
             .order_by(
                 AIReviewItem.ai_score.desc(),
@@ -674,9 +761,11 @@ class VerificationItemRepository:
                 CandidateItem.id.asc(),
             )
         )
+        rows = list(self.session.scalars(stmt).all())
+        pending = [candidate for candidate in rows if force or _candidate_needs_ai_verification(candidate)]
         if limit is not None:
-            stmt = stmt.limit(limit)
-        return list(self.session.scalars(stmt).all())
+            pending = pending[:limit]
+        return pending
 
     def insert_if_new(
         self,
@@ -685,6 +774,8 @@ class VerificationItemRepository:
         model: str | None,
         verification: FinalVerification,
         freshness_score: int = 0,
+        verification_version: str = "ai_verify_v1",
+        source_claim_verification_updated_at: datetime | None = None,
     ) -> InsertResult:
         stmt = select(VerificationItem.id).where(VerificationItem.candidate_item_id == candidate_item_id)
         if self.session.execute(stmt).first():
@@ -713,10 +804,61 @@ class VerificationItemRepository:
             evidence_summary=json.dumps(verification.evidence_summary, ensure_ascii=False),
             risk_flags=json.dumps(verification.risk_flags, ensure_ascii=False),
             raw_response=json.dumps(verification.raw_response or {}, ensure_ascii=False, default=str),
+            verification_version=verification_version,
+            source_claim_verification_updated_at=source_claim_verification_updated_at,
+            stale=False,
         )
         self.session.add(item)
         self.session.flush()
         return InsertResult(inserted=True, item_id=item.id)
+
+    def upsert(
+        self,
+        *,
+        candidate_item_id: int,
+        model: str | None,
+        verification: FinalVerification,
+        freshness_score: int = 0,
+        verification_version: str = "ai_verify_v1",
+        source_claim_verification_updated_at: datetime | None = None,
+    ) -> InsertResult:
+        item = self.session.scalars(
+            select(VerificationItem).where(VerificationItem.candidate_item_id == candidate_item_id)
+        ).first()
+        created = False
+        if item is None:
+            item = VerificationItem(candidate_item_id=candidate_item_id)
+            self.session.add(item)
+            created = True
+
+        now = datetime.now(timezone.utc)
+        item.model = model
+        item.verified = verification.verified
+        item.final_keep = verification.final_keep
+        item.final_score = verification.final_score
+        item.freshness_score = _clamp_score(freshness_score)
+        item.recommendation_level = verification.recommendation_level
+        item.relevance_score = verification.relevance_score
+        item.usefulness_score = verification.usefulness_score
+        item.credibility_score = verification.credibility_score
+        item.novelty_score = verification.novelty_score
+        item.reproducibility_score = verification.reproducibility_score
+        item.audience_fit_score = verification.audience_fit_score
+        item.source_quality_score = verification.source_quality_score
+        item.spam_risk_score = verification.spam_risk_score
+        item.category = verification.category
+        item.summary_cn = verification.summary_cn
+        item.recommendation_reason = verification.recommendation_reason
+        item.risk_reason = verification.risk_reason
+        item.evidence_summary = json.dumps(verification.evidence_summary, ensure_ascii=False)
+        item.risk_flags = json.dumps(verification.risk_flags, ensure_ascii=False)
+        item.raw_response = json.dumps(verification.raw_response or {}, ensure_ascii=False, default=str)
+        item.verification_version = verification_version
+        item.source_claim_verification_updated_at = source_claim_verification_updated_at
+        item.stale = False
+        item.updated_at = now
+        self.session.flush()
+        return InsertResult(inserted=created, reason=None if created else "updated", item_id=item.id)
 
     def list_for_recommendation_export(
         self,
@@ -993,7 +1135,7 @@ class RecommendationCardRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def list_pending_for_write(self, *, limit: int | None = 100) -> list[VerificationItem]:
+    def list_pending_for_write(self, *, limit: int | None = 100, force: bool = False) -> list[VerificationItem]:
         stmt = (
             select(VerificationItem)
             .join(CandidateItem, CandidateItem.id == VerificationItem.candidate_item_id)
@@ -1008,11 +1150,10 @@ class RecommendationCardRepository:
                 joinedload(VerificationItem.candidate_item)
                 .selectinload(CandidateItem.entity_mentions)
                 .joinedload(EntityMention.entity),
+                selectinload(VerificationItem.recommendation_card),
             )
-            .outerjoin(RecommendationCard, RecommendationCard.verification_item_id == VerificationItem.id)
             .where(
                 VerificationItem.final_keep.is_(True),
-                RecommendationCard.id.is_(None),
             )
             .order_by(
                 VerificationItem.final_score.desc(),
@@ -1020,9 +1161,11 @@ class RecommendationCardRepository:
                 VerificationItem.id.asc(),
             )
         )
+        rows = list(self.session.scalars(stmt).all())
+        pending = [row for row in rows if force or _verification_needs_recommendation_write(row)]
         if limit is not None:
-            stmt = stmt.limit(limit)
-        return list(self.session.scalars(stmt).all())
+            pending = pending[:limit]
+        return pending
 
     def insert_if_new(
         self,
@@ -1036,6 +1179,8 @@ class RecommendationCardRepository:
         risk_note: str | None,
         evidence_note: str | None,
         raw_response: dict | str | None = None,
+        writer_version: str = "recommendation_writer_v1",
+        source_verification_updated_at: datetime | None = None,
     ) -> InsertResult:
         stmt = select(RecommendationCard.id).where(RecommendationCard.verification_item_id == verification_item_id)
         if self.session.execute(stmt).first():
@@ -1051,10 +1196,53 @@ class RecommendationCardRepository:
             risk_note=risk_note,
             evidence_note=evidence_note,
             raw_response=raw_text,
+            writer_version=writer_version,
+            source_verification_updated_at=source_verification_updated_at,
+            stale=False,
         )
         self.session.add(item)
         self.session.flush()
         return InsertResult(inserted=True, item_id=item.id)
+
+    def upsert(
+        self,
+        *,
+        verification_item_id: int,
+        entity_id: int | None,
+        title: str,
+        summary_cn: str | None,
+        why_recommend: str | None,
+        how_to_try: str | None,
+        risk_note: str | None,
+        evidence_note: str | None,
+        raw_response: dict | str | None = None,
+        writer_version: str = "recommendation_writer_v1",
+        source_verification_updated_at: datetime | None = None,
+    ) -> InsertResult:
+        item = self.session.scalars(
+            select(RecommendationCard).where(RecommendationCard.verification_item_id == verification_item_id)
+        ).first()
+        created = False
+        if item is None:
+            item = RecommendationCard(verification_item_id=verification_item_id)
+            self.session.add(item)
+            created = True
+        raw_text = raw_response if isinstance(raw_response, str) else json.dumps(raw_response or {}, ensure_ascii=False, default=str)
+        now = datetime.now(timezone.utc)
+        item.entity_id = entity_id
+        item.title = title
+        item.summary_cn = summary_cn
+        item.why_recommend = why_recommend
+        item.how_to_try = how_to_try
+        item.risk_note = risk_note
+        item.evidence_note = evidence_note
+        item.raw_response = raw_text
+        item.writer_version = writer_version
+        item.source_verification_updated_at = source_verification_updated_at
+        item.stale = False
+        item.updated_at = now
+        self.session.flush()
+        return InsertResult(inserted=created, reason=None if created else "updated", item_id=item.id)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -1063,6 +1251,83 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _max_datetime(values: list[datetime | None]) -> datetime | None:
+    normalized = [_as_utc(value) for value in values if value is not None]
+    normalized = [value for value in normalized if value is not None]
+    return max(normalized) if normalized else None
+
+
+def _source_evidence_updated_at(claim: ExtractedClaim) -> datetime | None:
+    candidate = claim.candidate_item
+    if candidate is None:
+        return None
+    return _max_datetime(
+        [
+            getattr(item, "updated_at", None)
+            or getattr(item, "classified_at", None)
+            or getattr(item, "fetched_at", None)
+            for item in candidate.evidence_items
+        ]
+    )
+
+
+def _source_claim_verification_updated_at(candidate: CandidateItem) -> datetime | None:
+    rows = list(candidate.claim_verification_items or [])
+    claim = getattr(candidate, "extracted_claim", None)
+    if claim is not None:
+        rows.extend(list(getattr(claim, "claim_verification_items", []) or []))
+    unique = {row.id: row for row in rows if getattr(row, "id", None) is not None}
+    rows = list(unique.values()) if unique else rows
+    return _max_datetime([getattr(row, "updated_at", None) or getattr(row, "created_at", None) for row in rows])
+
+
+def _claim_needs_verification(claim: ExtractedClaim) -> bool:
+    rows = list(claim.claim_verification_items or [])
+    if not rows:
+        return True
+    evidence_updated_at = _source_evidence_updated_at(claim)
+    if evidence_updated_at is None:
+        return False
+    for row in rows:
+        if getattr(row, "stale", False):
+            return True
+        source_time = _as_utc(getattr(row, "source_evidence_updated_at", None))
+        if source_time is None or evidence_updated_at > source_time:
+            row.stale = True
+            return True
+    return False
+
+
+def _candidate_needs_ai_verification(candidate: CandidateItem) -> bool:
+    verification = candidate.verification_item
+    if verification is None:
+        return True
+    if getattr(verification, "stale", False):
+        return True
+    claim_updated_at = _source_claim_verification_updated_at(candidate)
+    if claim_updated_at is None:
+        return False
+    source_time = _as_utc(getattr(verification, "source_claim_verification_updated_at", None))
+    if source_time is None or claim_updated_at > source_time:
+        verification.stale = True
+        return True
+    return False
+
+
+def _verification_needs_recommendation_write(verification: VerificationItem) -> bool:
+    card = verification.recommendation_card
+    if card is None:
+        return True
+    if getattr(card, "stale", False):
+        return True
+    verification_updated_at = _as_utc(getattr(verification, "updated_at", None) or getattr(verification, "created_at", None))
+    source_time = _as_utc(getattr(card, "source_verification_updated_at", None))
+    if verification_updated_at is not None and (source_time is None or verification_updated_at > source_time):
+        card.stale = True
+        return True
+    return False
 
 
 def _clamp_score(value: int | float | None) -> int:

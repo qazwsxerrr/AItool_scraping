@@ -8,6 +8,7 @@ from app.ai.verify_client import AIVerifyResponse
 from app.config.source_registry import SourceConfig
 from app.jobs.ai_verify_job import run_ai_verify_job
 from app.jobs.claim_extract_job import run_claim_extract_job
+from app.jobs.claim_verify_job import run_claim_verify_job
 from app.jobs.evidence_search_job import run_evidence_search_job
 from app.jobs.recommendation_export_job import run_audit_export_job, run_recommendation_export_job
 from app.parsers.feed_parser import ParsedFeedItem
@@ -237,6 +238,8 @@ def test_ai_verify_job_inserts_final_verification_idempotently(tmp_path):
     session_factory = _seed_reviewed_candidate(tmp_path / "verify.db")
     run_claim_extract_job(session_factory=session_factory, client=FakeClaimClient(), limit=10)
     run_evidence_search_job(session_factory=session_factory, client=FakeTavilyClient(), limit=10)
+    _mark_evidence_as_direct_support(session_factory)
+    run_claim_verify_job(session_factory=session_factory, limit=10)
     client = FakeVerifyClient()
 
     first = run_ai_verify_job(session_factory=session_factory, client=client, limit=10)
@@ -264,6 +267,8 @@ def test_recommendation_export_writes_ranked_markdown_and_jsonl(tmp_path):
     session_factory = _seed_reviewed_candidate(tmp_path / "export.db")
     run_claim_extract_job(session_factory=session_factory, client=FakeClaimClient(), limit=10)
     run_evidence_search_job(session_factory=session_factory, client=FakeTavilyClient(), limit=10)
+    _mark_evidence_as_direct_support(session_factory)
+    run_claim_verify_job(session_factory=session_factory, limit=10)
     run_ai_verify_job(session_factory=session_factory, client=FakeVerifyClient(), limit=10)
 
     result = run_recommendation_export_job(
@@ -278,13 +283,24 @@ def test_recommendation_export_writes_ranked_markdown_and_jsonl(tmp_path):
     assert "今日强推荐" in markdown
     assert "Example MCP server released" in markdown
     assert "final_score" in jsonl
-    assert json.loads(jsonl.splitlines()[0])["recommendation_level"] == "A"
+    payload = json.loads(jsonl.splitlines()[0])
+    assert payload["recommendation_level"] == "A"
+    assert payload["verification_version"] == "ai_verify_v1"
+    assert payload["stale"] is False
+    assert payload["source_claim_verification_updated_at"] is not None
+    assert payload["claim_verifications"][0]["support_strength"] == "direct"
+    assert payload["evidence_items"][0]["classify_status"] == "completed"
+    assert payload["evidence_items"][0]["classified_at"] is not None
+    assert payload["evidence_items"][0]["classify_error"] is None
+    assert "guard_stats" in payload["raw_response"]
 
 
 def test_recommendation_export_defaults_to_final_keep_only_and_audit_exports_all(tmp_path):
     session_factory = _seed_reviewed_candidate(tmp_path / "export_filter.db")
     run_claim_extract_job(session_factory=session_factory, client=FakeClaimClient(), limit=10)
     run_evidence_search_job(session_factory=session_factory, client=FakeTavilyClient(), limit=10)
+    _mark_evidence_as_direct_support(session_factory)
+    run_claim_verify_job(session_factory=session_factory, limit=10)
     run_ai_verify_job(session_factory=session_factory, client=FakeVerifyClient(), limit=10)
 
     with session_factory() as session:
@@ -379,3 +395,24 @@ def _seed_reviewed_candidate(db_path):
         )
         session.commit()
     return session_factory
+
+
+def _mark_evidence_as_direct_support(session_factory) -> None:
+    with session_factory() as session:
+        for evidence in session.query(EvidenceItem).all():
+            evidence.fetch_status = "completed"
+            evidence.classify_status = "completed"
+            evidence.classified_at = datetime.now(timezone.utc)
+            evidence.classify_error = None
+            evidence.classification_version = "rules_v1"
+            evidence.supports_claim = "support"
+            evidence.confidence = 90
+            evidence.evidence_confidence = 90
+            evidence.url_validation_status = "reachable"
+            evidence.http_status = 200
+            evidence.fetched_title = evidence.title or "Example MCP evidence"
+            evidence.fetched_description = "Example MCP server released with install usage quickstart."
+            evidence.fetched_text_preview = "Example MCP server released. README contains MCP install usage quickstart."
+            evidence.risk_flags = "[]"
+            evidence.quality_flags = '["readme_exists", "install_docs"]'
+        session.commit()

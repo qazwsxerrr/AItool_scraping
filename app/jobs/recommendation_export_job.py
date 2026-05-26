@@ -117,6 +117,7 @@ def _verification_to_record(verification) -> dict:
     freshness_bonus = _freshness_bonus(verification.freshness_score)
     update_bonus = 4 if entity and entity.major_update_detected else 0
     rerank_score = _clamp_score(verification.final_score + feedback_adjustment + freshness_bonus + update_bonus)
+    raw_response = _loads_json_dict(verification.raw_response)
     return {
         "candidate_id": candidate.id,
         "title": item.title,
@@ -134,6 +135,13 @@ def _verification_to_record(verification) -> dict:
         "final_keep": verification.final_keep,
         "final_score": verification.final_score,
         "freshness_score": verification.freshness_score,
+        "verification_version": verification.verification_version,
+        "source_claim_verification_updated_at": _datetime_to_iso(
+            verification.source_claim_verification_updated_at
+        ),
+        "stale": bool(verification.stale),
+        "updated_at": _datetime_to_iso(verification.updated_at),
+        "raw_response": raw_response,
         "feedback_adjustment": feedback_adjustment,
         "freshness_bonus": freshness_bonus,
         "rerank_score": rerank_score,
@@ -157,12 +165,38 @@ def _verification_to_record(verification) -> dict:
         "evidence_count": len(evidence),
         "evidence_domains": sorted({row.source_domain for row in evidence if row.source_domain}),
         "evidence_status": claim.evidence_status if claim else None,
+        "evidence_items": [
+            {
+                "id": row.id,
+                "evidence_type": row.evidence_type,
+                "url": row.url,
+                "source_domain": row.source_domain,
+                "supports_claim": row.supports_claim,
+                "evidence_confidence": row.evidence_confidence,
+                "url_validation_status": row.url_validation_status,
+                "http_status": row.http_status,
+                "fetch_status": row.fetch_status,
+                "classify_status": row.classify_status,
+                "classified_at": _datetime_to_iso(row.classified_at),
+                "classify_error": row.classify_error,
+                "classification_version": row.classification_version,
+                "risk_flags": _loads_json_list(row.risk_flags),
+                "quality_flags": _loads_json_list(row.quality_flags),
+                "updated_at": _datetime_to_iso(row.updated_at),
+            }
+            for row in sorted(evidence, key=lambda item: (-item.evidence_confidence, -item.retrieval_score, item.id))
+        ],
         "claim_verifications": [
             {
                 "claim_text": row.claim_text,
                 "supports_claim": row.supports_claim,
+                "support_strength": row.support_strength,
                 "confidence": row.confidence,
                 "risk_flags": _loads_json_list(row.risk_flags),
+                "verification_version": row.verification_version,
+                "source_evidence_updated_at": _datetime_to_iso(row.source_evidence_updated_at),
+                "stale": bool(row.stale),
+                "updated_at": _datetime_to_iso(row.updated_at),
             }
             for row in sorted(candidate.claim_verification_items, key=lambda item: (item.claim_index, item.id))
         ],
@@ -176,6 +210,10 @@ def _verification_to_record(verification) -> dict:
                 "how_to_try": card.how_to_try,
                 "risk_note": card.risk_note,
                 "evidence_note": card.evidence_note,
+                "writer_version": card.writer_version,
+                "source_verification_updated_at": _datetime_to_iso(card.source_verification_updated_at),
+                "stale": bool(card.stale),
+                "updated_at": _datetime_to_iso(card.updated_at),
             }
             if card
             else None
@@ -264,6 +302,20 @@ def _loads_json_list(value: str | None) -> list[str]:
     if not isinstance(data, list):
         return []
     return [str(item) for item in data]
+
+
+def _loads_json_dict(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _datetime_to_iso(value) -> str | None:
+    return value.isoformat() if value else None
 
 
 def _feedback_summary_from_loaded(rows) -> dict:
