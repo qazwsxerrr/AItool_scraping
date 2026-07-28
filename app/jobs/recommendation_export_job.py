@@ -267,6 +267,8 @@ def _write_markdown(path: Path, records: list[dict]) -> None:
                     f"### {index}. {record['entity_name'] or record['title']}",
                     "",
                     f"- 标题：{record['title']}",
+                    f"- 原始来源：{record.get('url') or (record.get('links') or {}).get('source') or '无'}",
+                    f"- 来源标识：`{record.get('source_id') or 'unknown'}`；来源组：`{record.get('source_group') or 'unknown'}`；子类型：`{record.get('source_subtype') or 'unknown'}`",
                     f"- 分类：`{record['category'] or record['entity_type'] or 'unknown'}`",
                     f"- 推荐分：`{record['final_score']}` / `{record['recommendation_level']}`",
                     f"- 推荐排序分：`{record['rerank_score']}`（反馈调整 `{record['feedback_adjustment']}`；新鲜度 `{record['freshness_score']}`）",
@@ -280,7 +282,8 @@ def _write_markdown(path: Path, records: list[dict]) -> None:
                     f"- 证据说明：{(record.get('recommendation_card') or {}).get('evidence_note') or ''}",
                     f"- 风险提示：{record['risk_reason'] or ''}",
                     f"- 风险标签：`{', '.join(record['risk_flags'])}`",
-                    f"- 链接：{_format_links(record['links'])}",
+                    f"- 来源/相关链接：{_format_links(record['links'])}",
+                    f"- 证据链接：{_format_evidence_links(record.get('evidence_items') or [])}",
                     "",
                 ]
             )
@@ -289,6 +292,18 @@ def _write_markdown(path: Path, records: list[dict]) -> None:
 
 def _format_links(links: dict[str, str | None]) -> str:
     parts = [f"{name}: {url}" for name, url in links.items() if url]
+    return " / ".join(parts) if parts else "（无）"
+
+
+def _format_evidence_links(evidence_items: list[dict]) -> str:
+    parts: list[str] = []
+    for item in evidence_items[:5]:
+        url = item.get("url")
+        if not url:
+            continue
+        domain = item.get("source_domain") or "unknown"
+        relation = item.get("relation") or item.get("support_status") or item.get("evidence_type") or "evidence"
+        parts.append(f"{domain} ({relation}): {url}")
     return " / ".join(parts) if parts else "（无）"
 
 

@@ -26,6 +26,12 @@ SOURCE_QUALITY_DEFAULTS: dict[str, dict[str, object]] = {
         "spam_risk": "medium",
         "requires_verification": True,
     },
+    "github": {
+        "quality_weight": 0.70,
+        "source_role": "code_hosting",
+        "spam_risk": "medium",
+        "requires_verification": True,
+    },
     "x": {
         "quality_weight": 0.45,
         "source_role": "social",

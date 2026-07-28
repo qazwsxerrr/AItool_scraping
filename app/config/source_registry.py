@@ -21,7 +21,7 @@ class SourceConfig(BaseModel):
 
     id: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    type: Literal["rss", "atom", "rsshub"]
+    type: Literal["rss", "atom", "rsshub", "github_api"]
     url: str = Field(min_length=1)
     enabled: bool = True
     priority: int = 100

@@ -7,6 +7,7 @@ from typing import Iterable
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.collectors.base import FeedCollector
+from app.collectors.github_collector import GitHubAPICollector
 from app.collectors.rss_collector import HTTPFeedCollector
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, SourceConfig, load_source_registry
@@ -45,6 +46,21 @@ class FetchJobResult:
     @property
     def total_failed(self) -> int:
         return sum(item.failed for item in self.stats.values())
+
+
+class SourceCollectorRouter:
+    """Route source configs to the collector that understands their source type."""
+
+    def __init__(self, *, feed_collector: FeedCollector, github_collector: FeedCollector) -> None:
+        self.feed_collector = feed_collector
+        self.github_collector = github_collector
+
+    def collect(self, source: SourceConfig, limit: int | None = None):
+        if source.type in {"rss", "atom", "rsshub"}:
+            return self.feed_collector.collect(source, limit=limit)
+        if source.type == "github_api":
+            return self.github_collector.collect(source, limit=limit)
+        raise ValueError(f"unsupported source type: {source.type}")
 
 
 def run_fetch_job(
@@ -116,11 +132,19 @@ def run_fetch_from_registry(
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
     session_factory = create_session_factory(engine)
-    collector = HTTPFeedCollector(
+    feed_collector = HTTPFeedCollector(
         timeout_seconds=settings.request_timeout_seconds,
         retries=settings.request_retries,
         user_agent=settings.user_agent,
     )
+    github_collector = GitHubAPICollector(
+        base_url=settings.github_api_base_url,
+        token=settings.github_api_token,
+        api_version=settings.github_api_version,
+        timeout_seconds=settings.github_timeout_seconds,
+        user_agent=settings.user_agent,
+    )
+    collector = SourceCollectorRouter(feed_collector=feed_collector, github_collector=github_collector)
     result = run_fetch_job(
         session_factory=session_factory,
         sources=registry.sources,

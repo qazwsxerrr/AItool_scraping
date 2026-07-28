@@ -33,6 +33,10 @@ class Settings:
     request_timeout_seconds: float = 20.0
     request_retries: int = 2
     user_agent: str = DEFAULT_USER_AGENT
+    github_api_base_url: str = "https://api.github.com"
+    github_api_token: str | None = None
+    github_api_version: str = "2022-11-28"
+    github_timeout_seconds: float = 20.0
     ai_review_api_url: str | None = None
     ai_review_api_key: str | None = None
     ai_review_model: str | None = None
@@ -77,6 +81,10 @@ class Settings:
             request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
             request_retries=int(os.getenv("REQUEST_RETRIES", "2")),
             user_agent=os.getenv("USER_AGENT", DEFAULT_USER_AGENT),
+            github_api_base_url=os.getenv("GITHUB_API_BASE_URL", "https://api.github.com").rstrip("/"),
+            github_api_token=os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_API_TOKEN") or None,
+            github_api_version=os.getenv("GITHUB_API_VERSION", "2022-11-28"),
+            github_timeout_seconds=float(os.getenv("GITHUB_TIMEOUT_SECONDS", "20")),
             ai_review_api_url=os.getenv("AI_REVIEW_API_URL") or None,
             ai_review_api_key=os.getenv("AI_REVIEW_API_KEY") or None,
             ai_review_model=os.getenv("AI_REVIEW_MODEL") or None,

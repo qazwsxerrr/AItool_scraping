@@ -48,6 +48,56 @@ sources:
     source_subtype: fixed_feed
     default_limit: 20
 
+  # GitHub REST API sources. They use GITHUB_TOKEN/GITHUB_API_TOKEN when configured.
+  - id: github_search_ai_tools
+    name: GitHub Search AI Tools
+    type: github_api
+    url: https://api.github.com/search/repositories
+    enabled: true
+    priority: 45
+    fetch_interval: 21600
+    parser_type: feedparser
+    source_group: github
+    source_subtype: search_repositories
+    quality_weight: 0.70
+    source_role: code_hosting
+    spam_risk: medium
+    requires_verification: true
+    search_query: 'mcp in:name,description,readme stars:>20'
+    default_limit: 20
+
+  - id: github_releases_ollama
+    name: GitHub Releases Ollama
+    type: github_api
+    url: https://api.github.com/repos/ollama/ollama/releases
+    enabled: true
+    priority: 46
+    fetch_interval: 21600
+    parser_type: feedparser
+    source_group: github
+    source_subtype: repo_releases
+    quality_weight: 0.80
+    source_role: code_hosting
+    spam_risk: low
+    requires_verification: true
+    default_limit: 10
+
+  - id: github_releases_transformers
+    name: GitHub Releases Hugging Face Transformers
+    type: github_api
+    url: https://api.github.com/repos/huggingface/transformers/releases
+    enabled: true
+    priority: 47
+    fetch_interval: 21600
+    parser_type: feedparser
+    source_group: github
+    source_subtype: repo_releases
+    quality_weight: 0.80
+    source_role: code_hosting
+    spam_risk: low
+    requires_verification: true
+    default_limit: 10
+
   - id: linux_do_top
     name: LINUX DO Top Topics
     type: rss
