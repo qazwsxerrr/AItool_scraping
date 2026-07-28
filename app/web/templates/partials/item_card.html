@@ -1,0 +1,26 @@
+<article class="card item-card">
+  <div class="item-time">
+    <strong>{{ item.published_at | relative_time }}</strong>
+    <span>{{ item.published_at | datetime }}</span>
+  </div>
+  <div class="card-body">
+    <div class="card-meta">
+      <span>{{ item.source_name }}</span>
+      {% if item.candidate_score is not none %}<span>candidate {{ item.candidate_score }}</span>{% endif %}
+      {% if item.ai_score is not none %}<span>AI {{ item.ai_score }}</span>{% endif %}
+    </div>
+    <h3>
+      {% if item.url %}<a href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
+    </h3>
+    {% if item.summary_cn %}<p>{{ item.summary_cn }}</p>{% endif %}
+    <div class="badges">
+      {% if item.source_group %}<span class="badge">{{ item.source_group }}</span>{% endif %}
+      {% if item.source_subtype %}<span class="badge">{{ item.source_subtype }}</span>{% endif %}
+      {% if item.source_role %}<span class="badge">{{ item.source_role }}</span>{% endif %}
+      {% if item.spam_risk %}<span class="badge warning">risk {{ item.spam_risk }}</span>{% endif %}
+      {% if item.candidate_status %}<span class="badge primary">{{ item.candidate_status }}</span>{% endif %}
+      {% if item.ai_keep is sameas true %}<span class="badge success">ai keep</span>{% endif %}
+      {% if item.ai_keep is sameas false %}<span class="badge danger">ai drop</span>{% endif %}
+    </div>
+  </div>
+</article>

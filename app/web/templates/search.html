@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}热点搜索 - AI 热点内容台{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">热点搜索</p>
+    <h1>本地 AI 情报搜索</h1>
+    <p class="muted-text">搜索推荐卡片、全部动态、Claim、Evidence 和 GitHub 项目热点。外部搜索后续只作为 lead 进入流水线。</p>
+  </div>
+</section>
+
+<form class="search-hero" action="/search" method="get">
+  <input name="q" type="search" placeholder="例如：Claude Code、MCP、Agent、GitHub、Hugging Face..." value="{{ query }}" autofocus>
+  <button type="submit">搜索</button>
+</form>
+
+{% if not query %}
+  <div class="empty-state">
+    <h3>输入关键词开始搜索</h3>
+    <p>第一版只搜索本地数据库，不直接调用外部 AI 或搜索 API 生成推荐。</p>
+  </div>
+{% elif total_count == 0 %}
+  <div class="empty-state">
+    <h3>没有找到相关内容</h3>
+    <p>可以换一个关键词，或先运行 fetch / normalize / recommendation-write 生成更多数据。</p>
+  </div>
+{% else %}
+  <section class="search-summary">
+    <span>搜索：<strong>{{ results.query }}</strong></span>
+    <span>{{ total_count }} 条结果</span>
+    <span>GitHub {{ github_projects | length }}</span>
+    <span>推荐 {{ results.recommendations | length }}</span>
+    <span>动态 {{ results.items | length }}</span>
+    <span>Claim {{ results.claims | length }}</span>
+    <span>Evidence {{ results.evidence | length }}</span>
+  </section>
+
+  {% if github_projects %}
+    <section class="search-group">
+      <h2>GitHub Projects</h2>
+      {% for project in github_projects %}
+        {% include "partials/github_project_card.html" %}
+      {% endfor %}
+    </section>
+  {% endif %}
+
+  {% set groups = [
+    ('推荐卡片', results.recommendations),
+    ('全部动态', results.items),
+    ('Claims', results.claims),
+    ('Evidence', results.evidence),
+  ] %}
+  {% for group_title, rows in groups %}
+    {% if rows %}
+      <section class="search-group">
+        <h2>{{ group_title }}</h2>
+        {% for result in rows %}
+          {% include "partials/search_result_card.html" %}
+        {% endfor %}
+      </section>
+    {% endif %}
+  {% endfor %}
+{% endif %}
+{% endblock %}

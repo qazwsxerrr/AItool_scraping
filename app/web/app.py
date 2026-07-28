@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.config.settings import Settings
+from app.storage.db import create_engine_from_url, create_session_factory, init_db
+from app.web.routes import all_items, github, home, search
+
+
+def create_app(
+    *,
+    settings: Settings | None = None,
+    session_factory: sessionmaker[Session] | None = None,
+    init_database: bool = True,
+    github_report_path: str | Path | None = None,
+    github_report_output_root: str | Path = "output",
+) -> FastAPI:
+    app = FastAPI(title="AI 热点内容台")
+
+    if session_factory is None:
+        settings = settings or Settings.from_env()
+        engine = create_engine_from_url(settings.database_url)
+        if init_database:
+            init_db(engine)
+        session_factory = create_session_factory(engine)
+
+    app.state.session_factory = session_factory
+    app.state.github_report_path = github_report_path
+    app.state.github_report_output_root = github_report_output_root
+
+    static_dir = Path(__file__).parent / "static"
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    app.include_router(home.router)
+    app.include_router(all_items.router)
+    app.include_router(github.router)
+    app.include_router(search.router)
+    return app
+
+
+app = create_app()

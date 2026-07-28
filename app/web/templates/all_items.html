@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}全部动态 - AI 热点内容台{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">全部动态</p>
+    <h1>AI 信息流</h1>
+    <p class="muted-text">展示 raw / normalized / candidate / AI 初筛结果，线索来源会明确标注。</p>
+  </div>
+</section>
+
+<form class="filters" action="/all" method="get">
+  <input name="q" type="search" placeholder="搜索标题、摘要..." value="{{ filters.query or '' }}">
+  <select name="source_group">
+    <option value="">全部来源</option>
+    {% for group in ['official', 'news', 'community', 'reddit_local_llama', 'x', 'rsshub'] %}
+      <option value="{{ group }}" {{ 'selected' if filters.source_group == group else '' }}>{{ group }}</option>
+    {% endfor %}
+  </select>
+  <select name="status">
+    <option value="">全部状态</option>
+    {% for status in ['kept', 'dropped'] %}
+      <option value="{{ status }}" {{ 'selected' if filters.status == status else '' }}>{{ status }}</option>
+    {% endfor %}
+  </select>
+  <select name="ai_keep">
+    <option value="">AI 初筛</option>
+    <option value="keep" {{ 'selected' if filters.ai_keep is sameas true else '' }}>keep</option>
+    <option value="drop" {{ 'selected' if filters.ai_keep is sameas false else '' }}>drop</option>
+  </select>
+  <button type="submit">筛选</button>
+</form>
+
+<section class="timeline">
+  {% if items %}
+    {% for item in items %}
+      {% include "partials/item_card.html" %}
+    {% endfor %}
+    <nav class="pagination">
+      {% if page > 1 %}
+        <a class="button secondary" href="{{ request.url.include_query_params(page=page - 1) }}">上一页</a>
+      {% endif %}
+      <span>第 {{ page }} 页</span>
+      {% if has_next_page %}
+        <a class="button secondary" href="{{ request.url.include_query_params(page=page + 1) }}">下一页</a>
+      {% endif %}
+    </nav>
+  {% else %}
+    <div class="empty-state">
+      <h3>暂无动态</h3>
+      <p>可以先运行 fetch / normalize / prefilter，或调整筛选条件。</p>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

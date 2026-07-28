@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}今日精选 - AI 热点内容台{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">今日精选</p>
+    <h1>AI 热点推荐</h1>
+    <p class="muted-text">
+      {{ stats.raw_items }} 条动态 · {{ stats.kept_candidates }} 条候选 · {{ stats.recommendations }} 张推荐卡片
+      {% if stats.stale_recommendations %} · {{ stats.stale_recommendations }} 张 stale{% endif %}
+    </p>
+  </div>
+  <div class="run-status">
+    <span>Last run</span>
+    <strong>{{ stats.last_run_type or '暂无' }}</strong>
+    <small>{{ stats.last_run_status or 'unknown' }}</small>
+  </div>
+</section>
+
+<section class="chips" aria-label="分类筛选">
+  {% set categories = [('全部', None), ('模型', 'model'), ('产品', 'product'), ('Agent', 'agent'), ('MCP', 'mcp'), ('开源项目', 'open_source'), ('论文', 'paper'), ('技巧', 'tip')] %}
+  {% for label, value in categories %}
+    <a class="chip {{ 'active' if category == value else '' }}" href="/?{% if value %}category={{ value }}&{% endif %}hide_stale={{ 1 if hide_stale else 0 }}">{{ label }}</a>
+  {% endfor %}
+  <a class="chip {{ 'active' if direct else '' }}" href="/?direct={{ 0 if direct else 1 }}&hide_stale={{ 1 if hide_stale else 0 }}">仅 direct support</a>
+  <a class="chip {{ 'active' if hide_stale else '' }}" href="/?hide_stale={{ 0 if hide_stale else 1 }}">隐藏 stale</a>
+</section>
+
+{% if top_card %}
+  <section class="top-story">
+    <p class="eyebrow">今日热点 TOP 1</p>
+    {% with card=top_card, is_top=true %}
+      {% include "partials/recommendation_card.html" %}
+    {% endwith %}
+  </section>
+{% endif %}
+
+{% if github_hotspots %}
+  <section class="timeline github-home-list">
+    <div class="section-title-row">
+      <div>
+        <p class="eyebrow">GitHub</p>
+        <h2>本周 GitHub AI 项目热点</h2>
+      </div>
+      <a class="button secondary" href="/github">查看全部 {{ github_hotspot_stats.total }}</a>
+    </div>
+    <p class="muted-text">GitHub 项目热点来自 API metadata 和项目 ranking，不等同于已核实推荐。</p>
+    {% for project in github_hotspots %}
+      {% include "partials/github_project_card.html" %}
+    {% endfor %}
+  </section>
+{% endif %}
+
+<section class="timeline">
+  <h2>推荐列表</h2>
+  {% if cards %}
+    {% for card in cards %}
+      {% if loop.index0 != 0 or not top_card %}
+        {% include "partials/recommendation_card.html" %}
+      {% endif %}
+    {% endfor %}
+  {% else %}
+    <div class="empty-state">
+      <h3>暂无推荐卡片</h3>
+      <p>先运行 recommendation-write，或前往“全部动态”查看候选内容。</p>
+      <a class="button" href="/all">查看全部动态</a>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

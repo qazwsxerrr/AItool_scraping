@@ -1,0 +1,26 @@
+<article class="card recommendation-card {{ 'top' if is_top | default(false) else '' }}">
+  <div class="score-pill score-{{ 'high' if card.total_score >= 80 else 'mid' if card.total_score >= 60 else 'low' }}">
+    {{ card.total_score }}
+  </div>
+  <div class="card-body">
+    <div class="card-meta">
+      <span>{{ card.source_name or '未知来源' }}</span>
+      {% if card.published_at %}<span>{{ card.published_at | relative_time }}</span>{% endif %}
+      <span>{{ card.evidence_count }} evidence</span>
+      <span>{{ card.direct_support_count }} direct</span>
+    </div>
+    <h3>{{ card.title }}</h3>
+    {% if card.summary %}<p>{{ card.summary }}</p>{% endif %}
+    {% if card.why_recommend %}<p class="note"><strong>为什么值得看：</strong>{{ card.why_recommend }}</p>{% endif %}
+    {% if card.how_to_try %}<p class="note"><strong>怎么试：</strong>{{ card.how_to_try }}</p>{% endif %}
+    {% if card.risk_note %}<p class="note risk"><strong>风险：</strong>{{ card.risk_note }}</p>{% endif %}
+    <div class="badges">
+      <span class="badge primary">{{ card.recommendation_level }}</span>
+      {% if card.category %}<span class="badge">{{ card.category }}</span>{% endif %}
+      {% if card.source_group %}<span class="badge">{{ card.source_group }}</span>{% endif %}
+      {% if card.direct_support_count > 0 %}<span class="badge success">direct-support</span>{% endif %}
+      {% if card.stale %}<span class="badge warning">stale</span>{% endif %}
+      {% for flag in card.risk_flags %}<span class="badge danger">{{ flag }}</span>{% endfor %}
+    </div>
+  </div>
+</article>

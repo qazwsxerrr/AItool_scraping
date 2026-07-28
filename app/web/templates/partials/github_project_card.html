@@ -1,0 +1,33 @@
+<article class="card github-card">
+  <div class="score-pill score-{{ 'high' if project.final_score >= 80 else 'mid' if project.final_score >= 60 else 'low' }}">
+    {{ project.final_score }}
+  </div>
+  <div class="card-body">
+    <div class="card-meta">
+      <span>GitHub 项目热点</span>
+      <span>{{ project.level }} · {{ project.decision }}</span>
+      {% if project.primary_language %}<span>{{ project.primary_language }}</span>{% endif %}
+      {% if project.pushed_at %}<span>更新 {{ project.pushed_at | relative_time }}</span>{% endif %}
+    </div>
+    <h3>
+      {% if project.url %}<a href="{{ project.url }}" target="_blank" rel="noreferrer">{{ project.display_title }}</a>{% else %}{{ project.display_title }}{% endif %}
+    </h3>
+    {% if project.summary_cn %}<p>{{ project.summary_cn }}</p>{% elif project.description_cn %}<p>{{ project.description_cn }}</p>{% endif %}
+    {% if project.how_to_try %}<p class="note"><strong>怎么试：</strong>{{ project.how_to_try }}</p>{% endif %}
+    <div class="github-metrics" aria-label="GitHub 项目指标">
+      <span>stars {{ project.stars }}</span>
+      <span>forks {{ project.forks }}</span>
+      <span>issues {{ project.open_issues }}</span>
+      <span>AI {{ project.ai_relevance_score }}</span>
+      <span>活跃 {{ project.activity_score }}</span>
+      <span>风险 {{ project.risk_score }}</span>
+    </div>
+    <div class="badges">
+      <span class="badge primary">github-hot</span>
+      {% if project.project_type %}<span class="badge">{{ project.project_type }}</span>{% endif %}
+      {% if project.license_name %}<span class="badge success">{{ project.license_name }}</span>{% else %}<span class="badge warning">missing-license</span>{% endif %}
+      {% for keyword in project.keywords[:6] %}<span class="badge">{{ keyword }}</span>{% endfor %}
+      {% for flag in project.risk_flags %}<span class="badge danger">{{ flag }}</span>{% endfor %}
+    </div>
+  </div>
+</article>

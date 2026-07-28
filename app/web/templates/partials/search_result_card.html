@@ -1,0 +1,22 @@
+<article class="card search-result-card">
+  <div class="score-pill score-{{ 'high' if result.score and result.score >= 80 else 'mid' if result.score and result.score >= 60 else 'low' }}">
+    {{ result.score if result.score is not none else '—' }}
+  </div>
+  <div class="card-body">
+    <div class="card-meta">
+      <span>{{ result.result_type }}</span>
+      {% if result.source_name %}<span>{{ result.source_name }}</span>{% endif %}
+      {% if result.published_at %}<span>{{ result.published_at | relative_time }}</span>{% endif %}
+      {% if result.candidate_item_id %}<span>candidate #{{ result.candidate_item_id }}</span>{% endif %}
+    </div>
+    <h3>
+      {% if result.url %}<a href="{{ result.url }}" target="_blank" rel="noreferrer">{{ result.title }}</a>{% else %}{{ result.title }}{% endif %}
+    </h3>
+    {% if result.summary %}<p>{{ result.summary }}</p>{% endif %}
+    <div class="badges">
+      {% for badge in result.badges %}
+        <span class="badge {{ 'danger' if badge in ['contradict', 'failed', 'broken', 'stale'] else 'success' if badge in ['support', 'direct_support', 'completed'] else 'primary' if loop.first else '' }}">{{ badge }}</span>
+      {% endfor %}
+    </div>
+  </div>
+</article>
