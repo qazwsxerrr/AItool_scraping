@@ -10,8 +10,8 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config.settings import Settings
-from app.github.report_reader import GitHubHotspotReportReader
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
+from app.storage.github_reader import GitHubProjectReader
 from app.storage.read_repository import UIReadRepository
 
 
@@ -62,7 +62,7 @@ def get_repository(request: Request) -> Iterator[UIReadRepository]:
         yield UIReadRepository(session)
 
 
-def get_github_hotspot_reader(request: Request) -> GitHubHotspotReportReader:
-    report_path = getattr(request.app.state, "github_report_path", None)
-    output_root = getattr(request.app.state, "github_report_output_root", "output")
-    return GitHubHotspotReportReader(report_path=report_path, output_root=output_root)
+def get_github_project_reader(request: Request) -> GitHubProjectReader:
+    data_path = getattr(request.app.state, "github_data_path", None)
+    output_root = getattr(request.app.state, "intel_output_root", "output")
+    return GitHubProjectReader(data_path=data_path, output_root=output_root)

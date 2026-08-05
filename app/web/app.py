@@ -16,8 +16,8 @@ def create_app(
     settings: Settings | None = None,
     session_factory: sessionmaker[Session] | None = None,
     init_database: bool = True,
-    github_report_path: str | Path | None = None,
-    github_report_output_root: str | Path = "output",
+    github_data_path: str | Path | None = None,
+    intel_output_root: str | Path = "output",
 ) -> FastAPI:
     app = FastAPI(title="AI 热点内容台")
 
@@ -29,8 +29,8 @@ def create_app(
         session_factory = create_session_factory(engine)
 
     app.state.session_factory = session_factory
-    app.state.github_report_path = github_report_path
-    app.state.github_report_output_root = github_report_output_root
+    app.state.github_data_path = github_data_path
+    app.state.intel_output_root = intel_output_root
 
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")

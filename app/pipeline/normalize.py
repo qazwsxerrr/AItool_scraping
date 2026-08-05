@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from app.storage.models import RawItem
-
 TAG_RE = re.compile(r"<[^>]+>")
 BLOCK_TAG_RE = re.compile(r"(?i)<\s*/?\s*(br|p|div|li|tr|h[1-6]|article|section)[^>]*>")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -25,8 +23,8 @@ TRACKING_QUERY_KEYS = {
 
 
 @dataclass(frozen=True)
-class NormalizedItemData:
-    raw_item_id: int
+class StandardizedItem:
+    item_id: int | str | None
     title: str
     body_text: str | None
     url: str | None
@@ -36,19 +34,19 @@ class NormalizedItemData:
     dedupe_key: str
 
 
-def normalize_raw_item(raw_item: RawItem) -> NormalizedItemData:
-    """Convert one raw feed item into the stable normalized item shape."""
-    title = clean_text(raw_item.title) or "(untitled)"
-    body_source = raw_item.raw_content or raw_item.raw_summary
+def standardize_item(item: object) -> StandardizedItem:
+    """Standardize collector-shaped text and identity fields without a DB dependency."""
+    title = clean_text(_value(item, "title")) or "(untitled)"
+    body_source = _value(item, "content") or _value(item, "raw_content") or _value(item, "summary") or _value(item, "raw_summary")
     body_text = clean_text(body_source)
-    url = normalize_url(raw_item.link)
-    author = clean_text(raw_item.author)
-    published_at = _as_utc(raw_item.published_at)
+    url = normalize_url(_value(item, "url") or _value(item, "link"))
+    author = clean_text(_value(item, "author"))
+    published_at = _as_utc(_value(item, "published_at"))
     language = detect_language(" ".join(part for part in [title, body_text] if part))
     dedupe_key = build_dedupe_key(title=title, url=url)
 
-    return NormalizedItemData(
-        raw_item_id=raw_item.id,
+    return StandardizedItem(
+        item_id=_value(item, "id") or _value(item, "item_id"),
         title=title,
         body_text=body_text,
         url=url,
@@ -127,3 +125,9 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _value(item: object, name: str):
+    if isinstance(item, dict):
+        return item.get(name)
+    return getattr(item, name, None)

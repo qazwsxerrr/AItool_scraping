@@ -1,11 +1,17 @@
+"""Canonical collector contract for the v2 ingestion flow."""
+
 from __future__ import annotations
 
 from typing import Protocol
 
-from app.config.source_registry import SourceConfig
-from app.parsers.feed_parser import ParsedFeedItem
+from app.domain.models import FetchBatch, SourceSpec
 
 
-class FeedCollector(Protocol):
-    def collect(self, source: SourceConfig, limit: int | None = None) -> list[ParsedFeedItem]:
-        """Collect and parse items for one source."""
+class Collector(Protocol):
+    def collect(self, source: SourceSpec, limit: int) -> FetchBatch:
+        """Fetch and map one source without database or AI side effects."""
+
+
+FeedCollector = Collector
+
+__all__ = ["Collector", "FeedCollector"]

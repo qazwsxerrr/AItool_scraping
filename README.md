@@ -1,742 +1,133 @@
-# AI 工具情报抓取（文字版）
+# AI 情报抓取与处理
 
-本仓库用于构建面向 AI 工具发现、筛选、聚合、归档与文字分发的工程化情报系统。
+本项目当前只实现数据抓取和 AI 处理，不修改网页 UI。唯一的数据处理链路是：
 
-当前阶段目标：实现“多源抓取 → 标准化 → 规则预筛 → AI 初筛 → claim 抽取 → Tavily 证据搜索 → 证据抓取/分类 → claim 级核实 → AI 最终核实 → 推荐卡片/审计导出”的可复跑闭环。
+```text
+source registry -> fetch -> process -> export
+```
 
-## 当前实现范围
+## 内容分流
 
-- 读取 `app/config/source_registry.yaml` 中启用的信息源。
-- 支持原生 RSS / Atom，以及通过 `RSSHUB_BASE_URL` 启用的 RSSHub 路由。
-- 使用 `feedparser` 解析标题、链接、作者、发布时间、摘要、正文与原始 payload。
-- 使用 SQLite + SQLAlchemy 保存 `sources` 与 `raw_items`。
-- 对 `source_id + external_id`、`source_id + link`、`content_hash` 做幂等去重。
-- 单个 source 抓取失败只记录失败，不中断其他 source。
-- 抓取层内置有限重试；当 `httpx` 遇到 timeout / 403 / 429 时会尝试 `curl` fallback。
-- 将 `raw_items` 标准化为 `normalized_items`。
-- 对标准化 URL / 标题生成 `dedupe_key`，避免同一条内容因追踪参数重复进入后续流程。
-- 按规则预筛生成 `candidate_items` 候选池，先过滤低信号闲聊，再进入后续 AI 初筛。
-- 将 `candidate_items` 中保留的候选导出为 Markdown / JSONL，便于 AI 初筛前人工审阅。
-- 已支持通用 JSON API 与 OpenAI-compatible Chat Completions 风格 AI 初筛，调用地址、key 和模型通过环境变量配置。
+| content_class | 适用内容 | 确定性筛选 | 处理语义 |
+| --- | --- | --- | --- |
+| `official_model_company` | 官方模型、模型卡、公司产品和 API 更新 | 最近 30 天 + 发布/模型/API/版本/价格关键词 | 一个官方直链成功才是 `verified`，否则 `needs_review` |
+| `project_tool` | GitHub、Product Hunt、AI 工具 | GitHub 最近 30 天 push 且 `stars > 100`；Product Hunt 按时间和热度 | metadata 驱动的 `hotspot`，不要求第三方证据 |
+| `community_social` | X、Reddit、RSSHub、论坛讨论 | 最近 7 天 + 关键词或互动信号 | `discovery_only`，不能单独形成高可信结论 |
 
-当前仍未接入 Notion / Telegram 分发；输出以 Markdown / JSONL 文字归档为主。项目不做视频、TTS、截图或前端渲染。
+来源配置位于 `app/config/source_registry.yaml`。每个来源可以声明 `content_class`、`collector_type`、`selection_policy` 和 `verification_policy`。
 
-## 项目构成
-
-本项目不是单个 RSS 抓取脚本，而是一条分阶段、可复跑、可审计的 AI 工具情报流水线。核心代码在 `app/`：
+## 代码边界
 
 ```text
 app/
-├─ main.py                 # Typer CLI 入口，注册 fetch / normalize / verify / export 等命令
-├─ config/                 # 环境配置、source_registry.yaml 信息源注册与元数据
-├─ collectors/             # RSS / Atom / RSSHub 抓取器
-├─ parsers/                # feedparser 解析与原始条目抽取
-├─ storage/                # SQLAlchemy models、数据库初始化、Repository 幂等写入
-├─ pipeline/               # 纯业务逻辑：normalize、prefilter、证据 query、claim/最终评分规则
-├─ ai/                     # AI review / claim extract / AI verify 客户端与响应解析
-├─ search/                 # Tavily 搜索客户端与搜索结果解析
-├─ evidence/               # evidence URL 抓取、GitHub/Hugging Face 专用 verifier、证据分类
-└─ jobs/                   # 每个流水线阶段的 job，负责数据库读写与阶段编排
+├─ config/                 # Settings 和 source registry
+├─ collectors/             # RSS/Atom/RSSHub/GitHub/Product Hunt 请求与字段映射
+├─ parsers/                # feed 解析
+├─ domain/                 # DTO、来源策略、确定性筛选、轻量核实
+├─ ai/                     # 一条目一次结构化 AI 分析
+├─ storage/                # v2 ORM、Repository、数据库和 UI 只读查询
+├─ jobs/                   # intel fetch/process/export/run 编排
+├─ storage/github_reader.py # 从标准 intel_items.jsonl 读取 GitHub metadata
+├─ pipeline/normalize.py   # 无数据库依赖的基础文本/URL 标准化工具
+└─ web/                    # 现有 FastAPI/Jinja UI，当前阶段不改
 ```
 
-辅助目录：
+旧 claim、evidence、recommendation 阶段和对应客户端、表模型、脚本已经移除。数据库只由 v2 schema 初始化；历史数据库不迁移，删除后重新运行即可创建新 schema。
 
-```text
-scripts/      # CLI 的薄封装脚本，便于 Windows/定时任务直接调用
-docs/         # 项目文档、后续计划与 RSSHub/X 接入说明
-data/         # 本地 SQLite 数据库，已忽略，不提交
-output/       # Markdown / JSONL / 日志输出，已忽略，不提交
-tests/        # 针对各阶段的单元/集成测试
-rsshub-local/ # 本地 RSSHub Docker 部署配置
-```
+## 数据表
 
-典型数据流：
+- `sources`：来源、调度间隔、内容类别和 JSON 策略。
+- `fetch_attempts`：每次请求的状态、HTTP 状态、传输方式、重试、字节数和错误。
+- `intel_runs`：一次 `run-once` 或单阶段执行的汇总状态。
+- `intel_items`：统一条目、canonical URL、指标、原始 payload、内容 hash 和选择状态。
+- `ai_item_reviews`：每条最多一条结构化模型结果，保留原始响应。
+- `item_verifications`：官方直链、项目 metadata 或社区 discovery 的轻量结果。
 
-```text
-source_registry.yaml
-  ↓
-fetch_job → raw_items
-  ↓
-normalize_job → normalized_items
-  ↓
-prefilter_job → candidate_items
-  ↓
-ai_review_job → ai_review_items
-  ↓
-claim_extract_job → extracted_claims
-  ↓
-evidence_search_job / Tavily → evidence_items
-  ↓
-evidence_fetch_job → evidence_items.fetch_status / URL 内容预览
-  ↓
-evidence_classify_job → supports_claim / risk_flags / quality_flags
-  ↓
-claim_verify_job → claim_verification_items
-  ↓
-ai_verify_job → verification_items
-  ↓
-entity_resolve_job → canonical_entities / entity_mentions
-  ↓
-recommendation_write_job → recommendation_cards
-  ↓
-recommendation_export_job / audit_export → Markdown / JSONL
-```
-
-设计原则：
-
-- 每个阶段可以单独执行，也可以重复执行。
-- 数据库写入尽量幂等，重复内容会 `skipped` 或更新已有记录。
-- 上游证据或 claim 变化时，下游 verification / recommendation 可标记 stale 并重算。
-- 原始条目、标准化条目、候选、claim、证据和最终推荐都保留，方便追溯。
-- AI 输出不直接当事实；必须经过 evidence / claim verification / deterministic guard。
-
-## 当前默认信息源
-
-| source_id | 来源 | Feed |
-|---|---|---|
-| `openai_news` | OpenAI News | `https://openai.com/news/rss.xml` |
-| `google_deepmind_blog` | Google DeepMind Blog | `https://deepmind.google/blog/rss.xml` |
-| `huggingface_blog` | Hugging Face Blog | `https://huggingface.co/blog/feed.xml` |
-| `producthunt_feed` | Product Hunt | `https://www.producthunt.com/feed` |
-| `linux_do_top` | LINUX DO Top 话题 | `https://linux.do/top.rss` |
-| `linux_do_hot` | LINUX DO Hot 话题 | `https://linux.do/hot.rss` |
-| `reddit_local_llama_new` | Reddit r/LocalLLaMA new | `https://www.reddit.com/r/LocalLLaMA/new/.rss` |
-| `reddit_local_llama_hot` | Reddit r/LocalLLaMA hot | `https://www.reddit.com/r/LocalLLaMA/hot/.rss` |
-| `reddit_local_llama_top_day` | Reddit r/LocalLLaMA top day | `https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day` |
-| `reddit_local_llama_top_week` | Reddit r/LocalLLaMA top week | `https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week` |
-| `reddit_local_llama_search_agent` | Reddit r/LocalLLaMA search | `agent` |
-| `reddit_local_llama_search_open_weights` | Reddit r/LocalLLaMA search | `open weights` |
-| `reddit_local_llama_search_gguf` | Reddit r/LocalLLaMA search | `gguf` |
-| `reddit_local_llama_search_benchmark` | Reddit r/LocalLLaMA search | `benchmark` |
-| `reddit_local_llama_search_mcp` | Reddit r/LocalLLaMA search | `mcp` |
-| `reddit_local_llama_search_workflow` | Reddit r/LocalLLaMA search | `workflow` |
-| `reddit_local_llama_search_2api` | Reddit r/LocalLLaMA search | `2api / openai-compatible / proxy` |
-| `reddit_local_llama_search_claude_code` | Reddit r/LocalLLaMA search | `claude code workflow` |
-| `reddit_local_llama_search_comfyui` | Reddit r/LocalLLaMA search | `comfyui workflow` |
-| `reddit_local_llama_search_n8n_dify` | Reddit r/LocalLLaMA search | `n8n / dify` |
-
-默认条数说明：
-
-- `linux_do_top`：默认抓取 30 条。
-- `linux_do_hot`：默认抓取 30 条。
-- Reddit `new/hot/top/search` 源各自有独立默认条数，详见 `app/config/source_registry.yaml`。
-
-## X / RSSHub 来源
-
-X 账号流和搜索流已按 RSSHub 模板加入 `source_registry.yaml`。未配置 `RSSHUB_BASE_URL` 时会自动跳过，不影响 LINUX DO / Reddit 抓取。
-
-示例：
-
-```env
-RSSHUB_BASE_URL=https://rsshub.example.com
-```
-
-当前预置：
-
-- `x_account_openai`
-- `x_account_huggingface`
-- `x_account_local_llama`
-- `x_search_github_launch`
-- `x_search_huggingface_model`
+GitHub 项目使用 `external_id=github_repo:<numeric id>` 去重；指标保存在 `metrics_json`，包括 stars、forks、votes、comments、pushed_at 等。
 
 ## 安装
 
-推荐 Python 3.11+。
-
-### Windows conda（当前项目目录本地环境）
-
-本项目已按 Windows conda 方式在项目目录创建本地环境：`.conda/`。
-
-```cmd
-conda activate D:\ai_code\ai_vibecode\AItool_scraping\.conda
-python -m pytest
+```bash
+uv sync --extra test
 ```
 
-如需重建：
-
-```cmd
-conda create -y -p D:\ai_code\ai_vibecode\AItool_scraping\.conda python=3.12 pip
-cd /d D:\ai_code\ai_vibecode\AItool_scraping
-.conda\python.exe -m pip install -e ".[test]"
-```
-
-`.conda/` 为本地环境目录，已加入 `.gitignore`，不会上传到 GitHub。
-
-### venv
+也可以使用 Python 3.12 的虚拟环境安装项目依赖：
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
 python -m pip install -e ".[test]"
-```
-
-如果当前环境没有可用 `pip` / `venv`，也可以使用 `uv`：
-
-```bash
-uv run --extra test pytest
 ```
 
 ## 配置
 
-复制环境变量模板：
-
-```bash
-cp .env.example .env
-```
-
-最小配置：
+复制 `.env.example` 为 `.env`。最小配置：
 
 ```env
 DATABASE_URL=sqlite:///./data/ai_tool_intel.db
 ```
 
-可选：配置自己的 RSSHub 实例后，`source_registry.yaml` 中的 RSSHub 源才会启用：
+常用可选配置：
 
 ```env
 RSSHUB_BASE_URL=https://rsshub.example.com
-```
-
-未配置 `RSSHUB_BASE_URL` 时，RSSHub 源会被跳过并记录 warning，不影响原生 RSS / Atom 抓取。
-
-> 如果你是在 WSL 中直接调用项目目录下的 Windows `.conda/python.exe`，临时
-> `export DATABASE_URL=...` 或 `export RSSHUB_BASE_URL=...` 这类环境变量可能不会透传给
-> Windows Python。此时请优先把配置写入 `.env` 后再运行脚本。
-
-AI 初筛 API 框架配置项：
-
-```env
-AI_REVIEW_API_URL=https://your-ai-endpoint.example/review
-AI_REVIEW_API_KEY=your-key
-AI_REVIEW_MODEL=your-model-name
-AI_REVIEW_API_STYLE=generic_json
-AI_REVIEW_TIMEOUT_SECONDS=30
-AI_REVIEW_MIN_CANDIDATE_SCORE=70
-```
-
-当前只搭建 API 调用框架，不会在人工审阅导出时默认调用 AI。预期接口接受候选 JSON，返回：
-
-```json
-{
-  "keep": true,
-  "score": 80,
-  "category": "model_release",
-  "reason": "why this should continue",
-  "summary_cn": "中文摘要"
-}
-```
-
-如果使用 DeepSeek / OpenAI-compatible Chat Completions，把 URL 写为 base URL，并指定：
-
-```env
+GITHUB_TOKEN=your-github-token
+PRODUCTHUNT_API_TOKEN=your-producthunt-developer-token
 AI_REVIEW_API_URL=https://api.deepseek.com
+AI_REVIEW_API_KEY=your-key
 AI_REVIEW_MODEL=deepseek-v4-flash
 AI_REVIEW_API_STYLE=openai_chat
+AI_REVIEW_TIMEOUT_SECONDS=30
 ```
+
+未配置 `RSSHUB_BASE_URL` 时，依赖模板 URL 的来源会被跳过并记录原因。未配置 Product Hunt token 时使用公开 Atom，并透明标记热度字段不可用。
 
 ## 运行
 
-以下命令默认在项目根目录执行：
-
-```powershell
-cd D:\ai_code\ai_vibecode\AItool_scraping
-```
-
-如果在 WSL 中执行，则路径通常是：
+逐阶段运行：
 
 ```bash
-cd /mnt/d/ai_code/ai_vibecode/AItool_scraping
+python -m app.main fetch --class project_tool
+python -m app.main process --class project_tool --limit 100
+python -m app.main export --output-dir output/intel
 ```
 
-### 1. 初始化数据库
+日常入口：
 
-PowerShell / Windows：
-
-```powershell
-./.conda/python.exe scripts/init_db.py
+```bash
+python -m app.main run-once --limit 100
 ```
 
-WSL / Linux 原生 Python：
+常用参数：
+
+- `--source SOURCE_ID`：只处理一个来源。
+- `--class official_model_company|project_tool|community_social`：只处理一个内容类别。
+- `--limit N`：限制当前阶段条目数。
+- `--force`：忽略抓取冷却并重新处理已有条目。
+- `--dry-run`：使用临时 SQLite 和内存输出，不写目标数据库或输出目录。
+
+脚本入口只保留：
 
 ```bash
 python scripts/init_db.py
+python scripts/run_fetch_once.py
+python scripts/run_intel_once.py
 ```
 
-### 2. 抓取信息源
+## 导出
 
-抓取单个源：
+`export` 默认写入 `output/intel/`：
 
-```powershell
-./.conda/python.exe scripts/run_fetch_once.py --source openai_news --limit-per-source 5
-```
+- `intel_items.jsonl`：状态为 `verified`、`hotspot` 或 `discovery_only` 的条目。
+- `intel_pending.jsonl`：`needs_review`、`ai_failed` 或尚未分析的条目。
+- `intel_digest.md`：分类、状态、指标、风险和链接摘要。
 
-抓取所有启用源：
+GitHub 项目不再生成独立报告，也不执行 AI 评分。它们与其他条目一起写入 `intel_items.jsonl`，读取时按 stars、forks 和最近 push 等原始 metadata 排序。
 
-```powershell
-./.conda/python.exe scripts/run_fetch_once.py
-```
-
-按来源组抓取：
-
-```powershell
-./.conda/python.exe scripts/run_fetch_once.py --group linux_do
-./.conda/python.exe scripts/run_fetch_once.py --group reddit_local_llama
-./.conda/python.exe scripts/run_fetch_once.py --group x
-```
-
-如不传 `--limit-per-source`，会使用每个 source 在 registry 中配置的 `default_limit`。
-
-手动覆盖每源条数：
-
-```powershell
-./.conda/python.exe scripts/run_fetch_once.py --group reddit_local_llama --limit-per-source 10
-```
-
-CLI 会输出每个 source 的：
-
-- `fetched`
-- `inserted`
-- `skipped`
-- `failed`
-
-重复执行同一个 source 时，已入库条目会显示为 `skipped`。
-
-### 3. 标准化待处理 `raw_items`
-
-```powershell
-./.conda/python.exe scripts/run_normalize_once.py --limit 300
-```
-
-标准化会：
-
-- 清理 HTML 标签与多余空白
-- 规范化 URL 的 scheme / host
-- 移除 `utm_*`、`ref`、`gclid`、`fbclid` 等常见追踪参数
-- 生成 `dedupe_key`
-- 将成功标准化的原始条目标记为 `normalized`
-- 将同一标准化内容的重复条目标记为 `duplicate`
-
-### 4. 规则预筛生成候选池
-
-```powershell
-./.conda/python.exe scripts/run_prefilter_once.py --limit 300
-```
-
-预筛会根据以下信号生成 `candidate_items`：
-
-- 目标保留：AI 工具、agent 工作流、MCP、skill、OpenAI-compatible API、2API、反代/中转/API gateway、模型部署/调用工具。
-- 目标保留：明确的新模型、新开源权重、新产品或新能力发布。
-- GitHub / Hugging Face / Product Hunt 等外链会从原始 HTML 中识别，但单独出现不再自动视为强保留信号。
-- 明确丢弃：泛 benchmark、纯模型横评、硬件功耗 / VRAM / 吞吐调优、观点讨论、问题求推荐、个人部署踩坑、社区公告、抽奖、治理帖。
-- 噪声关键词、个人体验类和低分内容会标记为 `dropped`。
-
-### 5. 调用 AI API 对 `kept` 候选做二次筛选
-
-```powershell
-./.conda/python.exe scripts/run_ai_review_once.py --limit 50
-```
-
-这里的 `--limit 50` 只是本次 AI 审阅的最大上限，不代表一定会审 50 条。AI 阶段会先筛选：
-
-```text
-status = kept
-candidate_score >= AI_REVIEW_MIN_CANDIDATE_SCORE
-尚未写入 ai_review_items
-```
-
-然后按以下优先级选择：
-
-```text
-candidate_score 降序 → published_at 降序 → candidate_id 升序
-```
-
-因此如果本轮只有 12 条达到最低分，即使传 `--limit 50` 也只会审 12 条，不会为了凑满 50 条把低质量候选送给 AI。
-
-可以临时覆盖最低分：
-
-```powershell
-./.conda/python.exe scripts/run_ai_review_once.py --limit 50 --min-score 80
-```
-
-或：
-
-```powershell
-./.conda/python.exe -m app.main ai-review --limit 50 --min-score 80
-```
-
-AI 初筛结果会写入 `ai_review_items` 表；重复运行不会重复审同一个 `candidate_item_id`。
-
-### 6. 抽取 claim、Tavily 搜索证据、AI 核实与推荐导出
-
-AI 初筛之后可以进入情报核实层。该层不会只根据标题/摘要推荐，而是先抽取实体与 claim，再用 Tavily 搜索外部证据，最后让 AI 基于证据做多维评分。
-
-需要在本地 `.env` 配置：
-
-```env
-TAVILY_BASE_URL=https://api.tavily.com
-TAVILY_API_KEY=your-local-key
-TAVILY_SEARCH_DEPTH=basic
-TAVILY_MAX_RESULTS=5
-EVIDENCE_SEARCH_MAX_ATTEMPTS=3
-EVIDENCE_SEARCH_CACHE_TTL_HOURS=24
-EVIDENCE_FETCH_TIMEOUT_SECONDS=20
-EVIDENCE_FETCH_MAX_BYTES=524288
-```
-
-`CLAIM_EXTRACT_*` 与 `AI_VERIFY_*` 默认可复用 `AI_REVIEW_*`；如果要使用不同模型或 endpoint，可以单独配置。
-
-运行顺序：
-
-```powershell
-./.conda/python.exe scripts/run_claim_extract_once.py --limit 50
-./.conda/python.exe scripts/run_evidence_search_once.py --limit 30
-./.conda/python.exe scripts/run_evidence_fetch_once.py --limit 50
-./.conda/python.exe scripts/run_evidence_classify_once.py --limit 100
-./.conda/python.exe scripts/run_claim_verify_once.py --limit 100
-./.conda/python.exe scripts/run_ai_verify_once.py --limit 30
-./.conda/python.exe scripts/run_entity_resolve_once.py --limit 100
-./.conda/python.exe scripts/run_recommendation_write_once.py --limit 100
-./.conda/python.exe scripts/run_recommendation_export_once.py --limit 20
-./.conda/python.exe scripts/run_audit_export_once.py --limit 100
-```
-
-或使用 Typer CLI：
-
-```powershell
-./.conda/python.exe -m app.main claim-extract --limit 50
-./.conda/python.exe -m app.main evidence-search --limit 30
-./.conda/python.exe -m app.main evidence-fetch --limit 50
-./.conda/python.exe -m app.main evidence-classify --limit 100
-./.conda/python.exe -m app.main claim-verify --limit 100
-./.conda/python.exe -m app.main ai-verify --limit 30
-./.conda/python.exe -m app.main entity-resolve --limit 100
-./.conda/python.exe -m app.main recommendation-write --limit 100
-./.conda/python.exe -m app.main recommendation-export --limit 20
-./.conda/python.exe -m app.main audit-export --limit 100
-```
-
-新增表：
-
-- `extracted_claims`：候选实体、类型、关键 claim、抽取出的官网/GitHub/Hugging Face/Product Hunt 链接。
-- `evidence_items`：Tavily 搜索结果和直接证据 URL，包含证据类型、域名、置信度、原始 payload。
-- `claim_verification_items`：逐条 claim 的 support / contradict / neutral 判断、证据 ID、置信度和风险标签。
-- `verification_items`：基于证据与 claim 级核实的最终保留判断、多维评分、推荐等级、风险标签、`freshness_score` 和推荐理由。
-- `canonical_entities` / `entity_mentions`：将多个来源提到的同一个工具实体聚合，推荐导出会按实体去重。
-- `recommendation_cards`：面向用户阅读的推荐卡片字段，包括为什么推荐、怎么试和证据说明。
-- `pipeline_runs`：记录 `run-daily` 每阶段统计、状态和错误。
-
-注意：
-
-- Tavily `score` 只作为 `retrieval_score`（搜索相关性），不直接视为事实可信度。
-- `evidence_confidence` 表示系统当前认为该 URL 作为证据的可信度；Tavily 搜索结果初始较低，后续可由 `evidence-fetch / evidence-classify` 提升。
-- `extracted_claims.evidence_status` 会记录 `pending / searching / partial / completed / failed`，避免 direct URL 入库后 Tavily 失败导致下次误判为已完成。
-- Tavily 查询会写入 `search_cache_items`，默认 24 小时内复用，降低重复搜索成本。
-- `evidence-fetch` 会真实 GET 普通 URL；GitHub repo 和 Hugging Face model 会走轻量专用 verifier，提取 README / license / 权重文件等质量信号。
-- `evidence-classify` 会在 AI verify 前用规则填充 `supports_claim`、`risk_flags`、`quality_flags` 和更新 `evidence_confidence`。
-- `claim-verify` 会把 `claims_json` 中的每条 claim 与已分类证据对应起来，生成 claim 级核实记录，供 AI verify 和导出使用。
-- `entity-resolve` 会基于 GitHub / Hugging Face / Product Hunt / official URL 强匹配合并实体，减少重复推荐。
-- `recommendation-write` 会基于最终核实结果生成用户可读推荐卡片；`recommendation-export` 会结合 `freshness_score`、实体更新信号和用户反馈计算 `rerank_score`。
-- `source_registry.yaml` 支持 `quality_weight / source_role / spam_risk / requires_verification`，这些字段会持久化到 `sources` 表；计算 source quality 时优先使用 source 级配置。
-
-如果希望顺序执行每日链路，可以使用：
-
-```powershell
-./.conda/python.exe scripts/run_daily_once.py
-```
-
-或：
-
-```powershell
-./.conda/python.exe -m app.main run-daily
-```
-
-最终推荐条件默认：
-
-```text
-final_keep = true
-final_score >= 75
-credibility_score >= 60
-spam_risk_score <= 40
-evidence_items >= 1
-无 hard negative flag
-```
-
-`recommendation-export` 会在 `output/` 下生成：
-
-- `recommendations_YYYYMMDD_HHMMSS.md`
-- `recommendations_YYYYMMDD_HHMMSS.jsonl`
-
-`recommendation-export` 默认只导出 `final_keep=true` 且推荐等级为 `S/A/B` 的内容；如果需要内部审阅所有核实结果，使用 `audit-export`。
-
-### 7. 用户反馈闭环
-
-当你在推荐结果中看到 `entity_id` 后，可以记录反馈：
-
-```powershell
-./.conda/python.exe -m app.main feedback-add save --entity-id 1 --reason "值得试用"
-./.conda/python.exe -m app.main feedback-add hide --entity-id 2 --reason "营销味太重"
-```
-
-支持的 action：
-
-```text
-like / dislike / save / hide / click / report
-```
-
-查看反馈汇总：
-
-```powershell
-./.conda/python.exe -m app.main feedback-summary --entity-id 1
-```
-
-或使用脚本：
-
-```powershell
-./.conda/python.exe scripts/run_feedback_add.py save --entity-id 1 --reason "值得试用"
-./.conda/python.exe scripts/run_feedback_summary.py --entity-id 1
-```
-
-`recommendation-export` 会附带每个实体的反馈统计：
-
-```json
-{
-  "feedback": {
-    "total": 2,
-    "positive": 1,
-    "negative": 1,
-    "actions": {"like": 1, "hide": 1}
-  }
-}
-```
-
-### 8. 导出人工审阅文件
-
-```powershell
-./.conda/python.exe scripts/run_review_export_once.py --limit 100
-```
-
-会在 `output/` 下生成两份文件：
-
-- `review_candidates_YYYYMMDD_HHMMSS.md`：适合人工快速阅读和标注
-- `review_candidates_YYYYMMDD_HHMMSS.jsonl`：适合后续接入 AI 初筛 API 或批处理
-
-也可以通过 Typer CLI 执行：
-
-```powershell
-./.conda/python.exe -m app.main review-export --limit 100
-```
-
-### 9. 一键顺序执行完整流程
-
-推荐先跑重点来源，避免某些国外源网络超时拖慢全量流程：
-
-```powershell
-./.conda/python.exe scripts/init_db.py
-
-./.conda/python.exe scripts/run_fetch_once.py --group linux_do
-./.conda/python.exe scripts/run_fetch_once.py --group reddit_local_llama
-
-./.conda/python.exe scripts/run_normalize_once.py --limit 300
-./.conda/python.exe scripts/run_prefilter_once.py --limit 300
-./.conda/python.exe scripts/run_ai_review_once.py --limit 50
-./.conda/python.exe scripts/run_claim_extract_once.py --limit 50
-./.conda/python.exe scripts/run_evidence_search_once.py --limit 30
-./.conda/python.exe scripts/run_evidence_fetch_once.py --limit 50
-./.conda/python.exe scripts/run_evidence_classify_once.py --limit 100
-./.conda/python.exe scripts/run_claim_verify_once.py --limit 100
-./.conda/python.exe scripts/run_ai_verify_once.py --limit 30
-./.conda/python.exe scripts/run_entity_resolve_once.py --limit 100
-./.conda/python.exe scripts/run_recommendation_write_once.py --limit 100
-./.conda/python.exe scripts/run_recommendation_export_once.py --limit 20
-./.conda/python.exe scripts/run_audit_export_once.py --limit 100
-./.conda/python.exe scripts/run_review_export_once.py --limit 100
-```
-
-如果要抓所有启用来源：
-
-```powershell
-./.conda/python.exe scripts/init_db.py
-
-./.conda/python.exe scripts/run_fetch_once.py
-./.conda/python.exe scripts/run_normalize_once.py --limit 500
-./.conda/python.exe scripts/run_prefilter_once.py --limit 500
-./.conda/python.exe scripts/run_ai_review_once.py --limit 80
-./.conda/python.exe scripts/run_claim_extract_once.py --limit 80
-./.conda/python.exe scripts/run_evidence_search_once.py --limit 50
-./.conda/python.exe scripts/run_evidence_fetch_once.py --limit 80
-./.conda/python.exe scripts/run_evidence_classify_once.py --limit 120
-./.conda/python.exe scripts/run_claim_verify_once.py --limit 120
-./.conda/python.exe scripts/run_ai_verify_once.py --limit 50
-./.conda/python.exe scripts/run_entity_resolve_once.py --limit 100
-./.conda/python.exe scripts/run_recommendation_write_once.py --limit 100
-./.conda/python.exe scripts/run_recommendation_export_once.py --limit 20
-./.conda/python.exe scripts/run_review_export_once.py --limit 150
-```
-
-## 网络、代理与超时处理
-
-### RSSHub warning 是否正常
-
-未配置 `RSSHUB_BASE_URL` 时，会看到类似 warning：
-
-```text
-Skipping source x_account_openai: missing env: RSSHUB_BASE_URL
-```
-
-这是正常行为，表示 X / Anthropic / GitHub Trending 等 RSSHub 源被跳过；不会影响 LINUX DO、Reddit、OpenAI、DeepMind、Product Hunt 等原生 RSS / Atom 源。
-
-### 如果抓取一直 timeout
-
-PowerShell 下先测试系统 `curl.exe` 是否能访问：
-
-```powershell
-curl.exe -L --max-time 20 https://linux.do/top.rss -o $env:TEMP\linux_top.rss
-Get-Item $env:TEMP\linux_top.rss
-```
-
-再测试 Python/httpx：
-
-```powershell
-./.conda/python.exe -c "import httpx; r=httpx.get('https://linux.do/top.rss', timeout=20, follow_redirects=True); print(r.status_code, len(r.content))"
-```
-
-判断方式：
-
-- `curl.exe` 成功、Python/httpx 超时：程序会自动尝试 `curl` fallback；也可以缩短超时加快 fallback。
-- `curl.exe` 和 Python/httpx 都超时：通常是当前 PowerShell 网络/代理未配置，需要先配置代理。
-
-常见 Clash / Mihomo HTTP 代理示例：
-
-```powershell
-$env:HTTP_PROXY="http://127.0.0.1:7890"
-$env:HTTPS_PROXY="http://127.0.0.1:7890"
-```
-
-如果你的代理端口不是 `7890`，请改成实际端口。
-
-临时缩短抓取超时与重试次数：
-
-```powershell
-$env:REQUEST_TIMEOUT_SECONDS="10"
-$env:REQUEST_RETRIES="1"
-./.conda/python.exe scripts/run_fetch_once.py --group linux_do
-```
-
-## limit 参数怎么理解
-
-不同阶段的 `limit` 含义不同：
-
-| 阶段 | 参数 | 选择方式 |
-|---|---|---|
-| 抓取 | `--limit-per-source` | 每个 source 最多取多少条 feed item；不传则使用 `source_registry.yaml` 的 `default_limit`。 |
-| 标准化 | `--limit` | 从待标准化 `raw_items` 中按入库顺序处理最多 N 条，成本低，目标是清空库存。 |
-| 规则预筛 | `--limit` | 从未预筛 `normalized_items` 中按入库顺序处理最多 N 条，成本低，目标是生成候选池。 |
-| AI 二次筛选 | `--limit` + `--min-score` | `limit` 是最大上限；只处理高于最低分的候选，并按分数/时间优先级排序，允许不足 N 条。 |
-| 证据搜索 | `--limit` + `--max-attempts` | 从 `extracted_claims` 中处理待搜索 / 部分失败的 claim；Tavily query 会优先复用缓存。 |
-| 证据抓取 | `--limit` | 从 `evidence_items` 中抓取待验证 URL；GitHub / Hugging Face 走专用 verifier。 |
-| 证据分类 | `--limit` | 对已抓取证据做规则分类，更新 support/contradict、风险标签和证据可信度。 |
-| claim 级核实 | `--limit` | 从 `extracted_claims.claims_json` 逐条核实 claim，并记录对应证据 ID 与风险标签。 |
-| 推荐卡片生成 | `--limit` | 为最终保留项生成用户可读的 why/how/risk/evidence 推荐卡片。 |
-| 推荐导出 | `--limit` | 默认只导出 `final_keep=true` 且等级为 `S/A/B` 的结果，并按 `rerank_score` 排序。 |
-| 审计导出 | `--limit` | 导出所有核实结果，包括 rejected / D 档，便于排查。 |
-| 人工审阅导出 | `--limit` | 从候选池按分数降序导出最多 N 条，便于人工检查。 |
-
-### 为什么重复运行显示 skipped
-
-例如：
-
-```text
-linux_do_top: fetched=30 inserted=0 skipped=30 failed=0
-```
-
-表示实际抓到了 30 条，但这些条目已在数据库中，因此被幂等去重跳过。不是抓取失败。
-
-## 测试
+## 验证
 
 ```bash
-pytest
+RSSHUB_BASE_URL= uv run --extra test pytest -q
+uv run python -m compileall -q app scripts
+uv run python -m app.main --help
 ```
 
-或：
-
-```bash
-uv run --extra test pytest
-```
-
-### 为什么 `tests/` 文件比较多
-
-`tests/` 文件多是刻意拆分的结果。这个项目现在由采集、解析、存储、AI 初筛、证据搜索、证据抓取、claim 核实、最终验证、实体聚合、推荐导出等多个阶段组成；每个阶段都需要保证可复跑、幂等、可追溯，不能只靠一次端到端运行判断是否正确。
-
-可以按层理解：
-
-```text
-test_feed_parser / test_fetch_job / test_source_registry
-  → 采集层：RSS/RSSHub 解析、source 配置、抓取失败隔离
-
-test_normalize / test_prefilter / test_repository
-  → 数据处理层：标准化、去重、候选池规则、Repository 幂等写入
-
-test_ai_review_client / test_ai_verify_client / test_intelligence_jobs
-  → AI 客户端与 job：请求 payload、OpenAI-compatible 响应解析、重复运行不重复入库
-
-test_tavily_client / test_evidence_* / test_claim_support_strength
-  → 证据层：Tavily 搜索、证据抓取、证据分类、claim 支持/反驳判断
-
-test_verification_scoring / test_deterministic_guard
-  → 准确性门禁：final_score 公式、无证据降分、hard negative 拦截
-
-test_downstream_staleness / test_invalidate_downstream
-  → 下游一致性：上游证据变化后，verification/recommendation 标记 stale 并重算
-
-test_recommendation_intelligence_layer / test_review_export_job / test_feedback_loop
-  → 输出层：推荐卡片、审计导出、实体反馈和重排
-```
-
-`tests/__pycache__/` 是 Python/pytest 自动生成的缓存，不是项目源码，已被 `.gitignore` 忽略。
-
-当前测试覆盖：
-
-- RSS 样例解析
-- Atom 样例解析
-- RSSHub 环境变量插值与缺失跳过
-- `raw_items` 幂等去重
-- 单 source 抓取失败不影响其他 source
-- 标准化清洗与 URL 去追踪参数
-- `normalized_items` 幂等去重
-- normalize job 重跑不重复入库
-- source group 抓取与 source 默认条数
-- 规则预筛与 `candidate_items` 幂等入库
-- AI 初筛前人工审阅 Markdown / JSONL 导出
-- AI 初筛 API 客户端配置、请求载荷和响应解析
-- AI 初筛 job 幂等入库
-- Tavily evidence search 请求载荷、Bearer 鉴权和响应解析
-- claim 抽取、证据搜索、证据抓取、证据分类、AI 核实与推荐导出 job 幂等入库
-- claim 级核实、`freshness_score`、实体更新信号、推荐卡片生成和反馈重排
-- Tavily search cache 复用
-- GitHub / Hugging Face 轻量 verifier 信号抽取
-- source quality 持久化与 source 级覆盖
-- canonical entity 聚合、同实体推荐去重
-- pipeline_runs / run-daily 运行记录
-- 用户反馈记录、汇总和推荐导出反馈统计
-- final_score 多维公式、无证据降分和 hard negative 拦截
-
-## 数据表
-
-当前阶段创建以下表：
-
-- `sources`：来源配置与 `last_fetched_at`
-- `raw_items`：原始抓取条目、原始 payload、内容 hash 与处理状态
-- `normalized_items`：标准化后的标题、正文、URL、语言与 `dedupe_key`
-- `candidate_items`：规则预筛后的候选池，保存分数、命中关键词、保留/丢弃理由
-- `ai_review_items`：AI 初筛结果，保存 AI 是否保留、评分、分类、原因、中文摘要和原始响应
-- `extracted_claims`：AI 从候选中抽取出的实体、类型、claim 和关键外链
-- `evidence_items`：Tavily 搜索结果与直接证据链接
-- `claim_verification_items`：逐条 claim 的证据支持/反驳判断
-- `search_cache_items`：Tavily query 缓存，默认 24 小时内复用
-- `verification_items`：基于证据的最终核实结果、评分、推荐等级和风险标签
-- `canonical_entities`：聚合后的工具 / 模型 / MCP / workflow 实体
-- `entity_mentions`：候选条目、核实结果与 canonical entity 的映射
-- `recommendation_cards`：面向用户展示的推荐卡片内容
-- `pipeline_runs`：每日链路运行状态、统计与错误
-- `user_feedback`：用户对 entity 或 candidate 的 like / save / hide / report 等反馈
-
-默认数据库路径：`data/ai_tool_intel.db`。
+UI 只读取数据库和已生成的 `intel_items.jsonl`；本阶段不在请求中执行 collector、AI 或核实任务。

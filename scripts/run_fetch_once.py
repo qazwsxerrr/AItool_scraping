@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config.settings import Settings
-from app.jobs.fetch_job import run_fetch_from_registry
+from app.jobs.fetch_job import run_intel_fetch_from_settings
 from app.logging_config import configure_logging
 
 
@@ -21,14 +21,18 @@ def main(
         help="Maximum items to process per source. Defaults to each source's configured default_limit.",
     ),
     source: str | None = typer.Option(None, help="Only fetch one source id, e.g. openai_news."),
-    group: str | None = typer.Option(None, help="Only fetch one source group, e.g. reddit_local_llama."),
+    content_class: str | None = typer.Option(None, "--class", help="Only fetch one content class."),
+    force: bool = typer.Option(False, "--force", help="Fetch selected sources even when fetch_interval has not elapsed."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Fetch without writing the database."),
 ) -> None:
     configure_logging()
-    result = run_fetch_from_registry(
+    result = run_intel_fetch_from_settings(
         settings=Settings.from_env(),
         limit_per_source=limit_per_source,
         source_filter=source,
-        source_group_filter=group,
+        content_class=content_class,
+        force=force,
+        dry_run=dry_run,
     )
 
     if result.skipped_sources:
@@ -40,15 +44,16 @@ def main(
         typer.echo(f"No enabled source matched: {source}")
         raise typer.Exit(code=1)
 
-    if group and not result.stats:
-        typer.echo(f"No enabled source group matched: {group}")
-        raise typer.Exit(code=1)
+    if result.not_due_sources:
+        typer.echo("Not due (use --force to retry):")
+        for not_due in result.not_due_sources:
+            typer.echo(f"  - {not_due}")
 
     typer.echo("Fetch stats:")
     for source_id, stats in result.stats.items():
         line = (
             f"  - {source_id}: fetched={stats.fetched} inserted={stats.inserted} "
-            f"skipped={stats.skipped} failed={stats.failed}"
+            f"skipped={stats.skipped} failed={stats.failed} status={stats.status}"
         )
         if stats.error:
             line += f" error={stats.error}"

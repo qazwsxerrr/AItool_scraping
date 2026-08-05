@@ -7,55 +7,44 @@
     <p class="eyebrow">GitHub 项目热点</p>
     <h1>本周 AI 开源项目发现</h1>
     <p class="muted-text">
-      基于 GitHub API、README 摘要和项目 ranking 展示；这是项目热点，不等同于已核实推荐。
+      基于 GitHub API metadata 展示；项目按 stars、forks 和最近 push 排序，不使用 AI 评分。
     </p>
   </div>
   <div class="run-status">
-    <span>Hotlist</span>
+    <span>Metadata</span>
     <strong>{{ all_stats.total }} projects</strong>
-    <small>{% if all_stats.updated_at %}{{ all_stats.updated_at | datetime }}{% else %}暂无报告{% endif %}</small>
+    <small>{% if all_stats.updated_at %}{{ all_stats.updated_at | datetime }}{% else %}暂无数据{% endif %}</small>
   </div>
 </section>
 
 <section class="metric-grid" aria-label="GitHub 热点统计">
   <div class="metric"><span>全部</span><strong>{{ all_stats.total }}</strong></div>
-  <div class="metric"><span>S 强推荐</span><strong>{{ all_stats.strong_count }}</strong></div>
-  <div class="metric"><span>A 热点</span><strong>{{ all_stats.hot_count }}</strong></div>
-  <div class="metric"><span>B 关注</span><strong>{{ all_stats.watch_count }}</strong></div>
+  <div class="metric"><span>活跃项目</span><strong>{{ all_stats.active_count }}</strong></div>
+  <div class="metric"><span>最高 stars</span><strong>{{ all_stats.max_stars }}</strong></div>
+  <div class="metric"><span>已归档</span><strong>{{ all_stats.archived_count }}</strong></div>
   <div class="metric"><span>风险标记</span><strong>{{ all_stats.risky_count }}</strong></div>
 </section>
 
 <form class="filters" action="/github" method="get">
   <input name="q" type="search" placeholder="搜索 repo、MCP、RAG、Agent..." value="{{ filters.query or '' }}">
-  <select name="level">
-    <option value="">全部等级</option>
-    {% for value in ['S', 'A', 'B', 'C', 'D'] %}
-      <option value="{{ value }}" {{ 'selected' if filters.level == value else '' }}>{{ value }}</option>
-    {% endfor %}
-  </select>
   <select name="language">
     <option value="">全部语言</option>
     {% for value in languages %}
       <option value="{{ value }}" {{ 'selected' if filters.language == value else '' }}>{{ value }}</option>
     {% endfor %}
   </select>
-  <select name="project_type">
-    <option value="">全部类型</option>
-    {% for value in project_types %}
-      <option value="{{ value }}" {{ 'selected' if filters.project_type == value else '' }}>{{ value }}</option>
-    {% endfor %}
-  </select>
-  <input name="min_score" type="number" min="0" max="100" placeholder="最低分" value="{{ filters.min_score if filters.min_score is not none else '' }}">
-  <select name="include_risky">
-    <option value="1" {{ 'selected' if filters.include_risky else '' }}>包含风险</option>
-    <option value="0" {{ 'selected' if not filters.include_risky else '' }}>隐藏风险</option>
+  <input name="min_stars" type="number" min="0" placeholder="最低 stars" value="{{ filters.min_stars if filters.min_stars is not none else '' }}">
+  <input name="min_forks" type="number" min="0" placeholder="最低 forks" value="{{ filters.min_forks if filters.min_forks is not none else '' }}">
+  <select name="include_archived">
+    <option value="1" {{ 'selected' if filters.include_archived else '' }}>包含归档</option>
+    <option value="0" {{ 'selected' if not filters.include_archived else '' }}>隐藏归档</option>
   </select>
   <button type="submit">筛选</button>
   <a class="button secondary" href="/github">重置</a>
 </form>
 
 <p class="github-filter-note">
-  当前显示 {{ rows | length }} 个项目。GitHub 分数来自热度、活跃度、README、可用性和风险，不会绕过 evidence / claim 核验链路。
+  当前显示 {{ rows | length }} 个项目，按 stars、forks、watchers 和最近 push 等 metadata 排序。
 </p>
 
 <section class="timeline">
@@ -65,8 +54,8 @@
     {% endfor %}
   {% else %}
     <div class="empty-state">
-      <h3>暂无 GitHub 项目热点</h3>
-      <p>先运行 GitHub 项目报告任务，或检查 output 目录下是否存在 github_project_hotlist_cn.jsonl。</p>
+      <h3>暂无 GitHub 项目</h3>
+      <p>先运行 fetch、process、export 生成 output/intel/intel_items.jsonl。</p>
     </div>
   {% endif %}
 </section>

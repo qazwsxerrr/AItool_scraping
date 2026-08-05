@@ -36,17 +36,17 @@
   </section>
 {% endif %}
 
-{% if github_hotspots %}
+{% if github_projects %}
   <section class="timeline github-home-list">
     <div class="section-title-row">
       <div>
         <p class="eyebrow">GitHub</p>
         <h2>本周 GitHub AI 项目热点</h2>
       </div>
-      <a class="button secondary" href="/github">查看全部 {{ github_hotspot_stats.total }}</a>
+      <a class="button secondary" href="/github">查看全部 {{ github_project_stats.total }}</a>
     </div>
-    <p class="muted-text">GitHub 项目热点来自 API metadata 和项目 ranking，不等同于已核实推荐。</p>
-    {% for project in github_hotspots %}
+    <p class="muted-text">GitHub 项目按 stars、forks 和最近 push 等 API metadata 排序，不使用 AI 评分。</p>
+    {% for project in github_projects %}
       {% include "partials/github_project_card.html" %}
     {% endfor %}
   </section>

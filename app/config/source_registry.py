@@ -45,6 +45,21 @@ class SourceConfig(BaseModel):
     requires_verification: bool | None = None
     default_limit: int = 30
     search_query: str | None = None
+    # GitHub repository search controls. They are ignored by non-GitHub sources.
+    search_sort: Literal["stars", "forks", "help-wanted-issues", "updated"] = "updated"
+    search_order: Literal["asc", "desc"] = "desc"
+    search_pushed_days: int | None = None
+    # Intelligence routing policy. The checked-in registry declares these for
+    # every enabled source; optional values still allow small programmatic
+    # source specs to receive deterministic defaults in the policy layer.
+    content_class: Literal[
+        "official_model_company",
+        "project_tool",
+        "community_social",
+    ] | None = None
+    collector_type: Literal["rss", "atom", "rsshub", "github", "producthunt"] | None = None
+    selection_policy: dict[str, Any] = Field(default_factory=dict)
+    verification_policy: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("id")
     @classmethod
@@ -88,6 +103,20 @@ class SourceConfig(BaseModel):
         if value <= 0:
             raise ValueError("default_limit must be positive")
         return value
+
+    @field_validator("search_pushed_days")
+    @classmethod
+    def validate_search_pushed_days(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("search_pushed_days must be positive when configured")
+        return value
+
+    @field_validator("selection_policy", "verification_policy")
+    @classmethod
+    def validate_policy_mapping(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError("policy must be a mapping")
+        return dict(value)
 
     @field_validator("quality_weight")
     @classmethod

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -24,7 +24,6 @@ def create_session_factory(engine: Engine) -> sessionmaker[Session]:
 
 def init_db(engine: Engine) -> None:
     Base.metadata.create_all(bind=engine)
-    _ensure_sqlite_compat_columns(engine)
 
 
 def _ensure_sqlite_parent(database_url: str) -> None:
@@ -40,100 +39,3 @@ def _ensure_sqlite_parent(database_url: str) -> None:
     if not path.is_absolute():
         path = Path.cwd() / path
     path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def _ensure_sqlite_compat_columns(engine: Engine) -> None:
-    """Add additive SQLite columns introduced after the MVP schema.
-
-    The project intentionally avoids a migration framework in the MVP.  SQLite
-    create_all() will not alter existing tables, so keep small additive changes
-    here to let local databases keep running after model extensions.
-    """
-    if not engine.dialect.name.startswith("sqlite"):
-        return
-
-    required_columns: dict[str, dict[str, str]] = {
-        "sources": {
-            "source_group": "VARCHAR(64) NOT NULL DEFAULT 'general'",
-            "source_subtype": "VARCHAR(64) NOT NULL DEFAULT 'fixed'",
-            "quality_weight": "FLOAT",
-            "source_role": "VARCHAR(64)",
-            "spam_risk": "VARCHAR(32)",
-            "requires_verification": "BOOLEAN",
-        },
-        "extracted_claims": {
-            "evidence_status": "VARCHAR(32) NOT NULL DEFAULT 'pending'",
-            "evidence_attempts": "INTEGER NOT NULL DEFAULT 0",
-            "evidence_error": "TEXT",
-            "evidence_searched_at": "DATETIME",
-        },
-        "evidence_items": {
-            "retrieval_score": "INTEGER NOT NULL DEFAULT 0",
-            "evidence_confidence": "INTEGER NOT NULL DEFAULT 0",
-            "http_status": "INTEGER",
-            "final_url": "TEXT",
-            "url_validation_status": "VARCHAR(32) NOT NULL DEFAULT 'unchecked'",
-            "fetched_title": "TEXT",
-            "fetched_description": "TEXT",
-            "fetched_text_preview": "TEXT",
-            "fetch_status": "VARCHAR(32) NOT NULL DEFAULT 'pending'",
-            "fetch_error": "TEXT",
-            "classify_status": "VARCHAR(32) NOT NULL DEFAULT 'pending'",
-            "classified_at": "DATETIME",
-            "classify_error": "TEXT",
-            "classification_version": "VARCHAR(64) NOT NULL DEFAULT 'rules_v1'",
-            "risk_flags": "TEXT NOT NULL DEFAULT '[]'",
-            "quality_flags": "TEXT NOT NULL DEFAULT '[]'",
-            "updated_at": "DATETIME",
-        },
-        "claim_verification_items": {
-            "support_strength": "VARCHAR(32) NOT NULL DEFAULT 'none'",
-            "verification_version": "VARCHAR(64) NOT NULL DEFAULT 'claim_rules_v1'",
-            "source_evidence_updated_at": "DATETIME",
-            "stale": "BOOLEAN NOT NULL DEFAULT 0",
-            "updated_at": "DATETIME",
-        },
-        "verification_items": {
-            "freshness_score": "INTEGER NOT NULL DEFAULT 0",
-            "verification_version": "VARCHAR(64) NOT NULL DEFAULT 'ai_verify_v1'",
-            "source_claim_verification_updated_at": "DATETIME",
-            "stale": "BOOLEAN NOT NULL DEFAULT 0",
-            "updated_at": "DATETIME",
-        },
-        "recommendation_cards": {
-            "writer_version": "VARCHAR(64) NOT NULL DEFAULT 'recommendation_writer_v1'",
-            "source_verification_updated_at": "DATETIME",
-            "stale": "BOOLEAN NOT NULL DEFAULT 0",
-            "updated_at": "DATETIME",
-        },
-        "canonical_entities": {
-            "last_recommended_at": "DATETIME",
-            "last_update_reason": "TEXT",
-            "major_update_detected": "BOOLEAN NOT NULL DEFAULT 0",
-        },
-        "user_feedback": {
-            "entity_id": "INTEGER",
-            "candidate_item_id": "INTEGER",
-            "action": "VARCHAR(32)",
-            "reason": "TEXT",
-            "created_at": "DATETIME",
-        },
-    }
-
-    with engine.begin() as connection:
-        for table_name, columns in required_columns.items():
-            table_exists = connection.execute(
-                text("SELECT name FROM sqlite_master WHERE type='table' AND name=:table_name"),
-                {"table_name": table_name},
-            ).first()
-            if table_exists is None:
-                continue
-
-            existing = {
-                row[1]
-                for row in connection.execute(text(f"PRAGMA table_info({table_name})")).all()
-            }
-            for column_name, column_sql in columns.items():
-                if column_name in existing:
-                    continue
-                connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"))
