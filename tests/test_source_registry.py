@@ -18,7 +18,7 @@ sources:
   - id: rsshub_route
     name: RSSHub Route
     type: rsshub
-    url: ${RSSHUB_BASE_URL}/github/trending/daily/python
+    url: ${RSSHUB_BASE_URL}/twitter/user/OpenAI
     enabled: true
     priority: 20
     fetch_interval: 3600
@@ -40,7 +40,8 @@ def write_registry(tmp_path: Path) -> Path:
     return path
 
 
-def test_load_registry_skips_enabled_rsshub_source_when_base_url_missing(tmp_path):
+def test_load_registry_skips_enabled_rsshub_source_when_base_url_missing(tmp_path, monkeypatch):
+    monkeypatch.delenv("RSSHUB_BASE_URL", raising=False)
     result = load_source_registry(write_registry(tmp_path), env={})
 
     assert [source.id for source in result.sources] == ["native_blog"]
@@ -55,7 +56,7 @@ def test_load_registry_interpolates_rsshub_base_url_when_present(tmp_path):
 
     assert [source.id for source in result.sources] == ["native_blog", "rsshub_route"]
     rsshub_source = result.sources[1]
-    assert rsshub_source.url == "https://rsshub.example.com/github/trending/daily/python"
+    assert rsshub_source.url == "https://rsshub.example.com/twitter/user/OpenAI"
 
 
 def test_default_registry_includes_linux_do_sources():
@@ -76,34 +77,42 @@ def test_default_registry_includes_linux_do_sources():
         assert linux_source.parser_type == "feedparser"
 
 
-def test_default_registry_includes_github_api_sources():
+def test_default_registry_includes_native_github_trending_and_topic_sources():
     result = load_source_registry(env={})
     source_by_id = {source.id: source for source in result.sources}
 
-    search_source = source_by_id["github_search_ai_tools"]
-    assert search_source.type == "github_api"
-    assert search_source.url == "https://api.github.com/search/repositories"
-    assert search_source.source_group == "github"
-    assert search_source.source_subtype == "search_repositories"
-    assert search_source.source_role == "code_hosting"
-    assert search_source.spam_risk == "medium"
-    assert search_source.requires_verification is False
-    assert search_source.content_class == "project_tool"
-    assert search_source.collector_type == "github"
-    assert search_source.verification_policy["mode"] == "metadata_only"
-    assert search_source.search_query is not None
-    assert "mcp" in search_source.search_query
-    assert "stars:>100" in search_source.search_query
-    assert search_source.search_pushed_days == 30
+    daily = source_by_id["github_trending_daily_native"]
+    assert daily.type == "github_trending"
+    assert daily.collector_type == "github_trending"
+    assert daily.parser_type == "github_trending_html"
+    assert daily.url == "https://github.com/trending?since=daily"
+    assert daily.selection_policy["mode"] == "github_trending"
 
-    active_source = source_by_id["github_search_ai_active_high_star"]
-    assert active_source.search_sort == "stars"
-    assert active_source.search_order == "desc"
-    assert active_source.search_pushed_days == 30
-    assert "stars:>100" in (active_source.search_query or "")
-    assert "LLM OR MCP OR RAG" in (active_source.search_query or "")
-    assert "in:name,description" in (active_source.search_query or "")
-    assert "in:readme" not in (active_source.search_query or "")
+    weekly = source_by_id["github_trending_weekly_native"]
+    assert weekly.url == "https://github.com/trending?since=weekly"
+    assert weekly.source_subtype == "trending_weekly"
+
+    topic_ids = {
+        "github_search_topic_llm",
+        "github_search_topic_ai_agent",
+        "github_search_topic_rag",
+        "github_search_topic_vector_database",
+        "github_search_topic_large_language_model",
+        "github_search_topic_machine_learning",
+    }
+    assert topic_ids <= source_by_id.keys()
+    for topic_id in topic_ids:
+        source = source_by_id[topic_id]
+        assert source.type == "github_api"
+        assert source.collector_type == "github"
+        assert source.search_sort == "stars"
+        assert source.search_order == "desc"
+        assert source.search_pushed_days == 7
+        assert source.selection_policy["min_stars"] == 100
+        assert source.search_query.startswith("topic:")
+
+    assert "github_trending_python_daily" not in source_by_id
+    assert "github_trending_typescript_daily" not in source_by_id
 
     release_source = source_by_id["github_releases_ollama"]
     assert release_source.type == "github_api"

@@ -21,12 +21,12 @@ class SourceConfig(BaseModel):
 
     id: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    type: Literal["rss", "atom", "rsshub", "github_api"]
+    type: Literal["rss", "atom", "rsshub", "github_api", "github_trending"]
     url: str = Field(min_length=1)
     enabled: bool = True
     priority: int = 100
     fetch_interval: int = 3600
-    parser_type: Literal["feedparser"] = "feedparser"
+    parser_type: Literal["feedparser", "github_api", "github_trending_html"] = "feedparser"
     source_group: str = "general"
     source_subtype: str = "fixed"
     quality_weight: float | None = None
@@ -57,7 +57,7 @@ class SourceConfig(BaseModel):
         "project_tool",
         "community_social",
     ] | None = None
-    collector_type: Literal["rss", "atom", "rsshub", "github", "producthunt"] | None = None
+    collector_type: Literal["rss", "atom", "rsshub", "github", "github_trending", "producthunt"] | None = None
     selection_policy: dict[str, Any] = Field(default_factory=dict)
     verification_policy: dict[str, Any] = Field(default_factory=dict)
 

@@ -45,7 +45,7 @@
       </div>
       <a class="button secondary" href="/github">查看全部 {{ github_project_stats.total }}</a>
     </div>
-    <p class="muted-text">GitHub 项目按 stars、forks 和最近 push 等 API metadata 排序，不使用 AI 评分。</p>
+    <p class="muted-text">GitHub 项目来自 Trending HTML 与 Search API，优先展示周期新增 Star，不使用历史快照。</p>
     {% for project in github_projects %}
       {% include "partials/github_project_card.html" %}
     {% endfor %}

@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.config.settings import Settings
+from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
 from app.storage.models import AIItemReview, IntelItem, IntelItemVerification
@@ -26,6 +27,7 @@ class IntelExportResult:
     markdown_path: str
     pending_path: str
     dry_run: bool = False
+    github_report_path: str | None = None
     status_counts: dict[str, int] = field(default_factory=dict)
     failure_counts: dict[str, int] = field(default_factory=dict)
 
@@ -38,11 +40,13 @@ def run_intel_export_job(
     source_filter: str | None = None,
     content_class: str | None = None,
     dry_run: bool = False,
+    github_report_dir: str | Path | None = None,
 ) -> IntelExportResult:
     output = Path(output_dir)
     jsonl_path = output / "intel_items.jsonl"
     markdown_path = output / "intel_digest.md"
     pending_path = output / "intel_pending.jsonl"
+    report_root = Path(github_report_dir) if github_report_dir else output.parent / "github-trending"
     with session_factory() as session:
         repo = IntelRepository(session)
         items = repo.list_export_items(
@@ -66,6 +70,7 @@ def run_intel_export_job(
         if status in {"failed", "ai_failed", "needs_review"}
     }
 
+    github_report_path: Path | None = None
     if not dry_run:
         output.mkdir(parents=True, exist_ok=True)
         jsonl_path.write_text(
@@ -80,6 +85,7 @@ def run_intel_export_job(
             _markdown(records, pending_records, status_counts=status_counts, failure_counts=failure_counts),
             encoding="utf-8",
         )
+        github_report_path = write_github_trending_report(records, output_root=report_root)
 
     return IntelExportResult(
         exported=len(records),
@@ -88,6 +94,7 @@ def run_intel_export_job(
         markdown_path=str(markdown_path),
         pending_path=str(pending_path),
         dry_run=dry_run,
+        github_report_path=str(github_report_path) if github_report_path else None,
         status_counts=status_counts,
         failure_counts=failure_counts,
     )
@@ -101,6 +108,7 @@ def run_intel_export_from_settings(
     source_filter: str | None = None,
     content_class: str | None = None,
     dry_run: bool = False,
+    github_report_dir: str | Path | None = None,
 ) -> IntelExportResult:
     database_url = _readable_database_url(settings.database_url, dry_run=dry_run)
     engine = create_engine_from_url(database_url)
@@ -113,6 +121,7 @@ def run_intel_export_from_settings(
         source_filter=source_filter,
         content_class=content_class,
         dry_run=dry_run,
+        github_report_dir=github_report_dir,
     )
 
 

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.collectors.unified import (
     CollectorRouter,
     GitHubCollector,
+    GitHubTrendingCollector,
     ProductHuntCollector,
     RSSCollector,
     RSSHubCollector,
@@ -265,6 +266,11 @@ def run_intel_fetch_from_settings(
             retries=settings.request_retries,
             timeout_seconds=settings.github_timeout_seconds,
         )
+        github_trending = GitHubTrendingCollector(
+            client,
+            retries=settings.request_retries,
+            user_agent=settings.user_agent,
+        )
         producthunt = ProductHuntCollector(
             client,
             retries=settings.request_retries,
@@ -274,7 +280,13 @@ def run_intel_fetch_from_settings(
             api_url=settings.producthunt_api_url,
             timeout_seconds=settings.request_timeout_seconds,
         )
-        router = CollectorRouter(feed=feed, rsshub=rsshub, github=github, producthunt=producthunt)
+        router = CollectorRouter(
+            feed=feed,
+            rsshub=rsshub,
+            github=github,
+            github_trending=github_trending,
+            producthunt=producthunt,
+        )
         result = run_intel_fetch_job(
             session_factory=session_factory,
             sources=registry.sources,

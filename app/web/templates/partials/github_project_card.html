@@ -5,10 +5,12 @@
   </div>
   <div class="card-body">
     <div class="card-meta">
-      <span>GitHub metadata</span>
+      <span>{{ 'GitHub Trending' if project.trending else 'GitHub Search API' }}</span>
       {% if project.status %}<span>{{ project.status }}</span>{% endif %}
       {% if project.primary_language %}<span>{{ project.primary_language }}</span>{% endif %}
       {% if project.pushed_at %}<span>更新 {{ project.pushed_at | relative_time }}</span>{% endif %}
+      {% if project.trending.weekly %}<span>周榜 #{{ project.trending.weekly.get('rank') }}</span>{% endif %}
+      {% if project.trending.daily %}<span>日榜 #{{ project.trending.daily.get('rank') }}</span>{% endif %}
       {% if project.latest_release_names %}<span>release {{ project.latest_release_names[0] }}</span>{% endif %}
     </div>
     <h3>
@@ -18,6 +20,8 @@
     <div class="github-metrics" aria-label="GitHub 项目指标">
       <span>stars {{ project.stars }}</span>
       <span>forks {{ project.forks }}</span>
+      {% if project.trending.weekly %}<span>本周新增 {{ project.trending.weekly.get('stars_since') }}</span>{% endif %}
+      {% if project.trending.daily %}<span>今日新增 {{ project.trending.daily.get('stars_since') }}</span>{% endif %}
       <span>watchers {{ project.watchers }}</span>
       <span>issues {{ project.open_issues }}</span>
     </div>
@@ -27,6 +31,7 @@
       {% if project.fork %}<span class="badge warning">fork</span>{% endif %}
       {% if project.license_name %}<span class="badge success">{{ project.license_name }}</span>{% else %}<span class="badge warning">missing-license</span>{% endif %}
       {% for keyword in project.topics[:6] %}<span class="badge">{{ keyword }}</span>{% endfor %}
+      {% for topic in project.search_topics[:6] %}<span class="badge">topic:{{ topic }}</span>{% endfor %}
       {% for flag in project.risk_flags %}<span class="badge danger">{{ flag }}</span>{% endfor %}
     </div>
   </div>

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from app.collectors.unified import GitHubCollector, ProductHuntCollector, RSSCollector
+from app.collectors.unified import GitHubCollector, GitHubTrendingCollector, ProductHuntCollector, RSSCollector
 from app.domain.models import SourceSpec
 
 
@@ -47,23 +47,41 @@ def test_rss_collector_returns_fetch_batch_and_uses_shared_client():
     assert client.calls[0][0] == url
 
 
-def test_github_trending_feed_maps_star_text_and_push_snapshot():
-    url = "https://rsshub.example/github/trending/daily/python"
-    body = b"<rss version='2.0'><channel><item><title>owner/tool</title><link>https://github.com/owner/tool</link><description>1.2k stars, 80 forks</description><pubDate>Tue, 04 Aug 2026 00:00:00 GMT</pubDate></item></channel></rss>"
+def test_github_trending_html_maps_weekly_metrics_and_rank():
+    url = "https://github.com/trending?since=weekly"
+    body = b"""
+    <html><body>
+      <article class='Box-row'>
+        <h2><a href='/owner/tool'>owner/tool</a></h2>
+        <p>An AI tool</p>
+        <span itemprop='programmingLanguage'>Python</span>
+        <a href='/owner/tool/stargazers'>1,200</a>
+        <a href='/owner/tool/forks'>80</a>
+        <span class='float-sm-right'>250 stars this week</span>
+      </article>
+    </body></html>
+    """
     client = _Client([_response(url, body)])
     source = SourceSpec(
-        id="github_trending_python_daily",
+        id="github_trending_weekly_native",
         name="GitHub Trending",
-        type="rsshub",
+        type="github_trending",
         url=url,
+        source_subtype="trending_weekly",
         content_class="project_tool",
-        collector_type="rsshub",
-        selection_policy={"mode": "github_active_high_star", "pushed_days": 30, "min_stars": 100},
+        collector_type="github_trending",
+        selection_policy={"mode": "github_trending", "period": "weekly"},
     )
-    item = RSSCollector(client, sleeper=lambda _: None).collect(source, 10).items[0]
+    batch = GitHubTrendingCollector(client, sleeper=lambda _: None).collect(source, 10)
+    assert batch.status == "success"
+    assert batch.transport == "github_trending_html"
+    item = batch.items[0]
     assert item.metrics["stars"] == 1200
     assert item.metrics["forks"] == 80
-    assert item.metrics["pushed_at"]
+    assert item.metrics["stars_since"] == 250
+    assert item.metrics["trending_period"] == "weekly"
+    assert item.metrics["trending_rank"] == 1
+    assert item.metrics["language"] == "Python"
 
 
 def test_rss_503_retries_once_and_records_retry_count():

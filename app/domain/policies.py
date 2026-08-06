@@ -112,7 +112,7 @@ def classify_source(source: Any) -> ContentClass:
     if role in _COMMUNITY_ROLES:
         return COMMUNITY_SOCIAL
 
-    if source_type == "github_api":
+    if source_type in {"github_api", "github_trending"}:
         return PROJECT_TOOL
 
     identity = " ".join(
@@ -196,6 +196,8 @@ def _collector_type(raw: Mapping[str, Any]) -> str:
     identity = " ".join(str(raw.get(key) or "") for key in ("id", "name", "source_group")).casefold()
     if source_type == "github_api":
         return "github"
+    if source_type == "github_trending":
+        return "github_trending"
     if "producthunt" in identity or "product hunt" in identity:
         return "producthunt"
     if source_type == "rsshub":
@@ -219,9 +221,9 @@ def selection_decision(
     metadata_only_project = (
         spec.content_class == PROJECT_TOOL
         and (
-            spec.type == "github_api"
-            or spec.collector_type == "github"
-            or mode in {"github_active_high_star", "active_high_star"}
+            spec.type in {"github_api", "github_trending"}
+            or spec.collector_type in {"github", "github_trending"}
+            or mode in {"github_active_high_star", "active_high_star", "github_trending"}
         )
     )
     # GitHub repository inclusion is a metadata rule, not a composite score.
@@ -293,6 +295,19 @@ def _select_project(
     common: dict[str, Any],
 ) -> SelectionDecision:
     mode = policy.mode.casefold().replace("-", "_")
+    if _is_github_trending(source) or mode == "github_trending":
+        stars_since = _metric_number(item, "stars_since", "trending_stars", "stars_today", "stars_this_week")
+        if stars_since <= 0:
+            return SelectionDecision(
+                selected=False,
+                reason="github_trending_missing_period_stars",
+                risk_flags=("missing_stars_since",),
+                **common,
+            )
+        if _truthy_metric(item, "archived") or _truthy_metric(item, "fork"):
+            return SelectionDecision(selected=False, reason="github_trending_archived_or_fork", **common)
+        return SelectionDecision(selected=True, reason="selected:github_trending", **common)
+
     if _is_github_search(source) or mode in {"github_active_high_star", "active_high_star"}:
         stars = _metric_number(item, "stars", "stargazers_count", "star_count")
         minimum = float(policy.min_stars if policy.min_stars is not None else 100)
@@ -423,6 +438,12 @@ def _default_selection_policy(raw: Mapping[str, Any], content_class: ContentClas
             "sort_order": "desc",
             "discovery_only": True,
         }
+    if _is_github_trending(raw):
+        return {
+            "mode": "github_trending",
+            "sort_by": "stars_since",
+            "sort_order": "desc",
+        }
     if _is_github_search(raw):
         return {
             "mode": "github_active_high_star",
@@ -547,6 +568,20 @@ def _is_github_search(source: SourceSpec | Mapping[str, Any] | Any) -> bool:
     return source_type == "github_api" and subtype in {"", "search_repositories"}
 
 
+def _is_github_trending(source: SourceSpec | Mapping[str, Any] | Any) -> bool:
+    raw = _source_mapping(source)
+    source_type = _normalise_token(raw.get("type") or raw.get("source_type"))
+    collector_type = _normalise_token(raw.get("collector_type"))
+    subtype = _normalise_token(raw.get("source_subtype"))
+    mode = _normalise_token(_policy_mapping(raw.get("selection_policy")).get("mode"))
+    return bool(
+        source_type == "github_trending"
+        or collector_type == "github_trending"
+        or mode == "github_trending"
+        or subtype.startswith("trending_")
+    )
+
+
 def _is_producthunt(source: SourceSpec | Mapping[str, Any] | Any) -> bool:
     raw = _source_mapping(source)
     if _normalise_token(raw.get("collector_type")) == "producthunt":
@@ -588,6 +623,16 @@ def _metric_number(item: FetchItem, *names: str) -> float:
             if parsed is not None:
                 return parsed
     return 0.0
+
+
+def _truthy_metric(item: FetchItem, name: str) -> bool:
+    for container in (item.metrics, item.raw_payload):
+        value = container.get(name)
+        if isinstance(value, str):
+            return value.strip().casefold() in {"1", "true", "yes", "y", "on"}
+        if value is not None:
+            return bool(value)
+    return False
 
 
 def _item_datetime(item: FetchItem, *names: str) -> datetime | None:

@@ -103,6 +103,8 @@ def export(
     typer.echo(f"jsonl={result.jsonl_path}")
     typer.echo(f"markdown={result.markdown_path}")
     typer.echo(f"pending_jsonl={result.pending_path}")
+    if result.github_report_path:
+        typer.echo(f"github_report={result.github_report_path}")
 
 
 @app.command("run-once")
@@ -134,6 +136,8 @@ def run_once(
         f"analyzed={result.process.analyzed} failed={result.process.failed}"
     )
     typer.echo(f"export: exported={result.export.exported} pending={result.export.pending}")
+    if result.export.github_report_path:
+        typer.echo(f"github_report={result.export.github_report_path}")
     typer.echo(f"run_id={result.run_id} status={result.status}")
     if result.error:
         typer.echo(f"error={result.error}")

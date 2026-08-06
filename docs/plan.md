@@ -16,14 +16,15 @@ source registry
 → 生成数据库、JSONL、Markdown
 ```
 
-只处理数据抓取和 AI 处理，不修改 UI。由于历史数据不需要保留，允许重建数据库和删除旧阶段代码。
+数据侧负责抓取、确定性筛选和导出；现有 UI 只读取数据库和导出结果，不在请求中运行 collector 或 AI。GitHub 热点报告按日期保存，数据库不建立历史 Star 快照表。
 
 技术选型确定为：
 
 - Python 3.12
 - `httpx`：统一 HTTP 客户端和连接复用
 - `feedparser`：RSS/Atom 解析
-- GitHub REST API：项目和 Release
+- GitHub REST API：项目、Release 和最近 7 天 AI topic 候选
+- GitHub Trending HTML：daily/weekly 周期新增 Star
 - Pydantic：来源配置、AI 响应和内部 DTO 校验
 - SQLAlchemy + SQLite：单机定时场景
 - 同步单进程 Job，暂不引入 Celery、Redis、消息队列或微服务
@@ -66,11 +67,10 @@ source registry
 筛选方式按来源类型独立配置：
 
 - GitHub：
-  - 最近 30 天有 `pushed_at`
-  - 累计 Star > 100
-  - 按 Star 降序
-  - 不要求最近创建
-  - 额外记录 forks、语言、release、README 完整度
+  - Trending HTML daily/weekly 的周期新增 Star > 0
+  - Search API 命中六个 AI topic，最近 7 天有 `pushed_at` 且累计 Star > 100
+  - 按周期新增 Star、累计 Star 降序
+  - 额外记录 forks、语言、topic、release、README 完整度
 - Product Hunt：
   - 按 votes、评论、发布时间和增长信号排序
 - 带 GitHub 链接的产品：
@@ -202,11 +202,16 @@ status
   "forks": 100,
   "votes": 500,
   "comments": 30,
-  "pushed_at": "..."
+  "pushed_at": "...",
+  "trending": {
+    "weekly": {"rank": 1, "stars_since": 250},
+    "daily": {"rank": 3, "stars_since": 80}
+  },
+  "search_topics": ["llm"]
 }
 ```
 
-GitHub 项目使用 `owner/repo` 和 GitHub numeric ID 去重。
+GitHub 项目优先使用 `github_repo:<owner/repo>` 或 canonical URL 去重；来自 Trending HTML 和 Search API 的指标合并到同一条记录。
 
 ### `ai_item_reviews`
 
@@ -384,13 +389,16 @@ AI 单条响应固定返回：
 默认策略：
 
 ```text
-AI 关键词命中
-AND pushed_days <= 30
-AND stars > 100
-ORDER BY stars DESC
+Trending HTML daily/weekly 的周期新增 Star > 0
+OR Search API 命中 6 个 AI topic 且 pushed_days <= 7 AND stars > 100
+ORDER BY Trending 周期新增 Star、累计 Star DESC
 ```
 
-后续可增加：
+Search API 的候选 topic 为：`llm`、`ai-agent`、`rag`、`vector-database`、`large-language-model`、`machine-learning`。
+
+GitHub Trending 使用 GitHub 页面原生的 `stars today` / `stars this week` 信号；项目当前不建立历史 Star 快照，不把累计 Star 差值伪装成周增长。
+
+后续如需更细粒度评分可增加：
 
 ```text
 activity_score =
@@ -487,24 +495,25 @@ recommendation_write_job
 ### 保留
 
 ```text
-RSS/Atom/RSSHub/GitHub collectors
+RSS/Atom/RSSHub/GitHub API/Trending collectors
 source registry
 normalize 基础逻辑
 AI provider 配置
 GitHub metadata reader（`app/storage/github_reader.py`）
 数据库 Repository 思路
 JSONL/Markdown export
+GitHub Trending date-scoped Markdown report
 ```
 
-UI 代码不属于本阶段；GitHub 项目直接使用标准 `intel_items.jsonl` 的 stars、forks、watchers、pushed_at 等字段，不再生成独立报告或 AI 排名。
+GitHub 项目仍直接使用标准 `intel_items.jsonl` 的 metadata，不调用 AI 评分；`export` 同时生成 `output/github-trending/YYYY/MM/YYYYMMDD.md`，现有 `/github` 页面读取合并后的 Trending/Search 指标。
 
 ## 7. 测试和验收标准
 
 必须覆盖：
 
-- RSS、Atom、RSSHub、GitHub API、Product Hunt 的统一 collector 接口
+- RSS、Atom、RSSHub、GitHub API、GitHub Trending HTML、Product Hunt 的统一 collector 接口
 - source policy 的三类分流
-- GitHub 最近 push + Star 阈值
+- GitHub Trending 周期 Star、Search API 最近 push + Star 阈值
 - Product Hunt votes/时间排序
 - 社区内容标记 `discovery_only`
 - 官方直链成功、404、错误域名、超时
@@ -531,11 +540,11 @@ UI 代码不属于本阶段；GitHub 项目直接使用标准 `intel_items.jsonl
 ## 8. 实施顺序
 
 1. 新建简化后的 domain DTO、registry policy 和统一 collector 接口。
-2. 重写 `fetch_job` 和 `process_job`，先接 RSS、GitHub、官方 RSS。
+2. 重写 `fetch_job` 和 `process_job`，接入 RSS、GitHub API、GitHub Trending HTML、官方 RSS。
 3. 接入 Product Hunt 和 RSSHub/X/Reddit 的 `community_social` 策略。
 4. 接入单条 AI 结构化响应和本地 guard。
 5. 实现官方直链轻量核实。
 6. 实现 JSONL/Markdown export。
 7. 用现有真实 source registry 做全量回归。
 8. 删除旧 evidence/claim 多阶段默认入口和无效配置。
-9. 最后再处理 UI 读取兼容，不在本阶段扩展 UI 功能。
+9. 保持 UI 只读边界，并展示合并后的 GitHub Trending/Search 指标和日期报告入口。

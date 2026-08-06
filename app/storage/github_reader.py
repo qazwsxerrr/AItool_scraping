@@ -51,6 +51,9 @@ class GitHubProjectRow:
     published_at: datetime | None
     latest_release_names: list[str]
     risk_flags: list[str]
+    trending: dict[str, dict[str, Any]]
+    search_topics: list[str]
+    discovery_sources: list[str]
 
     @property
     def display_title(self) -> str:
@@ -181,6 +184,7 @@ def _row_from_record(record: dict[str, Any]) -> GitHubProjectRow | None:
     # not erase a useful value retained in the raw GitHub response.
     merged = dict(payload)
     merged.update({key: value for key, value in metrics.items() if value is not None})
+    trending = _trending_signals(merged)
     url = _text(record.get("url") or merged.get("html_url"))
     repo_full_name = (
         _text(merged.get("full_name"))
@@ -228,6 +232,9 @@ def _row_from_record(record: dict[str, Any]) -> GitHubProjectRow | None:
             or merged.get("tag_name")
         ),
         risk_flags=risk_flags,
+        trending=trending,
+        search_topics=_string_list(merged.get("search_topics")),
+        discovery_sources=_string_list(merged.get("discovery_sources")),
     )
 
 
@@ -239,7 +246,7 @@ def _is_github_record(record: dict[str, Any]) -> bool:
     metrics = _mapping(record.get("metrics"))
     payload = _mapping(record.get("raw_payload"))
     return bool(
-        source_type == "github_api"
+        source_type in {"github_api", "github_trending"}
         or source_id.startswith("github_")
         or external_id.startswith("github_repo:")
         or "github.com/" in url
@@ -271,14 +278,31 @@ def _search_text(row: GitHubProjectRow) -> str:
             row.primary_language,
             row.license_name,
             *row.topics,
+            *row.search_topics,
         )
         if value
     ).casefold()
 
 
-def _sort_key(row: GitHubProjectRow) -> tuple[int, int, float, int]:
+def _sort_key(row: GitHubProjectRow) -> tuple[int, int, int, int, float, int]:
     pushed = row.pushed_at.timestamp() if row.pushed_at else float("-inf")
-    return row.stars, row.forks, pushed, -(row.intel_item_id or 0)
+    weekly = _number(row.trending.get("weekly", {}).get("stars_since"))
+    daily = _number(row.trending.get("daily", {}).get("stars_since"))
+    return weekly, daily, row.stars, row.forks, pushed, -(row.intel_item_id or 0)
+
+
+def _trending_signals(metrics: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw = metrics.get("trending")
+    result = {key: dict(value) for key, value in raw.items() if isinstance(value, dict)} if isinstance(raw, dict) else {}
+    period = _text(metrics.get("trending_period"))
+    if period and period not in result:
+        result[period] = {
+            "rank": metrics.get("trending_rank"),
+            "stars_since": metrics.get("stars_since"),
+            "stars": metrics.get("stars"),
+            "forks": metrics.get("forks"),
+        }
+    return result
 
 
 def _mapping(value: Any) -> dict[str, Any]:

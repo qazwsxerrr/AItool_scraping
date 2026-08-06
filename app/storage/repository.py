@@ -212,7 +212,16 @@ class IntelRepository:
             # processing status. This lets a later fetch update star counts.
             old_metrics = existing.metrics_json
             old_payload = existing.raw_payload_json
-            new_metrics = _dump_json(fields["metrics"])
+            merged_metrics = (
+                _merge_github_project_metrics(
+                    _load_json(old_metrics, {}),
+                    fields["metrics"],
+                    source_id=fields["source_id"],
+                )
+                if _is_github_repository_fields(fields)
+                else fields["metrics"]
+            )
+            new_metrics = _dump_json(merged_metrics)
             new_payload = _dump_json(fields["raw_payload"])
             class_changed = existing.content_class != fields["content_class"]
             existing.title = fields["title"] or existing.title
@@ -241,6 +250,11 @@ class IntelRepository:
             existing.updated_at = utcnow()
             return IntelInsertResult(inserted=False, item_id=existing.id, reason="duplicate", updated=True)
 
+        row_metrics = (
+            _merge_github_project_metrics({}, fields["metrics"], source_id=fields["source_id"])
+            if _is_github_repository_fields(fields)
+            else fields["metrics"]
+        )
         row = IntelItem(
             source_id=fields["source_id"],
             external_id=fields["external_id"],
@@ -251,7 +265,7 @@ class IntelRepository:
             published_at=fields["published_at"],
             captured_at=fields["captured_at"],
             content_class=fields["content_class"],
-            metrics_json=_dump_json(fields["metrics"]),
+            metrics_json=_dump_json(row_metrics),
             raw_payload_json=_dump_json(fields["raw_payload"]),
             content_hash=fields["content_hash"],
             status="new",
@@ -507,6 +521,85 @@ def _load_json(value: str, default: Any) -> Any:
         return json.loads(value)
     except (TypeError, ValueError):
         return default
+
+
+def _is_github_repository_fields(fields: Mapping[str, Any]) -> bool:
+    external_id = _text(fields.get("external_id")) or ""
+    return external_id.casefold().startswith("github_repo:") and fields.get("content_class") == "project_tool"
+
+
+def _merge_github_project_metrics(
+    previous: Any,
+    current: Any,
+    *,
+    source_id: str,
+) -> dict[str, Any]:
+    """Merge current GitHub signals without losing other source periods."""
+
+    merged = dict(previous) if isinstance(previous, Mapping) else {}
+    values = dict(current) if isinstance(current, Mapping) else {}
+    period = _text(values.get("trending_period"))
+    if period:
+        trending = dict(merged.get("trending")) if isinstance(merged.get("trending"), Mapping) else {}
+        trending[period] = {
+            "rank": values.get("trending_rank"),
+            "stars_since": values.get("stars_since"),
+            "stars": values.get("stars"),
+            "forks": values.get("forks"),
+        }
+        merged["trending"] = trending
+        # Keep the latest period signal at the canonical top level too. The
+        # selection policy reads this fast path, while ``trending`` preserves
+        # daily/weekly history within the current record.
+        for key in ("trending_period", "trending_rank", "stars_since", "trending_signal"):
+            if values.get(key) is not None:
+                merged[key] = values[key]
+
+    for key, value in values.items():
+        if key in {"trending_period", "trending_rank", "stars_since", "trending_signal"}:
+            continue
+        if value is not None:
+            merged[key] = value
+
+    merged["discovery_sources"] = _unique_strings(
+        [
+            *_string_values(merged.get("discovery_sources")),
+            *_string_values(values.get("discovery_sources")),
+            source_id,
+        ]
+    )
+    query_values = [
+        merged.get("search_query"),
+        merged.get("query"),
+        values.get("search_query"),
+        values.get("query"),
+    ]
+    queries = _unique_strings(query_values)
+    if queries:
+        merged["search_queries"] = queries
+    if source_id.startswith("github_search_topic_"):
+        topic = source_id.removeprefix("github_search_topic_")
+        merged["search_topics"] = _unique_strings([*_string_values(merged.get("search_topics")), topic])
+    return merged
+
+
+def _unique_strings(values: Iterable[Any]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = _text(value)
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _string_values(value: Any) -> list[Any]:
+    """Normalize legacy scalar/list metadata before merging it."""
+
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
 
 
 def _text(value: Any) -> str | None:

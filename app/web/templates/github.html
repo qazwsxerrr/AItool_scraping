@@ -7,7 +7,7 @@
     <p class="eyebrow">GitHub 项目热点</p>
     <h1>本周 AI 开源项目发现</h1>
     <p class="muted-text">
-      基于 GitHub API metadata 展示；项目按 stars、forks 和最近 push 排序，不使用 AI 评分。
+      基于 GitHub Trending HTML 与 GitHub Search API；展示 GitHub 自身的 daily/weekly 新增 Star 指标，不使用历史快照。
     </p>
   </div>
   <div class="run-status">
@@ -44,7 +44,7 @@
 </form>
 
 <p class="github-filter-note">
-  当前显示 {{ rows | length }} 个项目，按 stars、forks、watchers 和最近 push 等 metadata 排序。
+  当前显示 {{ rows | length }} 个项目，优先按 Trending 周期新增 Star，再按累计 stars、forks 和最近 push 排序。
 </p>
 
 <section class="timeline">
@@ -55,7 +55,7 @@
   {% else %}
     <div class="empty-state">
       <h3>暂无 GitHub 项目</h3>
-      <p>先运行 fetch、process、export 生成 output/intel/intel_items.jsonl。</p>
+      <p>先运行 fetch、process、export 生成 GitHub Trending HTML 报告和 output/intel/intel_items.jsonl。</p>
     </div>
   {% endif %}
 </section>

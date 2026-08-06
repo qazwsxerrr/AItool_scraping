@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 import feedparser
 import httpx
+from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 
 from app.config.settings import DEFAULT_USER_AGENT
@@ -476,19 +477,133 @@ class GitHubCollector(Collector):
         return dict(payload) if isinstance(payload, dict) else None
 
 
+class GitHubTrendingCollector(Collector):
+    """Fetch GitHub's daily/weekly Trending pages directly as HTML."""
+
+    def __init__(
+        self,
+        client: HTTPClient,
+        *,
+        retries: int = 2,
+        user_agent: str = DEFAULT_USER_AGENT,
+        max_response_bytes: int = 4 * 1024 * 1024,
+        sleeper=time.sleep,
+    ) -> None:
+        self.client = client
+        self.retries = max(0, int(retries))
+        self.user_agent = user_agent
+        self.max_response_bytes = max_response_bytes
+        self.sleeper = sleeper
+
+    def collect(self, source: SourceSpec, limit: int) -> FetchBatch:
+        if not source.url:
+            return _failed_batch(source, "missing_url", "source has no URL")
+        response, retry_count, error = _request_with_retry(
+            self.client,
+            source.url,
+            retries=self.retries,
+            user_agent=self.user_agent,
+            max_response_bytes=self.max_response_bytes,
+            extra_headers={"Accept": "text/html,application/xhtml+xml"},
+            sleeper=self.sleeper,
+        )
+        if error is not None:
+            return _failed_batch(
+                source,
+                error[0],
+                error[1],
+                http_status=error[2],
+                response_bytes=getattr(error, "response_bytes", 0),
+                retry_count=retry_count,
+                request_url=source.url,
+                transport="github_trending_html",
+            )
+        assert response is not None
+        request_url = _response_request_url(response, source.url)
+        final_url = _response_final_url(response, source.url)
+        body = bytes(getattr(response, "content", b"") or b"")
+        try:
+            html = body.decode("utf-8", errors="replace")
+            repos = _parse_github_trending_html(
+                html,
+                period=_trending_period(source),
+                limit=max(1, int(limit)),
+                source_id=source.id,
+            )
+        except (TypeError, ValueError) as exc:
+            return _failed_batch(
+                source,
+                "invalid_html",
+                str(exc),
+                http_status=int(getattr(response, "status_code", 0) or 0),
+                response_bytes=len(body),
+                retry_count=retry_count,
+                request_url=request_url,
+                final_url=final_url,
+                transport="github_trending_html",
+            )
+        if not repos:
+            soup = BeautifulSoup(html, "html.parser")
+            if soup.select_one(".blankslate"):
+                return FetchBatch(
+                    source=source,
+                    items=[],
+                    status="success",
+                    http_status=int(getattr(response, "status_code", 0) or 0),
+                    request_url=request_url,
+                    final_url=final_url,
+                    response_bytes=len(body),
+                    retry_count=retry_count,
+                    transport="github_trending_html",
+                )
+            return _failed_batch(
+                source,
+                "trending_parse_empty",
+                "GitHub Trending HTML contained no repository rows",
+                http_status=int(getattr(response, "status_code", 0) or 0),
+                response_bytes=len(body),
+                retry_count=retry_count,
+                request_url=request_url,
+                final_url=final_url,
+                transport="github_trending_html",
+            )
+        return FetchBatch(
+            source=source,
+            items=repos,
+            status="success",
+            http_status=int(getattr(response, "status_code", 0) or 0),
+            request_url=request_url,
+            final_url=final_url,
+            response_bytes=len(body),
+            retry_count=retry_count,
+            transport="github_trending_html",
+        )
+
+
 class CollectorRouter:
     """Resolve a source to a collector while keeping one shared HTTP client."""
 
-    def __init__(self, *, feed: FeedCollector, rsshub: RSSHubCollector, github: GitHubCollector, producthunt: ProductHuntCollector) -> None:
+    def __init__(
+        self,
+        *,
+        feed: FeedCollector,
+        rsshub: RSSHubCollector,
+        github: GitHubCollector,
+        github_trending: GitHubTrendingCollector,
+        producthunt: ProductHuntCollector,
+    ) -> None:
         self.feed = feed
         self.rsshub = rsshub
         self.github = github
+        self.github_trending = github_trending
         self.producthunt = producthunt
 
     def collect(self, source: SourceSpec, limit: int) -> FetchBatch:
         collector_type = source.collector_type or _infer_collector_type(source)
         if collector_type == "github":
             return self.github.collect(source, limit)
+        if collector_type == "github_trending":
+            return self.github_trending.collect(source, limit)
         if collector_type == "producthunt":
             return self.producthunt.collect(source, limit)
         if collector_type == "rsshub":
@@ -515,7 +630,6 @@ def _feed_item_to_domain(item: Any, source: SourceSpec) -> FetchItem:
             if payload.get(key) is not None:
                 metrics[target] = payload[key]
                 break
-    _extract_feed_project_metrics(metrics, item, source)
     return FetchItem(
         source_id=source.id,
         external_id=getattr(item, "external_id", None),
@@ -529,35 +643,6 @@ def _feed_item_to_domain(item: Any, source: SourceSpec) -> FetchItem:
         raw_payload=payload,
         kind="feed",
     )
-
-
-def _extract_feed_project_metrics(metrics: dict[str, Any], item: Any, source: SourceSpec) -> None:
-    """Map common GitHub-trending feed text into the canonical project metrics."""
-
-    if source.content_class != "project_tool":
-        return
-    text = " ".join(
-        str(value)
-        for value in (
-            getattr(item, "title", None),
-            getattr(item, "raw_summary", None),
-            getattr(item, "raw_content", None),
-        )
-        if value
-    )
-    if "stars" not in metrics:
-        match = re.search(r"([0-9][0-9,]*(?:\.[0-9]+)?[kKmM]?)\s*stars?", text, re.IGNORECASE)
-        if match:
-            metrics["stars"] = _number(match.group(1))
-    if "forks" not in metrics:
-        match = re.search(r"([0-9][0-9,]*(?:\.[0-9]+)?[kKmM]?)\s*forks?", text, re.IGNORECASE)
-        if match:
-            metrics["forks"] = _number(match.group(1))
-    mode = source.selection_policy.mode.casefold().replace("-", "_")
-    if mode in {"github_active_high_star", "active_high_star"} and "pushed_at" not in metrics:
-        published_at = getattr(item, "published_at", None)
-        if published_at is not None:
-            metrics["pushed_at"] = published_at.isoformat()
 
 
 def _producthunt_node_to_item(source: SourceSpec, node: dict[str, Any]) -> FetchItem:
@@ -669,6 +754,115 @@ def _release_to_item(source: SourceSpec, release: dict[str, Any]) -> FetchItem:
     )
 
 
+def _parse_github_trending_html(
+    html: str,
+    *,
+    period: str,
+    limit: int,
+    source_id: str,
+) -> list[FetchItem]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows = soup.select("article.Box-row")
+    items: list[FetchItem] = []
+    captured_at = datetime.now(timezone.utc)
+    for rank, row in enumerate(rows[:limit], start=1):
+        link = row.select_one("h2 a, h3 a")
+        href = _text(link.get("href") if link else None)
+        full_name = _github_trending_full_name(href)
+        if not full_name:
+            continue
+
+        description_node = row.select_one("p")
+        language_node = row.select_one("[itemprop='programmingLanguage']")
+        stars_node = _find_github_trending_link(row, "stargazers")
+        forks_node = _find_github_trending_link(row, "forks")
+        stars = _number(stars_node.get_text(" ", strip=True) if stars_node else None) or 0
+        forks = _number(forks_node.get_text(" ", strip=True) if forks_node else None) or 0
+        stars_since = _github_trending_stars_since(row, period)
+        metrics = {
+            "stars": stars,
+            "forks": forks,
+            "stars_since": stars_since,
+            "trending_period": period,
+            "trending_rank": rank,
+            "trending_signal": "stars_since",
+            "discovery_sources": [source_id],
+            "language": _text(language_node.get_text(" ", strip=True) if language_node else None),
+        }
+        url = f"https://github.com/{full_name}"
+        owner = full_name.split("/", 1)[0]
+        raw_payload = {
+            "github_item_type": "repository",
+            "full_name": full_name,
+            "html_url": url,
+            "trending_period": period,
+            "trending_rank": rank,
+            "stars_since": stars_since,
+        }
+        items.append(
+            FetchItem(
+                source_id=source_id,
+                content_class="project_tool",
+                external_id=f"github_repo:{full_name.casefold()}",
+                title=f"GitHub repo: {full_name}",
+                url=url,
+                canonical_url=url,
+                author=owner,
+                published_at=captured_at,
+                captured_at=captured_at,
+                summary=_text(description_node.get_text(" ", strip=True) if description_node else None),
+                content=json.dumps(metrics, ensure_ascii=False, default=str),
+                metrics=metrics,
+                raw_payload=raw_payload,
+                kind="github_trending_repository",
+            )
+        )
+    return items
+
+
+def _github_trending_full_name(href: str | None) -> str | None:
+    if not href:
+        return None
+    parts = [part for part in urlparse(href).path.split("/") if part]
+    if len(parts) != 2 or any(part in {"trending", "sponsors", "collections"} for part in parts):
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _find_github_trending_link(row: Any, fragment: str) -> Any | None:
+    for link in row.select("a[href]"):
+        href = str(link.get("href") or "")
+        if f"/{fragment}" in href:
+            return link
+    return None
+
+
+def _github_trending_stars_since(row: Any, period: str) -> int:
+    text = row.get_text(" ", strip=True)
+    period_pattern = {
+        "daily": r"([0-9][0-9,]*(?:\.[0-9]+)?[kKmM]?)\s+stars?\s+today",
+        "weekly": r"([0-9][0-9,]*(?:\.[0-9]+)?[kKmM]?)\s+stars?\s+this\s+week",
+        "monthly": r"([0-9][0-9,]*(?:\.[0-9]+)?[kKmM]?)\s+stars?\s+this\s+month",
+    }
+    match = re.search(period_pattern.get(period, period_pattern["daily"]), text, flags=re.IGNORECASE)
+    if match:
+        return int(_number(match.group(1)) or 0)
+    for node in row.select(".float-sm-right"):
+        value = _number(node.get_text(" ", strip=True))
+        if value is not None:
+            return int(value)
+    return 0
+
+
+def _trending_period(source: SourceSpec) -> str:
+    subtype = (source.source_subtype or "").casefold()
+    if subtype.endswith("weekly"):
+        return "weekly"
+    if subtype.endswith("monthly"):
+        return "monthly"
+    return "daily"
+
+
 def _request_with_retry(
     client: HTTPClient,
     url: str,
@@ -744,6 +938,8 @@ def _failed_batch(source: SourceSpec, code: str, message: str, **kwargs: Any) ->
 
 
 def _infer_collector_type(source: SourceSpec) -> str:
+    if source.type == "github_trending":
+        return "github_trending"
     if source.type == "github_api":
         return "github"
     if source.source_group == "producthunt" or source.id.startswith("producthunt"):

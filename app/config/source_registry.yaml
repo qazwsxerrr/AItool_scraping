@@ -64,56 +64,194 @@ sources:
     verification_policy: {mode: metadata_only}
     default_limit: 20
 
-  # GitHub REST API sources. They use GITHUB_TOKEN/GITHUB_API_TOKEN when configured.
-  - id: github_search_ai_tools
-    name: GitHub Search AI Tools
+  # GitHub Trending is fetched directly from the rendered HTML. The weekly
+  # source exposes GitHub's own "stars this week" signal; the daily source
+  # provides a faster signal for projects that are accelerating today.
+  - id: github_trending_daily_native
+    name: GitHub Trending Daily
+    type: github_trending
+    url: https://github.com/trending?since=daily
+    enabled: true
+    priority: 40
+    fetch_interval: 86400
+    parser_type: github_trending_html
+    source_group: github
+    source_subtype: trending_daily
+    quality_weight: 0.90
+    source_role: code_hosting
+    spam_risk: medium
+    requires_verification: false
+    content_class: project_tool
+    collector_type: github_trending
+    selection_policy: {mode: github_trending, period: daily, sort: stars_since}
+    verification_policy: {mode: metadata_only}
+    default_limit: 25
+
+  - id: github_trending_weekly_native
+    name: GitHub Trending Weekly
+    type: github_trending
+    url: https://github.com/trending?since=weekly
+    enabled: true
+    priority: 41
+    fetch_interval: 86400
+    parser_type: github_trending_html
+    source_group: github
+    source_subtype: trending_weekly
+    quality_weight: 0.95
+    source_role: code_hosting
+    spam_risk: medium
+    requires_verification: false
+    content_class: project_tool
+    collector_type: github_trending
+    selection_policy: {mode: github_trending, period: weekly, sort: stars_since}
+    verification_policy: {mode: metadata_only}
+    default_limit: 25
+
+  # Search API candidate recall follows agents-radar: recent activity is
+  # restricted to seven days and each AI topic is kept as an auditable source.
+  - id: github_search_topic_llm
+    name: GitHub Search Topic LLM
     type: github_api
     url: https://api.github.com/search/repositories
     enabled: true
     priority: 45
     fetch_interval: 21600
-    parser_type: feedparser
+    parser_type: github_api
     source_group: github
     source_subtype: search_repositories
-    quality_weight: 0.70
+    quality_weight: 0.75
     source_role: code_hosting
     spam_risk: medium
     requires_verification: false
     content_class: project_tool
     collector_type: github
-    selection_policy: {mode: github_active_high_star, pushed_days: 30, min_stars: 100, sort: stars}
+    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
     verification_policy: {mode: metadata_only}
-    search_query: 'mcp in:name,description,readme stars:>100'
+    search_query: 'topic:llm'
     search_sort: stars
     search_order: desc
-    search_pushed_days: 30
-    default_limit: 20
+    search_pushed_days: 7
+    default_limit: 15
 
-  # Established projects are eligible when they are still being pushed recently;
-  # This is a discovery signal; it is ranked by project activity and metadata.
-  - id: github_search_ai_active_high_star
-    name: GitHub Active High-Star AI Projects
+  - id: github_search_topic_ai_agent
+    name: GitHub Search Topic AI Agent
     type: github_api
     url: https://api.github.com/search/repositories
     enabled: true
     priority: 46
     fetch_interval: 21600
-    parser_type: feedparser
+    parser_type: github_api
     source_group: github
     source_subtype: search_repositories
-    quality_weight: 0.70
+    quality_weight: 0.75
     source_role: code_hosting
     spam_risk: medium
     requires_verification: false
     content_class: project_tool
     collector_type: github
-    selection_policy: {mode: github_active_high_star, pushed_days: 30, min_stars: 100, sort: stars}
+    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
     verification_policy: {mode: metadata_only}
-    search_query: 'LLM OR MCP OR RAG OR "AI agent" OR "generative AI" in:name,description stars:>100'
+    search_query: 'topic:ai-agent'
     search_sort: stars
     search_order: desc
-    search_pushed_days: 30
-    default_limit: 30
+    search_pushed_days: 7
+    default_limit: 15
+
+  - id: github_search_topic_rag
+    name: GitHub Search Topic RAG
+    type: github_api
+    url: https://api.github.com/search/repositories
+    enabled: true
+    priority: 47
+    fetch_interval: 21600
+    parser_type: github_api
+    source_group: github
+    source_subtype: search_repositories
+    quality_weight: 0.75
+    source_role: code_hosting
+    spam_risk: medium
+    requires_verification: false
+    content_class: project_tool
+    collector_type: github
+    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
+    verification_policy: {mode: metadata_only}
+    search_query: 'topic:rag'
+    search_sort: stars
+    search_order: desc
+    search_pushed_days: 7
+    default_limit: 15
+
+  - id: github_search_topic_vector_database
+    name: GitHub Search Topic Vector Database
+    type: github_api
+    url: https://api.github.com/search/repositories
+    enabled: true
+    priority: 48
+    fetch_interval: 21600
+    parser_type: github_api
+    source_group: github
+    source_subtype: search_repositories
+    quality_weight: 0.75
+    source_role: code_hosting
+    spam_risk: medium
+    requires_verification: false
+    content_class: project_tool
+    collector_type: github
+    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
+    verification_policy: {mode: metadata_only}
+    search_query: 'topic:vector-database'
+    search_sort: stars
+    search_order: desc
+    search_pushed_days: 7
+    default_limit: 15
+
+  - id: github_search_topic_large_language_model
+    name: GitHub Search Topic Large Language Model
+    type: github_api
+    url: https://api.github.com/search/repositories
+    enabled: true
+    priority: 49
+    fetch_interval: 21600
+    parser_type: github_api
+    source_group: github
+    source_subtype: search_repositories
+    quality_weight: 0.75
+    source_role: code_hosting
+    spam_risk: medium
+    requires_verification: false
+    content_class: project_tool
+    collector_type: github
+    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
+    verification_policy: {mode: metadata_only}
+    search_query: 'topic:large-language-model'
+    search_sort: stars
+    search_order: desc
+    search_pushed_days: 7
+    default_limit: 15
+
+  - id: github_search_topic_machine_learning
+    name: GitHub Search Topic Machine Learning
+    type: github_api
+    url: https://api.github.com/search/repositories
+    enabled: true
+    priority: 50
+    fetch_interval: 21600
+    parser_type: github_api
+    source_group: github
+    source_subtype: search_repositories
+    quality_weight: 0.75
+    source_role: code_hosting
+    spam_risk: medium
+    requires_verification: false
+    content_class: project_tool
+    collector_type: github
+    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
+    verification_policy: {mode: metadata_only}
+    search_query: 'topic:machine-learning'
+    search_sort: stars
+    search_order: desc
+    search_pushed_days: 7
+    default_limit: 15
 
   - id: github_releases_ollama
     name: GitHub Releases Ollama
@@ -1050,32 +1188,6 @@ sources:
     collector_type: rsshub
     selection_policy: {mode: community_recent, max_age_days: 7}
     verification_policy: {mode: discovery_only}
-
-  - id: github_trending_python_daily
-    name: GitHub Trending Python Daily via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/github/trending/daily/python
-    enabled: true
-    priority: 210
-    fetch_interval: 86400
-    parser_type: feedparser
-    content_class: project_tool
-    collector_type: rsshub
-    selection_policy: {mode: github_active_high_star, pushed_days: 30, min_stars: 100, sort: stars}
-    verification_policy: {mode: metadata_only}
-
-  - id: github_trending_typescript_daily
-    name: GitHub Trending TypeScript Daily via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/github/trending/daily/typescript
-    enabled: true
-    priority: 220
-    fetch_interval: 86400
-    parser_type: feedparser
-    content_class: project_tool
-    collector_type: rsshub
-    selection_policy: {mode: github_active_high_star, pushed_days: 30, min_stars: 100, sort: stars}
-    verification_policy: {mode: metadata_only}
 
   # Disabled until stable RSS/RSSHub routes are confirmed.
   - id: mistral_news_disabled

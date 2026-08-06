@@ -263,7 +263,21 @@ def _ranking_key(entry: tuple[IntelItem, Any, SourceSpec]) -> tuple[int, float, 
             or metrics.get("canonical_project_key")
             or metrics.get("github_metadata_fetched")
         )
-        if mode in {"github_active_high_star", "active_high_star"} or linked_github:
+        trending = metrics.get("trending") if isinstance(metrics.get("trending"), dict) else {}
+        weekly_trending = trending.get("weekly") if isinstance(trending.get("weekly"), dict) else {}
+        daily_trending = trending.get("daily") if isinstance(trending.get("daily"), dict) else {}
+        if mode == "github_trending" or trending:
+            # A repository can first arrive through Search API and later be
+            # refreshed by Trending. Prefer the merged period signal whenever
+            # it exists, regardless of which source created the row.
+            period_signal = max(
+                _number(metrics.get("stars_since") or metrics.get("trending_stars")),
+                _number(weekly_trending.get("stars_since")),
+                _number(daily_trending.get("stars_since")),
+            )
+            primary = period_signal
+            secondary = _number(metrics.get("stars") or metrics.get("stargazers_count"))
+        elif mode in {"github_active_high_star", "active_high_star"} or linked_github:
             primary = _number(metrics.get("stars") or metrics.get("stargazers_count"))
             secondary = _number(metrics.get("forks") or metrics.get("forks_count"))
         elif mode in {"producthunt_hot", "product_hunt_hot"}:
@@ -299,9 +313,9 @@ def _is_github_source(spec: SourceSpec) -> bool:
 
     mode = spec.selection_policy.mode.casefold().replace("-", "_")
     return bool(
-        spec.type == "github_api"
-        or spec.collector_type == "github"
-        or mode in {"github_active_high_star", "active_high_star"}
+        spec.type in {"github_api", "github_trending"}
+        or spec.collector_type in {"github", "github_trending"}
+        or mode in {"github_active_high_star", "active_high_star", "github_trending"}
     )
 
 

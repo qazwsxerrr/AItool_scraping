@@ -1,6 +1,6 @@
 # AI 情报抓取与处理
 
-本项目当前只实现数据抓取和 AI 处理，不修改网页 UI。唯一的数据处理链路是：
+本项目当前实现数据抓取、确定性处理和结果展示。唯一的数据处理链路是：
 
 ```text
 source registry -> fetch -> process -> export
@@ -11,7 +11,7 @@ source registry -> fetch -> process -> export
 | content_class | 适用内容 | 确定性筛选 | 处理语义 |
 | --- | --- | --- | --- |
 | `official_model_company` | 官方模型、模型卡、公司产品和 API 更新 | 最近 30 天 + 发布/模型/API/版本/价格关键词 | 一个官方直链成功才是 `verified`，否则 `needs_review` |
-| `project_tool` | GitHub、Product Hunt、AI 工具 | GitHub 最近 30 天 push 且 `stars > 100`；Product Hunt 按时间和热度 | metadata 驱动的 `hotspot`，不要求第三方证据 |
+| `project_tool` | GitHub Trending/Search、Product Hunt、AI 工具 | GitHub Trending 使用 daily/weekly 周期 Star；Search 使用最近 7 天 push 且 `stars > 100`；Product Hunt 按时间和热度 | metadata 驱动的 `hotspot`，不要求第三方证据 |
 | `community_social` | X、Reddit、RSSHub、论坛讨论 | 最近 7 天 + 关键词或互动信号 | `discovery_only`，不能单独形成高可信结论 |
 
 来源配置位于 `app/config/source_registry.yaml`。每个来源可以声明 `content_class`、`collector_type`、`selection_policy` 和 `verification_policy`。
@@ -21,12 +21,13 @@ source registry -> fetch -> process -> export
 ```text
 app/
 ├─ config/                 # Settings 和 source registry
-├─ collectors/             # RSS/Atom/RSSHub/GitHub/Product Hunt 请求与字段映射
+├─ collectors/             # RSS/Atom/RSSHub/GitHub API/Trending/Product Hunt 请求与字段映射
 ├─ parsers/                # feed 解析
 ├─ domain/                 # DTO、来源策略、确定性筛选、轻量核实
 ├─ ai/                     # 一条目一次结构化 AI 分析
 ├─ storage/                # v2 ORM、Repository、数据库和 UI 只读查询
 ├─ jobs/                   # intel fetch/process/export/run 编排
+├─ github/report.py        # 按日期生成 GitHub Trending Markdown 报告
 ├─ storage/github_reader.py # 从标准 intel_items.jsonl 读取 GitHub metadata
 ├─ pipeline/normalize.py   # 无数据库依赖的基础文本/URL 标准化工具
 └─ web/                    # 现有 FastAPI/Jinja UI，当前阶段不改
@@ -43,7 +44,7 @@ app/
 - `ai_item_reviews`：每条最多一条结构化模型结果，保留原始响应。
 - `item_verifications`：官方直链、项目 metadata 或社区 discovery 的轻量结果。
 
-GitHub 项目使用 `external_id=github_repo:<numeric id>` 去重；指标保存在 `metrics_json`，包括 stars、forks、votes、comments、pushed_at 等。
+GitHub 项目使用稳定的 `github_repo:*` 标识或 canonical URL 去重；指标保存在 `metrics_json`，包括累计 stars、周期新增 Star、forks、pushed_at、Trending rank 和 Search topic。当前只保留最新合并指标，不建立历史 Star 快照表。
 
 ## 安装
 
@@ -119,8 +120,9 @@ python scripts/run_intel_once.py
 - `intel_items.jsonl`：状态为 `verified`、`hotspot` 或 `discovery_only` 的条目。
 - `intel_pending.jsonl`：`needs_review`、`ai_failed` 或尚未分析的条目。
 - `intel_digest.md`：分类、状态、指标、风险和链接摘要。
+- `output/github-trending/YYYY/MM/YYYYMMDD.md`：GitHub Trending daily/weekly 和 Search API 补充候选报告。
 
-GitHub 项目不再生成独立报告，也不执行 AI 评分。它们与其他条目一起写入 `intel_items.jsonl`，读取时按 stars、forks 和最近 push 等原始 metadata 排序。
+GitHub 项目不执行 AI 评分。Trending HTML 的 `stars today`、`stars this week` 会以原始周期指标写入报告；Search API 只作为最近活跃的候选补充，不生成虚假的周增长。
 
 ## 验证
 
