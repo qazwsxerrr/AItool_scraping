@@ -29,8 +29,22 @@ class FeedParseError(ValueError):
     pass
 
 
-def parse_feed(content: bytes | str, source_id: str) -> list[ParsedFeedItem]:
-    """Parse RSS/Atom content into canonical raw feed items."""
+def parse_feed(
+    content: bytes | str,
+    source_id: str,
+    *,
+    feed_format: str | None = None,
+) -> list[ParsedFeedItem]:
+    """Parse an RSS/Atom document into canonical raw feed items.
+
+    ``feed_format`` is supplied by the resolved ``SourceSpec`` so callers can
+    keep the configured format visible at the boundary.  ``feedparser`` is
+    deliberately still responsible for tolerant XML parsing; many real-world
+    feeds advertise a slightly different MIME/version string than their
+    registry entry.
+    """
+    if feed_format is not None and feed_format not in {"rss", "atom"}:
+        raise FeedParseError(f"unsupported feed format: {feed_format}")
     parsed = feedparser.parse(content)
     entries = list(parsed.get("entries", []))
     if parsed.get("bozo") and not entries:

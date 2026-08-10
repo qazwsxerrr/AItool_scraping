@@ -1,5 +1,5 @@
-"""Public v2 RSSHub collector name."""
+"""Public RSSHub collector export."""
 
-from app.collectors.unified import RSSHubCollector
+from app.collectors.feed import RSSHubCollector
 
 __all__ = ["RSSHubCollector"]

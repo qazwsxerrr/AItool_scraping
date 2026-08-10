@@ -36,8 +36,6 @@ class Settings:
     github_api_token: str | None = None
     github_api_version: str = "2022-11-28"
     github_timeout_seconds: float = 20.0
-    producthunt_api_url: str = "https://api.producthunt.com/v2/api/graphql"
-    producthunt_api_token: str | None = None
     ai_review_api_url: str | None = None
     ai_review_api_key: str | None = None
     ai_review_model: str | None = None
@@ -58,10 +56,6 @@ class Settings:
             github_api_token=os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_API_TOKEN") or None,
             github_api_version=os.getenv("GITHUB_API_VERSION", "2022-11-28"),
             github_timeout_seconds=float(os.getenv("GITHUB_TIMEOUT_SECONDS", "20")),
-            producthunt_api_url=os.getenv(
-                "PRODUCTHUNT_API_URL", "https://api.producthunt.com/v2/api/graphql"
-            ).rstrip("/"),
-            producthunt_api_token=os.getenv("PRODUCTHUNT_API_TOKEN") or os.getenv("PRODUCTHUNT_TOKEN") or None,
             ai_review_api_url=os.getenv("AI_REVIEW_API_URL") or None,
             ai_review_api_key=os.getenv("AI_REVIEW_API_KEY") or None,
             ai_review_model=os.getenv("AI_REVIEW_MODEL") or None,

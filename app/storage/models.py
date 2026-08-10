@@ -26,12 +26,23 @@ class Source(Base):
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # ``transport`` is the only persisted routing discriminator. Feed and
+    # GitHub options are flattened into nullable columns so the local SQLite
+    # schema remains inspectable without a compatibility/migration layer.
+    transport: Mapped[str] = mapped_column(String(32), nullable=False)
     url: Mapped[str] = mapped_column(Text, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     fetch_interval: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
-    parser_type: Mapped[str] = mapped_column(String(64), nullable=False, default="feedparser")
+    default_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    feed_format: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    feed_adapter: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    github_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    github_query: Mapped[str | None] = mapped_column(Text, nullable=True)
+    github_sort: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    github_order: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    github_pushed_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    github_period: Mapped[str | None] = mapped_column(String(16), nullable=True)
     source_group: Mapped[str] = mapped_column(String(64), nullable=False, default="general")
     source_subtype: Mapped[str] = mapped_column(String(64), nullable=False, default="fixed")
     quality_weight: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -39,7 +50,6 @@ class Source(Base):
     spam_risk: Mapped[str | None] = mapped_column(String(32), nullable=True)
     requires_verification: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     content_class: Mapped[str] = mapped_column(String(64), nullable=False)
-    collector_type: Mapped[str] = mapped_column(String(64), nullable=False)
     selection_policy_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     verification_policy_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     last_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -25,12 +25,12 @@ def _source(**overrides) -> SourceConfig:
     values = {
         "id": "github_test",
         "name": "GitHub test",
-        "type": "github_api",
+        "transport": "github",
         "url": "https://api.github.com/search/repositories",
+        "github": {"mode": "search", "query": "ai", "pushed_days": 7},
         "source_group": "github",
         "source_subtype": "search_repositories",
         "source_role": "code_hosting",
-        "search_query": "ai",
         "fetch_interval": 1,
     }
     values.update(overrides)
@@ -41,8 +41,9 @@ def _community_source(**overrides) -> SourceConfig:
     values = {
         "id": "community_test",
         "name": "Community test",
-        "type": "rss",
+        "transport": "feed",
         "url": "https://community.example/feed.xml",
+        "feed": {"format": "rss", "adapter": "generic"},
         "source_group": "community",
         "source_subtype": "fixed",
         "source_role": "community",
@@ -104,8 +105,8 @@ def test_fetch_is_idempotent_and_persists_attempt_telemetry(tmp_path):
         raw_payload={"github_item_type": "repository", "id": 7},
     )
     batch = FetchBatch(source=spec, items=[item], http_status=200, response_bytes=321, transport="github_api")
-    first = run_intel_fetch_job(session_factory=sf, sources=[source], router=_Router({source.id: batch}), force=True)
-    second = run_intel_fetch_job(session_factory=sf, sources=[source], router=_Router({source.id: batch}), force=True)
+    first = run_intel_fetch_job(session_factory=sf, sources=[spec], router=_Router({source.id: batch}), force=True)
+    second = run_intel_fetch_job(session_factory=sf, sources=[spec], router=_Router({source.id: batch}), force=True)
 
     assert (first.total_inserted, first.total_skipped) == (1, 0)
     assert (second.total_inserted, second.total_skipped) == (0, 1)
@@ -156,14 +157,16 @@ def test_process_applies_github_threshold_without_ai_scoring_or_filtering(tmp_pa
     assert result.processed == 2
     assert result.filtered == 1
     assert result.selected == 1
-    assert result.analyzed == 0
-    assert len(ai.calls) == 0
+    assert result.analyzed == 1
+    assert len(ai.calls) == 1
     with sf() as session:
         rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
         assert rows[0].status == "filtered"
         assert rows[1].status == "hotspot"
         assert rows[1].selection_score == 0
-        assert rows[1].ai_review is None
+        assert rows[1].ai_review.status == "success"
+        assert rows[1].ai_review.keep is False
+        assert rows[1].ai_review.summary_cn == "测试摘要"
         assert rows[1].verification.mode == "metadata_only"
 
 
@@ -172,8 +175,9 @@ def test_official_item_requires_successful_direct_link(tmp_path):
     source = SourceConfig(
         id="official_test",
         name="Official",
-        type="rss",
+        transport="feed",
         url="https://official.example/feed.xml",
+        feed={"format": "rss", "adapter": "generic"},
         source_group="official_blog",
         source_role="official",
         fetch_interval=1,
@@ -247,6 +251,42 @@ def test_ai_failure_isolated_per_item_and_persisted(tmp_path):
         assert session.scalar(select(AIItemReview).where(AIItemReview.status == "ai_failed")) is not None
 
 
+def test_github_summary_failure_remains_hotspot_and_is_retryable(tmp_path):
+    sf = _db(tmp_path)
+    source = _source()
+    spec = source_spec_from_config(source)
+    with sf() as session:
+        repo = IntelRepository(session)
+        repo.upsert_source(source, policy=spec)
+        repo.insert_item(
+            FetchItem(
+                source_id=source.id,
+                external_id="github_repo:retry/project",
+                title="Retry project",
+                url="https://github.com/retry/project",
+                metrics={"stars": 900, "pushed_at": (NOW - timedelta(days=1)).isoformat()},
+                raw_payload={"github_item_type": "repository", "full_name": "retry/project"},
+            )
+        )
+        session.commit()
+
+    class _FailingAI(_AI):
+        def analyze(self, request):
+            self.calls.append(request.item_id)
+            raise RuntimeError("summary unavailable")
+
+    ai = _FailingAI()
+    result = run_intel_process_job(session_factory=sf, source_specs={source.id: spec}, ai_client=ai, limit=10)
+    assert result.ai_failed == 1
+
+    with sf() as session:
+        row = session.scalar(select(IntelItem))
+        assert row.status == "hotspot"
+        assert row.ai_review.status == "ai_failed"
+        pending = IntelRepository(session).list_pending_items(limit=None)
+        assert [item.id for item in pending] == [row.id]
+
+
 def test_export_contains_audit_fields_and_dry_run_does_not_write(tmp_path):
     sf = _db(tmp_path)
     source = _source()
@@ -274,7 +314,7 @@ def test_export_contains_audit_fields_and_dry_run_does_not_write(tmp_path):
     assert actual.exported == 1
     record = json.loads((output / "intel_items.jsonl").read_text().splitlines()[0])
     assert record["metrics"]["stars"] == 999
-    assert record["ai"] is None
+    assert record["ai"]["summary_cn"] == "测试摘要"
     assert record["verification"]["mode"] == "metadata_only"
 
 
@@ -283,8 +323,9 @@ def test_community_links_are_retained_as_follow_up_candidates(tmp_path):
     source = SourceConfig(
         id="community_test",
         name="Community",
-        type="rss",
+        transport="feed",
         url="https://community.example/feed.xml",
+        feed={"format": "rss", "adapter": "generic"},
         source_group="community",
         source_role="community",
         fetch_interval=1,
@@ -318,8 +359,9 @@ def test_verifier_failure_keeps_successful_ai_review_and_marks_needs_review(tmp_
     source = SourceConfig(
         id="official_error",
         name="Official",
-        type="rss",
+        transport="feed",
         url="https://official.example/feed.xml",
+        feed={"format": "rss", "adapter": "generic"},
         source_group="official_blog",
         source_role="official",
         fetch_interval=1,

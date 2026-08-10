@@ -15,11 +15,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.client import ItemAnalysisClient
 from app.ai.schemas import ItemAnalysisRequest, ItemAnalysisResponse, parse_project_summary_response
-from app.collectors.unified import GitHubCollector
+from app.collectors.github import GitHubCollector
 from app.config.settings import Settings
-from app.config.source_registry import DEFAULT_REGISTRY_PATH, SourceConfig, load_source_registry
+from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
 from app.domain.models import FetchItem, SourceSpec
-from app.domain.policies import selection_decision, source_spec_from_config
+from app.domain.policies import selection_decision
 from app.domain.verification import (
     MODE_DISCOVERY,
     MODE_METADATA,
@@ -561,8 +561,8 @@ def _is_github_source(spec: SourceSpec) -> bool:
 
     mode = spec.selection_policy.mode.casefold().replace("-", "_")
     return bool(
-        spec.type in {"github_api", "github_trending"}
-        or spec.collector_type in {"github", "github_trending"}
+        spec.transport == "github"
+        or (spec.github is not None and spec.github.mode in {"search", "releases", "trending"})
         or mode in {"github_active_high_star", "active_high_star", "github_trending"}
     )
 
@@ -579,7 +579,7 @@ def run_intel_process_from_settings(
     http_client: Any | None = None,
 ) -> IntelProcessResult:
     registry = load_source_registry(registry_path, env={"RSSHUB_BASE_URL": settings.rsshub_base_url or ""})
-    specs = {source.id: source_spec_from_config(source) for source in registry.sources}
+    specs = {source.id: source for source in registry.sources}
     database_url = _readable_database_url(settings.database_url, dry_run=dry_run)
     engine = create_engine_from_url(database_url)
     if not dry_run or database_url == "sqlite:///:memory:":
@@ -709,24 +709,54 @@ def _item_to_fetch_item(item: IntelItem) -> FetchItem:
 
 def _spec_from_row(row: Source | None) -> SourceSpec:
     if row is None:
-        return source_spec_from_config({"id": "unknown", "name": "unknown", "type": "rss"})
-    return source_spec_from_config(
-        {
-            "id": row.id,
-            "name": row.name,
-            "type": row.type,
-            "url": row.url,
-            "enabled": row.enabled,
-            "priority": row.priority,
-            "fetch_interval": row.fetch_interval,
-            "source_group": row.source_group,
-            "source_subtype": row.source_subtype,
-            "source_role": row.source_role,
-            "content_class": row.content_class,
-            "selection_policy": _json_dict(row.selection_policy_json),
-            "verification_policy": _json_dict(row.verification_policy_json),
+        return SourceSpec.model_validate(
+            {
+                "id": "unknown",
+                "name": "unknown",
+                "transport": "feed",
+                "url": "https://invalid.local/",
+                "feed": {"format": "rss", "adapter": "generic"},
+                "content_class": "community_social",
+            }
+        )
+    data: dict[str, Any] = {
+        "id": row.id,
+        "name": row.name,
+        "transport": row.transport,
+        "url": row.url,
+        "enabled": row.enabled,
+        "priority": row.priority,
+        "fetch_interval": row.fetch_interval,
+        "default_limit": row.default_limit,
+        "source_group": row.source_group,
+        "source_subtype": row.source_subtype,
+        "source_role": row.source_role,
+        "spam_risk": row.spam_risk,
+        "requires_verification": row.requires_verification,
+        "quality_weight": row.quality_weight,
+        "content_class": row.content_class,
+        "selection_policy": _json_dict(row.selection_policy_json),
+        "verification_policy": _json_dict(row.verification_policy_json),
+    }
+    if row.transport in {"feed", "rsshub"}:
+        data["feed"] = {
+            "format": row.feed_format or "rss",
+            "adapter": row.feed_adapter or "generic",
         }
-    )
+    elif row.transport == "github":
+        github: dict[str, Any] = {"mode": row.github_mode or "search"}
+        if row.github_query is not None:
+            github["query"] = row.github_query
+        if row.github_sort is not None:
+            github["sort"] = row.github_sort
+        if row.github_order is not None:
+            github["order"] = row.github_order
+        if row.github_pushed_days is not None:
+            github["pushed_days"] = row.github_pushed_days
+        if row.github_period is not None:
+            github["period"] = row.github_period
+        data["github"] = github
+    return SourceSpec.model_validate(data)
 
 
 def _json_dict(value: str | None) -> dict[str, Any]:

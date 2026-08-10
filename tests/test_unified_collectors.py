@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
-from app.collectors.unified import GitHubCollector, GitHubTrendingCollector, ProductHuntCollector, RSSCollector
+from app.collectors.feed import FeedCollector, ProductHuntCollector, RSSCollector
+from app.collectors.github import GitHubCollector, GitHubTrendingCollector
+from app.collectors.router import CollectorRouter
 from app.domain.models import SourceSpec
 
 
@@ -12,18 +15,15 @@ class _Client:
         self.calls = []
 
     def get(self, url, **kwargs):
-        self.calls.append((url, kwargs))
+        self.calls.append(("GET", url, kwargs))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
         return response
 
     def post(self, url, **kwargs):
-        self.calls.append((url, kwargs))
-        response = self.responses.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        return response
+        self.calls.append(("POST", url, kwargs))
+        raise AssertionError("Product Hunt and feed collectors must not issue POST requests")
 
 
 def _response(url, body, status=200, headers=None):
@@ -35,16 +35,65 @@ def _response(url, body, status=200, headers=None):
     )
 
 
+def _feed_source(source_id="rss", *, transport="feed", feed=None, **kwargs):
+    return SourceSpec(
+        id=source_id,
+        name=kwargs.pop("name", source_id),
+        transport=transport,
+        url=kwargs.pop("url", "https://example.test/feed.xml"),
+        feed=feed,
+        **kwargs,
+    )
+
+
+def _github_source(source_id="github", *, mode="search", url=None, **kwargs):
+    options = {"mode": mode, **kwargs.pop("github", {})}
+    return SourceSpec(
+        id=source_id,
+        name=kwargs.pop("name", source_id),
+        transport="github",
+        url=url or ("https://api.github.com/search/repositories" if mode == "search" else "https://github.com/trending?since=weekly"),
+        github=options,
+        **kwargs,
+    )
+
+
 def test_rss_collector_returns_fetch_batch_and_uses_shared_client():
     url = "https://example.test/feed.xml"
     body = b"<rss version='2.0'><channel><title>feed</title><item><title>AI release</title><link>https://example.test/a</link><description>model release</description></item></channel></rss>"
     client = _Client([_response(url, body)])
-    source = SourceSpec(id="rss", name="RSS", type="rss", url=url)
+    source = _feed_source(url=url)
+
     batch = RSSCollector(client, sleeper=lambda _: None).collect(source, 10)
+
     assert batch.status == "success"
     assert batch.items_fetched == 1
     assert batch.items[0].source_id == "rss"
-    assert client.calls[0][0] == url
+    assert client.calls[0][0:2] == ("GET", url)
+
+
+def test_rsshub_uses_the_same_feed_implementation():
+    url = "https://rsshub.example.test/openai"
+    body = b"<rss version='2.0'><channel><item><title>RSSHub item</title></item></channel></rss>"
+    client = _Client([_response(url, body)])
+    source = _feed_source("rsshub", transport="rsshub", url=url)
+
+    batch = FeedCollector(client, sleeper=lambda _: None).collect(source, 10)
+
+    assert batch.status == "success"
+    assert batch.items[0].title == "RSSHub item"
+
+
+def test_rss_503_retries_once_and_records_retry_count():
+    url = "https://example.test/feed.xml"
+    body = b"<rss version='2.0'><channel><item><title>retry</title></item></channel></rss>"
+    client = _Client([_response(url, b"down", status=503), _response(url, body)])
+
+    batch = RSSCollector(client, retries=3, sleeper=lambda _: None).collect(_feed_source(url=url), 10)
+
+    assert batch.status == "success"
+    assert batch.retry_count == 1
+    assert len(client.calls) == 2
 
 
 def test_github_trending_html_maps_weekly_metrics_and_rank():
@@ -62,17 +111,16 @@ def test_github_trending_html_maps_weekly_metrics_and_rank():
     </body></html>
     """
     client = _Client([_response(url, body)])
-    source = SourceSpec(
-        id="github_trending_weekly_native",
-        name="GitHub Trending",
-        type="github_trending",
+    source = _github_source(
+        "github_trending_weekly_native",
+        mode="trending",
         url=url,
-        source_subtype="trending_weekly",
+        github={"period": "weekly"},
         content_class="project_tool",
-        collector_type="github_trending",
-        selection_policy={"mode": "github_trending", "period": "weekly"},
     )
+
     batch = GitHubTrendingCollector(client, sleeper=lambda _: None).collect(source, 10)
+
     assert batch.status == "success"
     assert batch.transport == "github_trending_html"
     item = batch.items[0]
@@ -82,20 +130,6 @@ def test_github_trending_html_maps_weekly_metrics_and_rank():
     assert item.metrics["trending_period"] == "weekly"
     assert item.metrics["trending_rank"] == 1
     assert item.metrics["language"] == "Python"
-
-
-def test_rss_503_retries_once_and_records_retry_count():
-    url = "https://example.test/feed.xml"
-    body = b"<rss version='2.0'><channel><item><title>retry</title></item></channel></rss>"
-    client = _Client([
-        _response(url, b"down", status=503),
-        _response(url, body),
-    ])
-    source = SourceSpec(id="rss", name="RSS", type="rss", url=url)
-    batch = RSSCollector(client, retries=3, sleeper=lambda _: None).collect(source, 10)
-    assert batch.status == "success"
-    assert batch.retry_count == 1
-    assert len(client.calls) == 2
 
 
 def test_github_search_adds_recent_push_filter_and_maps_metrics():
@@ -115,26 +149,20 @@ def test_github_search_adds_recent_push_filter_and_maps_metrics():
             }
         ]
     }
-    client = _Client([_response(url, b"{}")])
-    # Replace response.json without relying on private httpx helpers.
     response = _response(url, b"{}")
     response.json = lambda: payload
-    client.responses = [response]
-    source = SourceSpec(
-        id="github",
-        name="GitHub",
-        type="github_api",
+    client = _Client([response])
+    source = _github_source(
+        mode="search",
         url=url,
-        source_subtype="search_repositories",
-        search_query="AI stars:>100",
-        search_sort="stars",
-        search_order="desc",
-        search_pushed_days=30,
+        github={"query": "AI stars:>100", "sort": "stars", "order": "desc", "pushed_days": 30},
     )
+
     batch = GitHubCollector(client, base_url="https://api.github.com").collect(source, 10)
+
     assert batch.status == "success"
     assert batch.items[0].metrics["stars"] == 1200
-    assert "pushed:>" in client.calls[0][1]["params"]["q"]
+    assert "pushed:>" in client.calls[0][2]["params"]["q"]
 
 
 def test_github_search_rejects_payload_without_items_and_keeps_response_bytes():
@@ -142,14 +170,7 @@ def test_github_search_rejects_payload_without_items_and_keeps_response_bytes():
     response = _response(url, b'{"message":"rate limit metadata"}')
     response.json = lambda: {"message": "rate limit metadata"}
     client = _Client([response])
-    source = SourceSpec(
-        id="github",
-        name="GitHub",
-        type="github_api",
-        url=url,
-        source_subtype="search_repositories",
-        search_query="AI",
-    )
+    source = _github_source(mode="search", url=url, github={"query": "AI"})
 
     batch = GitHubCollector(client, retries=0).collect(source, 10)
 
@@ -158,14 +179,48 @@ def test_github_search_rejects_payload_without_items_and_keeps_response_bytes():
     assert batch.response_bytes == len(response.content)
 
 
-def test_producthunt_extracts_votes_and_github_link():
-    url = "https://www.producthunt.com/feed"
-    body = b"<feed xmlns='http://www.w3.org/2005/Atom'><entry><title>Tool</title><link href='https://example.test/tool'/><summary>https://github.com/owner/tool</summary><published>2026-08-04T00:00:00Z</published></entry></feed>"
-    client = _Client([_response(url, body)])
-    source = SourceSpec(id="producthunt_feed", name="Product Hunt", type="atom", url=url, source_group="producthunt")
-    batch = ProductHuntCollector(client, sleeper=lambda _: None).collect(source, 10)
+def test_github_releases_maps_release_items():
+    url = "https://api.github.com/repos/owner/project/releases"
+    payload = [{
+        "id": 7,
+        "tag_name": "v1.2.0",
+        "name": "Stable release",
+        "body": "Fixes",
+        "html_url": "https://github.com/owner/project/releases/tag/v1.2.0",
+        "published_at": "2026-08-04T00:00:00Z",
+        "author": {"login": "owner"},
+    }]
+    response = _response(url, b"[]")
+    response.json = lambda: payload
+    client = _Client([response])
+    source = _github_source("github_releases", mode="releases", url=url)
+
+    batch = GitHubCollector(client, retries=0).collect(source, 10)
+
     assert batch.status == "success"
-    assert batch.items[0].metrics["github_url"] == "https://github.com/owner/tool"
+    assert batch.items[0].kind == "github_release"
+    assert batch.items[0].external_id == "github_release:7"
+    assert "owner/project" in batch.items[0].title
+
+
+def test_producthunt_atom_maps_engagement_and_github_link_without_post():
+    url = "https://www.producthunt.com/feed"
+    body = b"<feed xmlns='http://www.w3.org/2005/Atom'><entry><title>Tool</title><link href='https://example.test/tool'/><summary>HTTPS://WWW.GITHUB.COM/Owner/Repo.git</summary><published>2026-08-04T00:00:00Z</published></entry></feed>"
+    client = _Client([_response(url, body)])
+    source = _feed_source(
+        "producthunt_feed",
+        url=url,
+        feed={"format": "atom", "adapter": "producthunt"},
+        source_group="producthunt",
+    )
+
+    batch = ProductHuntCollector(client, api_token="ignored", sleeper=lambda _: None).collect(source, 10)
+
+    assert batch.status == "success"
+    assert batch.items[0].metrics["github_url"] == "https://github.com/Owner/Repo"
+    assert batch.items[0].metrics["canonical_project_key"] == "Owner/Repo"
+    assert batch.items[0].external_id == "github_repo:owner/repo"
+    assert [method for method, _, _ in client.calls] == ["GET"]
 
 
 def test_producthunt_extracts_namespaced_vote_and_comment_fields():
@@ -177,7 +232,12 @@ def test_producthunt_extracts_namespaced_vote_and_comment_fields():
         b"<published>2026-08-04T00:00:00Z</published></entry></feed>"
     )
     client = _Client([_response(url, body)])
-    source = SourceSpec(id="producthunt_feed", name="Product Hunt", type="atom", url=url, source_group="producthunt")
+    source = _feed_source(
+        "producthunt_feed",
+        url=url,
+        feed={"format": "atom", "adapter": "producthunt"},
+        source_group="producthunt",
+    )
 
     batch = ProductHuntCollector(client, sleeper=lambda _: None).collect(source, 10)
 
@@ -185,73 +245,23 @@ def test_producthunt_extracts_namespaced_vote_and_comment_fields():
     assert batch.items[0].metrics["comments"] == 7
 
 
-def test_producthunt_canonicalizes_www_and_mixed_case_github_links():
-    url = "https://www.producthunt.com/feed"
-    body = (
-        b"<feed xmlns='http://www.w3.org/2005/Atom'><entry><title>Tool</title>"
-        b"<link href='https://example.test/tool'/>"
-        b"<summary>HTTPS://WWW.GITHUB.COM/Owner/Repo.git</summary>"
-        b"<published>2026-08-04T00:00:00Z</published></entry></feed>"
+def test_router_uses_explicit_nested_routes_and_rejects_unknown_transport():
+    feed = object()
+    router = CollectorRouter(
+        feed=feed,
+        github=object(),
+        github_trending=object(),
+        producthunt=object(),
     )
-    client = _Client([_response(url, body)])
-    source = SourceSpec(id="producthunt_feed", name="Product Hunt", type="atom", url=url, source_group="producthunt")
-
-    batch = ProductHuntCollector(client, sleeper=lambda _: None).collect(source, 10)
-
-    item = batch.items[0]
-    assert item.metrics["github_url"] == "https://github.com/Owner/Repo"
-    assert item.metrics["canonical_project_key"] == "Owner/Repo"
-    assert item.external_id == "github_repo:owner/repo"
-
-
-def test_producthunt_api_maps_votes_comments_and_rank_when_token_is_configured():
-    api_url = "https://api.producthunt.com/v2/api/graphql"
-    payload = {
-        "data": {
-            "posts": {
-                "nodes": [
-                    {
-                        "id": "123",
-                        "name": "API Tool",
-                        "tagline": "An AI workflow",
-                        "description": "Project at https://github.com/owner/tool",
-                        "url": "https://www.producthunt.com/posts/api-tool",
-                        "website": "https://example.test",
-                        "votesCount": 456,
-                        "commentsCount": 12,
-                        "createdAt": "2026-08-04T00:00:00Z",
-                        "featuredAt": "2026-08-04T01:00:00Z",
-                        "dailyRank": 3,
-                        "weeklyRank": 8,
-                        "productLinks": [],
-                    }
-                ]
-            }
-        }
-    }
-    response = _response(api_url, b"{}")
-    response.json = lambda: payload
-    client = _Client([response])
-    source = SourceSpec(
-        id="producthunt_feed",
-        name="Product Hunt",
-        type="atom",
-        url="https://www.producthunt.com/feed",
-        source_group="producthunt",
-    )
-
-    batch = ProductHuntCollector(
-        client,
-        api_token="token",
-        api_url=api_url,
-        sleeper=lambda _: None,
-    ).collect(source, 10)
-
-    item = batch.items[0]
-    assert batch.transport == "producthunt_api"
-    assert item.metrics["votes"] == 456
-    assert item.metrics["comments"] == 12
-    assert item.metrics["daily_rank"] == 3
-    assert item.metrics["github_url"] == "https://github.com/owner/tool"
-    assert client.calls[0][1]["headers"]["Authorization"] == "Bearer token"
-    assert client.calls[0][1]["json"]["variables"]["first"] == 10
+    assert router.collector_for(_feed_source()) is feed
+    assert router.collector_for(_feed_source(transport="rsshub")) is feed
+    with pytest.raises(ValueError, match="unsupported source transport"):
+        invalid = SourceSpec.model_construct(
+            id="invalid",
+            name="Invalid",
+            transport="unknown",
+            url="https://example.test/unknown",
+            feed=None,
+            github=None,
+        )
+        router.collector_for(invalid)

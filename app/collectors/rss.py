@@ -1,5 +1,5 @@
-"""Public v2 RSS/Atom collector name."""
+"""Public RSS/Atom collector exports."""
 
-from app.collectors.unified import FeedCollector, RSSCollector
+from app.collectors.feed import FeedCollector, RSSCollector
 
 __all__ = ["FeedCollector", "RSSCollector"]

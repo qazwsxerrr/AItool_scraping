@@ -59,23 +59,28 @@ def test_web_github_metadata_fixture_renders_home_github_and_search(tmp_path):
     assert home_response.status_code == 200
     assert "本周 GitHub AI 项目热点" in home_response.text
     assert "example/OmniRoute" in home_response.text
+    assert "持久化项目介绍：统一管理 LLM provider。" in home_response.text
 
     assert github_response.status_code == 200
     assert "GitHub 项目热点" in github_response.text
     assert "example/OmniRoute" in github_response.text
     assert "github-card" in github_response.text
     assert "8989" in github_response.text
+    assert "持久化项目介绍：统一管理 LLM provider。" in github_response.text
+    assert "本周新增 180" in github_response.text
+    assert "今日新增 42" in github_response.text
 
     assert search_response.status_code == 200
     assert "GitHub Projects" in search_response.text
     assert "example/OmniRoute" in search_response.text
+    assert "持久化项目介绍：统一管理 LLM provider。" in search_response.text
 
 
 def _write_github_metadata(path) -> None:
     payload = {
         "id": 100,
         "source_id": "github_weekly_active_rag",
-        "source_type": "github_api",
+        "source_transport": "github",
         "external_id": "github_repo:example/omniroute",
         "content_class": "project_tool",
         "status": "hotspot",
@@ -93,8 +98,12 @@ def _write_github_metadata(path) -> None:
             "pushed_at": "2026-07-01T09:27:17+00:00",
             "latest_release": "v1.0.0",
             "topics": ["OmniRoute", "MCP", "LLM", "gateway"],
+            "trending": {
+                "weekly": {"rank": 1, "stars_since": 180},
+                "daily": {"rank": 2, "stars_since": 42},
+            },
         },
         "raw_payload": {"github_item_type": "repository", "full_name": "example/OmniRoute"},
-        "ai": None,
+        "ai": {"status": "success", "summary_cn": "持久化项目介绍：统一管理 LLM provider。"},
     }
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

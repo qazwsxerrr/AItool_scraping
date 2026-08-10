@@ -30,7 +30,10 @@ RSSHUB_BASE_URL=http://127.0.0.1:1200
 Then run from the project root:
 
 ```bash
-./.conda/python.exe scripts/run_fetch_once.py --group x --limit-per-source 5
-./.conda/python.exe scripts/run_normalize_once.py --limit 300
-./.conda/python.exe scripts/run_prefilter_once.py --limit 300
+uv run python scripts/run_fetch_once.py --source x_account_openai --limit 5 --force
+uv run python scripts/run_intel_once.py --source x_account_openai --limit 5 --force
 ```
+
+RSSHub responses enter the same `transport: rsshub` route as other RSS/Atom
+feeds. The registry owns the route URL and the fetch job owns persistence; no
+separate normalize/prefilter scripts are required.

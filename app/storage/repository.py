@@ -13,7 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from app.config.source_registry import SourceConfig
+from app.domain.models import SourceSpec
 from app.storage.models import (
     AIItemReview,
     IntelItem,
@@ -50,26 +50,41 @@ class IntelRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def upsert_source(self, source: SourceConfig, *, policy: Any | None = None) -> Source:
+    def upsert_source(self, source: SourceSpec, *, policy: Any | None = None) -> Source:
+        """Persist one resolved ``SourceSpec`` without reconstructing config.
+
+        The nested feed/GitHub options are intentionally stored as explicit
+        columns. This keeps source rows useful to the fetch cooldown checks and
+        lets a fresh local database be inspected without legacy routing fields.
+        """
         row = self.session.get(Source, source.id)
         if row is None:
             row = Source(id=source.id)
             self.session.add(row)
-        row.name = source.name
-        row.type = source.type
+        row.name = source.name or source.id
+        row.transport = source.transport
         row.url = source.url
         row.enabled = source.enabled
         row.priority = source.priority
         row.fetch_interval = source.fetch_interval
-        row.parser_type = source.parser_type
-        row.source_group = source.source_group
-        row.source_subtype = source.source_subtype
+        row.default_limit = source.default_limit
+        feed = source.feed
+        github = source.github
+        row.feed_format = getattr(feed, "format", None) if feed is not None else None
+        row.feed_adapter = getattr(feed, "adapter", None) if feed is not None else None
+        row.github_mode = getattr(github, "mode", None) if github is not None else None
+        row.github_query = getattr(github, "query", None) if github is not None else None
+        row.github_sort = getattr(github, "sort", None) if github is not None else None
+        row.github_order = getattr(github, "order", None) if github is not None else None
+        row.github_pushed_days = getattr(github, "pushed_days", None) if github is not None else None
+        row.github_period = getattr(github, "period", None) if github is not None else None
+        row.source_group = source.source_group or "general"
+        row.source_subtype = source.source_subtype or "fixed"
         row.quality_weight = source.quality_weight
         row.source_role = source.source_role
         row.spam_risk = source.spam_risk
         row.requires_verification = source.requires_verification
         row.content_class = source.content_class or "community_social"
-        row.collector_type = source.collector_type or source.type
         selection_policy = getattr(source, "selection_policy", {})
         verification_policy = getattr(source, "verification_policy", {})
         if hasattr(selection_policy, "model_dump"):
@@ -88,12 +103,6 @@ class IntelRepository:
                 or source.content_class
                 or row.content_class
                 or "community_social"
-            )
-            row.collector_type = (
-                _text(getattr(policy, "collector_type", None))
-                or source.collector_type
-                or row.collector_type
-                or source.type
             )
             row.selection_policy_json = _dump_json(_policy_dict(policy, "selection"))
             row.verification_policy_json = _dump_json(_policy_dict(policy, "verification"))
@@ -569,6 +578,9 @@ def _object_mapping(value: Any) -> dict[str, Any]:
 
 
 def _policy_dict(policy: Any, kind: str) -> dict[str, Any]:
+    if isinstance(policy, Mapping):
+        value = policy.get(f"{kind}_policy", {})
+        return dict(value) if isinstance(value, Mapping) else {}
     value = getattr(policy, f"{kind}_policy", None)
     if isinstance(value, Mapping):
         return dict(value)

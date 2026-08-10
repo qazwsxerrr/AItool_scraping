@@ -26,13 +26,14 @@ def test_read_repository_maps_v2_items_to_existing_ui_dtos(tmp_path):
         source = Source(
             id="github_releases",
             name="GitHub Releases",
-            type="rss",
+            transport="feed",
             url="https://example.com/feed.xml",
+            feed_format="rss",
+            feed_adapter="generic",
             source_group="official_model_company",
             source_subtype="official",
             source_role="official",
             content_class="official_model_company",
-            collector_type="rss",
         )
         item = IntelItem(
             source_id=source.id,

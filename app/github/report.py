@@ -174,6 +174,7 @@ def _unique_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _is_github_repository(record: dict[str, Any]) -> bool:
+    source_transport = str(record.get("source_transport") or "").casefold()
     source_type = str(record.get("source_type") or "").casefold()
     source_id = str(record.get("source_id") or "").casefold()
     external_id = str(record.get("external_id") or "").casefold()
@@ -186,7 +187,8 @@ def _is_github_repository(record: dict[str, Any]) -> bool:
         and not external_id.startswith("github_release:")
         and (
             payload_type == "repository"
-            or source_type in {"github_api", "github_trending"}
+            or source_transport == "github"
+            or source_type in {"github", "github_api", "github_trending"}
             or source_id.startswith("github_")
             or external_id.startswith("github_repo:")
             or "github.com/" in url

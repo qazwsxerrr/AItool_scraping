@@ -18,6 +18,8 @@ source registry
 
 数据侧负责抓取、确定性筛选和导出；现有 UI 只读取数据库和导出结果，不在请求中运行 collector 或 AI。GitHub 热点报告按日期保存，数据库不建立历史 Star 快照表。
 
+本轮整理已按下述边界落地：来源 registry、collector 路由、fetch/storage 接口和本地 SQLite schema 已切换到 canonical `SourceSpec`；Product Hunt 固定为 Atom feed；旧路由字段和 GraphQL 配置不再参与运行。
+
 技术选型确定为：
 
 - Python 3.12
@@ -72,7 +74,7 @@ source registry
   - 按周期新增 Star、累计 Star 降序
   - 额外记录 forks、语言、topic、release、README 完整度
 - Product Hunt：
-  - 按 votes、评论、发布时间和增长信号排序
+  - 只抓取公开 Atom；以 feed 中可用的发布时间和互动字段排序，缺失字段不通过额外 API 补抓
 - 带 GitHub 链接的产品：
   - 解析 canonical `owner/repo`
   - 以 GitHub Star 和活跃度作为主要热度指标
@@ -119,12 +121,13 @@ source registry
 ```text
 id
 name
-type
+transport
 url
 enabled
 fetch_interval
 content_class
-collector_type
+feed.format / feed.adapter
+github.mode 及 mode-specific options
 selection_policy_json
 verification_policy_json
 priority
@@ -133,6 +136,13 @@ priority
 示例：
 
 ```yaml
+transport: github
+github:
+  mode: search
+  query: topic:llm
+  sort: stars
+  order: desc
+  pushed_days: 7
 content_class: project_tool
 selection_policy:
   mode: github_active_high_star
@@ -282,10 +292,12 @@ app/
 │  └─ source_registry.yaml
 ├─ collectors/
 │  ├─ base.py
-│  ├─ rss.py
-│  ├─ rsshub.py
-│  ├─ github.py
-│  └─ producthunt.py
+│  ├─ http.py
+│  ├─ feed.py
+│  ├─ github_api.py
+│  ├─ github_trending.py
+│  ├─ router.py
+│  └─ factory.py
 ├─ domain/
 │  ├─ models.py
 │  ├─ policies.py
@@ -326,7 +338,7 @@ transport
 error
 ```
 
-GitHub、RSS、RSSHub、Product Hunt 只负责抓取和字段映射，不包含 AI、评分或数据库写入。
+GitHub、RSS、RSSHub、Product Hunt 只负责抓取和字段映射，不包含 AI、评分或数据库写入。Product Hunt 是 `transport=feed` 且 `feed.format=atom`、`feed.adapter=producthunt` 的普通 Feed 路由；未知 transport/mode 必须显式失败。
 
 ### 三个主 Job
 
@@ -346,9 +358,9 @@ GitHub、RSS、RSSHub、Product Hunt 只负责抓取和字段映射，不包含 
 职责：
 
 1. 按 source policy 确定性筛选
-2. 仅对 `official_model_company` 和 `community_social` 保留项执行一次 AI 调用
-3. GitHub 项目/Release 只使用 stars、forks、pushed_at 等 metadata，不调用 AI
-4. 根据 `content_class` 决定是否执行轻量核实
+2. `official_model_company` 和 `community_social` 保留项执行一次通用 AI 分析；GitHub 选中仓库执行一次窄项目摘要 AI
+3. GitHub 项目先由累计 Star、daily/weekly 周期 Star、Fork 等确定性指标排序和筛选，再补充 bounded metadata/README；AI 不参与保留决策
+4. GitHub 项目只写入跳过状态的 metadata 审计行，不执行 claim/evidence 核实；其他类别按 `content_class` 决定轻量核实
 5. 按需写入 `ai_item_reviews` 和 `item_verifications`
 
 AI 单条响应固定返回：
@@ -396,7 +408,7 @@ ORDER BY Trending 周期新增 Star、累计 Star DESC
 
 Search API 的候选 topic 为：`llm`、`ai-agent`、`rag`、`vector-database`、`large-language-model`、`machine-learning`。
 
-GitHub Trending 使用 GitHub 页面原生的 `stars today` / `stars this week` 信号；项目当前不建立历史 Star 快照，不把累计 Star 差值伪装成周增长。
+GitHub Trending 使用 GitHub 页面原生的 `stars today` / `stars this week` 信号；项目当前不建立历史 Star 快照，不把累计 Star 差值伪装成周增长。累计 Star 为主要确定性排序信号，daily/weekly 周期 Star 和 Fork 作为后续信号；AI 摘要不能改变筛选结果。
 
 后续如需更细粒度评分可增加：
 
@@ -505,7 +517,7 @@ JSONL/Markdown export
 GitHub Trending date-scoped Markdown report
 ```
 
-GitHub 项目仍直接使用标准 `intel_items.jsonl` 的 metadata，不调用 AI 评分；`export` 同时生成 `output/github-trending/YYYY/MM/YYYYMMDD.md`，现有 `/github` 页面读取合并后的 Trending/Search 指标。
+GitHub 项目仍直接使用标准 `intel_items.jsonl` 的合并指标；选中后补充描述、topics、README，并持久化窄 AI 项目介绍。`export` 同时生成 `output/github-trending/YYYY/MM/YYYYMMDD.md`，现有 `/github` 页面读取合并后的 Trending/Search 指标和项目介绍。
 
 ## 7. 测试和验收标准
 
@@ -514,7 +526,7 @@ GitHub 项目仍直接使用标准 `intel_items.jsonl` 的 metadata，不调用 
 - RSS、Atom、RSSHub、GitHub API、GitHub Trending HTML、Product Hunt 的统一 collector 接口
 - source policy 的三类分流
 - GitHub Trending 周期 Star、Search API 最近 push + Star 阈值
-- Product Hunt votes/时间排序
+- Product Hunt Atom adapter 的字段映射和缺失互动字段降级
 - 社区内容标记 `discovery_only`
 - 官方直链成功、404、错误域名、超时
 - AI 合法 JSON、缺字段、非法分数、模型超时

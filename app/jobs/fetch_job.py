@@ -13,18 +13,12 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.collectors.unified import (
-    CollectorRouter,
-    GitHubCollector,
-    GitHubTrendingCollector,
-    ProductHuntCollector,
-    RSSCollector,
-    RSSHubCollector,
-)
+from app.collectors.feed import FeedCollector, ProductHuntCollector
+from app.collectors.github import GitHubCollector, GitHubTrendingCollector
+from app.collectors.router import CollectorRouter
 from app.config.settings import Settings
-from app.config.source_registry import DEFAULT_REGISTRY_PATH, SourceConfig, load_source_registry
-from app.domain.models import FetchBatch, FetchItem, SourceSpec
-from app.domain.policies import source_spec_from_config
+from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
+from app.domain.models import FetchBatch, SourceSpec
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelCounts, IntelRepository
 from app.storage.models import FetchAttempt, Source
@@ -79,7 +73,7 @@ class IntelFetchResult:
 def run_intel_fetch_job(
     *,
     session_factory: sessionmaker[Session],
-    sources: Iterable[SourceConfig],
+    sources: Iterable[SourceSpec],
     router: CollectorRouter,
     limit_per_source: int | None = None,
     source_filter: str | None = None,
@@ -90,7 +84,7 @@ def run_intel_fetch_job(
 ) -> IntelFetchResult:
     """Fetch due sources with one shared client and source-level isolation."""
 
-    specs = [source_spec_from_config(source) for source in sources]
+    specs = list(sources)
     selected = [
         spec
         for spec in specs
@@ -114,7 +108,7 @@ def run_intel_fetch_job(
             repo = IntelRepository(session)
             for spec in selected:
                 policy = spec
-                source_row = repo.upsert_source(spec_to_config(spec), policy=policy)
+                source_row = repo.upsert_source(spec, policy=policy)
                 latest = session.scalars(
                     select(FetchAttempt)
                     .where(FetchAttempt.source_id == spec.id)
@@ -136,7 +130,7 @@ def run_intel_fetch_job(
                     repo = IntelRepository(session)
                     attempt = repo.create_attempt(
                         source_id=spec.id,
-                        request_url=_safe_url(spec.url or ""),
+                        request_url=_safe_url(spec.url),
                         run_id=result.run_id,
                         manual_override=False,
                     )
@@ -157,7 +151,7 @@ def run_intel_fetch_job(
                 with session_factory() as session:
                     attempt = IntelRepository(session).create_attempt(
                         source_id=spec.id,
-                        request_url=_safe_url(spec.url or ""),
+                        request_url=_safe_url(spec.url),
                         run_id=result.run_id,
                         manual_override=force,
                     )
@@ -255,8 +249,8 @@ def run_intel_fetch_from_settings(
         headers={"User-Agent": settings.user_agent},
     )
     try:
-        feed = RSSCollector(client, retries=settings.request_retries, user_agent=settings.user_agent)
-        rsshub = RSSHubCollector(client, retries=settings.request_retries, user_agent=settings.user_agent)
+        feed = FeedCollector(client, retries=settings.request_retries, user_agent=settings.user_agent)
+        rsshub = feed
         github = GitHubCollector(
             client,
             base_url=settings.github_api_base_url,
@@ -276,9 +270,6 @@ def run_intel_fetch_from_settings(
             retries=settings.request_retries,
             user_agent=settings.user_agent,
             github_lookup=github.lookup_repository,
-            api_token=settings.producthunt_api_token,
-            api_url=settings.producthunt_api_url,
-            timeout_seconds=settings.request_timeout_seconds,
         )
         router = CollectorRouter(
             feed=feed,
@@ -302,21 +293,6 @@ def run_intel_fetch_from_settings(
         client.close()
     result.skipped_sources.extend(f"{item.source_id}: {item.reason}" for item in registry.skipped)
     return result
-
-
-def spec_to_config(spec: SourceSpec) -> SourceConfig:
-    """Convert a resolved spec back to the existing collector config shape."""
-
-    data = spec.model_dump(exclude_none=True)
-    if hasattr(spec.selection_policy, "model_dump"):
-        data["selection_policy"] = spec.selection_policy.model_dump(exclude_none=True)
-    if hasattr(spec.verification_policy, "model_dump"):
-        data["verification_policy"] = spec.verification_policy.model_dump(exclude_none=True)
-    data["name"] = data.get("name") or data["id"]
-    data["url"] = data.get("url") or "https://invalid.local/"
-    data["type"] = data.get("type") or "rss"
-    # SourceConfig accepts policy dictionaries and ignores v2-only extras.
-    return SourceConfig.model_validate(data)
 
 
 def _apply_batch_stats(stats: IntelSourceStats, batch: FetchBatch) -> None:

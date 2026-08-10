@@ -91,14 +91,14 @@ def classify_source(source: Any) -> ContentClass:
         return COMMUNITY_SOCIAL
 
     role = _normalise_token(raw.get("source_role"))
-    source_type = _normalise_token(raw.get("type") or raw.get("source_type"))
+    transport = _normalise_token(raw.get("transport"))
     group = _normalise_token(raw.get("source_group"))
     subtype = _normalise_token(raw.get("source_subtype"))
     source_id = _normalise_token(raw.get("id"))
     # X/RSSHub account and search feeds remain discovery sources even when the
     # account itself is official. The official article they link to is the
     # direct source link, not the social post.
-    if source_type == "rsshub" and (
+    if transport == "rsshub" and (
         group == "x"
         or source_id.startswith("x_")
         or role in {"social", "social_search"}
@@ -112,7 +112,7 @@ def classify_source(source: Any) -> ContentClass:
     if role in _COMMUNITY_ROLES:
         return COMMUNITY_SOCIAL
 
-    if source_type in {"github_api", "github_trending"}:
+    if transport == "github":
         return PROJECT_TOOL
 
     identity = " ".join(
@@ -165,7 +165,17 @@ def source_spec_from_config(source: Any) -> SourceSpec:
     if not source_id:
         raise ValueError("source id is required")
 
-    content_class = classify_source(raw)
+    # Validate the canonical transport/options before resolving policies.  In
+    # particular, this rejects the removed ``type``, ``parser_type`` and
+    # ``collector_type`` keys instead of silently guessing a route.
+    canonical = SourceSpec.model_validate(
+        {
+            **raw,
+            "id": source_id,
+            "name": raw.get("name") or source_id,
+        }
+    )
+    content_class = classify_source(canonical)
     selection_defaults = _default_selection_policy(raw, content_class)
     selection_explicit = _policy_mapping(raw.get("selection_policy"))
     selection = SelectionPolicy.model_validate({**selection_defaults, **selection_explicit})
@@ -176,33 +186,17 @@ def source_spec_from_config(source: Any) -> SourceSpec:
         {**verification_defaults, **verification_explicit}
     )
 
-    data = dict(raw)
+    data = canonical.model_dump(exclude={"selection_policy", "verification_policy"})
     data.update(
         {
             "id": source_id,
-            "name": raw.get("name") or source_id,
-            "type": raw.get("type") or raw.get("source_type") or "rss",
-            "collector_type": raw.get("collector_type") or _collector_type(raw),
+            "name": canonical.name or source_id,
             "content_class": content_class,
             "selection_policy": selection,
             "verification_policy": verification,
         }
     )
     return SourceSpec.model_validate(data)
-
-
-def _collector_type(raw: Mapping[str, Any]) -> str:
-    source_type = _normalise_token(raw.get("type") or raw.get("source_type"))
-    identity = " ".join(str(raw.get(key) or "") for key in ("id", "name", "source_group")).casefold()
-    if source_type == "github_api":
-        return "github"
-    if source_type == "github_trending":
-        return "github_trending"
-    if "producthunt" in identity or "product hunt" in identity:
-        return "producthunt"
-    if source_type == "rsshub":
-        return "rsshub"
-    return "atom" if source_type == "atom" else "rss"
 
 
 def selection_decision(
@@ -221,8 +215,7 @@ def selection_decision(
     metadata_only_project = (
         spec.content_class == PROJECT_TOOL
         and (
-            spec.type in {"github_api", "github_trending"}
-            or spec.collector_type in {"github", "github_trending"}
+            spec.transport == "github"
             or mode in {"github_active_high_star", "active_high_star", "github_trending"}
         )
     )
@@ -447,7 +440,7 @@ def _default_selection_policy(raw: Mapping[str, Any], content_class: ContentClas
     if _is_github_search(raw):
         return {
             "mode": "github_active_high_star",
-            "pushed_days": _positive_int(raw.get("search_pushed_days")) or 30,
+            "pushed_days": _github_pushed_days(raw) or 30,
             "min_stars": 100,
             "sort_by": "stars",
             "sort_order": "desc",
@@ -514,25 +507,23 @@ def _source_mapping(source: Any) -> dict[str, Any]:
     keys = (
         "id",
         "name",
-        "type",
-        "source_type",
+        "transport",
         "url",
         "enabled",
         "priority",
         "fetch_interval",
-        "parser_type",
-        "collector_type",
+        "feed",
+        "github",
         "source_group",
         "source_subtype",
+        "quality_weight",
         "source_role",
+        "spam_risk",
+        "requires_verification",
         "default_limit",
         "content_class",
         "selection_policy",
         "verification_policy",
-        "search_pushed_days",
-        "search_sort",
-        "search_order",
-        "search_query",
     )
     return {key: getattr(source, key) for key in keys if hasattr(source, key)}
 
@@ -558,38 +549,50 @@ def _coerce_item(item: Any) -> FetchItem:
 
 def _is_github_search(source: SourceSpec | Mapping[str, Any] | Any) -> bool:
     raw = _source_mapping(source)
-    source_type = _normalise_token(raw.get("type") or raw.get("source_type"))
-    subtype = _normalise_token(raw.get("source_subtype"))
+    transport = _normalise_token(raw.get("transport"))
+    github = _nested_mapping(raw.get("github"))
+    github_mode = _normalise_token(github.get("mode"))
     mode = _normalise_token(_policy_mapping(raw.get("selection_policy")).get("mode"))
     if mode in {"github_active_high_star", "active_high_star"}:
         return True
-    if subtype == "repo_releases":
-        return False
-    return source_type == "github_api" and subtype in {"", "search_repositories"}
+    return transport == "github" and github_mode == "search"
 
 
 def _is_github_trending(source: SourceSpec | Mapping[str, Any] | Any) -> bool:
     raw = _source_mapping(source)
-    source_type = _normalise_token(raw.get("type") or raw.get("source_type"))
-    collector_type = _normalise_token(raw.get("collector_type"))
-    subtype = _normalise_token(raw.get("source_subtype"))
+    transport = _normalise_token(raw.get("transport"))
+    github = _nested_mapping(raw.get("github"))
+    github_mode = _normalise_token(github.get("mode"))
     mode = _normalise_token(_policy_mapping(raw.get("selection_policy")).get("mode"))
     return bool(
-        source_type == "github_trending"
-        or collector_type == "github_trending"
+        transport == "github" and github_mode == "trending"
         or mode == "github_trending"
-        or subtype.startswith("trending_")
     )
 
 
 def _is_producthunt(source: SourceSpec | Mapping[str, Any] | Any) -> bool:
     raw = _source_mapping(source)
-    if _normalise_token(raw.get("collector_type")) == "producthunt":
+    feed = _nested_mapping(raw.get("feed"))
+    if _normalise_token(raw.get("transport")) == "feed" and _normalise_token(feed.get("adapter")) == "producthunt":
         return True
     identity = " ".join(
         str(raw.get(key) or "") for key in ("id", "name", "source_group", "url")
     ).casefold()
     return "producthunt" in identity or "product hunt" in identity
+
+
+def _nested_mapping(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    return {}
+
+
+def _github_pushed_days(raw: Mapping[str, Any]) -> int | None:
+    github = _nested_mapping(raw.get("github"))
+    value = github.get("pushed_days")
+    return _positive_int(value)
 
 
 def _matched_keywords(item: FetchItem, keywords: tuple[str, ...]) -> tuple[str, ...]:

@@ -24,13 +24,16 @@ def _source(**overrides) -> SourceConfig:
     values = {
         "id": "community_feed",
         "name": "Community Feed",
-        "type": "rss",
+        "transport": "feed",
         "url": "https://example.test/feed.xml",
+        "feed": {"format": "rss", "adapter": "generic"},
         "source_group": "community",
         "source_subtype": "fixed",
         "source_role": "community",
     }
     values.update(overrides)
+    if values.get("transport") == "github":
+        values.pop("feed", None)
     return SourceConfig(**values)
 
 
@@ -55,8 +58,9 @@ def test_source_classification_uses_explicit_value_then_registry_metadata():
     github = _source(
         id="github_active",
         name="GitHub Active",
-        type="github_api",
+        transport="github",
         url="https://api.github.com/search/repositories",
+        github={"mode": "search", "query": "agent"},
         source_group="github",
         source_subtype="search_repositories",
         source_role="code_hosting",
@@ -81,12 +85,12 @@ def test_source_spec_resolves_default_selection_and_verification_policies():
         _source(
             id="github_active",
             name="GitHub Active",
-            type="github_api",
+            transport="github",
             url="https://api.github.com/search/repositories",
+            github={"mode": "search", "query": "agent", "pushed_days": None},
             source_group="github",
             source_subtype="search_repositories",
             source_role="code_hosting",
-            search_pushed_days=None,
         )
     )
     official = source_spec_from_config(
@@ -117,8 +121,9 @@ def test_explicit_policy_overrides_defaults_without_losing_class_defaults():
         {
             "id": "custom_github",
             "name": "Custom GitHub",
-            "type": "github_api",
-            "source_subtype": "search_repositories",
+            "transport": "github",
+            "url": "https://api.github.com/search/repositories",
+            "github": {"mode": "search", "query": "agent"},
             "content_class": PROJECT_TOOL,
             "selection_policy": {"min_stars": 500, "pushed_days": 14},
             "verification_policy": {"mode": "metadata_only"},
@@ -166,8 +171,9 @@ def test_github_requires_more_than_100_stars_and_push_within_30_days():
     source = _source(
         id="github_active",
         name="GitHub Active",
-        type="github_api",
+        transport="github",
         url="https://api.github.com/search/repositories",
+        github={"mode": "search", "query": "agent"},
         source_group="github",
         source_subtype="search_repositories",
         source_role="code_hosting",
@@ -193,6 +199,9 @@ def test_github_requires_more_than_100_stars_and_push_within_30_days():
 def test_official_items_require_30_day_recency_and_release_keyword():
     source = {
         "id": "official_news",
+        "transport": "feed",
+        "url": "https://example.test/news.xml",
+        "feed": {"format": "rss", "adapter": "generic"},
         "source_role": "official",
         "content_class": OFFICIAL_MODEL_COMPANY,
     }
@@ -215,6 +224,9 @@ def test_official_items_require_30_day_recency_and_release_keyword():
 def test_official_change_signals_include_company_version_price_and_update(title):
     source = {
         "id": "official_news",
+        "transport": "feed",
+        "url": "https://example.test/news.xml",
+        "feed": {"format": "rss", "adapter": "generic"},
         "source_role": "official",
         "content_class": OFFICIAL_MODEL_COMPANY,
     }
@@ -226,7 +238,9 @@ def test_producthunt_uses_votes_and_time_with_configurable_threshold():
     source = {
         "id": "producthunt_feed",
         "name": "Product Hunt",
-        "type": "atom",
+        "transport": "feed",
+        "url": "https://www.producthunt.com/feed",
+        "feed": {"format": "atom", "adapter": "producthunt"},
         "source_group": "producthunt",
         "content_class": PROJECT_TOOL,
         "selection_policy": {"min_votes": 10, "max_age_days": 14},
@@ -251,3 +265,15 @@ def test_community_is_seven_day_discovery_only_signal():
     assert decision.discovery_only is True
     assert decision.verification_mode == "discovery_only"
     assert selection_decision(stale, source, now=NOW).reason == "community_item_too_old"
+
+
+def test_policy_rejects_legacy_source_routing_fields():
+    with pytest.raises(ValueError, match="type"):
+        source_spec_from_config(
+            {
+                "id": "legacy",
+                "name": "Legacy",
+                "type": "rss",
+                "url": "https://example.test/feed.xml",
+            }
+        )

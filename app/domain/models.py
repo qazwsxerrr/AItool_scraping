@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal, Mapping, TypeAlias
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 OFFICIAL_MODEL_COMPANY = "official_model_company"
@@ -110,35 +111,156 @@ class VerificationPolicy(BaseModel):
         return data
 
 
-class SourceSpec(BaseModel):
-    """A registry source with fully resolved content and policy metadata."""
+Transport: TypeAlias = Literal["feed", "rsshub", "github"]
+SourceTransport: TypeAlias = Transport
+FeedFormat: TypeAlias = Literal["rss", "atom"]
+FeedAdapter: TypeAlias = Literal["generic", "producthunt"]
+GitHubMode: TypeAlias = Literal["search", "releases", "trending"]
+GitHubSort: TypeAlias = Literal["stars", "forks", "help-wanted-issues", "updated"]
+TrendingPeriod: TypeAlias = Literal["daily", "weekly"]
 
-    model_config = ConfigDict(extra="allow", frozen=True, populate_by_name=True)
+
+class FeedOptions(BaseModel):
+    """Options for native and RSSHub feed transports.
+
+    RSSHub routes produce a regular RSS/Atom document.  Keeping the parser
+    format and the Product Hunt adapter in this small nested model makes feed
+    routing explicit without reintroducing collector/parser discriminator
+    fields on the source itself.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    format: FeedFormat = "rss"
+    adapter: FeedAdapter = "generic"
+
+    @model_validator(mode="after")
+    def _validate_adapter(self) -> "FeedOptions":
+        if self.adapter == "producthunt" and self.format != "atom":
+            raise ValueError("producthunt feed adapter requires feed.format=atom")
+        return self
+
+
+class GitHubOptions(BaseModel):
+    """Mode-specific options for GitHub Search, Releases, and Trending."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    mode: GitHubMode
+    query: str | None = Field(default=None, validation_alias=AliasChoices("query", "search_query"))
+    sort: GitHubSort = Field(default="updated", validation_alias=AliasChoices("sort", "search_sort"))
+    order: Literal["asc", "desc"] = Field(default="desc", validation_alias=AliasChoices("order", "search_order"))
+    pushed_days: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("pushed_days", "search_pushed_days"),
+    )
+    period: TrendingPeriod | None = None
+
+    @model_validator(mode="after")
+    def _validate_mode_options(self) -> "GitHubOptions":
+        if self.mode == "search":
+            if not self.query or not self.query.strip():
+                raise ValueError("github search mode requires github.query")
+            if self.pushed_days is not None and self.pushed_days <= 0:
+                raise ValueError("github.pushed_days must be positive when configured")
+        elif self.mode == "releases":
+            if self.query is not None or self.pushed_days is not None or self.period is not None:
+                raise ValueError("github releases mode does not accept search/trending options")
+        elif self.mode == "trending":
+            if self.query is not None or self.pushed_days is not None:
+                raise ValueError("github trending mode does not accept search options")
+            if self.period is None:
+                raise ValueError("github trending mode requires github.period")
+        return self
+
+    @property
+    def search_query(self) -> str | None:
+        """Compatibility accessor for callers migrating to nested options."""
+
+        return self.query
+
+    @property
+    def search_sort(self) -> GitHubSort:
+        return self.sort
+
+    @property
+    def search_order(self) -> Literal["asc", "desc"]:
+        return self.order
+
+    @property
+    def search_pushed_days(self) -> int | None:
+        return self.pushed_days
+
+
+class SourceSpec(BaseModel):
+    """Canonical registry source with resolved content and policy metadata.
+
+    ``transport`` is the only top-level routing discriminator.  Feed details
+    live under :attr:`feed`; GitHub mode details live under :attr:`github`.
+    Legacy ``type``, ``parser_type`` and ``collector_type`` keys are rejected
+    instead of being silently inferred.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
     id: str = Field(min_length=1)
     name: str | None = None
-    type: str = "rss"
-    url: str | None = None
+    transport: Transport
+    url: str = Field(min_length=1)
+    feed: FeedOptions | None = None
+    github: GitHubOptions | None = None
     enabled: bool = True
     priority: int = 100
     fetch_interval: int = 3600
-    parser_type: str = "feedparser"
     source_group: str | None = None
     source_subtype: str | None = None
+    quality_weight: float | None = None
     source_role: str | None = None
+    spam_risk: Literal["low", "medium", "high"] | None = None
+    requires_verification: bool | None = None
     default_limit: int = 30
-    collector_type: str | None = None
-    search_query: str | None = None
-    search_sort: str = "updated"
-    search_order: str = "desc"
-    search_pushed_days: int | None = None
     content_class: ContentClass | None = None
     selection_policy: SelectionPolicy = Field(default_factory=SelectionPolicy)
     verification_policy: VerificationPolicy = Field(default_factory=VerificationPolicy)
 
-    @property
-    def source_type(self) -> str:
-        return self.type
+    @model_validator(mode="after")
+    def _validate_transport(self) -> "SourceSpec":
+        parsed = urlparse(self.url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("url must be an absolute http(s) URL")
+        if self.priority < 0:
+            raise ValueError("priority must be non-negative")
+        if self.fetch_interval <= 0:
+            raise ValueError("fetch_interval must be positive")
+        if self.default_limit <= 0:
+            raise ValueError("default_limit must be positive")
+        if self.quality_weight is not None and not 0 <= self.quality_weight <= 1:
+            raise ValueError("quality_weight must be between 0 and 1")
+        if self.source_group is not None and not _valid_source_token(self.source_group):
+            raise ValueError("source_group must contain lowercase letters, numbers, underscore or dash")
+        if self.source_subtype is not None and not _valid_source_token(self.source_subtype):
+            raise ValueError("source_subtype must contain lowercase letters, numbers, underscore or dash")
+
+        if self.transport in {"feed", "rsshub"}:
+            if self.github is not None:
+                raise ValueError(f"{self.transport} source cannot define github options")
+            if self.feed is None:
+                object.__setattr__(self, "feed", FeedOptions())
+            elif self.transport == "rsshub" and self.feed.adapter == "producthunt":
+                raise ValueError("producthunt feed adapter is only valid for transport=feed")
+        elif self.transport == "github":
+            if self.feed is not None:
+                raise ValueError("github source cannot define feed options")
+            if self.github is None:
+                raise ValueError("github source requires github options")
+        return self
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: str) -> str:
+        if not _valid_source_token(value):
+            raise ValueError("id must contain lowercase letters, numbers, underscore or dash")
+        return value
 
     @classmethod
     def from_config(cls, source: Any) -> "SourceSpec":
@@ -146,6 +268,18 @@ class SourceSpec(BaseModel):
         from .policies import source_spec_from_config
 
         return source_spec_from_config(source)
+
+
+def _valid_source_token(value: str) -> bool:
+    import re
+
+    return re.fullmatch(r"[a-z0-9][a-z0-9_\-]*", value) is not None
+
+
+# Descriptive aliases make the nested model easy to discover while keeping a
+# single implementation and a single canonical serialized shape.
+FeedConfig = FeedOptions
+GitHubConfig = GitHubOptions
 
 
 class FetchItem(BaseModel):

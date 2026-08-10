@@ -160,7 +160,11 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
         "id": item.id,
         "source_id": item.source_id,
         "source_name": item.source.name if item.source else None,
-        "source_type": item.source.type if item.source else None,
+        "source_transport": item.source.transport if item.source else None,
+        # Keep the historical export key as a transport-valued alias for
+        # readers consuming existing JSONL files. Routing no longer depends on
+        # this compatibility field; new code uses ``source_transport``.
+        "source_type": item.source.transport if item.source else None,
         "source_priority": item.source.priority if item.source else None,
         "external_id": item.external_id,
         "content_hash": item.content_hash,
@@ -295,6 +299,7 @@ def _readable_database_url(database_url: str, *, dry_run: bool) -> str:
 
 
 def _is_github_repository(record: dict[str, Any]) -> bool:
+    source_transport = str(record.get("source_transport") or "").casefold()
     source_type = str(record.get("source_type") or "").casefold()
     source_id = str(record.get("source_id") or "").casefold()
     external_id = str(record.get("external_id") or "").casefold()
@@ -307,7 +312,8 @@ def _is_github_repository(record: dict[str, Any]) -> bool:
         and not external_id.startswith("github_release:")
         and (
             payload_type == "repository"
-            or source_type in {"github_api", "github_trending"}
+            or source_transport == "github"
+            or source_type in {"github", "github_api", "github_trending"}
             or source_id.startswith("github_")
             or external_id.startswith("github_repo:")
             or "github.com/" in url

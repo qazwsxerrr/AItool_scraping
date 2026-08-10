@@ -1,1209 +1,1360 @@
 sources:
-  # Native RSS / Atom feeds verified by direct HTTP access on 2026-04-22.
-  - id: openai_news
-    name: OpenAI News
-    type: rss
-    url: https://openai.com/news/rss.xml
-    enabled: true
-    priority: 10
-    fetch_interval: 3600
-    parser_type: feedparser
-    source_group: official_blog
-    source_subtype: fixed_news
-    content_class: official_model_company
-    collector_type: rss
-    selection_policy: {mode: official_recent, max_age_days: 30}
-    verification_policy: {mode: official_direct_link, required: true}
-    default_limit: 10
-
-  - id: google_deepmind_blog
-    name: Google DeepMind Blog
-    type: rss
-    url: https://deepmind.google/blog/rss.xml
-    enabled: true
-    priority: 20
-    fetch_interval: 3600
-    parser_type: feedparser
-    source_group: official_blog
-    source_subtype: fixed_blog
-    content_class: official_model_company
-    collector_type: rss
-    selection_policy: {mode: official_recent, max_age_days: 30}
-    verification_policy: {mode: official_direct_link, required: true}
-    default_limit: 10
-
-  - id: huggingface_blog
-    name: Hugging Face Blog
-    type: rss
-    url: https://huggingface.co/blog/feed.xml
-    enabled: true
-    priority: 30
-    fetch_interval: 3600
-    parser_type: feedparser
-    source_group: official_blog
-    source_subtype: fixed_blog
-    content_class: official_model_company
-    collector_type: rss
-    selection_policy: {mode: official_recent, max_age_days: 30}
-    verification_policy: {mode: official_direct_link, required: true}
-    default_limit: 10
-
-  - id: producthunt_feed
-    name: Product Hunt Feed
-    type: atom
-    url: https://www.producthunt.com/feed
-    enabled: true
-    priority: 40
-    fetch_interval: 3600
-    parser_type: feedparser
-    source_group: producthunt
-    source_subtype: fixed_feed
-    content_class: project_tool
-    collector_type: producthunt
-    selection_policy: {mode: producthunt_hot, max_age_days: 30, min_votes: 0, sort: votes}
-    verification_policy: {mode: metadata_only}
-    default_limit: 20
-
-  # GitHub Trending is fetched directly from the rendered HTML. The weekly
-  # source exposes GitHub's own "stars this week" signal; the daily source
-  # provides a faster signal for projects that are accelerating today.
-  - id: github_trending_daily_native
-    name: GitHub Trending Daily
-    type: github_trending
-    url: https://github.com/trending?since=daily
-    enabled: true
-    priority: 40
-    fetch_interval: 86400
-    parser_type: github_trending_html
-    source_group: github
-    source_subtype: trending_daily
-    quality_weight: 0.90
-    source_role: code_hosting
-    spam_risk: medium
-    requires_verification: false
-    content_class: project_tool
-    collector_type: github_trending
-    selection_policy: {mode: github_trending, period: daily, sort: stars_since}
-    verification_policy: {mode: metadata_only}
-    default_limit: 25
-
-  - id: github_trending_weekly_native
-    name: GitHub Trending Weekly
-    type: github_trending
-    url: https://github.com/trending?since=weekly
-    enabled: true
-    priority: 41
-    fetch_interval: 86400
-    parser_type: github_trending_html
-    source_group: github
-    source_subtype: trending_weekly
-    quality_weight: 0.95
-    source_role: code_hosting
-    spam_risk: medium
-    requires_verification: false
-    content_class: project_tool
-    collector_type: github_trending
-    selection_policy: {mode: github_trending, period: weekly, sort: stars_since}
-    verification_policy: {mode: metadata_only}
-    default_limit: 25
-
-  # Search API candidate recall follows agents-radar: recent activity is
-  # restricted to seven days and each AI topic is kept as an auditable source.
-  - id: github_search_topic_llm
-    name: GitHub Search Topic LLM
-    type: github_api
-    url: https://api.github.com/search/repositories
-    enabled: true
-    priority: 45
-    fetch_interval: 21600
-    parser_type: github_api
-    source_group: github
-    source_subtype: search_repositories
-    quality_weight: 0.75
-    source_role: code_hosting
-    spam_risk: medium
-    requires_verification: false
-    content_class: project_tool
-    collector_type: github
-    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
-    verification_policy: {mode: metadata_only}
-    search_query: 'topic:llm'
-    search_sort: stars
-    search_order: desc
-    search_pushed_days: 7
-    default_limit: 15
-
-  - id: github_search_topic_ai_agent
-    name: GitHub Search Topic AI Agent
-    type: github_api
-    url: https://api.github.com/search/repositories
-    enabled: true
-    priority: 46
-    fetch_interval: 21600
-    parser_type: github_api
-    source_group: github
-    source_subtype: search_repositories
-    quality_weight: 0.75
-    source_role: code_hosting
-    spam_risk: medium
-    requires_verification: false
-    content_class: project_tool
-    collector_type: github
-    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
-    verification_policy: {mode: metadata_only}
-    search_query: 'topic:ai-agent'
-    search_sort: stars
-    search_order: desc
-    search_pushed_days: 7
-    default_limit: 15
-
-  - id: github_search_topic_rag
-    name: GitHub Search Topic RAG
-    type: github_api
-    url: https://api.github.com/search/repositories
-    enabled: true
-    priority: 47
-    fetch_interval: 21600
-    parser_type: github_api
-    source_group: github
-    source_subtype: search_repositories
-    quality_weight: 0.75
-    source_role: code_hosting
-    spam_risk: medium
-    requires_verification: false
-    content_class: project_tool
-    collector_type: github
-    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
-    verification_policy: {mode: metadata_only}
-    search_query: 'topic:rag'
-    search_sort: stars
-    search_order: desc
-    search_pushed_days: 7
-    default_limit: 15
-
-  - id: github_search_topic_vector_database
-    name: GitHub Search Topic Vector Database
-    type: github_api
-    url: https://api.github.com/search/repositories
-    enabled: true
-    priority: 48
-    fetch_interval: 21600
-    parser_type: github_api
-    source_group: github
-    source_subtype: search_repositories
-    quality_weight: 0.75
-    source_role: code_hosting
-    spam_risk: medium
-    requires_verification: false
-    content_class: project_tool
-    collector_type: github
-    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
-    verification_policy: {mode: metadata_only}
-    search_query: 'topic:vector-database'
-    search_sort: stars
-    search_order: desc
-    search_pushed_days: 7
-    default_limit: 15
-
-  - id: github_search_topic_large_language_model
-    name: GitHub Search Topic Large Language Model
-    type: github_api
-    url: https://api.github.com/search/repositories
-    enabled: true
-    priority: 49
-    fetch_interval: 21600
-    parser_type: github_api
-    source_group: github
-    source_subtype: search_repositories
-    quality_weight: 0.75
-    source_role: code_hosting
-    spam_risk: medium
-    requires_verification: false
-    content_class: project_tool
-    collector_type: github
-    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
-    verification_policy: {mode: metadata_only}
-    search_query: 'topic:large-language-model'
-    search_sort: stars
-    search_order: desc
-    search_pushed_days: 7
-    default_limit: 15
-
-  - id: github_search_topic_machine_learning
-    name: GitHub Search Topic Machine Learning
-    type: github_api
-    url: https://api.github.com/search/repositories
-    enabled: true
-    priority: 50
-    fetch_interval: 21600
-    parser_type: github_api
-    source_group: github
-    source_subtype: search_repositories
-    quality_weight: 0.75
-    source_role: code_hosting
-    spam_risk: medium
-    requires_verification: false
-    content_class: project_tool
-    collector_type: github
-    selection_policy: {mode: github_active_high_star, pushed_days: 7, min_stars: 100, sort: stars}
-    verification_policy: {mode: metadata_only}
-    search_query: 'topic:machine-learning'
-    search_sort: stars
-    search_order: desc
-    search_pushed_days: 7
-    default_limit: 15
-
-  - id: github_releases_ollama
-    name: GitHub Releases Ollama
-    type: github_api
-    url: https://api.github.com/repos/ollama/ollama/releases
-    enabled: true
-    priority: 47
-    fetch_interval: 21600
-    parser_type: feedparser
-    source_group: github
-    source_subtype: repo_releases
-    quality_weight: 0.80
-    source_role: code_hosting
-    spam_risk: low
-    requires_verification: false
-    content_class: project_tool
-    collector_type: github
-    selection_policy: {mode: project_recent, max_age_days: 30, sort: published_at}
-    verification_policy: {mode: metadata_only}
-    default_limit: 10
-
-  - id: github_releases_transformers
-    name: GitHub Releases Hugging Face Transformers
-    type: github_api
-    url: https://api.github.com/repos/huggingface/transformers/releases
-    enabled: true
-    priority: 48
-    fetch_interval: 21600
-    parser_type: feedparser
-    source_group: github
-    source_subtype: repo_releases
-    quality_weight: 0.80
-    source_role: code_hosting
-    spam_risk: low
-    requires_verification: false
-    content_class: project_tool
-    collector_type: github
-    selection_policy: {mode: project_recent, max_age_days: 30, sort: published_at}
-    verification_policy: {mode: metadata_only}
-    default_limit: 10
-
-  - id: linux_do_top
-    name: LINUX DO Top Topics
-    type: rss
-    url: https://linux.do/top.rss
-    enabled: true
-    priority: 55
-    fetch_interval: 3600
-    parser_type: feedparser
-    source_group: linux_do
-    source_subtype: fixed_top
-    content_class: community_social
-    collector_type: rss
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 30
-
-  - id: linux_do_hot
-    name: LINUX DO Hot Topics
-    type: rss
-    url: https://linux.do/hot.rss
-    enabled: true
-    priority: 60
-    fetch_interval: 1800
-    parser_type: feedparser
-    source_group: linux_do
-    source_subtype: fixed_hot
-    content_class: community_social
-    collector_type: rss
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 30
-
-  - id: reddit_local_llama_new
-    name: Reddit LocalLLaMA New
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/new/.rss
-    enabled: true
-    priority: 70
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: fixed_new
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 40
-
-  - id: reddit_local_llama_hot
-    name: Reddit LocalLLaMA Hot
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/hot/.rss
-    enabled: true
-    priority: 75
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: fixed_hot
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 25
-
-  - id: reddit_local_llama_top_day
-    name: Reddit LocalLLaMA Top Day
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day
-    enabled: true
-    priority: 80
-    fetch_interval: 14400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: fixed_top_day
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 20
-
-  - id: reddit_local_llama_top_week
-    name: Reddit LocalLLaMA Top Week
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week
-    enabled: true
-    priority: 85
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: fixed_top_week
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 20
-
-  - id: reddit_local_llama_search_agent
-    name: Reddit LocalLLaMA Search agent
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=agent&restrict_sr=1&sort=new&t=day
-    enabled: true
-    priority: 90
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: search
-    search_query: agent
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 10
-
-  - id: reddit_local_llama_search_open_weights
-    name: Reddit LocalLLaMA Search open weights
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=open%20weights&restrict_sr=1&sort=new&t=day
-    enabled: true
-    priority: 91
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: search
-    search_query: open weights
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 10
-
-  - id: reddit_local_llama_search_gguf
-    name: Reddit LocalLLaMA Search gguf
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=gguf&restrict_sr=1&sort=new&t=day
-    enabled: true
-    priority: 92
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: search
-    search_query: gguf
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 10
-
-  - id: reddit_local_llama_search_benchmark
-    name: Reddit LocalLLaMA Search benchmark
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=benchmark&restrict_sr=1&sort=new&t=day
-    enabled: true
-    priority: 93
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: search
-    search_query: benchmark
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 10
-
-  - id: reddit_local_llama_search_mcp
-    name: Reddit LocalLLaMA Search MCP
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=mcp&restrict_sr=1&sort=new&t=week
-    enabled: true
-    priority: 94
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: search
-    search_query: mcp
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 8
-
-  - id: reddit_local_llama_search_workflow
-    name: Reddit LocalLLaMA Search workflow
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=workflow&restrict_sr=1&sort=new&t=week
-    enabled: true
-    priority: 95
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: search
-    search_query: workflow
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 8
-
-  - id: reddit_local_llama_search_2api
-    name: Reddit LocalLLaMA Search 2API
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=2api%20OR%20%22openai-compatible%22%20OR%20proxy&restrict_sr=1&sort=new&t=week
-    enabled: true
-    priority: 96
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: search
-    search_query: 2api
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 8
-
-  - id: reddit_local_llama_search_claude_code
-    name: Reddit LocalLLaMA Search Claude Code workflow
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=%22claude%20code%22%20workflow&restrict_sr=1&sort=new&t=week
-    enabled: true
-    priority: 97
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: search
-    search_query: claude code
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 8
-
-  - id: reddit_local_llama_search_comfyui
-    name: Reddit LocalLLaMA Search ComfyUI workflow
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=comfyui%20workflow&restrict_sr=1&sort=new&t=week
-    enabled: true
-    priority: 98
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: search
-    search_query: comfyui workflow
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 8
-
-  - id: reddit_local_llama_search_n8n_dify
-    name: Reddit LocalLLaMA Search n8n Dify
-    type: atom
-    url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=n8n%20OR%20dify&restrict_sr=1&sort=new&t=week
-    enabled: true
-    priority: 99
-    fetch_interval: 86400
-    parser_type: feedparser
-    source_group: reddit_local_llama
-    source_subtype: search
-    search_query: n8n dify
-    content_class: community_social
-    collector_type: atom
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    default_limit: 8
-
-  # X account feeds via local RSSHub. Handles were selected from official model/company/product accounts.
-  - id: x_account_openai
-    name: X OpenAI via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/OpenAI
-    enabled: true
-    priority: 100
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: OpenAI
-    default_limit: 5
-
-  - id: x_account_chatgpt
-    name: X ChatGPT via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/ChatGPTapp
-    enabled: true
-    priority: 101
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: ChatGPTapp
-    default_limit: 5
-
-  - id: x_account_anthropic
-    name: X Anthropic via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/AnthropicAI
-    enabled: true
-    priority: 102
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: AnthropicAI
-    default_limit: 5
-
-  - id: x_account_claude
-    name: X Claude via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/claudeai
-    enabled: true
-    priority: 103
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: claudeai
-    default_limit: 5
-
-  - id: x_account_google_deepmind
-    name: X Google DeepMind via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/GoogleDeepMind
-    enabled: true
-    priority: 104
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: GoogleDeepMind
-    default_limit: 5
-
-  - id: x_account_gemini
-    name: X Gemini via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/GeminiApp
-    enabled: true
-    priority: 105
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: GeminiApp
-    default_limit: 5
-
-  - id: x_account_xai
-    name: X xAI via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/xai
-    enabled: true
-    priority: 106
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: xai
-    default_limit: 5
-
-  - id: x_account_grok
-    name: X Grok via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/grok
-    enabled: true
-    priority: 107
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: grok
-    default_limit: 5
-
-  - id: x_account_meta_ai
-    name: X Meta AI via RSSHub (moved to AIatMeta)
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/MetaAI
-    enabled: false
-    priority: 108
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.35
-    source_role: social
-    spam_risk: high
-    requires_verification: true
-    search_query: MetaAI
-    default_limit: 5
-
-  - id: x_account_ai_at_meta
-    name: X AI at Meta via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/AIatMeta
-    enabled: true
-    priority: 109
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: AIatMeta
-    default_limit: 5
-
-  - id: x_account_mistral_ai
-    name: X Mistral AI via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/MistralAI
-    enabled: true
-    priority: 110
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: MistralAI
-    default_limit: 5
-
-  - id: x_account_cohere
-    name: X Cohere via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/cohere
-    enabled: true
-    priority: 111
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: cohere
-    default_limit: 5
-
-  - id: x_account_perplexity_ai
-    name: X Perplexity via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/perplexity_ai
-    enabled: true
-    priority: 112
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: perplexity_ai
-    default_limit: 5
-
-  - id: x_account_msft_copilot
-    name: X Microsoft Copilot via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/Copilot
-    enabled: true
-    priority: 113
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: Copilot
-    default_limit: 5
-
-  - id: x_account_deepseek
-    name: X DeepSeek via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/deepseek_ai
-    enabled: true
-    priority: 114
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: deepseek_ai
-    default_limit: 5
-
-  - id: x_account_qwen
-    name: X Qwen via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/Alibaba_Qwen
-    enabled: true
-    priority: 115
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: Alibaba_Qwen
-    default_limit: 5
-
-  - id: x_account_huggingface
-    name: X Hugging Face via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/huggingface
-    enabled: true
-    priority: 116
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: huggingface
-    default_limit: 5
-
-  - id: x_account_ollama
-    name: X Ollama via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/ollama
-    enabled: true
-    priority: 117
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: ollama
-    default_limit: 5
-
-  - id: x_account_replicate
-    name: X Replicate via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/replicate
-    enabled: true
-    priority: 118
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: replicate
-    default_limit: 5
-
-  - id: x_account_sam_altman
-    name: X Sam Altman via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/sama
-    enabled: true
-    priority: 119
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.35
-    source_role: social
-    spam_risk: high
-    requires_verification: true
-    search_query: sama
-    default_limit: 5
-
-  - id: x_account_tibo
-    name: X Tibo via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/thsottiaux
-    enabled: true
-    priority: 120
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.35
-    source_role: social
-    spam_risk: high
-    requires_verification: true
-    search_query: thsottiaux
-    default_limit: 5
-
-  - id: x_account_together_ai
-    name: X Together AI via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/togethercompute
-    enabled: true
-    priority: 121
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.75
-    source_role: official
-    spam_risk: medium
-    requires_verification: true
-    search_query: togethercompute
-    default_limit: 5
-
-  - id: x_account_local_llama
-    name: X LocalLLaMA via RSSHub (inactive)
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/user/LocalLLaMA
-    enabled: false
-    priority: 122
-    fetch_interval: 7200
-    parser_type: feedparser
-    source_group: x
-    source_subtype: account
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.35
-    source_role: social
-    spam_risk: high
-    requires_verification: true
-    search_query: LocalLLaMA
-    default_limit: 5
-
-  - id: x_search_github_launch
-    name: X Search GitHub Launch via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Agithub.com%20%28launch%20OR%20released%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
-    enabled: true
-    priority: 150
-    fetch_interval: 14400
-    parser_type: feedparser
-    source_group: x
-    source_subtype: search
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.45
-    source_role: social_search
-    spam_risk: high
-    requires_verification: true
-    search_query: 'url:github.com ("launch" OR "released" OR "open source") -is:retweet -is:reply'
-    default_limit: 20
-
-  - id: x_search_huggingface_model
-    name: X Search Hugging Face Model via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Ahuggingface.co%20%28model%20OR%20space%20OR%20dataset%20OR%20gguf%20OR%20weights%29%20-is%3Aretweet%20-is%3Areply
-    enabled: true
-    priority: 151
-    fetch_interval: 14400
-    parser_type: feedparser
-    source_group: x
-    source_subtype: search
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.45
-    source_role: social_search
-    spam_risk: high
-    requires_verification: true
-    search_query: 'url:huggingface.co (model OR space OR dataset OR gguf OR weights) -is:retweet -is:reply'
-    default_limit: 20
-
-  - id: x_search_ai_tool_launch
-    name: X Search AI Tool Launch via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/keyword/%28%22AI%20tool%22%20OR%20%22AI%20app%22%20OR%20agent%20OR%20workflow%29%20%28launch%20OR%20released%20OR%20introducing%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
-    enabled: true
-    priority: 152
-    fetch_interval: 14400
-    parser_type: feedparser
-    source_group: x
-    source_subtype: search
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.45
-    source_role: social_search
-    spam_risk: high
-    requires_verification: true
-    search_query: '("AI tool" OR "AI app" OR agent OR workflow) (launch OR released OR introducing OR "open source") -is:retweet -is:reply'
-    default_limit: 20
-
-  - id: x_search_github_ai_tool
-    name: X Search GitHub AI Tool via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Agithub.com%20%28agent%20OR%20LLM%20OR%20MCP%20OR%20%22AI%20tool%22%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
-    enabled: true
-    priority: 153
-    fetch_interval: 14400
-    parser_type: feedparser
-    source_group: x
-    source_subtype: search
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.45
-    source_role: social_search
-    spam_risk: high
-    requires_verification: true
-    search_query: 'url:github.com (agent OR LLM OR MCP OR "AI tool" OR "open source") -is:retweet -is:reply'
-    default_limit: 20
-
-  - id: x_search_mcp_agent
-    name: X Search MCP Agent via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/twitter/keyword/%28MCP%20OR%20%22model%20context%20protocol%22%20OR%20%22AI%20agent%22%20OR%20%22agent%20workflow%22%29%20%28github%20OR%20release%20OR%20launch%20OR%20tool%29%20-is%3Aretweet%20-is%3Areply
-    enabled: true
-    priority: 155
-    fetch_interval: 14400
-    parser_type: feedparser
-    source_group: x
-    source_subtype: search
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-    quality_weight: 0.45
-    source_role: social_search
-    spam_risk: high
-    requires_verification: true
-    search_query: '(MCP OR "model context protocol" OR "AI agent" OR "agent workflow") (github OR release OR launch OR tool) -is:retweet -is:reply'
-    default_limit: 20
-
-  # RSSHub feeds are enabled only when RSSHUB_BASE_URL is configured.
-  # Source-level failures are isolated, so an unavailable route will not stop other feeds.
-  - id: anthropic_news_rsshub
-    name: Anthropic News via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/anthropic/news
-    enabled: true
-    priority: 110
-    fetch_interval: 3600
-    parser_type: feedparser
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-
-  - id: anthropic_research_rsshub
-    name: Anthropic Research via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/anthropic/research
-    enabled: true
-    priority: 120
-    fetch_interval: 3600
-    parser_type: feedparser
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-
-  - id: anthropic_engineering_rsshub
-    name: Anthropic Engineering via RSSHub
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/anthropic/engineering
-    enabled: true
-    priority: 130
-    fetch_interval: 3600
-    parser_type: feedparser
-    content_class: community_social
-    collector_type: rsshub
-    selection_policy: {mode: community_recent, max_age_days: 7}
-    verification_policy: {mode: discovery_only}
-
-  # Disabled until stable RSS/RSSHub routes are confirmed.
-  - id: mistral_news_disabled
-    name: Mistral News (disabled placeholder)
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/mistral/news
-    enabled: false
-    priority: 900
-    fetch_interval: 3600
-    parser_type: feedparser
-
-  - id: perplexity_updates_disabled
-    name: Perplexity Updates (disabled placeholder)
-    type: rsshub
-    url: ${RSSHUB_BASE_URL}/perplexity/updates
-    enabled: false
-    priority: 910
-    fetch_interval: 3600
-    parser_type: feedparser
+- id: openai_news
+  name: OpenAI News
+  transport: feed
+  url: https://openai.com/news/rss.xml
+  enabled: true
+  priority: 10
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: fixed_news
+  content_class: official_model_company
+  selection_policy:
+    mode: official_recent
+    max_age_days: 30
+  verification_policy:
+    mode: official_direct_link
+    required: true
+  default_limit: 10
+- id: google_deepmind_blog
+  name: Google DeepMind Blog
+  transport: feed
+  url: https://deepmind.google/blog/rss.xml
+  enabled: true
+  priority: 20
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: fixed_blog
+  content_class: official_model_company
+  selection_policy:
+    mode: official_recent
+    max_age_days: 30
+  verification_policy:
+    mode: official_direct_link
+    required: true
+  default_limit: 10
+- id: huggingface_blog
+  name: Hugging Face Blog
+  transport: feed
+  url: https://huggingface.co/blog/feed.xml
+  enabled: true
+  priority: 30
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: fixed_blog
+  content_class: official_model_company
+  selection_policy:
+    mode: official_recent
+    max_age_days: 30
+  verification_policy:
+    mode: official_direct_link
+    required: true
+  default_limit: 10
+- id: producthunt_feed
+  name: Product Hunt Feed
+  transport: feed
+  url: https://www.producthunt.com/feed
+  enabled: true
+  priority: 40
+  fetch_interval: 3600
+  feed:
+    format: atom
+    adapter: producthunt
+  source_group: producthunt
+  source_subtype: fixed_feed
+  content_class: project_tool
+  selection_policy:
+    mode: producthunt_hot
+    max_age_days: 30
+    min_votes: 0
+    sort: votes
+  verification_policy:
+    mode: metadata_only
+  default_limit: 20
+- id: github_trending_daily_native
+  name: GitHub Trending Daily
+  transport: github
+  url: https://github.com/trending?since=daily
+  enabled: true
+  priority: 40
+  fetch_interval: 86400
+  github:
+    mode: trending
+    period: daily
+  source_group: github
+  source_subtype: trending_daily
+  quality_weight: 0.9
+  source_role: code_hosting
+  spam_risk: medium
+  requires_verification: false
+  content_class: project_tool
+  selection_policy:
+    mode: github_trending
+    period: daily
+    sort: stars_since
+  verification_policy:
+    mode: metadata_only
+  default_limit: 25
+- id: github_trending_weekly_native
+  name: GitHub Trending Weekly
+  transport: github
+  url: https://github.com/trending?since=weekly
+  enabled: true
+  priority: 41
+  fetch_interval: 86400
+  github:
+    mode: trending
+    period: weekly
+  source_group: github
+  source_subtype: trending_weekly
+  quality_weight: 0.95
+  source_role: code_hosting
+  spam_risk: medium
+  requires_verification: false
+  content_class: project_tool
+  selection_policy:
+    mode: github_trending
+    period: weekly
+    sort: stars_since
+  verification_policy:
+    mode: metadata_only
+  default_limit: 25
+- id: github_search_topic_llm
+  name: GitHub Search Topic LLM
+  transport: github
+  url: https://api.github.com/search/repositories
+  enabled: true
+  priority: 45
+  fetch_interval: 21600
+  github:
+    mode: search
+    query: topic:llm
+    sort: stars
+    order: desc
+    pushed_days: 7
+  source_group: github
+  source_subtype: search_repositories
+  quality_weight: 0.75
+  source_role: code_hosting
+  spam_risk: medium
+  requires_verification: false
+  content_class: project_tool
+  selection_policy:
+    mode: github_active_high_star
+    pushed_days: 7
+    min_stars: 100
+    sort: stars
+  verification_policy:
+    mode: metadata_only
+  default_limit: 15
+- id: github_search_topic_ai_agent
+  name: GitHub Search Topic AI Agent
+  transport: github
+  url: https://api.github.com/search/repositories
+  enabled: true
+  priority: 46
+  fetch_interval: 21600
+  github:
+    mode: search
+    query: topic:ai-agent
+    sort: stars
+    order: desc
+    pushed_days: 7
+  source_group: github
+  source_subtype: search_repositories
+  quality_weight: 0.75
+  source_role: code_hosting
+  spam_risk: medium
+  requires_verification: false
+  content_class: project_tool
+  selection_policy:
+    mode: github_active_high_star
+    pushed_days: 7
+    min_stars: 100
+    sort: stars
+  verification_policy:
+    mode: metadata_only
+  default_limit: 15
+- id: github_search_topic_rag
+  name: GitHub Search Topic RAG
+  transport: github
+  url: https://api.github.com/search/repositories
+  enabled: true
+  priority: 47
+  fetch_interval: 21600
+  github:
+    mode: search
+    query: topic:rag
+    sort: stars
+    order: desc
+    pushed_days: 7
+  source_group: github
+  source_subtype: search_repositories
+  quality_weight: 0.75
+  source_role: code_hosting
+  spam_risk: medium
+  requires_verification: false
+  content_class: project_tool
+  selection_policy:
+    mode: github_active_high_star
+    pushed_days: 7
+    min_stars: 100
+    sort: stars
+  verification_policy:
+    mode: metadata_only
+  default_limit: 15
+- id: github_search_topic_vector_database
+  name: GitHub Search Topic Vector Database
+  transport: github
+  url: https://api.github.com/search/repositories
+  enabled: true
+  priority: 48
+  fetch_interval: 21600
+  github:
+    mode: search
+    query: topic:vector-database
+    sort: stars
+    order: desc
+    pushed_days: 7
+  source_group: github
+  source_subtype: search_repositories
+  quality_weight: 0.75
+  source_role: code_hosting
+  spam_risk: medium
+  requires_verification: false
+  content_class: project_tool
+  selection_policy:
+    mode: github_active_high_star
+    pushed_days: 7
+    min_stars: 100
+    sort: stars
+  verification_policy:
+    mode: metadata_only
+  default_limit: 15
+- id: github_search_topic_large_language_model
+  name: GitHub Search Topic Large Language Model
+  transport: github
+  url: https://api.github.com/search/repositories
+  enabled: true
+  priority: 49
+  fetch_interval: 21600
+  github:
+    mode: search
+    query: topic:large-language-model
+    sort: stars
+    order: desc
+    pushed_days: 7
+  source_group: github
+  source_subtype: search_repositories
+  quality_weight: 0.75
+  source_role: code_hosting
+  spam_risk: medium
+  requires_verification: false
+  content_class: project_tool
+  selection_policy:
+    mode: github_active_high_star
+    pushed_days: 7
+    min_stars: 100
+    sort: stars
+  verification_policy:
+    mode: metadata_only
+  default_limit: 15
+- id: github_search_topic_machine_learning
+  name: GitHub Search Topic Machine Learning
+  transport: github
+  url: https://api.github.com/search/repositories
+  enabled: true
+  priority: 50
+  fetch_interval: 21600
+  github:
+    mode: search
+    query: topic:machine-learning
+    sort: stars
+    order: desc
+    pushed_days: 7
+  source_group: github
+  source_subtype: search_repositories
+  quality_weight: 0.75
+  source_role: code_hosting
+  spam_risk: medium
+  requires_verification: false
+  content_class: project_tool
+  selection_policy:
+    mode: github_active_high_star
+    pushed_days: 7
+    min_stars: 100
+    sort: stars
+  verification_policy:
+    mode: metadata_only
+  default_limit: 15
+- id: github_releases_ollama
+  name: GitHub Releases Ollama
+  transport: github
+  url: https://api.github.com/repos/ollama/ollama/releases
+  enabled: true
+  priority: 47
+  fetch_interval: 21600
+  github:
+    mode: releases
+  source_group: github
+  source_subtype: repo_releases
+  quality_weight: 0.8
+  source_role: code_hosting
+  spam_risk: low
+  requires_verification: false
+  content_class: project_tool
+  selection_policy:
+    mode: project_recent
+    max_age_days: 30
+    sort: published_at
+  verification_policy:
+    mode: metadata_only
+  default_limit: 10
+- id: github_releases_transformers
+  name: GitHub Releases Hugging Face Transformers
+  transport: github
+  url: https://api.github.com/repos/huggingface/transformers/releases
+  enabled: true
+  priority: 48
+  fetch_interval: 21600
+  github:
+    mode: releases
+  source_group: github
+  source_subtype: repo_releases
+  quality_weight: 0.8
+  source_role: code_hosting
+  spam_risk: low
+  requires_verification: false
+  content_class: project_tool
+  selection_policy:
+    mode: project_recent
+    max_age_days: 30
+    sort: published_at
+  verification_policy:
+    mode: metadata_only
+  default_limit: 10
+- id: linux_do_top
+  name: LINUX DO Top Topics
+  transport: feed
+  url: https://linux.do/top.rss
+  enabled: true
+  priority: 55
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: linux_do
+  source_subtype: fixed_top
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 30
+- id: linux_do_hot
+  name: LINUX DO Hot Topics
+  transport: feed
+  url: https://linux.do/hot.rss
+  enabled: true
+  priority: 60
+  fetch_interval: 1800
+  feed:
+    format: rss
+    adapter: generic
+  source_group: linux_do
+  source_subtype: fixed_hot
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 30
+- id: reddit_local_llama_new
+  name: Reddit LocalLLaMA New
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/new/.rss
+  enabled: true
+  priority: 70
+  fetch_interval: 7200
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: fixed_new
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 40
+- id: reddit_local_llama_hot
+  name: Reddit LocalLLaMA Hot
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/hot/.rss
+  enabled: true
+  priority: 75
+  fetch_interval: 7200
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: fixed_hot
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 25
+- id: reddit_local_llama_top_day
+  name: Reddit LocalLLaMA Top Day
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day
+  enabled: true
+  priority: 80
+  fetch_interval: 14400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: fixed_top_day
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 20
+- id: reddit_local_llama_top_week
+  name: Reddit LocalLLaMA Top Week
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week
+  enabled: true
+  priority: 85
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: fixed_top_week
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 20
+- id: reddit_local_llama_search_agent
+  name: Reddit LocalLLaMA Search agent
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=agent&restrict_sr=1&sort=new&t=day
+  enabled: true
+  priority: 90
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: search
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 10
+- id: reddit_local_llama_search_open_weights
+  name: Reddit LocalLLaMA Search open weights
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=open%20weights&restrict_sr=1&sort=new&t=day
+  enabled: true
+  priority: 91
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: search
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 10
+- id: reddit_local_llama_search_gguf
+  name: Reddit LocalLLaMA Search gguf
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=gguf&restrict_sr=1&sort=new&t=day
+  enabled: true
+  priority: 92
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: search
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 10
+- id: reddit_local_llama_search_benchmark
+  name: Reddit LocalLLaMA Search benchmark
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=benchmark&restrict_sr=1&sort=new&t=day
+  enabled: true
+  priority: 93
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: search
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 10
+- id: reddit_local_llama_search_mcp
+  name: Reddit LocalLLaMA Search MCP
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=mcp&restrict_sr=1&sort=new&t=week
+  enabled: true
+  priority: 94
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: search
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 8
+- id: reddit_local_llama_search_workflow
+  name: Reddit LocalLLaMA Search workflow
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=workflow&restrict_sr=1&sort=new&t=week
+  enabled: true
+  priority: 95
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: search
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 8
+- id: reddit_local_llama_search_2api
+  name: Reddit LocalLLaMA Search 2API
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=2api%20OR%20%22openai-compatible%22%20OR%20proxy&restrict_sr=1&sort=new&t=week
+  enabled: true
+  priority: 96
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: search
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 8
+- id: reddit_local_llama_search_claude_code
+  name: Reddit LocalLLaMA Search Claude Code workflow
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=%22claude%20code%22%20workflow&restrict_sr=1&sort=new&t=week
+  enabled: true
+  priority: 97
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: search
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 8
+- id: reddit_local_llama_search_comfyui
+  name: Reddit LocalLLaMA Search ComfyUI workflow
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=comfyui%20workflow&restrict_sr=1&sort=new&t=week
+  enabled: true
+  priority: 98
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: search
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 8
+- id: reddit_local_llama_search_n8n_dify
+  name: Reddit LocalLLaMA Search n8n Dify
+  transport: feed
+  url: https://www.reddit.com/r/LocalLLaMA/search.rss?q=n8n%20OR%20dify&restrict_sr=1&sort=new&t=week
+  enabled: true
+  priority: 99
+  fetch_interval: 86400
+  feed:
+    format: atom
+    adapter: generic
+  source_group: reddit_local_llama
+  source_subtype: search
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 8
+- id: x_account_openai
+  name: X OpenAI via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/OpenAI
+  enabled: true
+  priority: 100
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_chatgpt
+  name: X ChatGPT via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/ChatGPTapp
+  enabled: true
+  priority: 101
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_anthropic
+  name: X Anthropic via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/AnthropicAI
+  enabled: true
+  priority: 102
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_claude
+  name: X Claude via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/claudeai
+  enabled: true
+  priority: 103
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_google_deepmind
+  name: X Google DeepMind via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/GoogleDeepMind
+  enabled: true
+  priority: 104
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_gemini
+  name: X Gemini via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/GeminiApp
+  enabled: true
+  priority: 105
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_xai
+  name: X xAI via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/xai
+  enabled: true
+  priority: 106
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_grok
+  name: X Grok via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/grok
+  enabled: true
+  priority: 107
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_meta_ai
+  name: X Meta AI via RSSHub (moved to AIatMeta)
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/MetaAI
+  enabled: false
+  priority: 108
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.35
+  source_role: social
+  spam_risk: high
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_ai_at_meta
+  name: X AI at Meta via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/AIatMeta
+  enabled: true
+  priority: 109
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_mistral_ai
+  name: X Mistral AI via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/MistralAI
+  enabled: true
+  priority: 110
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_cohere
+  name: X Cohere via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/cohere
+  enabled: true
+  priority: 111
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_perplexity_ai
+  name: X Perplexity via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/perplexity_ai
+  enabled: true
+  priority: 112
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_msft_copilot
+  name: X Microsoft Copilot via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/Copilot
+  enabled: true
+  priority: 113
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_deepseek
+  name: X DeepSeek via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/deepseek_ai
+  enabled: true
+  priority: 114
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_qwen
+  name: X Qwen via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/Alibaba_Qwen
+  enabled: true
+  priority: 115
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_huggingface
+  name: X Hugging Face via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/huggingface
+  enabled: true
+  priority: 116
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_ollama
+  name: X Ollama via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/ollama
+  enabled: true
+  priority: 117
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_replicate
+  name: X Replicate via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/replicate
+  enabled: true
+  priority: 118
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_sam_altman
+  name: X Sam Altman via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/sama
+  enabled: true
+  priority: 119
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.35
+  source_role: social
+  spam_risk: high
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_tibo
+  name: X Tibo via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/thsottiaux
+  enabled: true
+  priority: 120
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.35
+  source_role: social
+  spam_risk: high
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_together_ai
+  name: X Together AI via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/togethercompute
+  enabled: true
+  priority: 121
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_account_local_llama
+  name: X LocalLLaMA via RSSHub (inactive)
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/LocalLLaMA
+  enabled: false
+  priority: 122
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: account
+  quality_weight: 0.35
+  source_role: social
+  spam_risk: high
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 5
+- id: x_search_github_launch
+  name: X Search GitHub Launch via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Agithub.com%20%28launch%20OR%20released%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
+  enabled: true
+  priority: 150
+  fetch_interval: 14400
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: search
+  quality_weight: 0.45
+  source_role: social_search
+  spam_risk: high
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 20
+- id: x_search_huggingface_model
+  name: X Search Hugging Face Model via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Ahuggingface.co%20%28model%20OR%20space%20OR%20dataset%20OR%20gguf%20OR%20weights%29%20-is%3Aretweet%20-is%3Areply
+  enabled: true
+  priority: 151
+  fetch_interval: 14400
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: search
+  quality_weight: 0.45
+  source_role: social_search
+  spam_risk: high
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 20
+- id: x_search_ai_tool_launch
+  name: X Search AI Tool Launch via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/keyword/%28%22AI%20tool%22%20OR%20%22AI%20app%22%20OR%20agent%20OR%20workflow%29%20%28launch%20OR%20released%20OR%20introducing%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
+  enabled: true
+  priority: 152
+  fetch_interval: 14400
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: search
+  quality_weight: 0.45
+  source_role: social_search
+  spam_risk: high
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 20
+- id: x_search_github_ai_tool
+  name: X Search GitHub AI Tool via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Agithub.com%20%28agent%20OR%20LLM%20OR%20MCP%20OR%20%22AI%20tool%22%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
+  enabled: true
+  priority: 153
+  fetch_interval: 14400
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: search
+  quality_weight: 0.45
+  source_role: social_search
+  spam_risk: high
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 20
+- id: x_search_mcp_agent
+  name: X Search MCP Agent via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/keyword/%28MCP%20OR%20%22model%20context%20protocol%22%20OR%20%22AI%20agent%22%20OR%20%22agent%20workflow%22%29%20%28github%20OR%20release%20OR%20launch%20OR%20tool%29%20-is%3Aretweet%20-is%3Areply
+  enabled: true
+  priority: 155
+  fetch_interval: 14400
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x
+  source_subtype: search
+  quality_weight: 0.45
+  source_role: social_search
+  spam_risk: high
+  requires_verification: true
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+  default_limit: 20
+- id: anthropic_news_rsshub
+  name: Anthropic News via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/anthropic/news
+  enabled: true
+  priority: 110
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+- id: anthropic_research_rsshub
+  name: Anthropic Research via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/anthropic/research
+  enabled: true
+  priority: 120
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+- id: anthropic_engineering_rsshub
+  name: Anthropic Engineering via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/anthropic/engineering
+  enabled: true
+  priority: 130
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  verification_policy:
+    mode: discovery_only
+- id: mistral_news_disabled
+  name: Mistral News (disabled placeholder)
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/mistral/news
+  enabled: false
+  priority: 900
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+- id: perplexity_updates_disabled
+  name: Perplexity Updates (disabled placeholder)
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/perplexity/updates
+  enabled: false
+  priority: 910
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic

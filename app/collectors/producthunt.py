@@ -1,5 +1,5 @@
-"""Public v2 Product Hunt collector name."""
+"""Public Product Hunt Atom adapter export."""
 
-from app.collectors.unified import ProductHuntCollector
+from app.collectors.feed import ProductHuntCollector
 
 __all__ = ["ProductHuntCollector"]

@@ -16,10 +16,10 @@ def test_github_trending_policy_requires_period_star_signal():
     source = SourceSpec(
         id="github_trending_weekly_native",
         name="GitHub Trending Weekly",
-        type="github_trending",
+        transport="github",
         url="https://github.com/trending?since=weekly",
+        github={"mode": "trending", "period": "weekly"},
         source_subtype="trending_weekly",
-        collector_type="github_trending",
         content_class="project_tool",
         selection_policy={"mode": "github_trending"},
     )
@@ -44,39 +44,34 @@ def test_github_metrics_merge_preserves_daily_weekly_and_search_signals(tmp_path
         SourceConfig(
             id="github_trending_daily_native",
             name="GitHub Trending Daily",
-            type="github_trending",
+            transport="github",
             url="https://github.com/trending?since=daily",
-            parser_type="github_trending_html",
+            github={"mode": "trending", "period": "daily"},
             source_group="github",
             source_subtype="trending_daily",
             content_class="project_tool",
-            collector_type="github_trending",
             selection_policy={"mode": "github_trending"},
         ),
         SourceConfig(
             id="github_trending_weekly_native",
             name="GitHub Trending Weekly",
-            type="github_trending",
+            transport="github",
             url="https://github.com/trending?since=weekly",
-            parser_type="github_trending_html",
+            github={"mode": "trending", "period": "weekly"},
             source_group="github",
             source_subtype="trending_weekly",
             content_class="project_tool",
-            collector_type="github_trending",
             selection_policy={"mode": "github_trending"},
         ),
         SourceConfig(
             id="github_search_topic_llm",
             name="GitHub Search Topic LLM",
-            type="github_api",
+            transport="github",
             url="https://api.github.com/search/repositories",
-            parser_type="github_api",
+            github={"mode": "search", "query": "topic:llm", "pushed_days": 7},
             source_group="github",
             source_subtype="search_repositories",
             content_class="project_tool",
-            collector_type="github",
-            search_query="topic:llm",
-            search_pushed_days=7,
             selection_policy={"mode": "github_active_high_star", "pushed_days": 7, "min_stars": 100},
         ),
     ]
@@ -139,25 +134,23 @@ def test_github_search_and_trending_rows_dedupe_by_canonical_repository_url(tmp_
     trending = SourceConfig(
         id="github_trending_weekly_native",
         name="GitHub Trending Weekly",
-        type="github_trending",
+        transport="github",
         url="https://github.com/trending?since=weekly",
-        parser_type="github_trending_html",
+        github={"mode": "trending", "period": "weekly"},
         source_group="github",
         source_subtype="trending_weekly",
         content_class="project_tool",
-        collector_type="github_trending",
         selection_policy={"mode": "github_trending"},
     )
     search = SourceConfig(
         id="github_search_topic_llm",
         name="GitHub Search Topic LLM",
-        type="github_api",
+        transport="github",
         url="https://api.github.com/search/repositories",
-        parser_type="github_api",
+        github={"mode": "search", "query": "topic:llm", "pushed_days": 7},
         source_group="github",
         source_subtype="search_repositories",
         content_class="project_tool",
-        collector_type="github",
         selection_policy={"mode": "github_active_high_star", "pushed_days": 7, "min_stars": 100},
     )
     with session_factory() as session:
@@ -196,11 +189,86 @@ def test_github_search_and_trending_rows_dedupe_by_canonical_repository_url(tmp_
     assert json.loads(row.metrics_json)["search_topics"] == ["llm"]
 
 
+def test_github_enrichment_persists_readme_and_does_not_expose_metrics_as_readme(tmp_path):
+    engine = create_engine_from_url(f"sqlite:///{tmp_path / 'enrichment.db'}")
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+    source = SourceConfig(
+        id="github_search_topic_llm",
+        name="GitHub Search Topic LLM",
+        transport="github",
+        url="https://api.github.com/search/repositories",
+        github={"mode": "search", "query": "topic:llm", "pushed_days": 7},
+        source_group="github",
+        source_subtype="search_repositories",
+        content_class="project_tool",
+        selection_policy={"mode": "github_active_high_star", "pushed_days": 7, "min_stars": 100},
+    )
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        repo.upsert_source(source)
+        inserted = repo.insert_item(
+            FetchItem(
+                source_id=source.id,
+                external_id="github_repo:owner/tool",
+                title="GitHub repo: owner/tool",
+                url="https://github.com/owner/tool",
+                content='{"stars": 1200}',
+                metrics={"stars": 1200, "forks": 10},
+                raw_payload={"github_item_type": "repository", "full_name": "owner/tool"},
+                content_class="project_tool",
+            )
+        )
+        session.flush()
+        repo.save_github_enrichment(
+            inserted.item_id,
+            {
+                "metadata": {},
+                "readme_checked": True,
+                "readme_present": False,
+                "readme_text": None,
+                "errors": ["readme:permanent_http_error"],
+            },
+        )
+        session.commit()
+
+        row = session.get(IntelItem, inserted.item_id)
+        assert row is not None
+        assert row.content_text is None
+
+        repo.save_github_enrichment(
+            inserted.item_id,
+            {
+                "metadata": {
+                    "full_name": "owner/tool",
+                    "description": "A reusable AI tool",
+                    "stargazers_count": 1210,
+                    "forks_count": 12,
+                    "topics": ["llm", "workflow"],
+                },
+                "readme_checked": True,
+                "readme_present": True,
+                "readme_text": "# Tool\nBuild reusable AI workflows.",
+                "errors": [],
+            },
+        )
+        session.commit()
+
+        row = session.get(IntelItem, inserted.item_id)
+        assert row is not None
+        assert row.summary == "A reusable AI tool"
+        assert row.content_text.startswith("# Tool")
+        metrics = json.loads(row.metrics_json)
+        assert metrics["stars"] == 1210
+        assert metrics["forks"] == 12
+        assert metrics["readme_chars"] > 0
+
+
 def test_github_report_uses_trending_period_labels_without_fake_week_delta():
     records = [
         {
             "content_class": "project_tool",
-            "source_type": "github_trending",
+            "source_transport": "github",
             "source_id": "github_trending_weekly_native",
             "external_id": "github_repo:owner/tool",
             "title": "GitHub repo: owner/tool",

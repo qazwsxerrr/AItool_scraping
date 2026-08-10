@@ -69,6 +69,30 @@ def test_github_project_reader_limit_does_not_truncate_stats(tmp_path):
     assert result.stats.total == 2
 
 
+def test_github_project_reader_uses_persisted_ai_summary_and_period_stars(tmp_path):
+    output_dir = tmp_path / "intel"
+    output_dir.mkdir()
+    payload = _project_payload(repo="example/ai-project", summary="collector description", stars=1200)
+    payload["ai"] = {
+        "summary_cn": "持久化项目介绍：用于构建 AI 工作流。",
+        "risk_flags": ["README 信息可能过时"],
+        "status": "success",
+    }
+    payload["metrics"]["trending"] = {
+        "weekly": {"rank": 2, "stars_since": 180},
+        "daily": {"rank": 1, "stars_since": 42},
+    }
+    _write_jsonl(output_dir / "intel_items.jsonl", [payload])
+
+    row = GitHubProjectReader(data_path=output_dir).list_projects().rows[0]
+
+    assert row.ai_summary == "持久化项目介绍：用于构建 AI 工作流。"
+    assert row.summary == row.ai_summary
+    assert row.weekly_stars_since == 180
+    assert row.daily_stars_since == 42
+    assert "README 信息可能过时" in row.risk_flags
+
+
 def _write_jsonl(path, rows: list[dict]) -> None:
     path.write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
@@ -90,7 +114,7 @@ def _project_payload(
     return {
         "id": stars,
         "source_id": "github_active_high_star",
-        "source_type": "github_api",
+        "source_transport": "github",
         "external_id": f"github_repo:{repo}",
         "content_class": "project_tool",
         "status": "hotspot",
