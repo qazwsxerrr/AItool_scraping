@@ -1,8 +1,8 @@
 """Read GitHub project metadata exported by the v2 intelligence pipeline.
 
-GitHub repositories are not scored by AI and do not use a second report
-pipeline. This reader only filters and orders observable repository metrics
-from ``intel_items.jsonl``.
+The reader stays on the export/UI boundary: it only filters and orders
+persisted repository metrics and the optional ``ai.summary_cn`` introduction.
+It never invokes collectors or AI at request time.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ class GitHubProjectRow:
     trending: dict[str, dict[str, Any]]
     search_topics: list[str]
     discovery_sources: list[str]
+    ai_summary: str | None = None
 
     @property
     def display_title(self) -> str:
@@ -62,6 +63,16 @@ class GitHubProjectRow:
     @property
     def is_risky(self) -> bool:
         return bool(self.risk_flags)
+
+    @property
+    def daily_stars_since(self) -> int:
+        """GitHub Trending daily-period Star signal, if persisted."""
+        return _number(self.trending.get("daily", {}).get("stars_since"))
+
+    @property
+    def weekly_stars_since(self) -> int:
+        """GitHub Trending weekly-period Star signal, if persisted."""
+        return _number(self.trending.get("weekly", {}).get("stars_since"))
 
 
 @dataclass(frozen=True)
@@ -208,13 +219,21 @@ def _row_from_record(record: dict[str, Any]) -> GitHubProjectRow | None:
     if readme_checked and has_readme is False:
         risk_flags.append("missing_readme")
 
+    ai = _mapping(record.get("ai"))
+    for flag in _string_list(ai.get("risk_flags")):
+        if flag not in risk_flags:
+            risk_flags.append(flag)
+    ai_summary = _text(ai.get("summary_cn"))
+    summary = ai_summary or _text(record.get("summary") or record.get("content_text"))
+
     return GitHubProjectRow(
         intel_item_id=_int_or_none(record.get("id")),
         repo_full_name=repo_full_name,
         url=url,
         source_id=_text(record.get("source_id")),
         status=_text(record.get("status")),
-        summary=_text(record.get("summary") or record.get("content_text")),
+        summary=summary,
+        ai_summary=ai_summary,
         stars=_number(merged.get("stars") or merged.get("stargazers_count")),
         forks=_number(merged.get("forks") or merged.get("forks_count")),
         watchers=_number(merged.get("watchers") or merged.get("watchers_count")),

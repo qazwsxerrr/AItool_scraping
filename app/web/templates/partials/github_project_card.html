@@ -16,12 +16,14 @@
     <h3>
       {% if project.url %}<a href="{{ project.url }}" target="_blank" rel="noreferrer">{{ project.display_title }}</a>{% else %}{{ project.display_title }}{% endif %}
     </h3>
-    {% if project.summary %}<p>{{ project.summary }}</p>{% endif %}
+    {% if project.ai_summary or project.summary %}
+      <p class="github-introduction">项目介绍：{{ project.ai_summary or project.summary }}</p>
+    {% endif %}
     <div class="github-metrics" aria-label="GitHub 项目指标">
       <span>stars {{ project.stars }}</span>
       <span>forks {{ project.forks }}</span>
-      {% if project.trending.weekly %}<span>本周新增 {{ project.trending.weekly.get('stars_since') }}</span>{% endif %}
-      {% if project.trending.daily %}<span>今日新增 {{ project.trending.daily.get('stars_since') }}</span>{% endif %}
+      {% if project.trending.weekly %}<span>本周新增 {{ project.weekly_stars_since }}</span>{% endif %}
+      {% if project.trending.daily %}<span>今日新增 {{ project.daily_stars_since }}</span>{% endif %}
       <span>watchers {{ project.watchers }}</span>
       <span>issues {{ project.open_issues }}</span>
     </div>

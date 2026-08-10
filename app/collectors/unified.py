@@ -6,6 +6,7 @@ Collectors only perform transport and field mapping. They return a
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -53,6 +54,13 @@ query IntelligencePosts($first: Int!, $postedAfter: DateTime!) {
   }
 }
 """.strip()
+
+# GitHub enrichment is deliberately small and bounded.  Search/Trending
+# payloads remain the source of selection signals; these caps only apply after
+# a repository has already passed deterministic selection.
+GITHUB_METADATA_MAX_RESPONSE_BYTES = 512 * 1024
+GITHUB_README_MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+GITHUB_README_MAX_CHARS = 16_000
 
 
 @dataclass(frozen=True)
@@ -235,8 +243,10 @@ class ProductHuntCollector(FeedCollector):
                             github_payload = self.github_lookup(owner, repo)
                             if isinstance(github_payload, dict):
                                 _merge_github_metrics(metrics, github_payload)
-                                if github_payload.get("id") is not None:
-                                    item.external_id = f"github_repo:{github_payload['id']}"
+                                # Keep the canonical path identity across
+                                # Product Hunt, Search, and Trending. Numeric
+                                # GitHub IDs do not match path-based collectors.
+                                item.external_id = f"github_repo:{owner.casefold()}/{repo.casefold()}"
                         except Exception as exc:
                             metrics.setdefault("github_enrichment_error", type(exc).__name__)
             item.metrics = metrics
@@ -466,6 +476,7 @@ class GitHubCollector(Collector):
                 "X-GitHub-Api-Version": self.api_version,
                 **({"Authorization": f"Bearer {self.token}"} if self.token else {}),
             },
+            max_response_bytes=GITHUB_METADATA_MAX_RESPONSE_BYTES,
             timeout_seconds=self.timeout_seconds,
         )
         if error is not None or response is None:
@@ -475,6 +486,91 @@ class GitHubCollector(Collector):
         except (TypeError, ValueError):
             return None
         return dict(payload) if isinstance(payload, dict) else None
+
+    def enrich_repository(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        max_readme_chars: int = GITHUB_README_MAX_CHARS,
+    ) -> dict[str, Any]:
+        """Fetch bounded metadata and README text for one selected repository.
+
+        This is an enrichment boundary, not a verifier: a 404, rate-limit, or
+        malformed README is returned as telemetry and never raises to the
+        batch.  The caller can persist the partial result and retain the
+        deterministic ``hotspot`` status.
+        """
+
+        owner_text = str(owner or "").strip()
+        repo_text = str(repo or "").strip().removesuffix(".git")
+        result: dict[str, Any] = {
+            "owner": owner_text,
+            "repo": repo_text,
+            "metadata": {},
+            "readme_text": None,
+            "readme_present": None,
+            "readme_checked": False,
+            "errors": [],
+        }
+        if not owner_text or not repo_text:
+            result["errors"].append("invalid_repository_identity")
+            return result
+
+        headers = self._github_headers()
+        metadata_url = f"{self.base_url}/repos/{owner_text}/{repo_text}"
+        response, retry_count, error = _request_with_retry(
+            self.client,
+            metadata_url,
+            retries=self.retries,
+            user_agent=self.user_agent,
+            extra_headers=headers,
+            max_response_bytes=GITHUB_METADATA_MAX_RESPONSE_BYTES,
+            timeout_seconds=self.timeout_seconds,
+        )
+        result["metadata_retry_count"] = retry_count
+        if error is not None or response is None:
+            result["errors"].append(f"metadata:{error[0] if error else 'request_error'}")
+        else:
+            try:
+                payload = response.json()
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                result["metadata"] = dict(payload)
+            else:
+                result["errors"].append("metadata:invalid_json")
+
+        readme_url = f"{self.base_url}/repos/{owner_text}/{repo_text}/readme"
+        response, retry_count, error = _request_with_retry(
+            self.client,
+            readme_url,
+            retries=self.retries,
+            user_agent=self.user_agent,
+            extra_headers={**headers, "Accept": "application/vnd.github.raw+json"},
+            max_response_bytes=GITHUB_README_MAX_RESPONSE_BYTES,
+            timeout_seconds=self.timeout_seconds,
+        )
+        result["readme_retry_count"] = retry_count
+        result["readme_checked"] = True
+        if error is not None or response is None:
+            result["readme_present"] = False if error and error[2] == 404 else None
+            result["errors"].append(f"readme:{error[0] if error else 'request_error'}")
+            return result
+
+        text = _decode_github_readme_response(response, max_chars=max_readme_chars)
+        result["readme_text"] = text
+        result["readme_present"] = bool(text)
+        if text is None:
+            result["errors"].append("readme:invalid_payload")
+        return result
+
+    def _github_headers(self) -> dict[str, str]:
+        return {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": self.api_version,
+            **({"Authorization": f"Bearer {self.token}"} if self.token else {}),
+        }
 
 
 class GitHubTrendingCollector(Collector):
@@ -693,12 +789,19 @@ def _graphql_error_message(payload: Any) -> str:
 def _repo_to_item(source: SourceSpec, repo: dict[str, Any], *, query: str | None) -> FetchItem:
     full_name = _text(repo.get("full_name") or repo.get("name")) or "unknown/repository"
     url = _text(repo.get("html_url"))
+    canonical_url = _canonical_github_repo_url(full_name) or url
     description = _text(repo.get("description"))
+    topics = repo.get("topics") if isinstance(repo.get("topics"), list) else []
     metrics = {
         "stars": _number(repo.get("stargazers_count")),
         "forks": _number(repo.get("forks_count")),
         "language": repo.get("language"),
-        "topics": repo.get("topics") if isinstance(repo.get("topics"), list) else [],
+        "topics": topics,
+        "full_name": full_name,
+        "canonical_project_key": full_name,
+        "github_owner": full_name.split("/", 1)[0] if "/" in full_name else None,
+        "github_repo": full_name.split("/", 1)[1] if "/" in full_name else full_name,
+        "description": description,
         "created_at": repo.get("created_at"),
         "updated_at": repo.get("updated_at"),
         "pushed_at": repo.get("pushed_at"),
@@ -720,9 +823,12 @@ def _repo_to_item(source: SourceSpec, repo: dict[str, Any], *, query: str | None
     raw = {"github_item_type": "repository", **repo}
     return FetchItem(
         source_id=source.id,
-        external_id=f"github_repo:{repo.get('id') or full_name}",
+        # Repository paths are stable across Search, Trending, and product
+        # links.  Numeric Search IDs alone would prevent cross-source dedupe.
+        external_id=f"github_repo:{full_name.casefold()}",
         title=f"GitHub repo: {full_name}",
         url=url,
+        canonical_url=canonical_url,
         author=author,
         published_at=_parse_dt(repo.get("pushed_at") or repo.get("updated_at") or repo.get("created_at")),
         summary=description,
@@ -779,6 +885,7 @@ def _parse_github_trending_html(
         stars = _number(stars_node.get_text(" ", strip=True) if stars_node else None) or 0
         forks = _number(forks_node.get_text(" ", strip=True) if forks_node else None) or 0
         stars_since = _github_trending_stars_since(row, period)
+        owner = full_name.split("/", 1)[0]
         metrics = {
             "stars": stars,
             "forks": forks,
@@ -787,10 +894,14 @@ def _parse_github_trending_html(
             "trending_rank": rank,
             "trending_signal": "stars_since",
             "discovery_sources": [source_id],
+            "full_name": full_name,
+            "canonical_project_key": full_name,
+            "github_owner": owner,
+            "github_repo": full_name.split("/", 1)[1],
             "language": _text(language_node.get_text(" ", strip=True) if language_node else None),
         }
         url = f"https://github.com/{full_name}"
-        owner = full_name.split("/", 1)[0]
+        canonical_url = _canonical_github_repo_url(full_name) or url
         raw_payload = {
             "github_item_type": "repository",
             "full_name": full_name,
@@ -806,7 +917,7 @@ def _parse_github_trending_html(
                 external_id=f"github_repo:{full_name.casefold()}",
                 title=f"GitHub repo: {full_name}",
                 url=url,
-                canonical_url=url,
+                canonical_url=canonical_url,
                 author=owner,
                 published_at=captured_at,
                 captured_at=captured_at,
@@ -827,6 +938,50 @@ def _github_trending_full_name(href: str | None) -> str | None:
     if len(parts) != 2 or any(part in {"trending", "sponsors", "collections"} for part in parts):
         return None
     return f"{parts[0]}/{parts[1]}"
+
+
+def _canonical_github_repo_url(value: Any) -> str | None:
+    """Return a case-insensitive repository URL suitable for cross-source dedupe."""
+
+    text = _text(value)
+    if not text:
+        return None
+    repo_url = text if "://" in text else f"https://github.com/{text.lstrip('/')}"
+    parsed = urlparse(repo_url)
+    host = (parsed.hostname or "").casefold()
+    parts = [part for part in parsed.path.split("/") if part]
+    if host not in {"github.com", "www.github.com"} or len(parts) < 2:
+        return None
+    owner, repo = parts[0].strip(), parts[1].removesuffix(".git").strip()
+    if not owner or not repo:
+        return None
+    return f"https://github.com/{owner.casefold()}/{repo.casefold()}"
+
+
+def _decode_github_readme_response(response: Any, *, max_chars: int) -> str | None:
+    """Decode either the GitHub JSON README envelope or a raw text response."""
+
+    try:
+        payload = response.json()
+    except (TypeError, ValueError, AttributeError):
+        payload = None
+    if isinstance(payload, dict):
+        content = payload.get("content")
+        encoding = str(payload.get("encoding") or "").casefold()
+        if isinstance(content, str) and encoding == "base64":
+            try:
+                content = base64.b64decode(content.encode("ascii"), validate=False).decode("utf-8", errors="replace")
+            except (ValueError, UnicodeError):
+                return None
+        if isinstance(content, str):
+            return content[: max(0, int(max_chars))]
+        return None
+    raw = getattr(response, "content", b"")
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")[: max(0, int(max_chars))] or None
+    if isinstance(raw, str):
+        return raw[: max(0, int(max_chars))] or None
+    return None
 
 
 def _find_github_trending_link(row: Any, fragment: str) -> Any | None:

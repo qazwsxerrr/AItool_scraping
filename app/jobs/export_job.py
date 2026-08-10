@@ -244,6 +244,24 @@ def _markdown(
                 "",
             ]
         )
+        if _is_github_repository(record):
+            metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+            periods = _trending_periods(metrics)
+            weekly = periods.get("weekly", {})
+            daily = periods.get("daily", {})
+            topics = _string_list(metrics.get("topics")) + _string_list(metrics.get("search_topics"))
+            lines.extend(
+                [
+                    "### GitHub 项目指标",
+                    f"- 累计 Star：{_count(metrics.get('stars'))}",
+                    f"- 本周新增 Star：{_count(weekly.get('stars_since')) if weekly else '-'}",
+                    f"- 今日新增 Star：{_count(daily.get('stars_since')) if daily else '-'}",
+                    f"- Fork：{_count(metrics.get('forks'))}",
+                    f"- Topics：{', '.join(topics) or '暂无'}",
+                    f"- 项目介绍：{ai.get('summary_cn') or record.get('summary') or '暂无介绍'}",
+                    "",
+                ]
+            )
     if pending:
         lines.extend(["## 待核实", ""])
         for record in pending:
@@ -274,3 +292,54 @@ def _readable_database_url(database_url: str, *, dry_run: bool) -> str:
     if not path.is_absolute():
         path = Path.cwd() / path
     return database_url if path.exists() else "sqlite:///:memory:"
+
+
+def _is_github_repository(record: dict[str, Any]) -> bool:
+    source_type = str(record.get("source_type") or "").casefold()
+    source_id = str(record.get("source_id") or "").casefold()
+    external_id = str(record.get("external_id") or "").casefold()
+    url = str(record.get("url") or "").casefold()
+    payload = record.get("raw_payload")
+    payload_type = payload.get("github_item_type") if isinstance(payload, dict) else None
+    return (
+        record.get("content_class") == "project_tool"
+        and payload_type not in {"release"}
+        and not external_id.startswith("github_release:")
+        and (
+            payload_type == "repository"
+            or source_type in {"github_api", "github_trending"}
+            or source_id.startswith("github_")
+            or external_id.startswith("github_repo:")
+            or "github.com/" in url
+        )
+    )
+
+
+def _trending_periods(metrics: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw = metrics.get("trending")
+    periods = {key: dict(value) for key, value in raw.items() if isinstance(value, dict)} if isinstance(raw, dict) else {}
+    period = metrics.get("trending_period")
+    if period and period not in periods:
+        periods[str(period)] = {
+            "rank": metrics.get("trending_rank"),
+            "stars_since": metrics.get("stars_since"),
+            "stars": metrics.get("stars"),
+            "forks": metrics.get("forks"),
+        }
+    return periods
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [str(entry) for entry in value if str(entry).strip()]
+
+
+def _count(value: Any) -> str:
+    try:
+        number = int(float(str(value).replace(",", ""))) if value is not None else 0
+    except (TypeError, ValueError):
+        number = 0
+    return f"{number:,}" if number else "-"

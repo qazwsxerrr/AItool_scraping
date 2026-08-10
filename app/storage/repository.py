@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
@@ -206,6 +207,10 @@ class IntelRepository:
                 self.session.flush()
                 source = self.session.get(Source, fields["source_id"])
             fields["content_class"] = source.content_class if source is not None else "community_social"
+        if fields["content_class"] == "project_tool":
+            github_url = _canonical_github_url(fields.get("canonical_url"))
+            if github_url and (str(fields.get("external_id") or "").casefold().startswith("github_repo:")):
+                fields["canonical_url"] = github_url
         existing = self._find_existing(fields)
         if existing is not None:
             # Refresh volatile metrics/payload while preserving a completed
@@ -222,11 +227,15 @@ class IntelRepository:
                 else fields["metrics"]
             )
             new_metrics = _dump_json(merged_metrics)
-            new_payload = _dump_json(fields["raw_payload"])
+            new_payload = _dump_json(
+                _merge_github_raw_payload(_load_json(old_payload, {}), fields["raw_payload"])
+                if _is_github_repository_fields(fields)
+                else fields["raw_payload"]
+            )
             class_changed = existing.content_class != fields["content_class"]
             existing.title = fields["title"] or existing.title
-            existing.summary = fields["summary"]
-            existing.content_text = fields["content_text"]
+            existing.summary = fields["summary"] or existing.summary
+            existing.content_text = fields["content_text"] or existing.content_text
             existing.canonical_url = fields["canonical_url"] or existing.canonical_url
             existing.published_at = fields["published_at"] or existing.published_at
             existing.content_class = fields["content_class"]
@@ -274,6 +283,63 @@ class IntelRepository:
         self.session.flush()
         return IntelInsertResult(inserted=True, item_id=row.id)
 
+    def save_github_enrichment(self, item_id: int, enrichment: Mapping[str, Any]) -> IntelItem | None:
+        """Persist bounded repository metadata/README enrichment in JSON fields.
+
+        GitHub rows already carry all required storage columns.  This method
+        merges enrichment into metrics/raw payload while preserving period Star
+        signals and source provenance, so reruns remain idempotent.
+        """
+
+        item = self.session.get(IntelItem, item_id)
+        if item is None:
+            return None
+        metadata = enrichment.get("metadata") if isinstance(enrichment, Mapping) else {}
+        metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+        metrics = _load_json(item.metrics_json, {})
+        metadata_metrics = _github_metadata_metrics(metadata)
+        metadata_metrics["github_enrichment_status"] = "partial" if enrichment.get("errors") else "success"
+        metadata_metrics["github_enrichment_errors"] = [str(error) for error in enrichment.get("errors", []) if error]
+        metadata_metrics["readme_checked"] = bool(enrichment.get("readme_checked"))
+        if enrichment.get("readme_checked"):
+            metadata_metrics["readme_present"] = enrichment.get("readme_present")
+            metadata_metrics["has_readme"] = enrichment.get("readme_present")
+        merged_metrics = _merge_github_project_metrics(metrics, metadata_metrics, source_id=item.source_id)
+
+        readme_text = _text(enrichment.get("readme_text"))
+        if readme_text:
+            merged_metrics["readme_chars"] = len(readme_text)
+            item.content_text = readme_text
+        elif not metrics.get("readme_chars") and (
+            enrichment.get("readme_checked")
+            or "readme_text" in enrichment
+            or enrichment.get("errors")
+        ):
+            # GitHub collectors use the normalized content field for a compact
+            # metrics payload before enrichment. Never expose that JSON as a
+            # README when the bounded README lookup did not produce text.
+            item.content_text = None
+        description = _text(metadata.get("description"))
+        if description:
+            item.summary = description
+        item.metrics_json = _dump_json(merged_metrics)
+
+        raw_payload = _load_json(item.raw_payload_json, {})
+        if not isinstance(raw_payload, dict):
+            raw_payload = {}
+        raw_payload = _merge_github_raw_payload(raw_payload, _bounded_github_metadata(metadata))
+        raw_payload["github_enrichment"] = {
+            "metadata_fetched": bool(metadata),
+            "readme_checked": bool(enrichment.get("readme_checked")),
+            "readme_present": enrichment.get("readme_present"),
+            "readme_text": readme_text,
+            "errors": [str(error) for error in enrichment.get("errors", []) if error],
+        }
+        item.raw_payload_json = _dump_json(raw_payload)
+        item.updated_at = utcnow()
+        self.session.flush()
+        return item
+
     def _find_existing(self, fields: Mapping[str, Any]) -> IntelItem | None:
         external_id = fields.get("external_id")
         if external_id:
@@ -319,7 +385,13 @@ class IntelRepository:
             .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
         )
         if not force:
-            stmt = stmt.where(IntelItem.status.in_(["new", "selected", "ai_failed"]))
+            stmt = stmt.where(
+                IntelItem.status.in_(["new", "selected", "ai_failed"])
+                | (
+                    (IntelItem.status == "hotspot")
+                    & (IntelItem.ai_review.has(AIItemReview.status == "ai_failed"))
+                )
+            )
         if content_class:
             stmt = stmt.where(IntelItem.content_class == content_class)
         if source_id:
@@ -445,6 +517,13 @@ def _item_fields(item: Any) -> dict[str, Any]:
     summary = _text(values.get("summary") or values.get("raw_summary"))
     content_text = _text(values.get("content_text") or values.get("content") or values.get("raw_content") or summary)
     content_class = _text(values.get("content_class"))
+    if content_class == "project_tool":
+        github_url = _canonical_github_url(canonical_url)
+        if github_url and (
+            (external_id or "").casefold().startswith("github_repo:")
+            or github_url.casefold().startswith("https://github.com/")
+        ):
+            canonical_url = github_url
     metrics = values.get("metrics") or {}
     raw_payload = values.get("raw_payload") or values.get("raw_payload_json") or {}
     if isinstance(metrics, str):
@@ -541,22 +620,50 @@ def _merge_github_project_metrics(
     period = _text(values.get("trending_period"))
     if period:
         trending = dict(merged.get("trending")) if isinstance(merged.get("trending"), Mapping) else {}
+        previous_period = trending.get(period) if isinstance(trending.get(period), Mapping) else {}
+        period_stars = values.get("stars")
+        period_forks = values.get("forks")
+        if _github_metric_number(previous_period.get("stars")) is not None and (
+            _github_metric_number(period_stars) or 0.0
+        ) < (_github_metric_number(previous_period.get("stars")) or 0.0):
+            period_stars = previous_period.get("stars")
+        if _github_metric_number(previous_period.get("forks")) is not None and (
+            _github_metric_number(period_forks) or 0.0
+        ) < (_github_metric_number(previous_period.get("forks")) or 0.0):
+            period_forks = previous_period.get("forks")
         trending[period] = {
-            "rank": values.get("trending_rank"),
-            "stars_since": values.get("stars_since"),
-            "stars": values.get("stars"),
-            "forks": values.get("forks"),
+            "rank": values.get("trending_rank") if values.get("trending_rank") is not None else previous_period.get("rank"),
+            "stars_since": values.get("stars_since") if values.get("stars_since") is not None else previous_period.get("stars_since"),
+            "stars": period_stars if period_stars is not None else previous_period.get("stars"),
+            "forks": period_forks if period_forks is not None else previous_period.get("forks"),
         }
         merged["trending"] = trending
-        # Keep the latest period signal at the canonical top level too. The
+        # Keep the strongest period signal at the canonical top level too. The
         # selection policy reads this fast path, while ``trending`` preserves
-        # daily/weekly history within the current record.
-        for key in ("trending_period", "trending_rank", "stars_since", "trending_signal"):
-            if values.get(key) is not None:
-                merged[key] = values[key]
+        # daily/weekly history within the current record. A later daily refresh
+        # therefore cannot erase a stronger weekly signal.
+        best_period = max(
+            trending.items(),
+            key=lambda entry: (_github_metric_number(entry[1].get("stars_since")) or 0.0, entry[0]),
+        )[0]
+        merged["trending_period"] = best_period
+        merged["trending_rank"] = trending[best_period].get("rank")
+        merged["stars_since"] = trending[best_period].get("stars_since")
+        merged["trending_signal"] = "stars_since"
 
     for key, value in values.items():
         if key in {"trending_period", "trending_rank", "stars_since", "trending_signal"}:
+            continue
+        if key in {"stars", "forks", "watchers", "open_issues"}:
+            previous_number = _github_metric_number(merged.get(key))
+            current_number = _github_metric_number(value)
+            if current_number is not None and (previous_number is None or current_number >= previous_number):
+                merged[key] = value
+            elif previous_number is None and value is not None:
+                merged[key] = value
+            continue
+        if key == "topics":
+            merged[key] = _unique_strings([*_string_values(merged.get(key)), *_string_values(value)])
             continue
         if value is not None:
             merged[key] = value
@@ -580,7 +687,95 @@ def _merge_github_project_metrics(
     if source_id.startswith("github_search_topic_"):
         topic = source_id.removeprefix("github_search_topic_")
         merged["search_topics"] = _unique_strings([*_string_values(merged.get("search_topics")), topic])
+    query_topics: list[str] = []
+    for query in queries:
+        query_topics.extend(re.findall(r"(?:^|\s)topic:([^\s]+)", query, flags=re.IGNORECASE))
+    if query_topics:
+        merged["search_topics"] = _unique_strings([*_string_values(merged.get("search_topics")), *query_topics])
     return merged
+
+
+def _github_metadata_metrics(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Select bounded, displayable repository fields from GitHub metadata."""
+
+    license_value = metadata.get("license")
+    if isinstance(license_value, Mapping):
+        license_value = license_value.get("spdx_id") or license_value.get("name")
+    topics = metadata.get("topics")
+    return {
+        key: value
+        for key, value in {
+            "stars": metadata.get("stargazers_count"),
+            "forks": metadata.get("forks_count"),
+            "watchers": metadata.get("watchers_count"),
+            "open_issues": metadata.get("open_issues_count"),
+            "language": metadata.get("language"),
+            "topics": list(topics)[:100] if isinstance(topics, list) else None,
+            "description": (_text(metadata.get("description")) or "")[:4_000] or None,
+            "full_name": _text(metadata.get("full_name")),
+            "canonical_project_key": _text(metadata.get("full_name")),
+            "pushed_at": metadata.get("pushed_at"),
+            "updated_at": metadata.get("updated_at"),
+            "created_at": metadata.get("created_at"),
+            "archived": metadata.get("archived"),
+            "fork": metadata.get("fork"),
+            "license": license_value,
+            "default_branch": metadata.get("default_branch"),
+        }.items()
+        if value is not None
+    }
+
+
+def _bounded_github_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only display/enrichment fields and cap free-form description text."""
+
+    allowed = {
+        "full_name", "html_url", "description", "topics", "stargazers_count",
+        "forks_count", "watchers_count", "open_issues_count", "language",
+        "pushed_at", "updated_at", "created_at", "archived", "fork", "license",
+        "default_branch", "readme_url",
+    }
+    bounded = {key: metadata[key] for key in allowed if key in metadata}
+    if "description" in bounded:
+        bounded["description"] = (_text(bounded.get("description")) or "")[:4_000] or None
+    if isinstance(bounded.get("topics"), list):
+        bounded["topics"] = [str(topic)[:128] for topic in bounded["topics"][:100] if str(topic).strip()]
+    return bounded
+
+
+def _merge_github_raw_payload(previous: Any, current: Any) -> dict[str, Any]:
+    merged = dict(previous) if isinstance(previous, Mapping) else {}
+    if isinstance(current, Mapping):
+        merged.update(dict(current))
+    return merged
+
+
+def _canonical_github_url(value: Any) -> str | None:
+    text = _text(value)
+    if not text:
+        return None
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return None
+    if (parsed.hostname or "").casefold() not in {"github.com", "www.github.com"}:
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[0], parts[1].removesuffix(".git")
+    if not owner or not repo:
+        return None
+    return f"https://github.com/{owner.casefold()}/{repo.casefold()}"
+
+
+def _github_metric_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _unique_strings(values: Iterable[Any]) -> list[str]:

@@ -7,6 +7,7 @@ from app.ai.schemas import (
     PROJECT_TOOL,
     ItemAnalysisRequest,
     ItemAnalysisResponse,
+    PROJECT_SUMMARY_RESPONSE_SCHEMA,
 )
 
 
@@ -17,4 +18,5 @@ __all__ = [
     "ItemAnalysisResponse",
     "OFFICIAL_MODEL_COMPANY",
     "PROJECT_TOOL",
+    "PROJECT_SUMMARY_RESPONSE_SCHEMA",
 ]

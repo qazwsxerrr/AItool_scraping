@@ -14,7 +14,8 @@ import httpx
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.client import ItemAnalysisClient
-from app.ai.schemas import ItemAnalysisRequest, ItemAnalysisResponse
+from app.ai.schemas import ItemAnalysisRequest, ItemAnalysisResponse, parse_project_summary_response
+from app.collectors.unified import GitHubCollector
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, SourceConfig, load_source_registry
 from app.domain.models import FetchItem, SourceSpec
@@ -62,11 +63,27 @@ def run_intel_process_job(
     force: bool = False,
     dry_run: bool = False,
     verification_timeout_seconds: float = 10.0,
+    github_enricher: Any | None = None,
+    github_api_base_url: str = "https://api.github.com",
+    github_token: str | None = None,
+    github_api_version: str = "2022-11-28",
+    github_retries: int = 0,
+    github_timeout_seconds: float | None = None,
 ) -> IntelProcessResult:
     result = IntelProcessResult()
     source_specs = dict(source_specs or {})
     with session_factory() as session:
         repo = IntelRepository(session)
+        resolved_github_enricher = github_enricher
+        if resolved_github_enricher is None and http_client is not None:
+            resolved_github_enricher = GitHubCollector(
+                http_client,
+                base_url=github_api_base_url,
+                token=github_token,
+                api_version=github_api_version,
+                retries=github_retries,
+                timeout_seconds=github_timeout_seconds,
+            )
         # Rank the complete pending pool before applying the work limit.  A
         # collector's page order is not reliable for persisted Product Hunt or
         # community items, and a low limit must not hide a higher-signal item.
@@ -117,18 +134,16 @@ def run_intel_process_job(
                     continue
                 result.selected += 1
 
-                # GitHub repository/release sources are already structured
-                # metadata. Their inclusion decision is deterministic
-                # (stars, recent push and source policy); do not spend an AI
-                # call producing a second score or gate. Keep the metadata
-                # verification row for auditable repository facts.
                 if _is_github_source(spec):
-                    verification = verify_item(
-                        fetch_item,
-                        {"content_class": "project_tool"},
+                    _process_github_project(
+                        item=item,
+                        fetch_item=fetch_item,
+                        spec=spec,
+                        repo=repo,
+                        ai_client=ai_client,
+                        github_enricher=resolved_github_enricher,
+                        result=result,
                     )
-                    repo.upsert_verification(item.id, verification)
-                    repo.set_item_status(item.id, "hotspot")
                     session.commit()
                     continue
 
@@ -216,12 +231,19 @@ def run_intel_process_job(
                             repo.set_item_status(item.id, "needs_review")
                             result.needs_review += 1
                         elif _is_github_source(spec):
-                            # A metadata verifier failure is not an AI failure;
-                            # keep the repository row auditable without
-                            # creating an artificial ai_item_reviews record.
-                            repo.upsert_verification(item.id, _failed_verification(spec, str(exc)))
-                            repo.set_item_status(item.id, "needs_review")
-                            result.needs_review += 1
+                            # GitHub enrichment/summary failures are auditable
+                            # but never change deterministic hotspot status or
+                            # invoke the general verification path.
+                            repo.upsert_ai_review(
+                                item.id,
+                                None,
+                                model=getattr(ai_client, "model", None) if ai_client is not None else None,
+                                content_class="project_tool",
+                                status="ai_failed",
+                                error_message=str(exc),
+                            )
+                            repo.set_item_status(item.id, "hotspot")
+                            result.ai_failed += 1
                         else:
                             # Commit the failure independently so a slow/broken
                             # model response cannot roll back earlier items.
@@ -242,6 +264,228 @@ def run_intel_process_job(
     return result
 
 
+def _process_github_project(
+    *,
+    item: IntelItem,
+    fetch_item: FetchItem,
+    spec: SourceSpec,
+    repo: IntelRepository,
+    ai_client: Any | None,
+    github_enricher: Any | None,
+    result: IntelProcessResult,
+) -> None:
+    """Enrich and summarize one selected GitHub repository exactly once."""
+
+    if _is_github_repository_item(fetch_item):
+        enrichment = _run_github_enrichment(fetch_item, github_enricher)
+        repo.save_github_enrichment(item.id, enrichment)
+        # Reload the persisted README/metadata before constructing the AI
+        # request, so the model only sees the selected repository's bounded
+        # material and never broad-fetches candidates.
+        refreshed = repo.session.get(IntelItem, item.id)
+        if refreshed is not None:
+            item = refreshed
+            fetch_item = _item_to_fetch_item(refreshed)
+
+        if ai_client is None:
+            repo.upsert_ai_review(
+                item.id,
+                None,
+                model=None,
+                content_class="project_tool",
+                status="ai_failed",
+                error_message="item analysis client is not configured",
+            )
+            result.ai_failed += 1
+        else:
+            request = _github_project_summary_request(item)
+            try:
+                analyzer = getattr(ai_client, "summarize_project", None)
+                if not callable(analyzer):
+                    analyzer = getattr(ai_client, "analyze", None)
+                if not callable(analyzer):
+                    raise TypeError("AI client does not expose summarize_project/analyze")
+                response_value = analyzer(request)
+                response = _coerce_github_project_response(response_value, request)
+            except Exception as exc:
+                repo.upsert_ai_review(
+                    item.id,
+                    None,
+                    model=getattr(ai_client, "model", None),
+                    content_class="project_tool",
+                    status="ai_failed",
+                    error_message=str(exc),
+                )
+                result.ai_failed += 1
+            else:
+                repo.upsert_ai_review(
+                    item.id,
+                    response,
+                    model=getattr(ai_client, "model", None),
+                    content_class="project_tool",
+                )
+                result.analyzed += 1
+
+    # Metadata enrichment is auditable, but is not claim/evidence
+    # verification.  Keep the existing metadata-only row for consumers that
+    # display verification state without invoking ``verify_item``.
+    repo.upsert_verification(item.id, _skipped_result(spec, reason="github_enrichment_only", mode=MODE_METADATA))
+    repo.set_item_status(item.id, "hotspot")
+
+
+def _run_github_enrichment(fetch_item: FetchItem, enricher: Any | None) -> dict[str, Any]:
+    owner, repo_name = _github_repo_identity(fetch_item)
+    if not owner or not repo_name:
+        return {
+            "metadata": {},
+            "readme_text": None,
+            "readme_checked": False,
+            "readme_present": None,
+            "errors": ["invalid_repository_identity"],
+        }
+    if enricher is None:
+        return {
+            "owner": owner,
+            "repo": repo_name,
+            "metadata": {},
+            "readme_text": None,
+            "readme_checked": False,
+            "readme_present": None,
+            "errors": ["enrichment_client_unavailable"],
+        }
+    try:
+        method = getattr(enricher, "enrich_repository", None)
+        value = method(owner, repo_name) if callable(method) else enricher(owner, repo_name)
+    except Exception as exc:
+        return {
+            "owner": owner,
+            "repo": repo_name,
+            "metadata": {},
+            "readme_text": None,
+            "readme_checked": False,
+            "readme_present": None,
+            "errors": [f"enrichment:{type(exc).__name__}"],
+        }
+    if not isinstance(value, Mapping):
+        return {
+            "owner": owner,
+            "repo": repo_name,
+            "metadata": {},
+            "readme_text": None,
+            "readme_checked": False,
+            "readme_present": None,
+            "errors": ["enrichment:invalid_result"],
+        }
+    if "metadata" not in value and any(key in value for key in ("full_name", "description", "stargazers_count", "topics")):
+        value = {"metadata": dict(value), "readme_text": None, "readme_checked": False, "readme_present": None, "errors": []}
+    result = dict(value)
+    metadata = result.get("metadata")
+    result["metadata"] = dict(metadata) if isinstance(metadata, Mapping) else {}
+    readme_text = result.get("readme_text")
+    if readme_text is not None:
+        result["readme_text"] = str(readme_text)[:16_000]
+    result.setdefault("owner", owner)
+    result.setdefault("repo", repo_name)
+    errors = result.get("errors", [])
+    if isinstance(errors, str):
+        errors = [errors]
+    elif not isinstance(errors, (list, tuple, set)):
+        errors = [str(errors)] if errors else []
+    result["errors"] = [str(error) for error in errors if str(error).strip()]
+    return result
+
+
+def _github_project_summary_request(item: IntelItem) -> ItemAnalysisRequest:
+    metrics = _json_dict(item.metrics_json)
+    topics = metrics.get("topics") if isinstance(metrics.get("topics"), list) else []
+    # ``content_text`` is only a README after successful enrichment. Before
+    # that, GitHub collectors use it for a compact metrics payload.
+    readme = item.content_text if metrics.get("readme_chars") else ""
+    description = item.summary or metrics.get("description") or ""
+    body_parts = [
+        f"项目简介：{description}" if description else "项目简介：暂无",
+        f"Topics：{', '.join(str(topic) for topic in topics[:100])}" if topics else "Topics：暂无",
+        f"README（最多 16000 字符）：\n{readme[:16_000]}" if readme else "README：暂无",
+    ]
+    return ItemAnalysisRequest(
+        item_id=item.id,
+        title=item.title,
+        url=item.canonical_url,
+        source_id=item.source_id,
+        source_content_class="project_tool",
+        body_preview="\n\n".join(body_parts)[:24_000],
+        metrics={**metrics, "analysis_scope": "github_project_summary"},
+    )
+
+
+def _coerce_github_project_response(value: Any, request: ItemAnalysisRequest) -> ItemAnalysisResponse:
+    if isinstance(value, ItemAnalysisResponse):
+        if not value.summary_cn.strip():
+            raise ValueError("GitHub project summary is empty")
+        return value.model_copy(
+            update={
+                # GitHub retention is decided before this call by the local
+                # Star policy.  Never preserve a provider's keep decision in
+                # the project-summary review row.
+                "keep": False,
+                "content_class": "project_tool",
+                "reason": "github_project_summary",
+                "needs_verification": False,
+                "official_url": None,
+            }
+        )
+    if isinstance(value, Mapping):
+        try:
+            response = _coerce_analysis_response(value, "project_tool")
+        except (TypeError, ValueError):
+            response = parse_project_summary_response(value)
+        return response.model_copy(
+            update={
+                "keep": False,
+                "content_class": "project_tool",
+                "reason": "github_project_summary",
+                "needs_verification": False,
+                "official_url": None,
+            }
+        )
+    raise TypeError("AI client returned an unsupported project summary")
+
+
+def _github_repo_identity(item: FetchItem) -> tuple[str | None, str | None]:
+    metrics = item.metrics if isinstance(item.metrics, Mapping) else {}
+    raw = item.raw_payload if isinstance(item.raw_payload, Mapping) else {}
+    for value in (
+        metrics.get("full_name"),
+        metrics.get("canonical_project_key"),
+        raw.get("full_name"),
+        item.external_id.removeprefix("github_repo:") if item.external_id and item.external_id.startswith("github_repo:") else None,
+    ):
+        text = str(value or "").strip().removesuffix(".git")
+        parts = [part for part in text.split("/") if part]
+        if len(parts) >= 2 and all(part not in {"repos", "search", "trending"} for part in parts[:2]):
+            return parts[0], parts[1]
+    url = item.canonical_url or item.url
+    if url:
+        parts = [part for part in str(url).split("/") if part]
+        if "github.com" in parts:
+            index = parts.index("github.com")
+            if len(parts) > index + 2:
+                return parts[index + 1], parts[index + 2].removesuffix(".git")
+    return None, None
+
+
+def _is_github_repository_item(item: FetchItem) -> bool:
+    raw = item.raw_payload if isinstance(item.raw_payload, Mapping) else {}
+    kind = str(item.kind or "").casefold()
+    item_type = str(raw.get("github_item_type") or "").casefold()
+    return bool(
+        item.external_id and item.external_id.casefold().startswith("github_repo:")
+        or item_type == "repository"
+        or "github_repository" in kind
+        or "trending_repository" in kind
+    )
+
+
 def _ranking_key(entry: tuple[IntelItem, Any, SourceSpec]) -> tuple[int, float, float, float, int, float, int]:
     """Apply explicit per-class ordering before the processing limit."""
 
@@ -256,6 +500,7 @@ def _ranking_key(entry: tuple[IntelItem, Any, SourceSpec]) -> tuple[int, float, 
     metrics = _json_dict(item.metrics_json)
     primary = float(decision.score)
     secondary = 0.0
+    tertiary = 0.0
     mode = spec.selection_policy.mode.casefold().replace("-", "_")
     if spec.content_class == "project_tool":
         linked_github = bool(
@@ -266,17 +511,19 @@ def _ranking_key(entry: tuple[IntelItem, Any, SourceSpec]) -> tuple[int, float, 
         trending = metrics.get("trending") if isinstance(metrics.get("trending"), dict) else {}
         weekly_trending = trending.get("weekly") if isinstance(trending.get("weekly"), dict) else {}
         daily_trending = trending.get("daily") if isinstance(trending.get("daily"), dict) else {}
-        if mode == "github_trending" or trending:
-            # A repository can first arrive through Search API and later be
-            # refreshed by Trending. Prefer the merged period signal whenever
-            # it exists, regardless of which source created the row.
+        if _is_github_source(spec) or linked_github or mode == "github_trending" or trending:
+            # Star-first ordering is independent of source arrival order.  A
+            # cumulative Star count is primary; daily/weekly Trending growth
+            # is retained as a deterministic tie-breaker, followed by forks.
             period_signal = max(
                 _number(metrics.get("stars_since") or metrics.get("trending_stars")),
                 _number(weekly_trending.get("stars_since")),
                 _number(daily_trending.get("stars_since")),
             )
-            primary = period_signal
-            secondary = _number(metrics.get("stars") or metrics.get("stargazers_count"))
+            cumulative_stars = _number(metrics.get("stars") or metrics.get("stargazers_count"))
+            primary = cumulative_stars if cumulative_stars > 0 else period_signal
+            secondary = period_signal
+            tertiary = _number(metrics.get("forks") or metrics.get("forks_count"))
         elif mode in {"github_active_high_star", "active_high_star"} or linked_github:
             primary = _number(metrics.get("stars") or metrics.get("stargazers_count"))
             secondary = _number(metrics.get("forks") or metrics.get("forks_count"))
@@ -290,7 +537,8 @@ def _ranking_key(entry: tuple[IntelItem, Any, SourceSpec]) -> tuple[int, float, 
 
     # Reverse sort makes higher stars/votes/newness win, lower registry
     # priority win ties, and the oldest row id provide a stable final tie-break.
-    signal = 0.0 if _is_github_source(spec) else float(decision.score)
+    github_fork_signal = tertiary if spec.content_class == "project_tool" and _is_github_source(spec) else 0.0
+    signal = github_fork_signal if _is_github_source(spec) else float(decision.score)
     return (
         1 if decision.selected else 0,
         primary,
@@ -352,6 +600,11 @@ def run_intel_process_from_settings(
             force=force,
             dry_run=dry_run,
             verification_timeout_seconds=settings.request_timeout_seconds,
+            github_api_base_url=settings.github_api_base_url,
+            github_token=settings.github_api_token,
+            github_api_version=settings.github_api_version,
+            github_retries=settings.request_retries,
+            github_timeout_seconds=settings.github_timeout_seconds,
         )
     finally:
         if own_client:

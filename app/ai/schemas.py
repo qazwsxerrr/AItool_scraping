@@ -41,6 +41,13 @@ ITEM_ANALYSIS_RESPONSE_SCHEMA: dict[str, str] = {
     "confidence": "integer 0-100",
 }
 
+PROJECT_SUMMARY_RESPONSE_SCHEMA: dict[str, str] = {
+    "summary_cn": "string",
+    "capabilities": "array<string>",
+    "use_cases": "array<string>",
+    "risk_flags": "array<string>",
+}
+
 
 class ItemAnalysisRequest(BaseModel):
     """Normalized item data supplied to the model."""
@@ -189,6 +196,34 @@ def parse_item_analysis_response(
         raw_response=raw,
     )
     return apply_local_guard(response, fallback_class)
+
+
+def parse_project_summary_response(data: Any) -> ItemAnalysisResponse:
+    """Parse the narrow GitHub summary contract into the existing audit row."""
+
+    raw = _coerce_raw_mapping(data)
+    result = _unwrap_response(raw)
+    summary = clean_text(result.get("summary_cn") or result.get("introduction") or result.get("intro"))
+    sections: list[str] = []
+    for label, key in (("主要能力", "capabilities"), ("适用场景", "use_cases")):
+        values = clean_string_list(result.get(key))
+        if values:
+            sections.append(f"{label}：" + "；".join(values[:8]))
+    if sections:
+        summary = "\n".join([part for part in (summary, *sections) if part])[:8_000]
+    if not summary:
+        raise ValueError("GitHub project summary is missing summary_cn, capabilities, or use_cases")
+    return ItemAnalysisResponse(
+        keep=False,
+        content_class=PROJECT_TOOL,
+        summary_cn=summary,
+        reason="github_project_summary",
+        risk_flags=clean_string_list(result.get("risk_flags")),
+        needs_verification=False,
+        official_url=None,
+        confidence=0,
+        raw_response=raw,
+    )
 
 
 def _coerce_raw_mapping(data: Any) -> dict[str, Any]:
@@ -385,6 +420,7 @@ __all__ = [
     "CONTENT_CLASSES",
     "ContentClass",
     "ITEM_ANALYSIS_RESPONSE_SCHEMA",
+    "PROJECT_SUMMARY_RESPONSE_SCHEMA",
     "ItemAnalysisRequest",
     "ItemAnalysisResponse",
     "OFFICIAL_MODEL_COMPANY",
@@ -399,5 +435,6 @@ __all__ = [
     "guard_item_analysis_response",
     "normalize_content_class",
     "parse_item_analysis_response",
+    "parse_project_summary_response",
     "strip_json_fence",
 ]

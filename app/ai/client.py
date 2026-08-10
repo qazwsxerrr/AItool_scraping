@@ -10,6 +10,8 @@ from app.ai.prompts import (
     ITEM_ANALYSIS_RESPONSE_SCHEMA,
     ITEM_ANALYSIS_SYSTEM_PROMPT,
     ITEM_ANALYSIS_TASK,
+    PROJECT_SUMMARY_SYSTEM_PROMPT,
+    PROJECT_SUMMARY_TASK,
     build_generic_json_payload,
     build_openai_chat_payload,
 )
@@ -20,8 +22,10 @@ from app.ai.schemas import (
     ItemAnalysisRequest,
     ItemAnalysisResponse,
     OFFICIAL_MODEL_COMPANY,
+    PROJECT_SUMMARY_RESPONSE_SCHEMA,
     PROJECT_TOOL,
     parse_item_analysis_response,
+    parse_project_summary_response,
 )
 from app.config.settings import Settings
 
@@ -92,6 +96,35 @@ class ItemAnalysisClient:
             raise ValueError("Item analysis API returned invalid JSON") from exc
         return parse_item_analysis_response(data, request.source_content_class)
 
+    def summarize_project(self, request: ItemAnalysisRequest) -> ItemAnalysisResponse:
+        """Run one GitHub project-summary request using the same schema/audit path."""
+
+        if not self.is_configured:
+            raise RuntimeError("Item analysis API is not configured")
+        if not isinstance(request, ItemAnalysisRequest):
+            raise TypeError("request must be an ItemAnalysisRequest")
+        payload = self._build_payload(
+            request,
+            task=PROJECT_SUMMARY_TASK,
+            system_prompt=PROJECT_SUMMARY_SYSTEM_PROMPT,
+            response_schema=PROJECT_SUMMARY_RESPONSE_SCHEMA,
+        )
+        response = self._post_once(self._endpoint_url(), payload)
+        try:
+            data = response.json()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Item analysis API returned invalid JSON") from exc
+        try:
+            return parse_item_analysis_response(data, request.source_content_class)
+        except ValueError as analysis_error:
+            # The narrow contract may arrive directly, inside a generic
+            # envelope, or inside an OpenAI-compatible choices message.  The
+            # project parser already knows how to unwrap all of those shapes.
+            try:
+                return parse_project_summary_response(data)
+            except ValueError:
+                raise analysis_error
+
     def _post_once(self, url: str, payload: dict[str, Any]):
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -123,10 +156,29 @@ class ItemAnalysisClient:
             return f"{self.api_url}/chat/completions"
         return self.api_url
 
-    def _build_payload(self, request: ItemAnalysisRequest) -> dict[str, Any]:
+    def _build_payload(
+        self,
+        request: ItemAnalysisRequest,
+        *,
+        task: str = ITEM_ANALYSIS_TASK,
+        system_prompt: str = ITEM_ANALYSIS_SYSTEM_PROMPT,
+        response_schema: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         if self.api_style == "openai_chat":
-            return build_openai_chat_payload(request, model=self.model)
-        return build_generic_json_payload(request, model=self.model)
+            return build_openai_chat_payload(
+                request,
+                model=self.model,
+                task=task,
+                system_prompt=system_prompt,
+                response_schema=response_schema,
+            )
+        return build_generic_json_payload(
+            request,
+            model=self.model,
+            task=task,
+            system_prompt=system_prompt,
+            response_schema=response_schema,
+        )
 
 __all__ = [
     "COMMUNITY_SOCIAL",
@@ -135,6 +187,9 @@ __all__ = [
     "ITEM_ANALYSIS_RESPONSE_SCHEMA",
     "ITEM_ANALYSIS_SYSTEM_PROMPT",
     "ITEM_ANALYSIS_TASK",
+    "PROJECT_SUMMARY_SYSTEM_PROMPT",
+    "PROJECT_SUMMARY_TASK",
+    "PROJECT_SUMMARY_RESPONSE_SCHEMA",
     "ItemAnalysisClient",
     "ItemAnalysisRequest",
     "ItemAnalysisResponse",
@@ -142,4 +197,5 @@ __all__ = [
     "PROJECT_TOOL",
     "SupportsPost",
     "parse_item_analysis_response",
+    "parse_project_summary_response",
 ]

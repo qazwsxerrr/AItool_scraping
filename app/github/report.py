@@ -98,7 +98,7 @@ def _search_table(records: list[dict[str, Any]]) -> list[str]:
                 url=record.get("url") or "",
                 stars=_count(metrics.get("stars")),
                 pushed=metrics.get("pushed_at") or "-",
-                topics=", ".join(_string_list(metrics.get("search_topics"))) or "-",
+                topics=", ".join(_project_topics(metrics)) or "-",
                 language=metrics.get("language") or "-",
             )
         )
@@ -111,7 +111,9 @@ def _detail_block(index: int, record: dict[str, Any]) -> list[str]:
     weekly = periods.get("weekly", {})
     daily = periods.get("daily", {})
     sources = ", ".join(_string_list(metrics.get("discovery_sources"))) or record.get("source_id") or "-"
-    topics = ", ".join(_string_list(metrics.get("search_topics")))
+    topics = ", ".join(_project_topics(metrics))
+    ai = _mapping(record.get("ai"))
+    introduction = _clean_text(ai.get("summary_cn") or record.get("summary") or record.get("content_text"))
     lines = [
         f"### {index}. {_repo_name(record)}",
         f"- 链接：{record.get('url') or '-'}",
@@ -122,7 +124,7 @@ def _detail_block(index: int, record: dict[str, Any]) -> list[str]:
         f"- 最近 Push：{metrics.get('pushed_at') or '-'}",
         f"- 来源：{sources}",
         *([f"- 命中 Topic：{topics}"] if topics else []),
-        f"- 描述：{_clean_text(record.get('summary')) or '暂无描述'}",
+        f"- 项目介绍：{introduction or '暂无介绍'}",
         "",
     ]
     return lines
@@ -173,8 +175,23 @@ def _unique_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _is_github_repository(record: dict[str, Any]) -> bool:
     source_type = str(record.get("source_type") or "").casefold()
+    source_id = str(record.get("source_id") or "").casefold()
+    external_id = str(record.get("external_id") or "").casefold()
+    url = str(record.get("url") or "").casefold()
     payload = _mapping(record.get("raw_payload"))
-    return record.get("content_class") == "project_tool" and source_type in {"github_api", "github_trending"} and payload.get("github_item_type") == "repository"
+    payload_type = payload.get("github_item_type")
+    return (
+        record.get("content_class") == "project_tool"
+        and payload_type not in {"release"}
+        and not external_id.startswith("github_release:")
+        and (
+            payload_type == "repository"
+            or source_type in {"github_api", "github_trending"}
+            or source_id.startswith("github_")
+            or external_id.startswith("github_repo:")
+            or "github.com/" in url
+        )
+    )
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -209,6 +226,16 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, (list, tuple, set)):
         return []
     return [str(entry) for entry in value if str(entry).strip()]
+
+
+def _project_topics(metrics: Mapping[str, Any]) -> list[str]:
+    """Combine repository topics and Search query topics without duplicates."""
+    topics: list[str] = []
+    for value in (_string_list(metrics.get("topics")), _string_list(metrics.get("search_topics"))):
+        for topic in value:
+            if topic not in topics:
+                topics.append(topic)
+    return topics
 
 
 def _clean_text(value: Any) -> str:
