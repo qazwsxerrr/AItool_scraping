@@ -42,8 +42,40 @@ def relative_time(value: datetime | None) -> str:
     return "刚刚"
 
 
+_CONTENT_CLASS_LABELS = {
+    "official_model_company": "官方发布",
+    "project_tool": "项目 / 工具",
+    "community_social": "社区线索",
+}
+_STATUS_LABELS = {
+    "new": "待处理",
+    "selected": "已选入处理",
+    "verified": "已核实",
+    "hotspot": "热点项目",
+    "discovery_only": "发现线索",
+    "needs_review": "待复核",
+    "ai_failed": "AI 处理失败",
+    "filtered": "未入选",
+    "rejected": "已排除",
+}
+
+
+def content_class_label(value: str | None) -> str:
+    if not value:
+        return "未分类"
+    return _CONTENT_CLASS_LABELS.get(value, value)
+
+
+def status_label(value: str | None) -> str:
+    if not value:
+        return "未知状态"
+    return _STATUS_LABELS.get(value, value)
+
+
 templates.env.filters["datetime"] = format_datetime
 templates.env.filters["relative_time"] = relative_time
+templates.env.filters["content_class_label"] = content_class_label
+templates.env.filters["status_label"] = status_label
 
 
 @lru_cache(maxsize=1)

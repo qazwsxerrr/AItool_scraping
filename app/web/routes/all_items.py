@@ -14,6 +14,7 @@ def all_items(
     request: Request,
     q: str | None = None,
     source_group: str | None = None,
+    content_class: str | None = None,
     status: str | None = None,
     ai_keep: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
@@ -22,18 +23,21 @@ def all_items(
     filters = AllItemFilters(
         query=q,
         source_group=source_group,
+        content_class=content_class,
         status=status,
         ai_keep=_parse_bool(ai_keep),
     )
     items = repo.list_all_items(filters=filters, page=page, page_size=50)
+    filter_options = repo.list_filter_options()
     return templates.TemplateResponse(
         request=request,
         name="all_items.html",
         context={
             "request": request,
-            "active_nav": "all",
+            "active_nav": "pending" if status == "needs_review" else "runs" if status == "ai_failed" else "all",
             "items": items,
             "filters": filters,
+            "filter_options": filter_options,
             "page": page,
             "has_next_page": len(items) == 50,
         },

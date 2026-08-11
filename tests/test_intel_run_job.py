@@ -4,11 +4,11 @@ from pathlib import Path
 
 from app.config.settings import Settings
 from app.jobs import run_job
-from app.jobs.export_job import IntelExportResult
+from app.jobs.export_job import IntelExportResult, run_intel_export_job
 from app.jobs.fetch_job import IntelFetchResult
 from app.jobs.process_job import IntelProcessResult
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelRun
+from app.storage.models import AIItemReview, IntelItem, IntelRun, Source
 from sqlalchemy import select
 
 
@@ -71,3 +71,69 @@ def test_run_once_dry_run_does_not_create_database(tmp_path, monkeypatch):
     result = run_job.run_intel_once_from_settings(settings=_settings(db_path), dry_run=True)
     assert result.status == "dry_run"
     assert not db_path.exists()
+
+
+def test_run_once_marks_isolated_ai_failures_as_completed_with_errors(tmp_path, monkeypatch):
+    db_path = tmp_path / "ai-failed.db"
+    engine = create_engine_from_url(f"sqlite:///{db_path}")
+    init_db(engine)
+
+    monkeypatch.setattr(
+        run_job,
+        "run_intel_fetch_from_settings",
+        lambda **kwargs: IntelFetchResult(run_id=kwargs.get("run_id"), stats={}),
+    )
+    monkeypatch.setattr(
+        run_job,
+        "run_intel_process_from_settings",
+        lambda **kwargs: IntelProcessResult(failed=1, ai_failed=1),
+    )
+    monkeypatch.setattr(
+        run_job,
+        "run_intel_export_from_settings",
+        lambda **kwargs: IntelExportResult(0, 0, "items", "digest", "pending"),
+    )
+
+    result = run_job.run_intel_once_from_settings(settings=_settings(db_path))
+
+    assert result.status == "completed_with_errors"
+    with create_session_factory(engine)() as session:
+        row = session.scalar(select(IntelRun))
+        assert row.status == "completed_with_errors"
+        assert row.failed == 1
+
+
+def test_export_surfaces_hotspot_with_failed_project_summary_as_pending(tmp_path):
+    db_path = tmp_path / "export-ai-failed.db"
+    engine = create_engine_from_url(f"sqlite:///{db_path}")
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        source = Source(
+            id="github_test",
+            name="GitHub",
+            transport="github",
+            url="https://github.com/trending?since=daily",
+            content_class="project_tool",
+        )
+        item = IntelItem(
+            source=source,
+            external_id="github_repo:owner/project",
+            canonical_url="https://github.com/owner/project",
+            title="GitHub repo: owner/project",
+            content_class="project_tool",
+            content_hash="a" * 64,
+            status="hotspot",
+        )
+        item.ai_review = AIItemReview(
+            content_class="project_tool",
+            status="ai_failed",
+            error_message="summary unavailable",
+        )
+        session.add(item)
+        session.commit()
+
+    result = run_intel_export_job(session_factory=session_factory, output_dir=tmp_path / "out")
+
+    assert result.exported == 1
+    assert result.pending == 1

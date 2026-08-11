@@ -14,10 +14,10 @@
       {% if project.latest_release_names %}<span>release {{ project.latest_release_names[0] }}</span>{% endif %}
     </div>
     <h3>
-      {% if project.url %}<a href="{{ project.url }}" target="_blank" rel="noreferrer">{{ project.display_title }}</a>{% else %}{{ project.display_title }}{% endif %}
+      {% if project.url %}<a href="{{ project.url }}" target="_blank" rel="noopener noreferrer">{{ project.display_title }}</a>{% else %}{{ project.display_title }}{% endif %}
     </h3>
     {% if project.ai_summary or project.summary %}
-      <p class="github-introduction">项目介绍：{{ project.ai_summary or project.summary }}</p>
+      <p class="github-introduction" title="{{ project.ai_summary or project.summary }}">项目介绍：{{ project.ai_summary or project.summary }}</p>
     {% endif %}
     <div class="github-metrics" aria-label="GitHub 项目指标">
       <span>stars {{ project.stars }}</span>
@@ -34,7 +34,14 @@
       {% if project.license_name %}<span class="badge success">{{ project.license_name }}</span>{% else %}<span class="badge warning">missing-license</span>{% endif %}
       {% for keyword in project.topics[:6] %}<span class="badge">{{ keyword }}</span>{% endfor %}
       {% for topic in project.search_topics[:6] %}<span class="badge">topic:{{ topic }}</span>{% endfor %}
-      {% for flag in project.risk_flags %}<span class="badge danger">{{ flag }}</span>{% endfor %}
+      {% if project.risk_flags %}
+        <details class="risk-details">
+          <summary class="badge warning">风险提示 {{ project.risk_flags | length }}</summary>
+          <ul class="risk-list">
+            {% for flag in project.risk_flags %}<li>{{ flag }}</li>{% endfor %}
+          </ul>
+        </details>
+      {% endif %}
     </div>
   </div>
 </article>

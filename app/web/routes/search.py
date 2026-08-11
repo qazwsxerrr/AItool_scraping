@@ -18,13 +18,7 @@ def search(
     github_reader: GitHubProjectReader = Depends(get_github_project_reader),
 ):
     query = (q or "").strip()
-    results = repo.search_content(query) if query else SearchContentResults(
-        query="",
-        recommendations=[],
-        items=[],
-        claims=[],
-        evidence=[],
-    )
+    results = repo.search_content(query) if query else SearchContentResults.empty()
     github_projects = github_reader.search(query) if query else []
     return templates.TemplateResponse(
         request=request,

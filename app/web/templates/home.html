@@ -5,26 +5,27 @@
 <section class="page-head">
   <div>
     <p class="eyebrow">今日精选</p>
-    <h1>AI 热点推荐</h1>
+    <h1>AI 热点精选</h1>
     <p class="muted-text">
-      {{ stats.raw_items }} 条动态 · {{ stats.kept_candidates }} 条候选 · {{ stats.recommendations }} 张推荐卡片
-      {% if stats.stale_recommendations %} · {{ stats.stale_recommendations }} 张 stale{% endif %}
+      {{ stats.raw_items }} 条动态 · {{ stats.selected_items }} 条已选内容 ·
+      {{ stats.hotspots }} 个项目热点 · {{ stats.verified_items }} 条已核实
+      {% if stats.pending_items %} · {{ stats.pending_items }} 条待处理{% endif %}
     </p>
   </div>
   <div class="run-status">
-    <span>Last run</span>
+    <span>最近运行</span>
     <strong>{{ stats.last_run_type or '暂无' }}</strong>
-    <small>{{ stats.last_run_status or 'unknown' }}</small>
+    <small>{{ stats.last_run_status | status_label }}</small>
   </div>
 </section>
 
 <section class="chips" aria-label="分类筛选">
-  {% set categories = [('全部', None), ('模型', 'model'), ('产品', 'product'), ('Agent', 'agent'), ('MCP', 'mcp'), ('开源项目', 'open_source'), ('论文', 'paper'), ('技巧', 'tip')] %}
+  {% set categories = [('全部', None), ('官方发布', 'official_model_company'), ('项目 / 工具', 'project_tool'), ('社区线索', 'community_social')] %}
   {% for label, value in categories %}
     <a class="chip {{ 'active' if category == value else '' }}" href="/?{% if value %}category={{ value }}&{% endif %}hide_stale={{ 1 if hide_stale else 0 }}">{{ label }}</a>
   {% endfor %}
-  <a class="chip {{ 'active' if direct else '' }}" href="/?direct={{ 0 if direct else 1 }}&hide_stale={{ 1 if hide_stale else 0 }}">仅 direct support</a>
-  <a class="chip {{ 'active' if hide_stale else '' }}" href="/?hide_stale={{ 0 if hide_stale else 1 }}">隐藏 stale</a>
+  <a class="chip {{ 'active' if direct else '' }}" href="/?direct={{ 0 if direct else 1 }}&hide_stale={{ 1 if hide_stale else 0 }}">仅显示已核实</a>
+  <a class="chip {{ 'active' if hide_stale else '' }}" href="/?hide_stale={{ 0 if hide_stale else 1 }}">{{ '隐藏待复核' if hide_stale else '显示待复核' }}</a>
 </section>
 
 {% if top_card %}
@@ -45,7 +46,7 @@
       </div>
       <a class="button secondary" href="/github">查看全部 {{ github_project_stats.total }}</a>
     </div>
-    <p class="muted-text">GitHub 项目来自 Trending HTML 与 Search API，优先展示周期新增 Star，不使用历史快照。</p>
+    <p class="muted-text">项目来自 Trending HTML 与 Search API，优先展示周期新增 Star，不使用历史快照。</p>
     {% for project in github_projects %}
       {% include "partials/github_project_card.html" %}
     {% endfor %}
@@ -53,7 +54,7 @@
 {% endif %}
 
 <section class="timeline">
-  <h2>推荐列表</h2>
+  <h2>精选时间线</h2>
   {% if cards %}
     {% for card in cards %}
       {% if loop.index0 != 0 or not top_card %}
@@ -62,8 +63,8 @@
     {% endfor %}
   {% else %}
     <div class="empty-state">
-      <h3>暂无推荐卡片</h3>
-      <p>先运行 recommendation-write，或前往“全部动态”查看候选内容。</p>
+      <h3>暂无精选内容</h3>
+      <p>先运行 fetch 与 process 生成可展示内容，或前往“全部动态”查看处理状态。</p>
       <a class="button" href="/all">查看全部动态</a>
     </div>
   {% endif %}

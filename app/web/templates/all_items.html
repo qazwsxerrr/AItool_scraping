@@ -6,30 +6,40 @@
   <div>
     <p class="eyebrow">全部动态</p>
     <h1>AI 信息流</h1>
-    <p class="muted-text">展示 raw / normalized / candidate / AI 初筛结果，线索来源会明确标注。</p>
+    <p class="muted-text">展示统一情报条目、来源类别、处理状态与可核实链接。</p>
   </div>
 </section>
 
 <form class="filters" action="/all" method="get">
-  <input name="q" type="search" placeholder="搜索标题、摘要..." value="{{ filters.query or '' }}">
+  <label class="sr-only" for="all-query">搜索动态</label>
+  <input id="all-query" name="q" type="search" placeholder="搜索标题、摘要..." value="{{ filters.query or '' }}">
   <select name="source_group">
     <option value="">全部来源</option>
-    {% for group in ['official', 'news', 'community', 'reddit_local_llama', 'x', 'rsshub'] %}
+    {% for group in filter_options.source_groups %}
       <option value="{{ group }}" {{ 'selected' if filters.source_group == group else '' }}>{{ group }}</option>
+    {% endfor %}
+  </select>
+  <select name="content_class">
+    <option value="">全部类别</option>
+    {% for value in filter_options.content_classes %}
+      <option value="{{ value }}" {{ 'selected' if filters.content_class == value else '' }}>{{ value | content_class_label }}</option>
     {% endfor %}
   </select>
   <select name="status">
     <option value="">全部状态</option>
-    {% for status in ['kept', 'dropped'] %}
-      <option value="{{ status }}" {{ 'selected' if filters.status == status else '' }}>{{ status }}</option>
+    {% for value in filter_options.statuses %}
+      <option value="{{ value }}" {{ 'selected' if filters.status == value else '' }}>{{ value | status_label }}</option>
     {% endfor %}
   </select>
   <select name="ai_keep">
-    <option value="">AI 初筛</option>
+    <option value="">AI 处理</option>
     <option value="keep" {{ 'selected' if filters.ai_keep is sameas true else '' }}>keep</option>
     <option value="drop" {{ 'selected' if filters.ai_keep is sameas false else '' }}>drop</option>
   </select>
-  <button type="submit">筛选</button>
+  <button type="submit">应用筛选</button>
+  {% if filters.query or filters.source_group or filters.content_class or filters.status or filters.ai_keep is not none %}
+    <a class="button secondary" href="/all">清除</a>
+  {% endif %}
 </form>
 
 <section class="timeline">
@@ -49,7 +59,7 @@
   {% else %}
     <div class="empty-state">
       <h3>暂无动态</h3>
-      <p>可以先运行 fetch / normalize / prefilter，或调整筛选条件。</p>
+      <p>可以先运行 fetch 与 process，或调整筛选条件。</p>
     </div>
   {% endif %}
 </section>

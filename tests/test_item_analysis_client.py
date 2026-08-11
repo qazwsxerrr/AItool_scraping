@@ -6,7 +6,7 @@ import pytest
 
 from app.ai import ItemAnalysisClient
 from app.ai.client import ItemAnalysisClient as CanonicalItemAnalysisClient
-from app.ai.prompts import ITEM_ANALYSIS_RESPONSE_SCHEMA, ITEM_ANALYSIS_SYSTEM_PROMPT
+from app.ai.prompts import ITEM_ANALYSIS_RESPONSE_SCHEMA, ITEM_ANALYSIS_SYSTEM_PROMPT, PROJECT_SUMMARY_SYSTEM_PROMPT
 from app.ai.schemas import ItemAnalysisRequest, ItemAnalysisResponse, apply_local_guard, parse_item_analysis_response
 from app.config.settings import Settings
 
@@ -160,6 +160,37 @@ def test_openai_chat_endpoint_and_json_fence_are_supported():
     assert result.confidence == 88
     assert result.raw_response == http.response.payload
     assert "community_social" in result.raw_response["choices"][0]["message"]["content"]
+
+
+def test_project_summary_parses_narrow_openai_response_without_keep_gate():
+    content = json.dumps(
+        {
+            "summary_cn": "一个可组合的 AI 工作流项目。",
+            "capabilities": ["编排模型调用"],
+            "use_cases": ["搭建内部自动化流程"],
+            "risk_flags": ["README 信息可能过时"],
+        },
+        ensure_ascii=False,
+    )
+    http = FakeHttpClient(FakeResponse({"choices": [{"message": {"content": content}}]}))
+    client = ItemAnalysisClient.from_settings(
+        Settings(
+            ai_review_api_url="https://api.example.test/v1",
+            ai_review_api_key="key",
+            ai_review_model="chat-model",
+            ai_review_api_style="openai_chat",
+        ),
+        http_client=http,
+    )
+
+    result = client.summarize_project(_request())
+
+    assert result.keep is False
+    assert result.content_class == "project_tool"
+    assert "编排模型调用" in result.summary_cn
+    assert result.risk_flags == ["README 信息可能过时"]
+    assert PROJECT_SUMMARY_SYSTEM_PROMPT in http.calls[0]["json"]["messages"][0]["content"]
+    assert len(http.calls) == 1
 
 
 def test_missing_or_malformed_provider_json_is_rejected():

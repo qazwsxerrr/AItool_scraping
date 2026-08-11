@@ -296,6 +296,7 @@ def _process_github_project(
                 status="ai_failed",
                 error_message="item analysis client is not configured",
             )
+            result.failed += 1
             result.ai_failed += 1
         else:
             request = _github_project_summary_request(item)
@@ -316,6 +317,7 @@ def _process_github_project(
                     status="ai_failed",
                     error_message=str(exc),
                 )
+                result.failed += 1
                 result.ai_failed += 1
             else:
                 repo.upsert_ai_review(

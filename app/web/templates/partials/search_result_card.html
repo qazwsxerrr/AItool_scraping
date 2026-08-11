@@ -1,22 +1,27 @@
 <article class="card search-result-card">
-  <div class="score-pill score-{{ 'high' if result.score and result.score >= 80 else 'mid' if result.score and result.score >= 60 else 'low' }}">
-    {{ result.score if result.score is not none else '—' }}
+  {% set is_hotspot_without_score = result.status == 'hotspot' and (result.score or 0) == 0 %}
+  <div class="score-pill {{ 'score-hot' if is_hotspot_without_score else 'score-' ~ ('high' if result.score is not none and result.score >= 80 else 'mid' if result.score is not none and result.score >= 60 else 'low') }}">
+    {{ 'HOT' if is_hotspot_without_score else (result.score if result.score is not none else '—') }}
   </div>
   <div class="card-body">
     <div class="card-meta">
-      <span>{{ result.result_type }}</span>
+      <span>{{ '精选情报' if result.result_type == 'recommendation' else '全部动态' }}</span>
       {% if result.source_name %}<span>{{ result.source_name }}</span>{% endif %}
+      {% if result.content_class %}<span>{{ result.content_class | content_class_label }}</span>{% endif %}
       {% if result.published_at %}<span>{{ result.published_at | relative_time }}</span>{% endif %}
-      {% if result.candidate_item_id %}<span>candidate #{{ result.candidate_item_id }}</span>{% endif %}
+      {% if result.status %}<span>{{ result.status | status_label }}</span>{% endif %}
     </div>
     <h3>
-      {% if result.url %}<a href="{{ result.url }}" target="_blank" rel="noreferrer">{{ result.title }}</a>{% else %}{{ result.title }}{% endif %}
+      {% if result.url %}<a href="{{ result.url }}" target="_blank" rel="noopener noreferrer">{{ result.title }}</a>{% else %}{{ result.title }}{% endif %}
     </h3>
-    {% if result.summary %}<p>{{ result.summary }}</p>{% endif %}
+    {% if result.summary %}<p class="summary-clamp" title="{{ result.summary }}">{{ result.summary }}</p>{% endif %}
+    {% if result.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ result.selection_reason }}</p>{% endif %}
     <div class="badges">
       {% for badge in result.badges %}
-        <span class="badge {{ 'danger' if badge in ['contradict', 'failed', 'broken', 'stale'] else 'success' if badge in ['support', 'direct_support', 'completed'] else 'primary' if loop.first else '' }}">{{ badge }}</span>
+        <span class="badge {{ 'danger' if badge in ['contradict', 'failed', 'broken', 'stale', 'ai_failed'] else 'success' if badge in ['support', 'direct_support', 'completed', 'verified'] else 'primary' if loop.first else '' }}">{{ badge | status_label if badge in ['verified', 'hotspot', 'discovery_only', 'needs_review', 'ai_failed', 'filtered', 'rejected', 'new', 'selected'] else (badge | content_class_label if badge in ['official_model_company', 'project_tool', 'community_social'] else badge) }}</span>
       {% endfor %}
+      {% if result.verification_status == 'verified' %}<span class="badge success">已核实</span>{% endif %}
+      {% if result.ai_status == 'ai_failed' %}<span class="badge warning">AI 处理失败</span>{% endif %}
     </div>
   </div>
 </article>

@@ -140,6 +140,7 @@ def _list_pending(
         .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
         .where(
             (IntelItem.status.in_(["needs_review", "ai_failed"]))
+            | ((IntelItem.status == "hotspot") & (AIItemReview.status == "ai_failed"))
             | ((IntelItem.status == "selected") & AIItemReview.id.is_(None))
         )
         .order_by(IntelItem.selection_score.desc(), IntelItem.id.asc())

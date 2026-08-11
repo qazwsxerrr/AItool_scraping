@@ -101,6 +101,8 @@ def run_intel_once_from_settings(
             limit=limit,
             output_dir=output_dir,
         )
+        # ``failed`` counts each failed item once; ``ai_failed`` is the
+        # narrower audit counter for model failures and is already included.
         status = "completed_with_errors" if (fetch.total_failed or process.failed) else "completed"
         with session_factory() as session:
             IntelRepository(session).finish_run(

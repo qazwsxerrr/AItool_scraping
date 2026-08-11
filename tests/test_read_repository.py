@@ -100,6 +100,60 @@ def test_read_repository_maps_v2_items_to_existing_ui_dtos(tmp_path):
     assert results.evidence == []
 
 
+def test_read_repository_uses_v2_statuses_and_keeps_project_hotspots_without_ai(tmp_path):
+    session_factory = _make_session_factory(tmp_path / "v2-contract.db")
+    with session_factory() as session:
+        source = Source(
+            id="github_trending",
+            name="GitHub Trending",
+            transport="github",
+            url="https://github.com/trending",
+            source_group="github",
+            source_subtype="trending",
+            content_class="project_tool",
+        )
+        project = IntelItem(
+            source_id=source.id,
+            external_id="github_repo:demo/project",
+            title="Demo project",
+            canonical_url="https://github.com/demo/project",
+            published_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
+            content_class="project_tool",
+            content_hash="project-contract",
+            selection_score=0,
+            status="hotspot",
+        )
+        pending = IntelItem(
+            source_id=source.id,
+            external_id="github_repo:demo/pending",
+            title="Pending project",
+            canonical_url="https://github.com/demo/pending",
+            content_class="project_tool",
+            content_hash="pending-contract",
+            status="needs_review",
+        )
+        session.add_all([source, project, pending])
+        session.commit()
+
+    with session_factory() as session:
+        repo = UIReadRepository(session)
+        stats = repo.get_dashboard_stats()
+        cards = repo.list_featured_cards()
+        options = repo.list_filter_options()
+        filtered = repo.list_all_items(
+            filters=AllItemFilters(content_class="project_tool", status="hotspot")
+        )
+
+    assert stats.selected_items == 1
+    assert stats.hotspots == 1
+    assert stats.needs_review_items == 1
+    assert cards[0].status == "hotspot"
+    assert cards[0].content_class == "project_tool"
+    assert "project_tool" in options.content_classes
+    assert "hotspot" in options.statuses
+    assert [row.title for row in filtered] == ["Demo project"]
+
+
 def _make_session_factory(db_path):
     engine = create_engine_from_url(f"sqlite:///{db_path}")
     init_db(engine)
