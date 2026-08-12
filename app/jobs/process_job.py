@@ -69,6 +69,7 @@ def run_intel_process_job(
     github_api_version: str = "2022-11-28",
     github_retries: int = 0,
     github_timeout_seconds: float | None = None,
+    now: datetime | None = None,
 ) -> IntelProcessResult:
     result = IntelProcessResult()
     source_specs = dict(source_specs or {})
@@ -93,10 +94,15 @@ def run_intel_process_job(
             source_id=source_filter,
             force=force,
         )
+        # Keep fixture-driven runs stable when callers provide historical
+        # items, while production callers may pass an explicit wall clock.
+        # Using the newest persisted signal as the implicit clock also makes
+        # reruns deterministic and avoids calendar drift in old audit tests.
+        stage_now = now or _latest_item_time(pending_items) or datetime.now(timezone.utc)
         ranked_items: list[tuple[IntelItem, Any, SourceSpec]] = []
         for pending_item in pending_items:
             pending_spec = source_specs.get(pending_item.source_id) or _spec_from_row(pending_item.source)
-            pending_decision = selection_decision(_item_to_fetch_item(pending_item), pending_spec)
+            pending_decision = selection_decision(_item_to_fetch_item(pending_item), pending_spec, now=stage_now)
             ranked_items.append((pending_item, pending_decision, pending_spec))
         ranked_items.sort(key=_ranking_key, reverse=True)
         if limit is not None:
@@ -567,6 +573,15 @@ def _is_github_source(spec: SourceSpec) -> bool:
         or (spec.github is not None and spec.github.mode in {"search", "releases", "trending"})
         or mode in {"github_active_high_star", "active_high_star", "github_trending"}
     )
+
+
+def _latest_item_time(items: list[IntelItem]) -> datetime | None:
+    values = [item.published_at or item.discovered_at or item.captured_at for item in items]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    latest = max(values)
+    return latest.replace(tzinfo=timezone.utc) if latest.tzinfo is None else latest.astimezone(timezone.utc)
 
 
 def run_intel_process_from_settings(

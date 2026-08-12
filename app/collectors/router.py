@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Mapping
+
 from app.domain.models import FetchBatch, SourceSpec
 
 from .base import Collector
@@ -58,8 +60,22 @@ class CollectorRouter:
             raise ValueError(f"unsupported GitHub mode for {source.id}: {options.mode}")
         raise ValueError(f"unsupported source transport for {source.id}: {source.transport}")
 
-    def collect(self, source: SourceSpec, limit: int) -> FetchBatch:
-        return self.collector_for(source).collect(source, limit)
+    def collect(
+        self,
+        source: SourceSpec,
+        limit: int,
+        request_headers: Mapping[str, str] | None = None,
+    ) -> FetchBatch:
+        collector = self.collector_for(source)
+        try:
+            return collector.collect(source, limit, request_headers=request_headers)
+        except TypeError as exc:
+            # Existing fake/third-party collectors often expose the original
+            # two-argument contract. Retry only when the optional keyword is
+            # rejected; genuine collector errors are re-raised.
+            if "request_headers" not in str(exc):
+                raise
+            return collector.collect(source, limit)
 
 
 __all__ = ["CollectorRouter"]

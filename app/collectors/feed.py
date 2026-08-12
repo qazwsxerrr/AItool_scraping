@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from app.config.settings import DEFAULT_USER_AGENT
 from app.domain.models import FetchBatch, FetchItem, SourceSpec
@@ -52,7 +52,12 @@ class FeedCollector(Collector):
         self.timeout_seconds = timeout_seconds
         self.sleeper = sleeper
 
-    def collect(self, source: SourceSpec, limit: int) -> FetchBatch:
+    def collect(
+        self,
+        source: SourceSpec,
+        limit: int,
+        request_headers: Mapping[str, str] | None = None,
+    ) -> FetchBatch:
         if not source.url:
             return failed_batch(source, "missing_url", "source has no URL")
         # Keep the registry URL unchanged. Reddit's standard ``.rss`` route
@@ -65,6 +70,7 @@ class FeedCollector(Collector):
             retries=self.retries,
             user_agent=self.user_agent,
             max_response_bytes=self.max_response_bytes,
+            extra_headers=dict(request_headers or {}),
             timeout_seconds=self.timeout_seconds,
             sleeper=self.sleeper,
         )
@@ -93,6 +99,9 @@ class FeedCollector(Collector):
                 response_bytes=0,
                 retry_count=retry_count,
                 transport="httpx",
+                etag=_response_header(response, "etag"),
+                last_modified=_response_header(response, "last-modified"),
+                not_modified=True,
             )
         body = bytes(getattr(response, "content", b""))
         try:
@@ -120,6 +129,8 @@ class FeedCollector(Collector):
             response_bytes=len(body),
             retry_count=retry_count,
             transport="httpx",
+            etag=_response_header(response, "etag"),
+            last_modified=_response_header(response, "last-modified"),
         )
 
 
@@ -142,7 +153,12 @@ class ProductHuntCollector(FeedCollector):
         super().__init__(*args, **kwargs)
         self.github_lookup = github_lookup
 
-    def collect(self, source: SourceSpec, limit: int) -> FetchBatch:
+    def collect(
+        self,
+        source: SourceSpec,
+        limit: int,
+        request_headers: Mapping[str, str] | None = None,
+    ) -> FetchBatch:
         feed = source.feed
         if source.transport != "feed" or feed is None or feed.format != "atom":
             return failed_batch(
@@ -150,7 +166,7 @@ class ProductHuntCollector(FeedCollector):
                 "invalid_source",
                 "Product Hunt collector requires transport=feed and feed.format=atom",
             )
-        batch = super().collect(source, limit)
+        batch = super().collect(source, limit, request_headers=request_headers)
         for item in batch.items:
             payload = dict(item.raw_payload)
             metrics = dict(item.metrics)
@@ -237,6 +253,16 @@ def _feed_item_to_domain(item: Any, source: SourceSpec) -> FetchItem:
         raw_payload=payload,
         kind="feed",
     )
+
+
+def _response_header(response: Any, name: str) -> str | None:
+    headers = getattr(response, "headers", {}) or {}
+    try:
+        value = headers.get(name) or headers.get(name.title())
+    except (AttributeError, TypeError):
+        return None
+    text = str(value).strip() if value is not None else ""
+    return text or None
 
 
 __all__ = ["FeedCollector", "ProductHuntCollector", "RSSCollector", "RSSHubCollector"]

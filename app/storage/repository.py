@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
@@ -80,6 +80,11 @@ class IntelRepository:
         row.github_period = getattr(github, "period", None) if github is not None else None
         row.source_group = source.source_group or "general"
         row.source_subtype = source.source_subtype or "fixed"
+        row.tier = getattr(source, "tier", None) or "p4"
+        row.topic_scopes_json = _dump_json(list(getattr(source, "topic_scopes", ()) or ()))
+        row.primary_eligible = bool(getattr(source, "primary_eligible", False))
+        row.citation_policy = getattr(source, "citation_policy", None) or "discovery_only"
+        row.account_verification_url = getattr(source, "account_verification_url", None)
         row.quality_weight = source.quality_weight
         row.source_role = source.source_role
         row.spam_risk = source.spam_risk
@@ -107,6 +112,57 @@ class IntelRepository:
             row.selection_policy_json = _dump_json(_policy_dict(policy, "selection"))
             row.verification_policy_json = _dump_json(_policy_dict(policy, "verification"))
         return row
+
+    def update_source_health(
+        self,
+        source_id: str,
+        *,
+        success: bool,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        now: datetime | None = None,
+        backoff_base_seconds: int = 60,
+        max_backoff_seconds: int = 86_400,
+    ) -> Source | None:
+        """Persist source health/backoff state without failing the batch."""
+
+        row = self.session.get(Source, source_id)
+        if row is None:
+            return None
+        current = now or utcnow()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        if success:
+            row.health_status = "healthy"
+            row.consecutive_failures = 0
+            row.backoff_until = None
+            row.last_error_code = None
+            row.last_error_message = None
+            row.last_fetched_at = current
+            if etag:
+                row.etag = str(etag)[:512]
+            if last_modified:
+                row.last_modified = str(last_modified)[:255]
+        else:
+            failures = int(row.consecutive_failures or 0) + 1
+            row.health_status = "failed"
+            row.consecutive_failures = failures
+            row.last_error_code = str(error_code or "fetch_failed")[:128]
+            row.last_error_message = str(error_message or "")[:4000] or None
+            delay = min(max_backoff_seconds, backoff_base_seconds * (2 ** max(0, failures - 1)))
+            row.backoff_until = current + timedelta(seconds=delay)
+            row.last_fetched_at = current
+        row.updated_at = current
+        self.session.flush()
+        return row
+
+    def list_source_health(self, *, source_id: str | None = None) -> list[Source]:
+        stmt = select(Source).order_by(Source.priority.asc(), Source.id.asc())
+        if source_id:
+            stmt = stmt.where(Source.id == source_id)
+        return list(self.session.scalars(stmt).all())
 
     def start_run(self, *, filters: Mapping[str, Any] | None = None) -> IntelRun:
         run = IntelRun(status="running", filters_json=_dump_json(dict(filters or {})))
@@ -247,6 +303,11 @@ class IntelRepository:
             existing.content_text = fields["content_text"] or existing.content_text
             existing.canonical_url = fields["canonical_url"] or existing.canonical_url
             existing.published_at = fields["published_at"] or existing.published_at
+            existing.discovered_at = fields["discovered_at"] or existing.discovered_at
+            existing.original_title = fields["original_title"] or existing.original_title
+            existing.source_url = fields["source_url"] or existing.source_url
+            existing.content_depth = fields["content_depth"] or existing.content_depth
+            existing.event_hint = fields["event_hint"] or existing.event_hint
             existing.content_class = fields["content_class"]
             existing.metrics_json = new_metrics
             existing.raw_payload_json = new_payload
@@ -282,6 +343,11 @@ class IntelRepository:
             content_text=fields["content_text"],
             published_at=fields["published_at"],
             captured_at=fields["captured_at"],
+            discovered_at=fields["discovered_at"],
+            original_title=fields["original_title"],
+            source_url=fields["source_url"],
+            content_depth=fields["content_depth"],
+            event_hint=fields["event_hint"],
             content_class=fields["content_class"],
             metrics_json=_dump_json(row_metrics),
             raw_payload_json=_dump_json(fields["raw_payload"]),
@@ -545,6 +611,11 @@ def _item_fields(item: Any) -> dict[str, Any]:
         raw_payload = {}
     published_at = _as_utc(values.get("published_at"))
     captured_at = _as_utc(values.get("captured_at")) or utcnow()
+    discovered_at = _as_utc(values.get("discovered_at")) or captured_at
+    original_title = _text(values.get("original_title") or values.get("title"))
+    source_url = _canonical_url(values.get("source_url") or values.get("url") or values.get("link"))
+    content_depth = _text(values.get("content_depth")) or ("full" if values.get("content_text") or values.get("content") else "summary")
+    event_hint = _text(values.get("event_hint") or values.get("event_type"))
     content_hash = _text(values.get("content_hash")) or _identity_hash(external_id, canonical_url, title, content_text)
     # Keep GitHub repository identity stable as star/description metrics change.
     if external_id and external_id.startswith("github_repo:"):
@@ -558,6 +629,11 @@ def _item_fields(item: Any) -> dict[str, Any]:
         "content_text": content_text,
         "published_at": published_at,
         "captured_at": captured_at,
+        "discovered_at": discovered_at,
+        "original_title": original_title,
+        "source_url": source_url,
+        "content_depth": content_depth,
+        "event_hint": event_hint,
         "content_class": content_class,
         "metrics": metrics,
         "raw_payload": raw_payload,
