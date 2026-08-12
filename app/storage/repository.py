@@ -128,6 +128,10 @@ class IntelRepository:
     ) -> Source | None:
         """Persist source health/backoff state without failing the batch."""
 
+        # ``upsert_source`` intentionally leaves the transaction open for
+        # callers that batch registry writes. Flush here so a health update in
+        # the same transaction can resolve a newly-created Source row too.
+        self.session.flush()
         row = self.session.get(Source, source_id)
         if row is None:
             return None

@@ -25,7 +25,17 @@ class SourceHealthRow:
 def run_source_health_job(*, session_factory, source_filter: str | None = None) -> list[SourceHealthRow]:
     with session_factory() as session:
         rows = IntelRepository(session).list_source_health(source_id=source_filter)
-        return [SourceHealthRow(row.id, row.health_status, int(row.consecutive_failures or 0), row.last_error_code, row.last_error_message, row.backoff_until) for row in rows]
+        return [
+            SourceHealthRow(
+                row.id,
+                row.health_status,
+                int(row.consecutive_failures or 0),
+                row.last_error_code,
+                row.last_error_message,
+                _as_utc(row.backoff_until),
+            )
+            for row in rows
+        ]
 
 
 def run_source_health_from_settings(*, settings: Settings, source_filter: str | None = None) -> list[SourceHealthRow]:
@@ -34,3 +44,9 @@ def run_source_health_from_settings(*, settings: Settings, source_filter: str | 
 
 
 __all__ = ["SourceHealthRow", "run_source_health_job", "run_source_health_from_settings"]
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)

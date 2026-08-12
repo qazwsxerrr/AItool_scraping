@@ -1,10 +1,19 @@
 # AI 情报抓取与处理
 
-本项目当前实现数据抓取、确定性处理和结果展示。唯一的数据处理链路是：
+本项目当前实现数据抓取、确定性处理和结果展示。旧版链路仍保持兼容：
 
 ```text
 source registry -> fetch -> process -> export
 ```
+
+V3 日报链路以事件（`events`）为选入单元，按以下顺序运行：
+
+```text
+source registry -> fetch + source health -> enrich -> triage
+-> cluster -> compose -> publication gates -> daily export
+```
+
+`intel_items` 是来源信号；`documents` 保存最小内容快照；`events` 汇聚同一事件的多个来源；`daily_editions` 和 `daily_event_entries` 保存每日选稿、门禁结果和渲染快照。各阶段均可单独运行，重复执行使用幂等 upsert，不需要网页请求触发。
 
 ## 内容分流
 
@@ -58,14 +67,14 @@ app/
 ├─ domain/                 # DTO、来源策略、确定性筛选、轻量核实
 ├─ ai/                     # 一条目一次结构化 AI 分析
 ├─ storage/                # v2 ORM、Repository、数据库和 UI 只读查询
-├─ jobs/                   # intel fetch/process/export/run 编排
+├─ jobs/                   # v2 intel 与 V3 daily 阶段编排
 ├─ github/report.py        # 按日期生成 GitHub Trending Markdown 报告
 ├─ storage/github_reader.py # 从标准 intel_items.jsonl 读取 GitHub metadata
 ├─ pipeline/normalize.py   # 无数据库依赖的基础文本/URL 标准化工具
 └─ web/                    # 现有 FastAPI/Jinja UI，当前阶段不改
 ```
 
-旧 claim、evidence、recommendation 阶段和对应客户端、表模型、脚本已经移除。数据库只由 v2 schema 初始化；历史数据库不迁移，删除后重新运行即可创建新 schema。
+旧 claim、evidence、recommendation 阶段和对应客户端、表模型、脚本已经移除。数据库只由当前 ORM metadata 初始化；本阶段不提供迁移框架。若本地数据库来自旧版本，建议先备份并删除 SQLite 文件，再运行 `python -m app.main fetch` 或 `python -m app.main run-daily` 让 `init_db()` 重建完整 schema。
 
 ## 数据表
 
@@ -75,6 +84,9 @@ app/
 - `intel_items`：统一条目、canonical URL、指标、原始 payload、内容 hash 和选择状态。
 - `ai_item_reviews`：每条最多一条结构化模型结果，保留原始响应。
 - `item_verifications`：官方直链、项目 metadata 或社区 discovery 的轻量结果。
+- `documents`、`triage_reviews`：V3 最小文档快照、确定性预筛和结构化 triage 原始响应。
+- `events`、`event_evidence`、`cluster_decisions`：事件身份、来源证据关系和 exact/fuzzy 聚类判断。
+- `event_editorial_reviews`、`daily_editions`、`daily_event_entries`：带证据引用的事件文案、发布门禁和每日顺序快照。
 
 GitHub 项目使用稳定的 `github_repo:*` 标识或 canonical URL 去重；指标保存在 `metrics_json`，包括累计 stars、周期新增 Star、forks、pushed_at、Trending rank 和 Search topic。当前只保留最新合并指标，不建立历史 Star 快照表。
 
@@ -187,6 +199,22 @@ python -m app.main run-once --limit 100
 - `--force`：忽略抓取冷却并重新处理已有条目。
 - `--dry-run`：使用临时 SQLite 和内存输出，不写目标数据库或输出目录。
 
+### V3 日报命令
+
+```bash
+python -m app.main source-health [--source SOURCE_ID]
+python -m app.main enrich [--source SOURCE_ID] [--limit N] [--force]
+python -m app.main triage [--source SOURCE_ID] [--limit N] [--force]
+python -m app.main cluster [--limit N] [--force]
+python -m app.main compose [--limit N] [--force]
+python -m app.main daily-export [--date YYYY-MM-DD] [--output-dir output/daily] [--force]
+python -m app.main run-daily [--date YYYY-MM-DD] [--limit N] [--force]
+```
+
+`source-health` 只读输出来源状态、连续失败次数、错误码和下一次可抓取时间。`fetch` 对 RSS/Atom 来源会发送已保存的 `ETag` / `Last-Modified` 条件请求；HTTP 304 视为成功并推进冷却，403/429 等失败按来源隔离并指数退避。
+
+来源治理字段位于 `app/config/source_registry.yaml`，包括 `tier`、`topic_scopes`、`primary_eligible` 和 `citation_policy`。每日配额、窗口、来源组上限和各 section 目标位于 `app/config/daily_profile.yaml`；修改后由严格模型校验，GitHub 还有跨子组 aggregate cap。
+
 本地 RSSHub 启动入口：
 
 ```bash
@@ -211,6 +239,15 @@ python scripts/run_intel_once.py
 - `output/github-trending/YYYY/MM/YYYYMMDD.md`：GitHub Trending daily/weekly 和 Search API 补充候选报告。
 
 GitHub 项目先按累计 Star、Trending daily/weekly 周期 Star、Fork 等已抓取指标做确定性筛选，AI 不参与保留决策。选中的唯一仓库最多执行一次项目摘要调用，生成项目介绍、主要能力、适用场景和风险提示；Trending HTML 的 `stars today`、`stars this week` 仍以原始周期指标写入报告，Search API 不生成虚假的周增长。
+
+V3 `daily-export` 默认写入：
+
+- 发布日报：`output/daily/YYYY/MM/YYYY-MM-DD.md`
+- 发布审计：`output/daily/YYYY/MM/YYYY-MM-DD.events.jsonl`
+- 门禁未通过：`output/daily/YYYY/MM/YYYY-MM-DD.draft.md`
+- 阻塞/待处理审计：`output/daily/YYYY/MM/YYYY-MM-DD.pending.jsonl`
+
+同一天已有 `published` edition 时，默认不会覆盖；只有传入 `--force` 才会重算。低信息日会保留明确的 machine-readable gate failures，不会用社交或噪声条目填充缺口。
 
 ## 验证
 
