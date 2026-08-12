@@ -43,6 +43,10 @@ class IntelSourceStats:
     error: str | None = None
     attempt_id: int | None = None
     duration_seconds: float | None = None
+    etag: str | None = None
+    last_modified: str | None = None
+    not_modified: bool = False
+    backoff_until: datetime | None = None
 
 
 @dataclass
@@ -159,8 +163,12 @@ def run_intel_fetch_job(
                     attempt_id = attempt.id
                     stats.attempt_id = attempt_id
 
-            batch = router.collect(spec, limit_per_source or spec.default_limit)
+            request_headers = _conditional_headers(source_row if not dry_run else None)
+            batch = _router_collect(router, spec, limit_per_source or spec.default_limit, request_headers)
             _apply_batch_stats(stats, batch)
+            stats.etag = batch.etag
+            stats.last_modified = batch.last_modified
+            stats.not_modified = bool(batch.not_modified or batch.status == "not_modified")
             if batch.status == "failed":
                 stats.failed = 1
                 stats.status = "failed"
@@ -187,9 +195,12 @@ def run_intel_fetch_job(
                             LOGGER.warning("intel item insert failed source=%s: %s", spec.id, exc)
                     source = session.get(Source, spec.id)
                     if source is not None:
-                        # A 304 is still a successful request and must advance
-                        # the cooldown, otherwise it would be retried every run.
-                        source.last_fetched_at = datetime.now(timezone.utc)
+                        IntelRepository(session).update_source_health(
+                            spec.id,
+                            success=True,
+                            etag=batch.etag,
+                            last_modified=batch.last_modified,
+                        )
                     repo.finish_attempt(
                         attempt_id or 0,
                         status=batch.status,
@@ -344,13 +355,22 @@ def _finish_attempt(
         # Failed requests also enter the source cooldown.  Keep skipped
         # cooldown checks from erasing that failure timestamp on the next run.
         if attempt is not None and status != "skipped":
-            source = session.get(Source, attempt.source_id)
-            if source is not None:
-                source.last_fetched_at = datetime.now(timezone.utc)
+            if status == "failed":
+                code = getattr(batch, "error_code", None) if batch is not None else None
+                message = error if error is not None else getattr(batch, "error_message", None)
+                repo.update_source_health(
+                    attempt.source_id,
+                    success=False,
+                    error_code=code,
+                    error_message=str(message) if message else None,
+                )
         session.commit()
 
 
 def _is_due(source: Source, latest: FetchAttempt | None) -> bool:
+    backoff_until = _as_utc(source.backoff_until)
+    if backoff_until is not None and datetime.now(timezone.utc) < backoff_until:
+        return False
     last = _as_utc(source.last_fetched_at)
     if latest is not None and latest.status == "failed":
         failure = _as_utc(latest.finished_at or latest.started_at)
@@ -359,6 +379,26 @@ def _is_due(source: Source, latest: FetchAttempt | None) -> bool:
     if last is None:
         return True
     return datetime.now(timezone.utc) >= last + timedelta(seconds=max(source.fetch_interval, 1))
+
+
+def _conditional_headers(source: Source | None) -> dict[str, str]:
+    if source is None:
+        return {}
+    headers: dict[str, str] = {}
+    if source.etag:
+        headers["If-None-Match"] = source.etag
+    if source.last_modified:
+        headers["If-Modified-Since"] = source.last_modified
+    return headers
+
+
+def _router_collect(router: Any, source: SourceSpec, limit: int, request_headers: dict[str, str]) -> FetchBatch:
+    try:
+        return router.collect(source, limit, request_headers=request_headers)
+    except TypeError as exc:
+        if "request_headers" not in str(exc):
+            raise
+        return router.collect(source, limit)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
