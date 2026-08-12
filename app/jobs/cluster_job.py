@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -105,7 +107,90 @@ def run_cluster_from_settings(*, settings: Settings, **kwargs: Any) -> ClusterRe
 
 def _candidate_values(item: IntelItem, triage: TriageReview | None = None, document: Document | None = None) -> dict[str, Any]:
     source = item.source
-    return {"id": item.id, "source_id": item.source_id, "source_group": source.source_group if source else None, "tier": source.tier if source else "p4", "primary_eligible": source.primary_eligible if source else False, "citation_policy": source.citation_policy if source else "discovery_only", "canonical_url": item.canonical_url, "title": item.title, "section": triage.section if triage else None, "event_type": triage.event_type if triage else None, "event_hint": (triage.event_hint if triage else None) or item.event_hint or item.title, "selection_score": item.selection_score, "published_at": item.published_at, "discovered_at": item.discovered_at or item.captured_at, "document_id": document.id if document else None}
+    metrics = _json_dict(item.metrics_json)
+    raw_payload = _json_dict(item.raw_payload_json)
+    repository = _first_text(
+        metrics.get("repository"), metrics.get("repo"), metrics.get("github_repo"),
+        metrics.get("full_name"), metrics.get("canonical_project_key"),
+        raw_payload.get("repository"), raw_payload.get("repo"), raw_payload.get("full_name"),
+    )
+    if not repository:
+        repository = _repository_from_url(
+            item.canonical_url or item.source_url or (source.url if source else None)
+        )
+    release = _first_text(
+        metrics.get("release"), metrics.get("release_tag"), metrics.get("tag_name"),
+        metrics.get("version"), raw_payload.get("release"), raw_payload.get("release_tag"),
+        raw_payload.get("tag_name"), raw_payload.get("version"),
+    )
+    arxiv_id = _first_text(
+        metrics.get("arxiv_id"), metrics.get("arxiv"), metrics.get("paper_id"),
+        raw_payload.get("arxiv_id"), raw_payload.get("arxiv"), raw_payload.get("paper_id"),
+    )
+    doi = _first_text(metrics.get("doi"), raw_payload.get("doi"))
+    return {
+        "id": item.id,
+        "source_id": item.source_id,
+        "external_id": item.external_id,
+        "source_group": source.source_group if source else None,
+        "tier": source.tier if source else "p4",
+        "primary_eligible": source.primary_eligible if source else False,
+        "citation_policy": source.citation_policy if source else "discovery_only",
+        "canonical_url": item.canonical_url,
+        "title": item.title,
+        "section": triage.section if triage else None,
+        "event_type": triage.event_type if triage else None,
+        "event_hint": (triage.event_hint if triage else None) or item.event_hint or item.title,
+        "selection_score": item.selection_score,
+        "published_at": item.published_at,
+        "discovered_at": item.discovered_at or item.captured_at,
+        "document_id": document.id if document else None,
+        # Keep identity aliases at the top level: canonical_event_key is
+        # deliberately independent of the persisted JSON payload shape.
+        "repository": repository,
+        "release": release,
+        "arxiv_id": arxiv_id,
+        "doi": doi,
+        "metrics": metrics,
+        "raw_payload": raw_payload,
+    }
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _first_text(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, Mapping):
+            value = value.get("full_name") or value.get("name") or value.get("id")
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
+def _repository_from_url(value: Any) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = urlsplit(str(value))
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").casefold()
+    parts = [part for part in parsed.path.split("/") if part]
+    if host == "api.github.com" and len(parts) >= 3 and parts[0].casefold() == "repos":
+        return "/".join(parts[1:3])
+    if host.endswith("github.com") and len(parts) >= 2:
+        return "/".join(parts[:2])
+    return None
 
 
 def _section_from_item(value: Mapping[str, Any]) -> str:

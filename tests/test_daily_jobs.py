@@ -6,9 +6,11 @@ from datetime import datetime, timezone
 from app.domain.models import FetchItem, SourceSpec
 from app.jobs.daily_export_job import run_daily_export_job
 from app.jobs.compose_job import run_compose_job
+from app.jobs.cluster_job import _candidate_values
 from app.jobs.enrich_job import run_enrich_job
+from app.pipeline.event_cluster import canonical_event_key
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import DailyEdition, Document, Event, EventEditorialReview, EventEvidence, IntelItem, Source
+from app.storage.models import DailyEdition, DailyEventEntry, Document, Event, EventEditorialReview, EventEvidence, IntelItem, Source
 from app.ai.client import StageCallResult
 from app.storage.repository import IntelRepository
 from sqlalchemy import select
@@ -70,6 +72,10 @@ def test_enrich_and_blocked_daily_export_use_no_network_sqlite(tmp_path):
         assert edition is not None
         assert edition.status == "blocked"
         assert json.loads(edition.gate_results_json)["publishable"] is False
+        events_snapshot = json.loads(edition.events_json)
+        assert isinstance(events_snapshot, list)
+        assert "InstanceState" not in edition.events_json
+        assert "Source object at" not in edition.events_json
 
 
 def test_daily_export_passes_primary_source_and_document_to_publication_gates(tmp_path):
@@ -169,6 +175,63 @@ def test_daily_export_passes_primary_source_and_document_to_publication_gates(tm
     assert result.status == "blocked"
     assert any(failure["code"] == "event_count" for failure in result.failures)
     assert not any(failure["code"] == "model_product_primary" for failure in result.failures)
+    with session_factory() as session:
+        edition = session.scalar(select(DailyEdition))
+        snapshot = json.loads(edition.events_json)
+        assert len(snapshot) == 4
+        assert "InstanceState" not in edition.events_json
+        assert "Source object at" not in edition.events_json
+        entries = list(session.scalars(select(DailyEventEntry).where(DailyEventEntry.edition_id == edition.id)).all())
+        assert len(entries) == 4
+        rendered = json.loads(entries[0].rendered_json)
+        assert isinstance(rendered.get("source"), dict)
+        assert isinstance(rendered.get("primary_document"), dict)
+        assert "InstanceState" not in entries[0].rendered_json
+        assert "Source object at" not in entries[0].rendered_json
+
+
+def test_cluster_candidate_preserves_exact_identity_fields():
+    now = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+    github_item = IntelItem(
+        source_id="github_release",
+        external_id="github_repo:OpenAI/Example",
+        title="Example v1.2.3",
+        canonical_url="https://github.com/OpenAI/Example/releases/tag/v1.2.3",
+        source_url="https://github.com/OpenAI/Example/releases/tag/v1.2.3",
+        metrics_json=json.dumps({"full_name": "OpenAI/Example", "release_tag": "v1.2.3"}),
+        raw_payload_json="{}",
+        content_hash="a" * 64,
+        content_class="project_tool",
+        captured_at=now,
+    )
+    candidate = _candidate_values(github_item)
+    assert candidate["external_id"] == "github_repo:OpenAI/Example"
+    assert candidate["repository"] == "OpenAI/Example"
+    assert canonical_event_key(candidate) == "github:openai/example@v1.2.3"
+
+    arxiv_item = IntelItem(
+        source_id="research",
+        external_id="arxiv:2401.12345",
+        title="A paper",
+        metrics_json="{}",
+        raw_payload_json="{}",
+        content_hash="b" * 64,
+        content_class="research_paper",
+        captured_at=now,
+    )
+    assert canonical_event_key(_candidate_values(arxiv_item)) == "arxiv:2401.12345"
+
+    doi_item = IntelItem(
+        source_id="research",
+        external_id="doi:10.1234/demo",
+        title="A DOI paper",
+        metrics_json="{}",
+        raw_payload_json="{}",
+        content_hash="c" * 64,
+        content_class="research_paper",
+        captured_at=now,
+    )
+    assert canonical_event_key(_candidate_values(doi_item)) == "doi:10.1234/demo"
 
 
 def test_compose_persists_failed_editorial_raw_and_error(tmp_path):

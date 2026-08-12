@@ -87,6 +87,8 @@ def _event_values(
 ) -> dict[str, Any]:
     source_id = event.primary_source_id
     source_group = source.source_group if source is not None else None
+    source_ref = _source_ref(source)
+    document_ref = _document_ref(document)
     return {
         "id": event.id,
         "event_id": event.id,
@@ -102,9 +104,11 @@ def _event_values(
         "tier": source.tier if source is not None else ("p1" if event.section == "model_product" else "p2"),
         "primary_eligible": bool(source.primary_eligible) if source is not None else True,
         "citation_policy": source.citation_policy if source is not None else "primary",
-        "source": source,
-        "document": document,
-        "primary_document": document,
+        # Keep the governance/evidence context, but never hand ORM instances
+        # to EditionRepository (its rendered JSON must be replayable).
+        "source": source_ref,
+        "document": document_ref,
+        "primary_document": document_ref,
         "primary_document_id": event.primary_document_id,
         "discovered_at": event.discovered_at,
         "editorial_review": {
@@ -115,6 +119,37 @@ def _event_values(
         if review
         else None,
         "score": event.score,
+    }
+
+
+def _source_ref(source: Source | None) -> dict[str, Any] | None:
+    if source is None:
+        return None
+    return {
+        "id": source.id,
+        "name": source.name,
+        "url": source.url,
+        "source_group": source.source_group,
+        "tier": source.tier,
+        "primary_eligible": bool(source.primary_eligible),
+        "citation_policy": source.citation_policy,
+        "content_class": source.content_class,
+        "account_verification_url": source.account_verification_url,
+    }
+
+
+def _document_ref(document: Document | None) -> dict[str, Any] | None:
+    if document is None:
+        return None
+    return {
+        "id": document.id,
+        "item_id": document.item_id,
+        "source_id": document.source_id,
+        "canonical_url": document.canonical_url,
+        "source_url": document.source_url,
+        "title": document.title,
+        "status": document.status,
+        "http_status": document.http_status,
     }
 
 
