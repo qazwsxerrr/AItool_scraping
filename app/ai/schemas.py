@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Literal, Mapping, TypeAlias
+from dataclasses import dataclass
+from typing import Any, Generic, Literal, Mapping, TypeAlias, TypeVar
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator, model_validator
 
 
 ContentClass: TypeAlias = Literal[
@@ -47,6 +48,224 @@ PROJECT_SUMMARY_RESPONSE_SCHEMA: dict[str, str] = {
     "use_cases": "array<string>",
     "risk_flags": "array<string>",
 }
+
+# V3 daily intelligence contracts.  These schemas deliberately keep the
+# deterministic editorial decisions out of the model's remit: source tier,
+# primary eligibility, quotas and publication gates are decided locally.
+DAILY_SECTIONS: tuple[str, ...] = (
+    "model_product",
+    "industry_infrastructure",
+    "research",
+    "open_source_tool",
+    "practice_opinion",
+)
+
+TRIAGE_RESPONSE_SCHEMA: dict[str, str] = {
+    "keep": "boolean",
+    "section": "model_product|industry_infrastructure|research|open_source_tool|practice_opinion",
+    "event_type": "string",
+    "event_hint": "string",
+    "entities": "array<string>",
+    "impact_score": "integer 0-100",
+    "novelty_score": "integer 0-100",
+    "readability_score": "integer 0-100",
+    "risk_flags": "array<string>",
+    "reason": "string",
+    "confidence": "integer 0-100",
+    "claim_types": "array<string>",
+}
+
+CLUSTER_DECISION_VALUES: tuple[str, ...] = ("merge", "related", "separate", "uncertain")
+CLUSTER_RESPONSE_SCHEMA: dict[str, str] = {
+    "decision": "merge|related|separate|uncertain",
+    "confidence": "integer 0-100",
+    "reason": "string",
+    "canonical_event_hint": "string|null",
+}
+
+EVENT_EDITORIAL_RESPONSE_SCHEMA: dict[str, str] = {
+    "title": "string",
+    "summary_cn": "string",
+    "why_it_matters": "string",
+    "facts": "array<{text:string,evidence_ids:array<string> non-empty}>",
+    "risk_notes": "array<string>",
+    "uncertainties": "array<string>",
+    "tags": "array<string>",
+}
+
+
+StageStatus: TypeAlias = Literal[
+    "success",
+    "not_configured",
+    "request_error",
+    "http_error",
+    "invalid_json",
+    "parse_error",
+]
+StageT = TypeVar("StageT")
+
+
+@dataclass(frozen=True)
+class StageCallResult(Generic[StageT]):
+    """Auditable result for a daily AI stage call.
+
+    The provider response is retained in ``raw`` even when parsing fails.  A
+    stage therefore never turns an invalid model response into an apparently
+    successful empty result.  ``raw_response`` is kept as a compatibility
+    alias for callers that use the naming of :class:`ItemAnalysisResponse`.
+    """
+
+    stage: str
+    status: StageStatus
+    parsed: StageT | None = None
+    raw: Any | None = None
+    error: str | None = None
+    model: str | None = None
+
+    @property
+    def raw_response(self) -> Any | None:
+        return self.raw
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "success" and self.parsed is not None
+
+
+class TriageResponse(BaseModel):
+    """Strict model output for deterministic prefilter/triage input."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    keep: bool
+    section: Literal[
+        "model_product",
+        "industry_infrastructure",
+        "research",
+        "open_source_tool",
+        "practice_opinion",
+    ]
+    event_type: StrictStr
+    event_hint: StrictStr
+    entities: list[StrictStr] = Field(default_factory=list)
+    impact_score: StrictInt = Field(ge=0, le=100)
+    novelty_score: StrictInt = Field(ge=0, le=100)
+    readability_score: StrictInt = Field(ge=0, le=100)
+    risk_flags: list[StrictStr] = Field(default_factory=list)
+    reason: StrictStr
+    confidence: StrictInt = Field(ge=0, le=100)
+    claim_types: list[StrictStr] = Field(default_factory=list)
+
+    @field_validator("event_type", "event_hint", "reason")
+    @classmethod
+    def _non_empty_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("text fields must not be empty")
+        return value
+
+    @field_validator("entities", "risk_flags", "claim_types")
+    @classmethod
+    def _clean_string_lists(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = value.strip()
+            if text and text not in seen:
+                cleaned.append(text)
+                seen.add(text)
+        return cleaned
+
+
+class ClusterDecision(BaseModel):
+    """Strict fuzzy-cluster judgement; local code applies the >=80 threshold."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    decision: Literal["merge", "related", "separate", "uncertain"]
+    confidence: StrictInt = Field(ge=0, le=100)
+    reason: StrictStr
+    canonical_event_hint: StrictStr | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def _non_empty_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reason must not be empty")
+        return value
+
+    @field_validator("canonical_event_hint")
+    @classmethod
+    def _clean_hint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class EditorialFact(BaseModel):
+    """One concrete editorial statement and its auditable evidence IDs."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    text: StrictStr
+    evidence_ids: list[StrictStr] = Field(min_length=1)
+
+    @field_validator("text")
+    @classmethod
+    def _non_empty_fact(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("fact text must not be empty")
+        return value
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def _non_empty_evidence_ids(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = value.strip()
+            if text and text not in seen:
+                cleaned.append(text)
+                seen.add(text)
+        if not cleaned:
+            raise ValueError("every fact must include at least one evidence_id")
+        return cleaned
+
+
+class EventEditorialResponse(BaseModel):
+    """Structured event copy with citation-bearing concrete facts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    title: StrictStr
+    summary_cn: StrictStr
+    why_it_matters: StrictStr
+    facts: list[EditorialFact] = Field(min_length=1)
+    risk_notes: list[StrictStr] = Field(default_factory=list)
+    uncertainties: list[StrictStr] = Field(default_factory=list)
+    tags: list[StrictStr] = Field(default_factory=list)
+
+    @field_validator("title", "summary_cn", "why_it_matters")
+    @classmethod
+    def _non_empty_editorial_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("editorial text fields must not be empty")
+        return value
+
+    @field_validator("risk_notes", "uncertainties", "tags")
+    @classmethod
+    def _clean_editorial_lists(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = value.strip()
+            if text and text not in seen:
+                cleaned.append(text)
+                seen.add(text)
+        return cleaned
 
 
 class ItemAnalysisRequest(BaseModel):
@@ -224,6 +443,41 @@ def parse_project_summary_response(data: Any) -> ItemAnalysisResponse:
         confidence=0,
         raw_response=raw,
     )
+
+
+def parse_triage_response(data: Any) -> TriageResponse:
+    """Strictly parse a provider response for the triage stage."""
+
+    raw = _coerce_raw_mapping(data)
+    result = _unwrap_response(raw)
+    try:
+        return TriageResponse.model_validate(result, strict=True)
+    except Exception as exc:
+        # Keep a stable, auditable public error type while retaining the
+        # provider payload in StageCallResult at the client boundary.
+        raise ValueError(f"Triage response failed schema validation: {exc}") from exc
+
+
+def parse_cluster_decision_response(data: Any) -> ClusterDecision:
+    """Strictly parse a provider response for fuzzy cluster judgement."""
+
+    raw = _coerce_raw_mapping(data)
+    result = _unwrap_response(raw)
+    try:
+        return ClusterDecision.model_validate(result, strict=True)
+    except Exception as exc:
+        raise ValueError(f"Cluster decision failed schema validation: {exc}") from exc
+
+
+def parse_event_editorial_response(data: Any) -> EventEditorialResponse:
+    """Strictly parse event copy and reject facts without evidence IDs."""
+
+    raw = _coerce_raw_mapping(data)
+    result = _unwrap_response(raw)
+    try:
+        return EventEditorialResponse.model_validate(result, strict=True)
+    except Exception as exc:
+        raise ValueError(f"Event editorial response failed schema validation: {exc}") from exc
 
 
 def _coerce_raw_mapping(data: Any) -> dict[str, Any]:
@@ -419,6 +673,17 @@ __all__ = [
     "COMMUNITY_SOCIAL",
     "CONTENT_CLASSES",
     "ContentClass",
+    "DAILY_SECTIONS",
+    "CLUSTER_DECISION_VALUES",
+    "TRIAGE_RESPONSE_SCHEMA",
+    "CLUSTER_RESPONSE_SCHEMA",
+    "EVENT_EDITORIAL_RESPONSE_SCHEMA",
+    "StageCallResult",
+    "StageStatus",
+    "TriageResponse",
+    "ClusterDecision",
+    "EditorialFact",
+    "EventEditorialResponse",
     "ITEM_ANALYSIS_RESPONSE_SCHEMA",
     "PROJECT_SUMMARY_RESPONSE_SCHEMA",
     "ItemAnalysisRequest",
@@ -436,5 +701,8 @@ __all__ = [
     "normalize_content_class",
     "parse_item_analysis_response",
     "parse_project_summary_response",
+    "parse_triage_response",
+    "parse_cluster_decision_response",
+    "parse_event_editorial_response",
     "strip_json_fence",
 ]

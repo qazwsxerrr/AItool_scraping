@@ -1,8 +1,8 @@
-"""Unified one-call AI client for normalized intelligence items."""
+"""Unified one-call AI client for normalized intelligence items and daily stages."""
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol, TypeVar
 
 import httpx
 
@@ -10,24 +10,44 @@ from app.ai.prompts import (
     ITEM_ANALYSIS_RESPONSE_SCHEMA,
     ITEM_ANALYSIS_SYSTEM_PROMPT,
     ITEM_ANALYSIS_TASK,
+    CLUSTER_RESPONSE_SCHEMA,
+    CLUSTER_SYSTEM_PROMPT,
+    CLUSTER_TASK,
+    COMPOSE_SYSTEM_PROMPT,
+    COMPOSE_TASK,
+    EVENT_EDITORIAL_RESPONSE_SCHEMA,
     PROJECT_SUMMARY_SYSTEM_PROMPT,
     PROJECT_SUMMARY_TASK,
+    TRIAGE_RESPONSE_SCHEMA,
+    TRIAGE_SYSTEM_PROMPT,
+    TRIAGE_TASK,
     build_generic_json_payload,
     build_openai_chat_payload,
+    build_stage_payload,
 )
 from app.ai.schemas import (
     COMMUNITY_SOCIAL,
     CONTENT_CLASSES,
     ContentClass,
+    ClusterDecision,
+    EventEditorialResponse,
     ItemAnalysisRequest,
     ItemAnalysisResponse,
     OFFICIAL_MODEL_COMPANY,
     PROJECT_SUMMARY_RESPONSE_SCHEMA,
     PROJECT_TOOL,
+    StageCallResult,
+    TriageResponse,
+    parse_cluster_decision_response,
+    parse_event_editorial_response,
     parse_item_analysis_response,
     parse_project_summary_response,
+    parse_triage_response,
 )
 from app.config.settings import Settings
+
+
+StageResultT = TypeVar("StageResultT")
 
 
 class SupportsPost(Protocol):
@@ -51,6 +71,9 @@ class ItemAnalysisClient:
         api_style: str = "generic_json",
         timeout_seconds: float = 30.0,
         http_client: SupportsPost | None = None,
+        triage_model: str | None = None,
+        cluster_model: str | None = None,
+        compose_model: str | None = None,
     ) -> None:
         style = str(api_style or "generic_json").strip().lower()
         if style not in {"generic_json", "openai_chat"}:
@@ -61,6 +84,12 @@ class ItemAnalysisClient:
         self.api_style = style
         self.timeout_seconds = timeout_seconds
         self._http_client = http_client
+        # Stage-specific overrides are optional.  Keeping them on the same
+        # client means URL, key, API style and timeout remain one provider
+        # configuration rather than being copied per workflow.
+        self.triage_model = triage_model or model
+        self.cluster_model = cluster_model or model
+        self.compose_model = compose_model or model
 
     @classmethod
     def from_settings(
@@ -77,6 +106,9 @@ class ItemAnalysisClient:
             api_style=settings.ai_review_api_style,
             timeout_seconds=settings.ai_review_timeout_seconds,
             http_client=http_client,
+            triage_model=getattr(settings, "ai_triage_model", None) or settings.ai_review_model,
+            cluster_model=getattr(settings, "ai_cluster_model", None) or settings.ai_review_model,
+            compose_model=getattr(settings, "ai_compose_model", None) or settings.ai_review_model,
         )
 
     @property
@@ -124,6 +156,157 @@ class ItemAnalysisClient:
                 return parse_project_summary_response(data)
             except ValueError:
                 raise analysis_error
+
+    def triage_item(self, item: Any) -> StageCallResult[TriageResponse]:
+        """Run the structured triage stage and retain raw/parse errors."""
+
+        return self._run_stage(
+            stage="triage_item",
+            input_data=item,
+            model=self.triage_model,
+            task=TRIAGE_TASK,
+            system_prompt=TRIAGE_SYSTEM_PROMPT,
+            response_schema=TRIAGE_RESPONSE_SCHEMA,
+            parser=parse_triage_response,
+        )
+
+    def judge_cluster(
+        self,
+        left: Any,
+        right: Any | None = None,
+    ) -> StageCallResult[ClusterDecision]:
+        """Judge whether two candidate signals refer to one event.
+
+        Callers may pass one already-shaped mapping (for example with
+        ``left``/``right`` keys), or pass the two candidates as separate
+        arguments.  The model only suggests a decision; local code owns the
+        confidence threshold and final merge operation.
+        """
+
+        input_data = left if right is None else {"left": left, "right": right}
+        return self._run_stage(
+            stage="judge_cluster",
+            input_data=input_data,
+            model=self.cluster_model,
+            task=CLUSTER_TASK,
+            system_prompt=CLUSTER_SYSTEM_PROMPT,
+            response_schema=CLUSTER_RESPONSE_SCHEMA,
+            parser=parse_cluster_decision_response,
+        )
+
+    def write_event(
+        self,
+        event: Any,
+        evidence: Any | None = None,
+    ) -> StageCallResult[EventEditorialResponse]:
+        """Write citation-bearing event copy from an event and its evidence."""
+
+        input_data = event if evidence is None else {"event": event, "evidence": evidence}
+        result = self._run_stage(
+            stage="write_event",
+            input_data=input_data,
+            model=self.compose_model,
+            task=COMPOSE_TASK,
+            system_prompt=COMPOSE_SYSTEM_PROMPT,
+            response_schema=EVENT_EDITORIAL_RESPONSE_SCHEMA,
+            parser=parse_event_editorial_response,
+        )
+        # If the caller supplied a structured evidence collection, enforce
+        # that every cited ID points to one of those records.  The schema
+        # already rejects empty evidence_ids; this additional local check
+        # prevents a model from inventing an otherwise non-empty citation.
+        if result.ok and evidence is not None and result.parsed is not None:
+            known_ids = _extract_evidence_ids(evidence)
+            if known_ids:
+                unknown = sorted(
+                    {
+                        evidence_id
+                        for fact in result.parsed.facts
+                        for evidence_id in fact.evidence_ids
+                        if evidence_id not in known_ids
+                    }
+                )
+                if unknown:
+                    return StageCallResult(
+                        stage="write_event",
+                        status="parse_error",
+                        parsed=None,
+                        raw=result.raw,
+                        model=result.model,
+                        error="Event editorial response cited unknown evidence_ids: " + ", ".join(unknown),
+                    )
+        return result
+
+    def _run_stage(
+        self,
+        *,
+        stage: str,
+        input_data: Any,
+        model: str | None,
+        task: str,
+        system_prompt: str,
+        response_schema: dict[str, str],
+        parser: Callable[[Any], StageResultT],
+    ) -> StageCallResult[StageResultT]:
+        """Execute one stage request and make every failure auditable."""
+
+        if not self.is_configured:
+            return StageCallResult(
+                stage=stage,
+                status="not_configured",
+                model=model,
+                error=f"{stage} AI API is not configured",
+            )
+
+        payload = build_stage_payload(
+            input_data,
+            model=model,
+            task=task,
+            system_prompt=system_prompt,
+            response_schema=response_schema,
+            api_style=self.api_style,
+        )
+        raw: Any | None = None
+        try:
+            response = self._post_once(self._endpoint_url(), payload)
+        except httpx.HTTPStatusError as exc:
+            return StageCallResult(
+                stage=stage,
+                status="http_error",
+                model=model,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception as exc:
+            return StageCallResult(
+                stage=stage,
+                status="request_error",
+                model=model,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+        try:
+            raw = response.json()
+        except Exception as exc:
+            raw = getattr(response, "text", None)
+            return StageCallResult(
+                stage=stage,
+                status="invalid_json",
+                raw=raw,
+                model=model,
+                error=f"{type(exc).__name__}: provider returned invalid JSON",
+            )
+
+        try:
+            parsed = parser(raw)
+        except Exception as exc:
+            return StageCallResult(
+                stage=stage,
+                status="parse_error",
+                raw=raw,
+                model=model,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return StageCallResult(stage=stage, status="success", parsed=parsed, raw=raw, model=model)
 
     def _post_once(self, url: str, payload: dict[str, Any]):
         headers = {
@@ -195,6 +378,15 @@ __all__ = [
     "PROJECT_SUMMARY_SYSTEM_PROMPT",
     "PROJECT_SUMMARY_TASK",
     "PROJECT_SUMMARY_RESPONSE_SCHEMA",
+    "TRIAGE_RESPONSE_SCHEMA",
+    "CLUSTER_RESPONSE_SCHEMA",
+    "EVENT_EDITORIAL_RESPONSE_SCHEMA",
+    "TRIAGE_SYSTEM_PROMPT",
+    "CLUSTER_SYSTEM_PROMPT",
+    "COMPOSE_SYSTEM_PROMPT",
+    "TRIAGE_TASK",
+    "CLUSTER_TASK",
+    "COMPOSE_TASK",
     "ItemAnalysisClient",
     "ItemAnalysisRequest",
     "ItemAnalysisResponse",
@@ -203,4 +395,30 @@ __all__ = [
     "SupportsPost",
     "parse_item_analysis_response",
     "parse_project_summary_response",
+    "parse_triage_response",
+    "parse_cluster_decision_response",
+    "parse_event_editorial_response",
+    "StageCallResult",
 ]
+
+
+def _extract_evidence_ids(evidence: Any) -> set[str]:
+    """Extract IDs from common evidence list/mapping shapes without guessing."""
+
+    values: Any = evidence
+    if isinstance(evidence, dict):
+        if evidence.get("id") is not None or evidence.get("evidence_id") is not None:
+            values = [evidence]
+        else:
+            values = evidence.get("evidence") or evidence.get("items") or evidence.get("records") or []
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+    result: set[str] = set()
+    for value in values:
+        if isinstance(value, dict):
+            evidence_id = value.get("id") or value.get("evidence_id")
+        else:
+            evidence_id = getattr(value, "id", None) or getattr(value, "evidence_id", None)
+        if isinstance(evidence_id, (str, int)) and str(evidence_id).strip():
+            result.add(str(evidence_id).strip())
+    return result

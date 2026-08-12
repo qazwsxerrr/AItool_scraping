@@ -7,7 +7,15 @@ import pytest
 from app.ai import ItemAnalysisClient
 from app.ai.client import ItemAnalysisClient as CanonicalItemAnalysisClient
 from app.ai.prompts import ITEM_ANALYSIS_RESPONSE_SCHEMA, ITEM_ANALYSIS_SYSTEM_PROMPT, PROJECT_SUMMARY_SYSTEM_PROMPT
-from app.ai.schemas import ItemAnalysisRequest, ItemAnalysisResponse, apply_local_guard, parse_item_analysis_response
+from app.ai.schemas import (
+    ClusterDecision,
+    EventEditorialResponse,
+    ItemAnalysisRequest,
+    ItemAnalysisResponse,
+    TriageResponse,
+    apply_local_guard,
+    parse_item_analysis_response,
+)
 from app.config.settings import Settings
 
 
@@ -269,3 +277,86 @@ def test_local_guard_requires_verification_for_official_and_social_items():
 
     assert official.needs_verification is True
     assert social.needs_verification is True
+
+
+def test_daily_stage_methods_use_strict_schema_and_keep_raw_response():
+    http = FakeHttpClient(
+        FakeResponse(
+            {
+                "keep": True,
+                "section": "model_product",
+                "event_type": "release",
+                "event_hint": "新模型发布",
+                "entities": ["Example Model"],
+                "impact_score": 90,
+                "novelty_score": 80,
+                "readability_score": 70,
+                "risk_flags": ["needs-primary-evidence"],
+                "reason": "有明确发布线索",
+                "confidence": 88,
+                "claim_types": ["release"],
+            }
+        )
+    )
+    client = ItemAnalysisClient(
+        api_url="https://ai.example.test",
+        api_key="key",
+        model="review-model",
+        triage_model="triage-model",
+        http_client=http,
+    )
+
+    result = client.triage_item({"title": "Example Model", "source_group": "official_blog"})
+
+    assert result.status == "success"
+    assert result.ok is True
+    assert isinstance(result.parsed, TriageResponse)
+    assert result.parsed.section == "model_product"
+    assert result.raw_response == http.response.payload
+    assert http.calls[0]["json"]["task"] == "ai_triage_item"
+    assert http.calls[0]["json"]["model"] == "triage-model"
+
+
+def test_cluster_decision_rejects_unsupported_value_and_preserves_raw():
+    payload = {"decision": "merge-ish", "confidence": 120, "reason": "maybe"}
+    http = FakeHttpClient(FakeResponse(payload))
+    client = ItemAnalysisClient(api_url="https://ai.example.test", api_key="key", http_client=http)
+
+    result = client.judge_cluster({"left": "a", "right": "b"})
+
+    assert result.status == "parse_error"
+    assert result.parsed is None
+    assert result.raw_response == payload
+    assert "Cluster decision failed schema validation" in (result.error or "")
+
+
+def test_event_editorial_requires_evidence_ids_and_rejects_unknown_ids():
+    payload = {
+        "title": "事件标题",
+        "summary_cn": "摘要",
+        "why_it_matters": "影响",
+        "facts": [{"text": "具体事实", "evidence_ids": ["missing"]}],
+        "risk_notes": [],
+        "uncertainties": [],
+        "tags": ["release"],
+    }
+    http = FakeHttpClient(FakeResponse(payload))
+    client = ItemAnalysisClient(api_url="https://ai.example.test", api_key="key", http_client=http)
+
+    result = client.write_event(
+        {"event_id": "evt-1"},
+        [{"id": "evidence-1", "title": "primary"}],
+    )
+
+    assert result.status == "parse_error"
+    assert result.parsed is None
+    assert "unknown evidence_ids" in (result.error or "")
+    assert result.raw_response == payload
+
+
+def test_daily_stage_not_configured_is_auditable_result():
+    result = ItemAnalysisClient(api_url=None, api_key=None).triage_item({"title": "x"})
+
+    assert result.status == "not_configured"
+    assert result.parsed is None
+    assert "not configured" in (result.error or "")
