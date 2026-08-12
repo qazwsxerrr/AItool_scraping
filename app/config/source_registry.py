@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
-from app.domain.models import SourceSpec
+from app.domain.models import CANONICAL_SOURCE_GROUPS, SourceSpec
 
 LOGGER = logging.getLogger(__name__)
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -66,14 +66,24 @@ def load_source_registry(
     env_mapping = env or {}
     sources: list[SourceSpec] = []
     skipped: list[SkippedSource] = []
+    seen_ids: set[str] = set()
 
     for raw_source in raw_sources:
         if not isinstance(raw_source, dict):
             raise ValueError("each source entry must be a mapping")
 
         source_id = str(raw_source.get("id", "<unknown>"))
+        if source_id in seen_ids:
+            raise ValueError(f"duplicate source id: {source_id}")
+        seen_ids.add(source_id)
         if raw_source.get("enabled", True) is False:
             continue
+
+        source_group = raw_source.get("source_group")
+        if source_group is not None and source_group not in CANONICAL_SOURCE_GROUPS:
+            raise ValueError(
+                f"source {source_id} uses non-canonical source_group: {source_group}"
+            )
 
         url = str(raw_source.get("url", ""))
         interpolated_url, skip_reason = _interpolate_env(url, env_mapping)

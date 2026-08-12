@@ -62,6 +62,17 @@ DEFAULT_COMMUNITY_KEYWORDS: tuple[str, ...] = (
 _OFFICIAL_ROLES = {"official"}
 _PROJECT_ROLES = {"code_hosting", "launch_platform"}
 _COMMUNITY_ROLES = {"community", "social", "social_search", "forum", "search"}
+_OFFICIAL_GROUPS = {"official_blog", "official_research"}
+_PROJECT_GROUPS = {"github_trending", "github_release", "github_search", "producthunt"}
+_COMMUNITY_GROUPS = {
+    "reddit_fixed",
+    "reddit_search",
+    "linux_do",
+    "x_official",
+    "x_social",
+    "x_search",
+}
+_SOCIAL_GROUPS = {"x_official", "x_social", "x_search", "reddit_fixed", "reddit_search", "linux_do"}
 
 
 def classify_source(source: Any) -> ContentClass:
@@ -82,7 +93,8 @@ def classify_source(source: Any) -> ContentClass:
     # is an official company account. A registry entry may explicitly override
     # this only by setting content_class.
     if (
-        source_group == "x"
+        source_group in _SOCIAL_GROUPS
+        or source_group == "x"
         or source_group.startswith("reddit")
         or source_group == "linux_do"
         or "/twitter/" in source_url
@@ -99,17 +111,17 @@ def classify_source(source: Any) -> ContentClass:
     # account itself is official. The official article they link to is the
     # direct source link, not the social post.
     if transport == "rsshub" and (
-        group == "x"
+        group in {"x", "x_official", "x_social", "x_search"}
         or source_id.startswith("x_")
         or role in {"social", "social_search"}
         or subtype in {"account", "search"}
     ):
         return COMMUNITY_SOCIAL
-    if role in _OFFICIAL_ROLES:
+    if group in _OFFICIAL_GROUPS or role in _OFFICIAL_ROLES:
         return OFFICIAL_MODEL_COMPANY
-    if role in _PROJECT_ROLES:
+    if group in _PROJECT_GROUPS or role in _PROJECT_ROLES:
         return PROJECT_TOOL
-    if role in _COMMUNITY_ROLES:
+    if group in _COMMUNITY_GROUPS or role in _COMMUNITY_ROLES:
         return COMMUNITY_SOCIAL
 
     if transport == "github":

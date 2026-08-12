@@ -28,6 +28,47 @@ CONTENT_CLASSES: tuple[ContentClass, ...] = (
     COMMUNITY_SOCIAL,
 )
 
+# Source governance vocabulary.  These aliases intentionally live in the
+# transport-neutral domain module so registry, daily composition and storage
+# consumers share one spelling without importing configuration code.
+SourceTier: TypeAlias = Literal["p1", "p2", "p3", "p4"]
+TopicScope: TypeAlias = Literal[
+    "model_product",
+    "industry_infrastructure",
+    "research",
+    "open_source_tool",
+    "practice_opinion",
+]
+CitationPolicy: TypeAlias = Literal["primary", "supplementary", "discovery_only"]
+CanonicalSourceGroup: TypeAlias = Literal[
+    "official_blog",
+    "official_research",
+    "github_trending",
+    "github_release",
+    "github_search",
+    "producthunt",
+    "reddit_fixed",
+    "reddit_search",
+    "linux_do",
+    "x_official",
+    "x_social",
+    "x_search",
+]
+CANONICAL_SOURCE_GROUPS: tuple[CanonicalSourceGroup, ...] = (
+    "official_blog",
+    "official_research",
+    "github_trending",
+    "github_release",
+    "github_search",
+    "producthunt",
+    "reddit_fixed",
+    "reddit_search",
+    "linux_do",
+    "x_official",
+    "x_social",
+    "x_search",
+)
+
 
 class SelectionPolicy(BaseModel):
     """Typed common rules with room for collector-specific policy fields."""
@@ -214,6 +255,11 @@ class SourceSpec(BaseModel):
     fetch_interval: int = 3600
     source_group: str | None = None
     source_subtype: str | None = None
+    tier: SourceTier = "p4"
+    topic_scopes: tuple[TopicScope, ...] = ()
+    primary_eligible: bool = False
+    citation_policy: CitationPolicy = "discovery_only"
+    account_verification_url: str | None = None
     quality_weight: float | None = None
     source_role: str | None = None
     spam_risk: Literal["low", "medium", "high"] | None = None
@@ -240,6 +286,12 @@ class SourceSpec(BaseModel):
             raise ValueError("source_group must contain lowercase letters, numbers, underscore or dash")
         if self.source_subtype is not None and not _valid_source_token(self.source_subtype):
             raise ValueError("source_subtype must contain lowercase letters, numbers, underscore or dash")
+        if self.account_verification_url is not None:
+            verification_url = urlparse(self.account_verification_url)
+            if verification_url.scheme not in {"http", "https"} or not verification_url.netloc:
+                raise ValueError("account_verification_url must be an absolute http(s) URL")
+        if self.citation_policy == "discovery_only" and self.primary_eligible:
+            raise ValueError("discovery_only sources cannot be primary_eligible")
 
         if self.transport in {"feed", "rsshub"}:
             if self.github is not None:
@@ -402,6 +454,11 @@ class FetchBatch(BaseModel):
     http_status: int | None = None
     request_url: str | None = None
     final_url: str | None = None
+    # Conditional feed request metadata.  These fields are optional so older
+    # collectors and persisted batches remain fully backwards compatible.
+    etag: str | None = None
+    last_modified: str | None = None
+    not_modified: bool = False
     response_bytes: int = 0
     retry_count: int = 0
     transport: str | None = None

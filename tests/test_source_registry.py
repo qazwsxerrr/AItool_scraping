@@ -135,7 +135,7 @@ def test_default_registry_uses_canonical_github_modes_and_producthunt_atom():
     assert release_source.transport == "github"
     assert release_source.github.mode == "releases"
     assert release_source.url == "https://api.github.com/repos/ollama/ollama/releases"
-    assert release_source.source_group == "github"
+    assert release_source.source_group == "github_release"
     assert release_source.source_subtype == "repo_releases"
     assert release_source.quality_weight == 0.80
     assert release_source.spam_risk == "low"
@@ -224,3 +224,64 @@ sources:
 
     with pytest.raises(ValueError, match="producthunt.*atom"):
         load_source_registry(path, env={})
+
+
+def test_registry_rejects_duplicate_source_ids(tmp_path):
+    path = tmp_path / "source_registry.yaml"
+    path.write_text(
+        """
+sources:
+  - id: duplicate
+    transport: feed
+    url: https://example.test/one.xml
+  - id: duplicate
+    transport: feed
+    url: https://example.test/two.xml
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate source id: duplicate"):
+        load_source_registry(path, env={})
+
+
+def test_enabled_sources_use_canonical_groups_and_governance_defaults():
+    result = load_source_registry(env={})
+    canonical = {
+        "official_blog",
+        "official_research",
+        "github_trending",
+        "github_release",
+        "github_search",
+        "producthunt",
+        "reddit_fixed",
+        "reddit_search",
+        "linux_do",
+        "x_official",
+        "x_social",
+        "x_search",
+    }
+    assert result.sources
+    assert all(source.source_group in canonical for source in result.sources)
+    assert all(source.tier in {"p1", "p2", "p3", "p4"} for source in result.sources)
+    assert all(source.topic_scopes for source in result.sources)
+    assert all(not source.primary_eligible for source in result.sources if source.source_group.startswith("x_"))
+
+
+def test_default_registry_contains_v3_official_feeds_and_x_handles():
+    result = load_source_registry(env={"RSSHUB_BASE_URL": "https://rsshub.example"})
+    source_by_id = {source.id: source for source in result.sources}
+    assert source_by_id["anthropic_news_rsshub"].source_group == "official_blog"
+    assert source_by_id["anthropic_research_rsshub"].source_group == "official_research"
+    assert source_by_id["anthropic_engineering_rsshub"].source_group == "official_research"
+    for source_id, handle in {
+        "x_account_zai_org": "Zai_org",
+        "x_account_kimi_moonshot": "Kimi_Moonshot",
+        "x_account_minimax_ai": "MiniMax__AI",
+    }.items():
+        source = source_by_id[source_id]
+        assert source.source_group == "x_official"
+        assert source.primary_eligible is False
+        assert source.citation_policy == "supplementary"
+        assert handle in source.url
+        assert source.account_verification_url == f"https://x.com/{handle}"
