@@ -17,7 +17,7 @@ from app.pipeline.editorial import evaluate_publication_gates
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.edition_repository import EditionRepository
 from app.storage.event_repository import EventRepository
-from app.storage.models import Event, EventEditorialReview
+from app.storage.models import Document, Event, EventEditorialReview, Source
 
 
 @dataclass
@@ -45,7 +45,15 @@ def run_daily_export_job(
             return DailyExportResult(day.isoformat(), "published", len(_load_events(existing.events_json)), True, str(markdown), str(events_path), failures=[])
         events = list(session.scalars(select(Event).where(Event.state == "composed").order_by(Event.score.desc(), Event.id.asc())).all())
         reviews = {review.event_id: review for review in session.scalars(select(EventEditorialReview).where(EventEditorialReview.event_id.in_([e.id for e in events] or [-1]))).all()}
-        rows = [_event_values(event, reviews.get(event.id)) for event in events]
+        rows = [
+            _event_values(
+                event,
+                reviews.get(event.id),
+                session.get(Source, event.primary_source_id),
+                session.get(Document, event.primary_document_id),
+            )
+            for event in events
+        ]
         gates = evaluate_publication_gates(rows, profile, editorial_reviews=reviews)
         status = "published" if gates.publishable else "blocked"
         edition = edition_repo.upsert_edition(day, status=status, gate_results=gates.to_dict(), markdown_path=str(markdown if gates.publishable else draft), events=rows)
@@ -71,9 +79,43 @@ def _as_date(value: date | str | None) -> date:
     return date.fromisoformat(str(value)[:10])
 
 
-def _event_values(event: Event, review: Any | None) -> dict[str, Any]:
-    source = event.primary_source_id
-    return {"id": event.id, "event_id": event.id, "title": getattr(review, "title", None) or event.title, "summary_cn": getattr(review, "summary_cn", None), "why_it_matters": getattr(review, "why_it_matters", None), "section": event.section, "event_type": event.event_type, "event_hint": event.event_hint, "primary_source_id": source, "source_id": source, "source_group": None, "tier": "p1" if event.section == "model_product" else "p2", "primary_eligible": True, "citation_policy": "primary", "discovered_at": event.discovered_at, "editorial_review": {"status": getattr(review, "status", None), "title": getattr(review, "title", None), "facts": _json(getattr(review, "facts_json", None))} if review else None, "score": event.score}
+def _event_values(
+    event: Event,
+    review: Any | None,
+    source: Source | None = None,
+    document: Document | None = None,
+) -> dict[str, Any]:
+    source_id = event.primary_source_id
+    source_group = source.source_group if source is not None else None
+    return {
+        "id": event.id,
+        "event_id": event.id,
+        "title": getattr(review, "title", None) or event.title,
+        "summary_cn": getattr(review, "summary_cn", None),
+        "why_it_matters": getattr(review, "why_it_matters", None),
+        "section": event.section,
+        "event_type": event.event_type,
+        "event_hint": event.event_hint,
+        "primary_source_id": source_id,
+        "source_id": source_id,
+        "source_group": source_group,
+        "tier": source.tier if source is not None else ("p1" if event.section == "model_product" else "p2"),
+        "primary_eligible": bool(source.primary_eligible) if source is not None else True,
+        "citation_policy": source.citation_policy if source is not None else "primary",
+        "source": source,
+        "document": document,
+        "primary_document": document,
+        "primary_document_id": event.primary_document_id,
+        "discovered_at": event.discovered_at,
+        "editorial_review": {
+            "status": getattr(review, "status", None),
+            "title": getattr(review, "title", None),
+            "facts": _json(getattr(review, "facts_json", None)),
+        }
+        if review
+        else None,
+        "score": event.score,
+    }
 
 
 def _render_markdown(day: date, rows: list[dict[str, Any]]) -> str:
