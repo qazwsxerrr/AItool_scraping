@@ -7,6 +7,13 @@ from app.jobs.export_job import run_intel_export_from_settings
 from app.jobs.fetch_job import run_intel_fetch_from_settings
 from app.jobs.process_job import run_intel_process_from_settings
 from app.jobs.run_job import run_intel_once_from_settings
+from app.jobs.daily_run_job import run_daily_from_settings
+from app.jobs.daily_export_job import run_daily_export_from_settings
+from app.jobs.enrich_job import run_enrich_from_settings
+from app.jobs.triage_job import run_triage_from_settings
+from app.jobs.cluster_job import run_cluster_from_settings
+from app.jobs.compose_job import run_compose_from_settings
+from app.jobs.source_health_job import run_source_health_from_settings
 from app.logging_config import configure_logging
 
 
@@ -143,6 +150,52 @@ def run_once(
         typer.echo(f"error={result.error}")
     if result.status == "failed":
         raise typer.Exit(code=1)
+
+
+@app.command("source-health")
+def source_health(source: str | None = typer.Option(None, "--source")) -> None:
+    configure_logging()
+    for row in run_source_health_from_settings(settings=Settings.from_env(), source_filter=source):
+        next_time = row.next_fetch_at.isoformat() if row.next_fetch_at else "now"
+        typer.echo(f"{row.source_id}: status={row.status} failures={row.consecutive_failures} next={next_time} error={row.error_code or '-'}")
+
+
+@app.command("enrich")
+def enrich(source: str | None = typer.Option(None, "--source"), limit: int = typer.Option(100, min=1), force: bool = typer.Option(False, "--force")) -> None:
+    result = run_enrich_from_settings(settings=Settings.from_env(), source_filter=source, limit=limit, force=force)
+    typer.echo(f"processed={result.processed} enriched={result.enriched} skipped={result.skipped} failed={result.failed}")
+
+
+@app.command("triage")
+def triage(source: str | None = typer.Option(None, "--source"), limit: int = typer.Option(100, min=1), force: bool = typer.Option(False, "--force")) -> None:
+    result = run_triage_from_settings(settings=Settings.from_env(), source_filter=source, limit=limit, force=force)
+    typer.echo(f"processed={result.processed} kept={result.kept} filtered={result.filtered} ai_failed={result.ai_failed} failed={result.failed}")
+
+
+@app.command("cluster")
+def cluster(limit: int = typer.Option(100, min=1), force: bool = typer.Option(False, "--force")) -> None:
+    result = run_cluster_from_settings(settings=Settings.from_env(), limit=limit, force=force)
+    typer.echo(f"processed={result.processed} events={result.events} merged={result.merged} uncertain={result.uncertain} failed={result.failed}")
+
+
+@app.command("compose")
+def compose(limit: int = typer.Option(200, min=1), force: bool = typer.Option(False, "--force")) -> None:
+    result = run_compose_from_settings(settings=Settings.from_env(), limit=limit, force=force)
+    typer.echo(f"candidates={result.candidates} selected={result.selected} written={result.written} failed={result.failed}")
+
+
+@app.command("daily-export")
+def daily_export(date: str | None = typer.Option(None, "--date"), output_dir: str = typer.Option("output/daily"), force: bool = typer.Option(False, "--force")) -> None:
+    result = run_daily_export_from_settings(settings=Settings.from_env(), edition_date=date, output_dir=output_dir, force=force)
+    typer.echo(f"date={result.edition_date} status={result.status} selected={result.selected} published={result.published}")
+    typer.echo(f"markdown={result.markdown_path}")
+    if result.draft_path: typer.echo(f"draft={result.draft_path}")
+
+
+@app.command("run-daily")
+def run_daily(source: str | None = typer.Option(None, "--source"), limit: int = typer.Option(100, min=1), force: bool = typer.Option(False, "--force"), output_dir: str = typer.Option("output/daily"), date: str | None = typer.Option(None, "--date")) -> None:
+    result = run_daily_from_settings(settings=Settings.from_env(), source=source, limit=limit, force=force, output_dir=output_dir, edition_date=date)
+    typer.echo(f"fetch_failed={result.fetch.total_failed} enriched={result.enrich.enriched} triage_kept={result.triage.kept} events={result.cluster.events} composed={result.compose.written} export={result.export.status} status={result.status}")
 
 
 def _validate_content_class(value: str | None) -> None:
