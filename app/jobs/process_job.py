@@ -576,12 +576,38 @@ def _is_github_source(spec: SourceSpec) -> bool:
 
 
 def _latest_item_time(items: list[IntelItem]) -> datetime | None:
-    values = [item.published_at or item.discovered_at or item.captured_at for item in items]
-    values = [value for value in values if value is not None]
+    values: list[datetime] = []
+    for item in items:
+        if item.published_at is not None:
+            values.append(item.published_at)
+            continue
+        metrics = _json_dict(item.metrics_json)
+        pushed_at = metrics.get("pushed_at") or metrics.get("updated_at")
+        pushed = _as_utc_datetime(pushed_at)
+        if pushed is not None:
+            values.append(pushed)
+            continue
+        # ``discovered_at`` is populated for V3 rows, but when it is exactly
+        # the capture timestamp it is a local ingestion timestamp rather than
+        # a source signal. Keep it only as a final fallback for items that have
+        # no historical publication/push marker.
+        values.append(item.discovered_at or item.captured_at)
     if not values:
         return None
     latest = max(values)
     return latest.replace(tzinfo=timezone.utc) if latest.tzinfo is None else latest.astimezone(timezone.utc)
+
+
+def _as_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    return None
 
 
 def run_intel_process_from_settings(

@@ -14,7 +14,7 @@ from app.config.settings import Settings
 from app.pipeline.event_cluster import canonical_event_key, cluster_candidates
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.event_repository import EventRepository
-from app.storage.models import IntelItem, Source
+from app.storage.models import Document, IntelItem, Source
 
 
 @dataclass
@@ -57,7 +57,7 @@ def run_cluster_job(
                     canonical_url=primary.get("canonical_url"), section=section,
                     event_type=event_type, event_hint=event_hint, title=primary.get("title"),
                     state="candidate", score=float(primary.get("selection_score") or 0),
-                    primary_item_id=primary.get("id"), primary_source_id=primary.get("source_id"),
+                    primary_item_id=primary.get("id"), primary_document_id=primary.get("document_id"), primary_source_id=primary.get("source_id"),
                     discovered_at=primary.get("discovered_at") or current,
                 )
                 event = event_result.event
@@ -90,7 +90,8 @@ def run_cluster_from_settings(*, settings: Settings, **kwargs: Any) -> ClusterRe
 
 def _candidate_values(item: IntelItem) -> dict[str, Any]:
     source = item.source
-    return {"id": item.id, "source_id": item.source_id, "source_group": source.source_group if source else None, "tier": source.tier if source else "p4", "primary_eligible": source.primary_eligible if source else False, "citation_policy": source.citation_policy if source else "discovery_only", "canonical_url": item.canonical_url, "title": item.title, "section": None, "event_type": None, "event_hint": item.event_hint or item.title, "selection_score": item.selection_score, "published_at": item.published_at, "discovered_at": item.discovered_at or item.captured_at}
+    document = getattr(item, "document", None)
+    return {"id": item.id, "source_id": item.source_id, "source_group": source.source_group if source else None, "tier": source.tier if source else "p4", "primary_eligible": source.primary_eligible if source else False, "citation_policy": source.citation_policy if source else "discovery_only", "canonical_url": item.canonical_url, "title": item.title, "section": None, "event_type": None, "event_hint": item.event_hint or item.title, "selection_score": item.selection_score, "published_at": item.published_at, "discovered_at": item.discovered_at or item.captured_at, "document_id": getattr(document, "id", None)}
 
 
 def _section_from_item(value: Mapping[str, Any]) -> str:
