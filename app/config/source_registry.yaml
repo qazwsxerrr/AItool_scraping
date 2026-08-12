@@ -59,6 +59,106 @@ sources:
     mode: official_direct_link
     required: true
   default_limit: 10
+- id: openrouter_blog
+  name: OpenRouter Blog
+  transport: feed
+  url: https://openrouter.ai/blog/feed.xml
+  enabled: true
+  priority: 31
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: fixed_blog
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  requires_verification: true
+  content_class: official_model_company
+  selection_policy:
+    mode: official_recent
+    max_age_days: 30
+    keywords: [ai, model, router, inference, agent, api, release, launch, pricing, eval]
+  verification_policy:
+    mode: official_direct_link
+    required: true
+  default_limit: 10
+- id: google_research_blog
+  name: Google Research Blog
+  transport: feed
+  url: https://research.google/blog/rss/
+  enabled: true
+  priority: 32
+  fetch_interval: 21600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_research
+  source_subtype: research_blog
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  requires_verification: true
+  content_class: official_model_company
+  selection_policy:
+    mode: official_recent
+    max_age_days: 30
+    keywords: [ai, model, research, framework, agent, language, learning, diffusion, benchmark, robotics, intelligence, foundation, generative, gemini, machine]
+  verification_policy:
+    mode: official_direct_link
+    required: true
+  default_limit: 8
+- id: nvidia_ai_blog
+  name: NVIDIA AI Blog
+  transport: feed
+  url: https://blogs.nvidia.com/feed/
+  enabled: true
+  priority: 33
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: ai_blog
+  quality_weight: 0.85
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: official_model_company
+  selection_policy:
+    mode: official_recent
+    max_age_days: 30
+    keywords: [ai, model, inference, generative, agent, robotics, blackwell, cuda, foundation, open weights, accelerated computing]
+  verification_policy:
+    mode: official_direct_link
+    required: true
+  default_limit: 8
+- id: aws_machine_learning_blog
+  name: AWS Machine Learning Blog
+  transport: feed
+  url: https://aws.amazon.com/blogs/machine-learning/feed/
+  enabled: true
+  priority: 34
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: machine_learning_blog
+  quality_weight: 0.85
+  source_role: official
+  spam_risk: medium
+  requires_verification: true
+  content_class: official_model_company
+  selection_policy:
+    mode: official_recent
+    max_age_days: 30
+    keywords: [bedrock, sagemaker, agent, agentcore, jumpstart, titan, llama, embedding, transformer, neuron]
+  verification_policy:
+    mode: official_direct_link
+    required: true
+  default_limit: 8
 - id: producthunt_feed
   name: Product Hunt Feed
   transport: feed

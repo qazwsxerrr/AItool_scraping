@@ -144,7 +144,12 @@ class ItemAnalysisClient:
                 # ``post(url, headers, json)`` signature.
                 response = self._http_client.post(url, headers=headers, json=payload)
         else:
-            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
+            with httpx.Client(
+                timeout=self.timeout_seconds,
+                follow_redirects=True,
+                http2=True,
+                trust_env=True,
+            ) as client:
                 response = client.post(url, headers=headers, json=payload)
         response.raise_for_status()
         return response

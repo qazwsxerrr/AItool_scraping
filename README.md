@@ -18,11 +18,11 @@ source registry -> fetch -> process -> export
 
 ## 数据抓取途径
 
-当前 registry 共 63 条来源定义（59 条启用，4 条停用），实现方式如下：
+当前 registry 共 67 条来源定义（63 条启用，4 条停用），实现方式如下：
 
 | transport | 具体途径 | 实现方式 | 典型来源 |
 | --- | --- | --- | --- |
-| `feed` | 原生 RSS | 共享 HTTP 客户端获取 RSS，通用 feed parser 标准化 | OpenAI、Google DeepMind、Hugging Face、LINUX DO |
+| `feed` | 原生 RSS | 共享 HTTP 客户端获取 RSS，通用 feed parser 标准化 | OpenAI、Google Research、OpenRouter、NVIDIA、AWS、Hugging Face、LINUX DO |
 | `feed` | 原生 Atom | 同一 feed parser 解析 Atom | Reddit LocalLLaMA |
 | `feed` | Product Hunt Atom | Atom feed + `producthunt` adapter；先从 feed 提取，发现 GitHub 链接时可复用 GitHub metadata enrichment | Product Hunt |
 | `rsshub` | RSSHub 配置路由 | `${RSSHUB_BASE_URL}` 解析模板 URL，响应仍按 RSS/Atom 解析 | X 账号、X 搜索、Anthropic 路由 |
@@ -36,7 +36,8 @@ registry 的来源组清单（启用时）：
 
 | 来源组 | 数量 | 配置/路由范围 |
 | --- | ---: | --- |
-| 官方博客 | 3 | `openai_news`、`google_deepmind_blog`、`huggingface_blog`，原生 RSS |
+| 官方博客 | 6 | `openai_news`、`google_deepmind_blog`、`huggingface_blog`、`openrouter_blog`、`nvidia_ai_blog`、`aws_machine_learning_blog`，原生 RSS |
+| 官方研究 | 1 | `google_research_blog`，原生 RSS |
 | Product Hunt | 1 | `producthunt_feed`，Atom + `producthunt` adapter |
 | LINUX DO | 2 | `linux_do_top`、`linux_do_hot`，原生 RSS |
 | Reddit LocalLLaMA | 14 | new/hot/top 及 9 个主题搜索，Atom |
@@ -44,8 +45,8 @@ registry 的来源组清单（启用时）：
 | RSSHub Anthropic | 3 | news/research/engineering 路由，RSSHub 模板 URL |
 | GitHub | 10 | Trending daily/weekly、6 个 topic Search、Ollama/Transformers Releases |
 
-合计 59 条启用来源；另有 4 条 registry 定义默认停用。RSSHub 组在未设置
-`RSSHUB_BASE_URL` 时按条目跳过，不影响其他 30 条非模板来源。
+合计 63 条启用来源；另有 4 条 registry 定义默认停用。RSSHub 组在未设置
+`RSSHUB_BASE_URL` 时按条目跳过，不影响其他 34 条非模板来源。
 
 ## 代码边界
 
@@ -100,7 +101,12 @@ DATABASE_URL=sqlite:///./data/ai_tool_intel.db
 常用可选配置：
 
 ```env
-RSSHUB_BASE_URL=https://rsshub.example.com
+HTTP_PROXY=http://127.0.0.1:2080
+HTTPS_PROXY=http://127.0.0.1:2080
+NO_PROXY=127.0.0.1,localhost,::1
+RSSHUB_BASE_URL=http://127.0.0.1:1200
+RSSHUB_PORT=1200
+PROXY_URI=http://127.0.0.1:2080
 GITHUB_TOKEN=your-github-token
 AI_REVIEW_API_URL=https://api.deepseek.com
 AI_REVIEW_API_KEY=your-key
@@ -109,7 +115,53 @@ AI_REVIEW_API_STYLE=openai_chat
 AI_REVIEW_TIMEOUT_SECONDS=30
 ```
 
+### `.env` 参数说明
+
+项目只读取根目录的 `.env`；请先复制 `.env.example`，再填入本机配置。
+`.env` 已被 Git 忽略，真实 token、API key 和代理地址不要写入 README 或提交到仓库。
+
+| 参数 | 必填 | 默认值/示例 | 用途 |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | 否 | `sqlite:///./data/ai_tool_intel.db` | SQLite 或其他 SQLAlchemy 数据库连接串。 |
+| `REQUEST_TIMEOUT_SECONDS` | 否 | `20` | Python 外部请求超时时间，单位为秒。 |
+| `REQUEST_RETRIES` | 否 | `2` | 单个来源的重试次数。 |
+| `USER_AGENT` | 否 | `AItool_scraping/0.1 (+https://example.local)` | Python HTTP 请求的 User-Agent。 |
+| `HTTP_PROXY` | 否 | 例如 `http://127.0.0.1:2080` | Reddit、LINUX DO、GitHub 等外部 Python 请求使用的 HTTP 代理。 |
+| `HTTPS_PROXY` | 否 | 例如 `http://127.0.0.1:2080` | 外部 HTTPS 请求使用的代理；通常与 `HTTP_PROXY` 保持一致。 |
+| `ALL_PROXY` | 否 | 留空 | httpx 可用的全协议代理兜底配置。 |
+| `NO_PROXY` | 否 | `127.0.0.1,localhost,::1` | 不走代理的地址列表；应包含本地 RSSHub 地址。 |
+| `RSSHUB_BASE_URL` | X/RSSHub 必填 | `http://127.0.0.1:1200` | Python 访问 RSSHub 的基础地址；为空时跳过 RSSHub 模板来源。 |
+| `RSSHUB_PORT` | 启动本地 RSSHub 时必填 | `1200` | `scripts/start_rsshub.sh` 传给 Node RSSHub 的监听端口，必须与 `RSSHUB_BASE_URL` 的端口一致。 |
+| `PROXY_URI` | X 使用外部代理时填写 | 例如 `http://127.0.0.1:2080` | RSSHub Node 进程访问 X 等外部服务时使用的代理；留空表示 RSSHub 直连。 |
+| `TWITTER_AUTH_TOKEN` | X 推荐 | 留空 | RSSHub 的 Web API 认证 token；配置后优先走 RSSHub Web API 路径。 |
+| `TWITTER_CONSUMER_KEY` | OAuth 备用 | 留空 | X OAuth 1.0a consumer key。 |
+| `TWITTER_CONSUMER_SECRET` | OAuth 备用 | 留空 | X OAuth 1.0a consumer secret。 |
+| `TWITTER_ACCESS_TOKEN` | OAuth 备用 | 留空 | X OAuth 1.0a access token。 |
+| `TWITTER_ACCESS_SECRET` | OAuth 备用 | 留空 | X OAuth 1.0a access secret。四个 OAuth 参数需要成组配置。 |
+| `GITHUB_API_BASE_URL` | 否 | `https://api.github.com` | GitHub API 地址。 |
+| `GITHUB_TOKEN` | GitHub API 推荐 | 留空 | GitHub API token。 |
+| `GITHUB_API_TOKEN` | 否 | 留空 | `GITHUB_TOKEN` 为空时使用的兼容别名。 |
+| `GITHUB_API_VERSION` | 否 | `2022-11-28` | GitHub API 版本请求头。 |
+| `GITHUB_TIMEOUT_SECONDS` | 否 | `20` | GitHub API 请求超时时间，单位为秒。 |
+| `AI_REVIEW_API_URL` | 否 | 留空 | AI review 服务地址；为空时不调用 AI review。 |
+| `AI_REVIEW_API_KEY` | 启用 AI review 时必填 | 留空 | AI review 服务密钥。 |
+| `AI_REVIEW_MODEL` | 启用 AI review 时填写 | 留空 | AI review 使用的模型名。 |
+| `AI_REVIEW_API_STYLE` | 否 | `generic_json` | AI review API 协议风格，例如 `openai_chat`。 |
+| `AI_REVIEW_TIMEOUT_SECONDS` | 否 | `30` | AI review 请求超时时间，单位为秒。 |
+
+代理和端口的关系固定如下：
+
+- Reddit、LINUX DO、GitHub 等外部来源由 Python 使用 `HTTP_PROXY`/`HTTPS_PROXY`；
+  Reddit 默认不追加 `raw_json=1`。
+- RSSHub/X 的 Python 请求直接访问 `RSSHUB_BASE_URL`，不继承外部 Python 代理；
+  RSSHub Node 进程自身使用 `PROXY_URI` 访问 X。
+- 本地启动时只执行 `bash scripts/start_rsshub.sh`。脚本只读取根 `.env` 的
+  `RSSHUB_PORT` 和 `PROXY_URI`，不读取其他目录的 `.env`，也不使用 Docker。
+
 未配置 `RSSHUB_BASE_URL` 时，依赖模板 URL 的来源会被跳过并记录原因。Product Hunt 始终使用公开 Atom feed，不读取或发送 API token。
+
+本地 RSSHub 当前需要 Node.js 22.22.2+ 或 24.15.0+。首次运行前在
+`../RSSHub` 执行 `corepack pnpm install --frozen-lockfile && corepack pnpm build`。
 
 ## 运行
 
@@ -135,7 +187,13 @@ python -m app.main run-once --limit 100
 - `--force`：忽略抓取冷却并重新处理已有条目。
 - `--dry-run`：使用临时 SQLite 和内存输出，不写目标数据库或输出目录。
 
-脚本入口只保留：
+本地 RSSHub 启动入口：
+
+```bash
+bash scripts/start_rsshub.sh
+```
+
+数据脚本入口：
 
 ```bash
 python scripts/init_db.py

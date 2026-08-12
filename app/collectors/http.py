@@ -188,16 +188,29 @@ def _retryable(status: int, attempt: int, retries: int) -> bool:
 def _retry_after(response: Any) -> float | None:
     headers = getattr(response, "headers", {}) or {}
     raw = headers.get("retry-after") or headers.get("Retry-After")
-    try:
-        return min(max(float(raw), 0.0), 60.0) if raw is not None else None
-    except (TypeError, ValueError):
+    if raw is not None:
         try:
-            parsed = parsedate_to_datetime(str(raw))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return min(max((parsed - datetime.now(timezone.utc)).total_seconds(), 0.0), 60.0)
-        except (TypeError, ValueError, OverflowError):
-            return None
+            return min(max(float(raw), 0.0), 60.0)
+        except (TypeError, ValueError):
+            try:
+                parsed = parsedate_to_datetime(str(raw))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return min(max((parsed - datetime.now(timezone.utc)).total_seconds(), 0.0), 60.0)
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    # Reddit exposes a short, relative reset window as ``x-ratelimit-reset``
+    # instead of ``Retry-After``.  Treat large values as Unix timestamps so
+    # the same parser also works with providers that use an absolute reset.
+    raw_reset = headers.get("x-ratelimit-reset") or headers.get("X-Ratelimit-Reset")
+    try:
+        reset = float(raw_reset)
+    except (TypeError, ValueError):
+        return None
+    if reset > 10_000_000:
+        reset -= time.time()
+    return min(max(reset, 0.0), 60.0)
 
 
 __all__ = [

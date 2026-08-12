@@ -573,6 +573,8 @@ def _make_http_fetcher(*, http_client: Any | None, transport: httpx.BaseTranspor
         with httpx.Client(
             timeout=timeout,
             follow_redirects=True,
+            http2=True,
+            trust_env=True,
             transport=transport,
             headers={"Accept": "text/html,application/json;q=0.9,*/*;q=0.1"},
         ) as client:

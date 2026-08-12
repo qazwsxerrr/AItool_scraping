@@ -55,9 +55,13 @@ class FeedCollector(Collector):
     def collect(self, source: SourceSpec, limit: int) -> FetchBatch:
         if not source.url:
             return failed_batch(source, "missing_url", "source has no URL")
+        # Keep the registry URL unchanged. Reddit's standard ``.rss`` route
+        # already returns Atom XML; query-string workarounds such as
+        # ``raw_json=1`` can trigger a different 403/429 edge path.
+        request_url = source.url
         response, retry_count, error = request_with_retry(
             self.client,
-            source.url,
+            request_url,
             retries=self.retries,
             user_agent=self.user_agent,
             max_response_bytes=self.max_response_bytes,
@@ -72,11 +76,11 @@ class FeedCollector(Collector):
                 http_status=error[2],
                 response_bytes=getattr(error, "response_bytes", 0),
                 retry_count=retry_count,
-                request_url=source.url,
+                request_url=request_url,
             )
         assert response is not None
-        final_url = response_final_url(response, source.url)
-        request_url = response_request_url(response, source.url)
+        final_url = response_final_url(response, request_url)
+        request_url = response_request_url(response, request_url)
         status_code = int(getattr(response, "status_code", 0) or 0)
         if status_code == 304:
             return FetchBatch(

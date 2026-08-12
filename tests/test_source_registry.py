@@ -141,6 +141,33 @@ def test_default_registry_uses_canonical_github_modes_and_producthunt_atom():
     assert release_source.spam_risk == "low"
 
 
+def test_default_registry_includes_verified_official_feed_expansion():
+    result = load_source_registry(env={})
+    source_by_id = {source.id: source for source in result.sources}
+
+    expected = {
+        "openrouter_blog": ("https://openrouter.ai/blog/feed.xml", "official_blog"),
+        "google_research_blog": ("https://research.google/blog/rss/", "official_research"),
+        "nvidia_ai_blog": ("https://blogs.nvidia.com/feed/", "official_blog"),
+        "aws_machine_learning_blog": (
+            "https://aws.amazon.com/blogs/machine-learning/feed/",
+            "official_blog",
+        ),
+    }
+    assert expected.keys() <= source_by_id.keys()
+    for source_id, (url, group) in expected.items():
+        source = source_by_id[source_id]
+        assert source.transport == "feed"
+        assert source.feed.format == "rss"
+        assert source.feed.adapter == "generic"
+        assert source.url == url
+        assert source.source_group == group
+        assert source.content_class == "official_model_company"
+        assert source.verification_policy.mode == "official_direct_link"
+        assert source.verification_policy.required is True
+        assert source.selection_policy.keywords
+
+
 def test_legacy_routing_fields_are_rejected(tmp_path):
     path = tmp_path / "source_registry.yaml"
     path.write_text(

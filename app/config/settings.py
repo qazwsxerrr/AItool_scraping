@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -33,11 +33,11 @@ class Settings:
     request_retries: int = 2
     user_agent: str = DEFAULT_USER_AGENT
     github_api_base_url: str = "https://api.github.com"
-    github_api_token: str | None = None
+    github_api_token: str | None = field(default=None, repr=False)
     github_api_version: str = "2022-11-28"
     github_timeout_seconds: float = 20.0
     ai_review_api_url: str | None = None
-    ai_review_api_key: str | None = None
+    ai_review_api_key: str | None = field(default=None, repr=False)
     ai_review_model: str | None = None
     ai_review_api_style: str = "generic_json"
     ai_review_timeout_seconds: float = 30.0
@@ -45,7 +45,7 @@ class Settings:
     @classmethod
     def from_env(cls, dotenv_path: str | Path = ".env") -> "Settings":
         load_dotenv(dotenv_path)
-        rsshub_base_url = os.getenv("RSSHUB_BASE_URL") or None
+        rsshub_base_url = _env_value("RSSHUB_BASE_URL")
         return cls(
             database_url=os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL),
             rsshub_base_url=rsshub_base_url.rstrip("/") if rsshub_base_url else None,
@@ -62,3 +62,8 @@ class Settings:
             ai_review_api_style=os.getenv("AI_REVIEW_API_STYLE", "generic_json"),
             ai_review_timeout_seconds=float(os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "30")),
         )
+
+
+def _env_value(name: str) -> str | None:
+    value = os.getenv(name)
+    return value.strip() if value and value.strip() else None

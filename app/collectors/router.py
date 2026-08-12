@@ -28,8 +28,8 @@ class CollectorRouter:
         self.feed = feed
         # RSSHub documents are parsed exactly like native feeds.  Keep the
         # optional name for callers migrating from the old constructor while
-        # using the shared implementation by default.
-        self.rsshub = feed
+        # honoring a separately configured local RSSHub client when provided.
+        self.rsshub = rsshub if rsshub is not None else feed
         self.github = github
         self.github_trending = github_trending
         self.producthunt = producthunt

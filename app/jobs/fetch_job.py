@@ -13,7 +13,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.collectors.feed import FeedCollector, ProductHuntCollector
+from app.collectors.feed import FeedCollector, ProductHuntCollector, RSSHubCollector
 from app.collectors.github import GitHubCollector, GitHubTrendingCollector
 from app.collectors.router import CollectorRouter
 from app.config.settings import Settings
@@ -243,16 +243,16 @@ def run_intel_fetch_from_settings(
     engine = create_engine_from_url(database_url)
     init_db(engine)
     session_factory = create_session_factory(engine)
-    client = httpx.Client(
-        timeout=settings.request_timeout_seconds,
-        follow_redirects=True,
-        headers={"User-Agent": settings.user_agent},
-    )
+    external_client = _build_http_client(settings, trust_env=True)
+    # The active RSSHub deployment is a local Node process. Its outbound X
+    # proxy is configured by scripts/start_rsshub.sh; Python calls the
+    # configured RSSHUB_BASE_URL directly instead of inheriting HTTP_PROXY.
+    rsshub_client = _build_http_client(settings, trust_env=False)
     try:
-        feed = FeedCollector(client, retries=settings.request_retries, user_agent=settings.user_agent)
-        rsshub = feed
+        feed = FeedCollector(external_client, retries=settings.request_retries, user_agent=settings.user_agent)
+        rsshub = RSSHubCollector(rsshub_client, retries=settings.request_retries, user_agent=settings.user_agent)
         github = GitHubCollector(
-            client,
+            external_client,
             base_url=settings.github_api_base_url,
             token=settings.github_api_token,
             api_version=settings.github_api_version,
@@ -261,12 +261,12 @@ def run_intel_fetch_from_settings(
             timeout_seconds=settings.github_timeout_seconds,
         )
         github_trending = GitHubTrendingCollector(
-            client,
+            external_client,
             retries=settings.request_retries,
             user_agent=settings.user_agent,
         )
         producthunt = ProductHuntCollector(
-            client,
+            external_client,
             retries=settings.request_retries,
             user_agent=settings.user_agent,
             github_lookup=github.lookup_repository,
@@ -290,9 +290,28 @@ def run_intel_fetch_from_settings(
             run_id=run_id,
         )
     finally:
-        client.close()
+        external_client.close()
+        rsshub_client.close()
     result.skipped_sources.extend(f"{item.source_id}: {item.reason}" for item in registry.skipped)
     return result
+
+
+def _build_http_client(settings: Settings, *, trust_env: bool) -> httpx.Client:
+    """Build one of the two fixed fetch profiles.
+
+    ``trust_env=True`` is used for external native feeds such as Reddit and
+    LINUX DO, so they use the configured 2080 proxy.  ``trust_env=False`` is
+    used for the local RSSHub endpoint, whose Node process owns X's outbound
+    proxy configuration.
+    """
+
+    return httpx.Client(
+        timeout=settings.request_timeout_seconds,
+        follow_redirects=True,
+        http2=True,
+        trust_env=trust_env,
+        headers={"User-Agent": settings.user_agent},
+    )
 
 
 def _apply_batch_stats(stats: IntelSourceStats, batch: FetchBatch) -> None:

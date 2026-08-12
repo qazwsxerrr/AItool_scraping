@@ -588,7 +588,13 @@ def run_intel_process_from_settings(
         init_db(engine)
     session_factory = create_session_factory(engine)
     own_client = http_client is None
-    client = http_client or httpx.Client(timeout=settings.request_timeout_seconds, follow_redirects=True, headers={"User-Agent": settings.user_agent})
+    client = http_client or httpx.Client(
+        timeout=settings.request_timeout_seconds,
+        follow_redirects=True,
+        http2=True,
+        trust_env=True,
+        headers={"User-Agent": settings.user_agent},
+    )
     try:
         ai_client = ItemAnalysisClient.from_settings(settings, http_client=client)
         return run_intel_process_job(

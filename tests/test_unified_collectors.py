@@ -84,6 +84,23 @@ def test_rsshub_uses_the_same_feed_implementation():
     assert batch.items[0].title == "RSSHub item"
 
 
+def test_reddit_feed_uses_standard_registry_url_without_query_rewrite():
+    url = "https://www.reddit.com/r/LocalLLaMA/new/.rss"
+    source = _feed_source(
+        "reddit_local_llama_new",
+        url=url,
+        source_group="reddit_local_llama",
+    )
+    body = b"<feed xmlns='http://www.w3.org/2005/Atom'><entry><title>Reddit item</title></entry></feed>"
+    client = _Client([_response(url, body)])
+
+    batch = RSSCollector(client, retries=0, sleeper=lambda _: None).collect(source, 10)
+
+    assert batch.status == "success"
+    assert client.calls[0][1] == url
+    assert "raw_json" not in client.calls[0][1]
+
+
 def test_rss_503_retries_once_and_records_retry_count():
     url = "https://example.test/feed.xml"
     body = b"<rss version='2.0'><channel><item><title>retry</title></item></channel></rss>"
@@ -94,6 +111,26 @@ def test_rss_503_retries_once_and_records_retry_count():
     assert batch.status == "success"
     assert batch.retry_count == 1
     assert len(client.calls) == 2
+
+
+def test_rss_rate_limit_reset_header_controls_retry_sleep():
+    url = "https://www.reddit.com/r/LocalLLaMA/new/.rss"
+    body = b"<rss version='2.0'><channel><item><title>retry</title></item></channel></rss>"
+    client = _Client(
+        [
+            _response(url, b"limited", status=429, headers={"x-ratelimit-reset": "7"}),
+            _response(url, body),
+        ]
+    )
+    sleeps = []
+
+    batch = RSSCollector(client, retries=1, sleeper=sleeps.append).collect(
+        _feed_source(url=url), 10
+    )
+
+    assert batch.status == "success"
+    assert batch.retry_count == 1
+    assert sleeps == [7.0]
 
 
 def test_github_trending_html_maps_weekly_metrics_and_rank():
@@ -247,14 +284,16 @@ def test_producthunt_extracts_namespaced_vote_and_comment_fields():
 
 def test_router_uses_explicit_nested_routes_and_rejects_unknown_transport():
     feed = object()
+    rsshub = object()
     router = CollectorRouter(
         feed=feed,
+        rsshub=rsshub,
         github=object(),
         github_trending=object(),
         producthunt=object(),
     )
     assert router.collector_for(_feed_source()) is feed
-    assert router.collector_for(_feed_source(transport="rsshub")) is feed
+    assert router.collector_for(_feed_source(transport="rsshub")) is rsshub
     with pytest.raises(ValueError, match="unsupported source transport"):
         invalid = SourceSpec.model_construct(
             id="invalid",
