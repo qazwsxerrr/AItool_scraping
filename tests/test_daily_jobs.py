@@ -5,9 +5,11 @@ from datetime import datetime, timezone
 
 from app.domain.models import FetchItem, SourceSpec
 from app.jobs.daily_export_job import run_daily_export_job
+from app.jobs.compose_job import run_compose_job
 from app.jobs.enrich_job import run_enrich_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import DailyEdition, Document, Event, EventEditorialReview, EventEvidence, IntelItem, Source
+from app.ai.client import StageCallResult
 from app.storage.repository import IntelRepository
 from sqlalchemy import select
 
@@ -167,3 +169,68 @@ def test_daily_export_passes_primary_source_and_document_to_publication_gates(tm
     assert result.status == "blocked"
     assert any(failure["code"] == "event_count" for failure in result.failures)
     assert not any(failure["code"] == "model_product_primary" for failure in result.failures)
+
+
+def test_compose_persists_failed_editorial_raw_and_error(tmp_path):
+    engine = create_engine_from_url(f"sqlite:///{tmp_path / 'compose.db'}")
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+    now = datetime(2026, 8, 12, 12, tzinfo=timezone.utc)
+    with session_factory() as session:
+        source = Source(
+            id="compose_source",
+            name="Compose source",
+            transport="feed",
+            url="https://compose.example/feed.xml",
+            feed_format="rss",
+            feed_adapter="generic",
+            source_group="official_blog",
+            tier="p1",
+            primary_eligible=True,
+            citation_policy="primary",
+            content_class="official_model_company",
+        )
+        session.add(source)
+        session.flush()
+        item = IntelItem(
+            source_id=source.id,
+            title="Compose candidate",
+            canonical_url="https://compose.example/item",
+            content_hash="f" * 64,
+            content_class="official_model_company",
+            status="selected",
+            discovered_at=now,
+            captured_at=now,
+        )
+        session.add(item)
+        session.flush()
+        event = Event(
+            canonical_key="url:https://compose.example/item",
+            canonical_url=item.canonical_url,
+            section="model_product",
+            event_type="release",
+            event_hint=item.title,
+            title=item.title,
+            state="candidate",
+            score=90,
+            primary_item_id=item.id,
+            primary_source_id=source.id,
+            discovered_at=now,
+        )
+        session.add(event)
+        session.flush()
+        session.add(EventEvidence(evidence_key="compose-ev", event_id=event.id, item_id=item.id, role="primary", support_level="direct", is_primary=True, citation_url=item.canonical_url))
+        session.commit()
+
+    class FailingAI:
+        def write_event(self, event, evidence):
+            return StageCallResult(stage="write_event", status="request_error", raw={"provider": "offline"}, error="offline provider")
+
+    result = run_compose_job(session_factory=session_factory, ai_client=FailingAI(), limit=10, now=now)
+    assert result.failed == 1
+    with session_factory() as session:
+        review = session.scalar(select(EventEditorialReview))
+        assert review is not None
+        assert review.status == "request_error"
+        assert review.error_message == "offline provider"
+        assert json.loads(review.raw_response_json) == {"provider": "offline"}

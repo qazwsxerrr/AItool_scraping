@@ -46,6 +46,15 @@ def run_compose_job(*, session_factory: sessionmaker[Session], ai_client: ItemAn
                 if ai_client is not None:
                     call = ai_client.write_event(row, [{"id": e.evidence_key, "citation_url": e.citation_url} for e in evidence])
                     if not getattr(call, "ok", False):
+                        repo.upsert_editorial_review(
+                            event.id,
+                            None,
+                            model=getattr(call, "model", None),
+                            raw_response=getattr(call, "raw", None),
+                            status=getattr(call, "status", "request_error"),
+                            error_message=getattr(call, "error", None) or "write_event failed",
+                        )
+                        session.commit()
                         fallback = next((candidate for candidate in rows if candidate.get("section") == row.get("section") and int(candidate.get("id") or 0) not in used_ids), None)
                         if fallback is not None:
                             fallback_event = session.get(Event, int(fallback["id"]))
