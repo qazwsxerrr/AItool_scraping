@@ -123,4 +123,3 @@ def test_generic_stage_payload_contains_schema_and_prompt_policy():
     assert payload["task"] == "ai_judge_cluster"
     assert payload["response_schema"]["decision"] == "merge|related|separate|uncertain"
     assert "publication gate" in payload["instructions"]
-
