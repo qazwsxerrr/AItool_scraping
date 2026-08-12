@@ -14,7 +14,7 @@ from app.config.settings import Settings
 from app.pipeline.event_cluster import canonical_event_key, cluster_candidates
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.event_repository import EventRepository
-from app.storage.models import Document, IntelItem, Source
+from app.storage.models import Document, IntelItem, Source, TriageReview
 
 
 @dataclass
@@ -39,7 +39,19 @@ def run_cluster_job(
         if limit is not None:
             stmt = stmt.limit(limit)
         items = list(session.scalars(stmt).all())
-        candidates = [_candidate_values(item) for item in items]
+        triage_rows = {
+            row.item_id: row
+            for row in session.scalars(
+                select(TriageReview).where(TriageReview.item_id.in_([item.id for item in items] or [-1]))
+            ).all()
+        }
+        documents = {
+            row.item_id: row
+            for row in session.scalars(
+                select(Document).where(Document.item_id.in_([item.id for item in items] or [-1]))
+            ).all()
+        }
+        candidates = [_candidate_values(item, triage_rows.get(item.id), documents.get(item.id)) for item in items]
         groups = cluster_candidates(candidates)
         event_repo = EventRepository(session)
         for group in groups:
@@ -73,7 +85,10 @@ def run_cluster_job(
                         call = ai_client.judge_cluster(left, right)
                         decision = call.parsed if getattr(call, "ok", False) else {"decision": "uncertain", "confidence": 0, "reason": getattr(call, "error", "AI failed")}
                         event_repo.upsert_cluster_decision(left["id"], right["id"], decision, model=getattr(call, "model", None), raw_response=getattr(call, "raw", None), status=getattr(call, "status", "success"))
-                        if getattr(decision, "decision", decision.get("decision") if isinstance(decision, dict) else "") == "merge":
+                        decision_value = getattr(decision, "decision", None)
+                        if decision_value is None and isinstance(decision, dict):
+                            decision_value = decision.get("decision")
+                        if decision_value == "merge":
                             result.merged += 1
                         else:
                             result.uncertain += 1
@@ -88,10 +103,9 @@ def run_cluster_from_settings(*, settings: Settings, **kwargs: Any) -> ClusterRe
     return run_cluster_job(session_factory=create_session_factory(engine), ai_client=ItemAnalysisClient.from_settings(settings), **kwargs)
 
 
-def _candidate_values(item: IntelItem) -> dict[str, Any]:
+def _candidate_values(item: IntelItem, triage: TriageReview | None = None, document: Document | None = None) -> dict[str, Any]:
     source = item.source
-    document = getattr(item, "document", None)
-    return {"id": item.id, "source_id": item.source_id, "source_group": source.source_group if source else None, "tier": source.tier if source else "p4", "primary_eligible": source.primary_eligible if source else False, "citation_policy": source.citation_policy if source else "discovery_only", "canonical_url": item.canonical_url, "title": item.title, "section": None, "event_type": None, "event_hint": item.event_hint or item.title, "selection_score": item.selection_score, "published_at": item.published_at, "discovered_at": item.discovered_at or item.captured_at, "document_id": getattr(document, "id", None)}
+    return {"id": item.id, "source_id": item.source_id, "source_group": source.source_group if source else None, "tier": source.tier if source else "p4", "primary_eligible": source.primary_eligible if source else False, "citation_policy": source.citation_policy if source else "discovery_only", "canonical_url": item.canonical_url, "title": item.title, "section": triage.section if triage else None, "event_type": triage.event_type if triage else None, "event_hint": (triage.event_hint if triage else None) or item.event_hint or item.title, "selection_score": item.selection_score, "published_at": item.published_at, "discovered_at": item.discovered_at or item.captured_at, "document_id": document.id if document else None}
 
 
 def _section_from_item(value: Mapping[str, Any]) -> str:
