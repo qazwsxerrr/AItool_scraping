@@ -3,8 +3,10 @@
 本版本只处理抓取和 AI 情报处理，不在请求期间运行 UI 逻辑。默认链路固定为：
 
 ```text
-source registry -> fetch -> process -> export
+source registry -> fetch -> ai-review -> candidate export -> (later) evidence/verification
 ```
+
+`ai-review` 只负责确定性来源策略筛选、AI 分类和逐条中文简要总结。它不会调用轻量验证 HTTP，也不会执行 evidence、claim、entity、triage、cluster、compose 或 recommendation。候选导出固定带 `evidence_status=not_run`、`verification_status=not_run`；filtered、rejected、ai_failed 记录保留在审计输出和 `intel_items`/`ai_item_reviews` 中。
 
 ## 内容分流
 
@@ -32,6 +34,7 @@ source registry -> fetch -> process -> export
 ```bash
 # 逐阶段运行
 python -m app.main fetch --class project_tool
+python -m app.main ai-review --class project_tool --limit 100 --output-dir output/ai-review
 python -m app.main process --class project_tool --limit 100
 python -m app.main export --output-dir output/intel
 

@@ -11,7 +11,7 @@ runner = CliRunner()
 def test_cli_exposes_v2_and_v3_commands():
     result = runner.invoke(main.app, ["--help"])
     assert result.exit_code == 0
-    for command in ("fetch", "process", "export", "run-once"):
+    for command in ("fetch", "process", "ai-review", "export", "run-once"):
         assert command in result.stdout
     for command in (
         "source-health",

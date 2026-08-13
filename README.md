@@ -3,8 +3,10 @@
 本项目当前实现数据抓取、确定性处理和结果展示。旧版链路仍保持兼容：
 
 ```text
-source registry -> fetch -> process -> export
+source registry -> fetch -> ai-review -> candidate export -> (later) evidence/verification
 ```
+
+`ai-review` 是独立的 AI 编辑预处理阶段：先按来源策略做确定性初筛，再对保留条目逐条分类并生成中文简要总结。它不会调用 `_verify`、文章/证据 HTTP、claim、entity、triage、cluster、compose 或推荐门禁。每条候选的导出记录显式写入 `evidence_status=not_run` 和 `verification_status=not_run`；筛除条目和 provider 失败条目仍在 `ai_review_audit.jsonl` 与数据库中保留。
 
 V3 日报链路以事件（`events`）为选入单元，按以下顺序运行：
 
@@ -181,6 +183,7 @@ AI_REVIEW_TIMEOUT_SECONDS=30
 
 ```bash
 python -m app.main fetch --class project_tool
+python -m app.main ai-review --class project_tool --limit 100 --output-dir output/ai-review
 python -m app.main process --class project_tool --limit 100
 python -m app.main export --output-dir output/intel
 ```
@@ -194,6 +197,8 @@ python -m app.main fetch-only --source openai_news --force --output-dir output/f
 `fetch-only` 写出 `fetch_items.json`、`fetch_items.jsonl` 和 `fetch_items.md`。每条记录都包含
 `source_id`、来源名称、`transport`、`source_group`、`source_subtype`、`tier`、`role`；X 官方账号的
 `x_official` 为 `true`，`x_social`/`x_search` 保持发现性质并标为 `false`。抓取失败按来源隔离，单一来源失败不会中断批次。
+
+`ai-review` 写出 `ai_review_candidates.jsonl`（保留候选）、`ai_review_audit.jsonl`（包含 filtered/rejected/ai_failed 的全部审计记录）和 `ai_review_digest.md`。候选文件含标题、来源字段、AI 分类、中文简要总结、keep、confidence、风险以及明确的 `evidence_status/verification_status=not_run`。
 
 日常入口：
 

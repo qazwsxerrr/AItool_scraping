@@ -3,6 +3,7 @@ from __future__ import annotations
 import typer
 
 from app.config.settings import Settings
+from app.jobs.ai_review_job import run_ai_review_from_settings
 from app.jobs.export_job import run_intel_export_from_settings
 from app.jobs.fetch_job import run_intel_fetch_from_settings
 from app.jobs.fetch_only_job import run_fetch_only_from_settings
@@ -135,6 +136,38 @@ def process(
         f"analyzed={result.analyzed} verified={result.verified} needs_review={result.needs_review} "
         f"ai_failed={result.ai_failed} failed={result.failed}"
     )
+
+
+@app.command("ai-review")
+def ai_review(
+    source: str | None = typer.Option(None, "--source", help="Only review one source id."),
+    content_class: str | None = typer.Option(None, "--class", help="Only review one content class."),
+    limit: int = typer.Option(100, min=1, help="Maximum items to review."),
+    force: bool = typer.Option(False, "--force", help="Re-review previously handled items."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Run selection without AI/database/output writes."),
+    output_dir: str = typer.Option("output/ai-review", help="Candidate and audit output directory."),
+) -> None:
+    """Run AI-only classification and Chinese summary; evidence is not run."""
+
+    configure_logging()
+    _validate_content_class(content_class)
+    result = run_ai_review_from_settings(
+        settings=Settings.from_env(),
+        source_filter=source,
+        content_class=content_class,
+        limit=limit,
+        force=force,
+        dry_run=dry_run,
+        output_dir=output_dir,
+    )
+    typer.echo(
+        f"processed={result.processed} selected={result.selected} filtered={result.filtered} "
+        f"analyzed={result.analyzed} ai_failed={result.ai_failed} failed={result.failed} "
+        f"exported={result.exported} audit={result.audit_exported} dry_run={result.dry_run}"
+    )
+    typer.echo(f"candidates={result.candidate_path}")
+    typer.echo(f"audit={result.audit_path}")
+    typer.echo(f"markdown={result.markdown_path}")
 
 
 @app.command("export")
