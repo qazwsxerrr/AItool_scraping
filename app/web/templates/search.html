@@ -24,7 +24,7 @@
 {% elif total_count == 0 %}
   <div class="empty-state">
     <h3>没有找到相关内容</h3>
-    <p>可以换一个关键词，或先运行 fetch 与 process 生成更多数据。</p>
+    <p>可以换一个关键词，或先运行 fetch 与 ai-review 生成更多数据。</p>
   </div>
 {% else %}
   <section class="search-summary">
@@ -45,7 +45,7 @@
   {% endif %}
 
   {% set groups = [
-    ('精选情报', results.selected_items),
+    ('AI 已选情报', results.selected_items),
     ('全部动态', results.all_items),
   ] %}
   {% for group_title, rows in groups %}

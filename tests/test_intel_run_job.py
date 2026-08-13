@@ -4,9 +4,9 @@ from pathlib import Path
 
 from app.config.settings import Settings
 from app.jobs import run_job
+from app.jobs.ai_review_job import AIReviewResult
 from app.jobs.export_job import IntelExportResult, run_intel_export_job
 from app.jobs.fetch_job import IntelFetchResult
-from app.jobs.process_job import IntelProcessResult
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import AIItemReview, IntelItem, IntelRun, Source
 from sqlalchemy import select
@@ -26,15 +26,16 @@ def test_run_once_passes_one_run_id_through_fetch_and_finishes_run(tmp_path, mon
         calls["fetch_run_id"] = kwargs.get("run_id")
         return IntelFetchResult(run_id=kwargs.get("run_id"), stats={})
 
-    def fake_process(**kwargs):
-        calls["process_source"] = kwargs.get("source_filter")
-        return IntelProcessResult()
+    def fake_ai_review(**kwargs):
+        calls["ai_review_source"] = kwargs.get("source_filter")
+        calls["ai_review_run_id"] = kwargs.get("run_id")
+        return AIReviewResult(run_id=kwargs.get("run_id"))
 
     def fake_export(**kwargs):
         return IntelExportResult(0, 0, "items", "digest", "pending")
 
     monkeypatch.setattr(run_job, "run_intel_fetch_from_settings", fake_fetch)
-    monkeypatch.setattr(run_job, "run_intel_process_from_settings", fake_process)
+    monkeypatch.setattr(run_job, "run_ai_review_from_settings", fake_ai_review)
     monkeypatch.setattr(run_job, "run_intel_export_from_settings", fake_export)
 
     result = run_job.run_intel_once_from_settings(
@@ -45,7 +46,8 @@ def test_run_once_passes_one_run_id_through_fetch_and_finishes_run(tmp_path, mon
     )
     assert result.status == "completed"
     assert result.run_id == calls["fetch_run_id"]
-    assert calls["process_source"] == "github_source"
+    assert calls["ai_review_source"] == "github_source"
+    assert calls["ai_review_run_id"] == result.run_id
     with create_session_factory(engine)() as session:
         row = session.scalar(select(IntelRun))
         assert row.status == "completed"
@@ -60,8 +62,8 @@ def test_run_once_dry_run_does_not_create_database(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         run_job,
-        "run_intel_process_from_settings",
-        lambda **kwargs: IntelProcessResult(),
+        "run_ai_review_from_settings",
+        lambda **kwargs: AIReviewResult(run_id=kwargs.get("run_id")),
     )
     monkeypatch.setattr(
         run_job,
@@ -85,8 +87,8 @@ def test_run_once_marks_isolated_ai_failures_as_completed_with_errors(tmp_path, 
     )
     monkeypatch.setattr(
         run_job,
-        "run_intel_process_from_settings",
-        lambda **kwargs: IntelProcessResult(failed=1, ai_failed=1),
+        "run_ai_review_from_settings",
+        lambda **kwargs: AIReviewResult(failed=1, ai_failed=1, run_id=kwargs.get("run_id")),
     )
     monkeypatch.setattr(
         run_job,

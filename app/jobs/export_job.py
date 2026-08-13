@@ -198,6 +198,8 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
         "content_hash": item.content_hash,
         "content_class": item.content_class,
         "status": item.status,
+        "evidence_status": "not_run",
+        "verification_status": verification.status if verification else "not_run",
         "title": item.title,
         "url": item.canonical_url,
         "summary": item.summary,
@@ -253,7 +255,7 @@ def _markdown(
     for record in records:
         key = str(record.get("content_class") or "unknown")
         counts[key] = counts.get(key, 0) + 1
-    lines = ["# AI 情报日报", "", f"保留条目：{len(records)}", f"待处理/待核实：{len(pending)}", ""]
+    lines = ["# AI 情报导出", "", f"保留条目：{len(records)}", f"待处理：{len(pending)}", ""]
     if counts:
         lines.append("分类统计：" + "、".join(f"{key}={value}" for key, value in sorted(counts.items())))
         lines.append("")
@@ -275,8 +277,9 @@ def _markdown(
                     f"tier=`{record.get('tier')}` role=`{record.get('source_role')}` "
                     f"x_official=`{str(bool(record.get('x_official'))).lower()}`"
                 ),
-                f"- 摘要：{ai.get('summary_cn') or record.get('summary') or '暂无摘要'}",
-                f"- 核实：`{verification.get('status') if verification else '未执行'}` / `{verification.get('mode') if verification else 'n/a'}`",
+                f"- AI 摘要：{ai.get('summary_cn') or record.get('summary') or '暂无摘要'}",
+                f"- AI 处理：`{ai.get('status') if ai else '未执行'}` / keep=`{str(bool(ai.get('keep'))).lower() if ai else 'n/a'}`",
+                f"- 核实状态（后续阶段）：`{record.get('verification_status') or (verification.get('status') if verification else 'not_run')}` / `{verification.get('mode') if verification else 'n/a'}`",
                 f"- 风险：{', '.join(ai.get('risk_flags') or verification.get('risk_flags') or []) or '无'}",
                 f"- 链接：{record.get('url') or '无'}",
                 "",
@@ -301,7 +304,7 @@ def _markdown(
                 ]
             )
     if pending:
-        lines.extend(["## 待核实", ""])
+        lines.extend(["## 待处理", ""])
         for record in pending:
             lines.append(f"- `{record.get('status')}` {record.get('title')}：{record.get('url') or '无链接'}")
     return "\n".join(lines) + "\n"

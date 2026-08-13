@@ -49,7 +49,7 @@ _CONTENT_CLASS_LABELS = {
 }
 _STATUS_LABELS = {
     "new": "待处理",
-    "selected": "已选入处理",
+    "selected": "AI 已选",
     "verified": "已核实",
     "hotspot": "热点项目",
     "discovery_only": "发现线索",

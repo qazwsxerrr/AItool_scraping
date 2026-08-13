@@ -221,8 +221,8 @@ def run_once(
         f"skipped={result.fetch.total_skipped} failed={result.fetch.total_failed}"
     )
     typer.echo(
-        f"process: processed={result.process.processed} selected={result.process.selected} "
-        f"analyzed={result.process.analyzed} failed={result.process.failed}"
+        f"ai-review: processed={result.process.processed} selected={result.process.selected} "
+        f"analyzed={result.process.analyzed} ai_failed={result.process.ai_failed} failed={result.process.failed}"
     )
     typer.echo(f"export: exported={result.export.exported} pending={result.export.pending}")
     if result.export.github_report_path:

@@ -558,9 +558,11 @@ class IntelRepository:
         content_class: str | None = None,
         source_id: str | None = None,
     ) -> list[IntelItem]:
+        # AI-kept rows are exportable before later evidence/verification. The
+        # legacy metadata-only GitHub hotspot path remains compatible.
         retained_without_ai = (IntelItem.content_class == "project_tool") & (IntelItem.status == "hotspot")
         retained_with_ai = AIItemReview.keep.is_(True) & IntelItem.status.in_(
-            ["verified", "hotspot", "discovery_only"]
+            ["selected", "verified", "hotspot", "discovery_only"]
         )
         stmt = (
             select(IntelItem)

@@ -204,11 +204,14 @@ python -m app.main fetch-only --source openai_news --force --output-dir output/f
 
 `ai-review` 写出 `ai_review_candidates.jsonl`（保留候选）、`ai_review_audit.jsonl`（包含 filtered/rejected/ai_failed 的全部审计记录）和 `ai_review_digest.md`。候选文件含标题、来源字段、`content_class`、输出层 `editorial_section`、AI 分类、中文简要总结、keep、confidence、风险以及明确的 `evidence_status/verification_status=not_run`。
 
-日常入口：
+日常 AI-only 入口：
 
 ```bash
 python -m app.main run-once --limit 100
 ```
+
+`run-once` 固定执行 `fetch -> ai-review -> export`；显式 `process` 仍保留为
+后续核实兼容入口，普通入口不会调用 evidence/verification HTTP。
 
 常用参数：
 
@@ -250,9 +253,10 @@ python scripts/run_intel_once.py
 
 ## 导出
 
-`export` 默认写入 `output/intel/`：
+`export` 默认写入 `output/intel/`。AI review 的 `selected` 且 `keep=true`
+条目无需 evidence/verification 即可进入普通导出：
 
-- `intel_items.jsonl`：状态为 `verified`、`hotspot` 或 `discovery_only` 的条目。
+- `intel_items.jsonl`：AI 已选条目（`selected`）以及兼容的 `verified`、`hotspot`、`discovery_only` 条目。
 - `intel_pending.jsonl`：`needs_review`、`ai_failed` 或尚未分析的条目。
 - `intel_digest.md`：分类、状态、指标、风险和链接摘要。
 - `output/github-trending/YYYY/MM/YYYYMMDD.md`：GitHub Trending daily/weekly 和 Search API 补充候选报告。

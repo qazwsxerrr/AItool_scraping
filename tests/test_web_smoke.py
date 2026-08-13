@@ -205,6 +205,60 @@ def test_web_hotspot_zero_score_and_mobile_nav_contract(tmp_path):
     assert "white-space: nowrap" in css_response.text
 
 
+def test_web_home_renders_ai_selected_without_verification_gate(tmp_path):
+    db_path = tmp_path / "web-ai-only.db"
+    engine = create_engine_from_url(f"sqlite:///{db_path}")
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        source = Source(
+            id="web_ai_only",
+            name="AI-only feed",
+            transport="feed",
+            url="https://example.test/feed.xml",
+            source_group="official_blog",
+            source_subtype="fixed_news",
+            source_role="official",
+            content_class="official_model_company",
+        )
+        item = IntelItem(
+            source_id=source.id,
+            external_id="web-ai-only-1",
+            title="AI-only homepage item",
+            canonical_url="https://example.test/ai-only",
+            summary="source summary",
+            content_class="official_model_company",
+            content_hash="web-ai-only-contract",
+            selection_score=86,
+            status="selected",
+        )
+        session.add_all(
+            [
+                source,
+                item,
+                AIItemReview(
+                    item=item,
+                    status="success",
+                    keep=True,
+                    content_class="official_model_company",
+                    confidence=93,
+                    summary_cn="首页 AI 摘要",
+                    raw_response_json="{}",
+                ),
+            ]
+        )
+        session.commit()
+
+    app = create_app(session_factory=session_factory, init_database=False)
+    response = TestClient(app).get("/")
+
+    assert response.status_code == 200
+    assert "AI-only homepage item" in response.text
+    assert "首页 AI 摘要" in response.text
+    assert "AI 已选" in response.text
+    assert "已核实" not in response.text
+
+
 def _write_github_metadata(path) -> None:
     payload = {
         "id": 100,

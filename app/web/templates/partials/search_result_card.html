@@ -5,7 +5,7 @@
   </div>
   <div class="card-body">
     <div class="card-meta">
-      <span>{{ '精选情报' if result.result_type == 'recommendation' else '全部动态' }}</span>
+      <span>{{ 'AI 已选情报' if result.result_type == 'recommendation' else '全部动态' }}</span>
       {% if result.source_name %}<span>{{ result.source_name }}</span>{% endif %}
       {% if result.content_class %}<span>{{ result.content_class | content_class_label }}</span>{% endif %}
       {% if result.published_at %}<span>{{ result.published_at | relative_time }}</span>{% endif %}
@@ -14,13 +14,13 @@
     <h3>
       {% if result.url %}<a href="{{ result.url }}" target="_blank" rel="noopener noreferrer">{{ result.title }}</a>{% else %}{{ result.title }}{% endif %}
     </h3>
-    {% if result.summary %}<p class="summary-clamp" title="{{ result.summary }}">{{ result.summary }}</p>{% endif %}
+    {% if result.summary %}<p class="summary-clamp" title="{{ result.summary }}"><strong>AI 摘要：</strong>{{ result.summary }}</p>{% endif %}
     {% if result.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ result.selection_reason }}</p>{% endif %}
     <div class="badges">
       {% for badge in result.badges %}
         <span class="badge {{ 'danger' if badge in ['contradict', 'failed', 'broken', 'stale', 'ai_failed'] else 'success' if badge in ['support', 'direct_support', 'completed', 'verified'] else 'primary' if loop.first else '' }}">{{ badge | status_label if badge in ['verified', 'hotspot', 'discovery_only', 'needs_review', 'ai_failed', 'filtered', 'rejected', 'new', 'selected'] else (badge | content_class_label if badge in ['official_model_company', 'project_tool', 'community_social'] else badge) }}</span>
       {% endfor %}
-      {% if result.verification_status == 'verified' %}<span class="badge success">已核实</span>{% endif %}
+      {% if result.verification_status == 'verified' %}<span class="badge success">直接核实</span>{% endif %}
       {% if result.ai_status == 'ai_failed' %}<span class="badge warning">AI 处理失败</span>{% endif %}
     </div>
   </div>

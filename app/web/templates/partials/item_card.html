@@ -13,7 +13,7 @@
     <h3>
       {% if item.url %}<a href="{{ item.url }}" target="_blank" rel="noopener noreferrer">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
     </h3>
-    {% if item.summary_cn %}<p>{{ item.summary_cn }}</p>{% endif %}
+    {% if item.summary_cn %}<p><strong>AI 摘要：</strong>{{ item.summary_cn }}</p>{% endif %}
     {% if item.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ item.selection_reason }}</p>{% endif %}
     <div class="badges">
       {% if item.source_group %}<span class="badge">{{ item.source_group }}</span>{% endif %}
@@ -24,8 +24,8 @@
       {% if item.ai_status %}<span class="badge">AI {{ item.ai_status }}</span>{% endif %}
       {% if item.ai_keep is sameas true %}<span class="badge success">AI 保留</span>{% endif %}
       {% if item.ai_keep is sameas false %}<span class="badge danger">AI 未保留</span>{% endif %}
-      {% if item.verification_status == 'verified' or item.supports_basic_fact %}<span class="badge success">已核实</span>{% endif %}
-      {% if item.verification_status and item.verification_status != 'verified' %}<span class="badge warning">核实：{{ item.verification_status }}</span>{% endif %}
+      {% if item.verification_status == 'verified' or item.supports_basic_fact %}<span class="badge success">直接核实</span>{% endif %}
+      {% if item.verification_status and item.verification_status != 'verified' and item.verification_status != 'not_run' %}<span class="badge warning">核实：{{ item.verification_status }}</span>{% endif %}
     </div>
   </div>
 </article>

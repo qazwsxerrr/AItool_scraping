@@ -1,4 +1,8 @@
-"""Fixed-order fetch -> process -> export orchestration."""
+"""Fixed-order fetch -> AI review -> export orchestration.
+
+The explicit ``process`` command remains available as a legacy verification
+path; the normal ``run-once`` entry point intentionally does not invoke it.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from app.config.settings import Settings
+from app.jobs.ai_review_job import AIReviewResult, run_ai_review_from_settings
 from app.jobs.export_job import IntelExportResult, run_intel_export_from_settings
 from app.jobs.fetch_job import IntelFetchResult, run_intel_fetch_from_settings
-from app.jobs.process_job import IntelProcessResult, run_intel_process_from_settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelCounts, IntelRepository
 
@@ -19,10 +23,14 @@ from app.storage.repository import IntelCounts, IntelRepository
 class IntelRunResult:
     run_id: int | None
     fetch: IntelFetchResult
-    process: IntelProcessResult
+    process: AIReviewResult
     export: IntelExportResult
     status: str
     error: str | None = None
+
+    @property
+    def ai_review(self) -> AIReviewResult:
+        return self.process
 
 
 def run_intel_once_from_settings(
@@ -49,7 +57,7 @@ def run_intel_once_from_settings(
                 force=force,
                 dry_run=False,
             )
-            process = run_intel_process_from_settings(
+            process = run_ai_review_from_settings(
                 settings=ephemeral,
                 source_filter=source,
                 content_class=content_class,
@@ -87,12 +95,13 @@ def run_intel_once_from_settings(
             force=force,
             run_id=run_id,
         )
-        process = run_intel_process_from_settings(
+        process = run_ai_review_from_settings(
             settings=settings,
             source_filter=source,
             content_class=content_class,
             limit=limit,
             force=force,
+            run_id=run_id,
         )
         export = run_intel_export_from_settings(
             settings=settings,
@@ -114,7 +123,7 @@ def run_intel_once_from_settings(
                     skipped=fetch.total_skipped,
                     selected=process.selected,
                     analyzed=process.analyzed,
-                    verified=process.verified,
+                    verified=0,
                     failed=fetch.total_failed + process.failed,
                 ),
             )
@@ -125,6 +134,6 @@ def run_intel_once_from_settings(
             IntelRepository(session).finish_run(run_id, status="failed", error=str(exc))
             session.commit()
         empty_fetch = IntelFetchResult(run_id=run_id)
-        empty_process = IntelProcessResult()
+        empty_process = AIReviewResult()
         empty_export = IntelExportResult(0, 0, f"{output_dir}/intel_items.jsonl", f"{output_dir}/intel_digest.md", f"{output_dir}/intel_pending.jsonl")
         return IntelRunResult(run_id, empty_fetch, empty_process, empty_export, "failed", str(exc))

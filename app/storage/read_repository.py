@@ -21,7 +21,9 @@ from app.storage.models import AIItemReview, IntelItem, IntelItemVerification, I
 
 
 FINAL_ITEM_STATUSES = ("verified", "hotspot", "discovery_only")
+AI_VISIBLE_ITEM_STATUSES = ("selected", *FINAL_ITEM_STATUSES)
 PENDING_ITEM_STATUSES = ("new", "selected", "needs_review", "ai_failed")
+DASHBOARD_PENDING_ITEM_STATUSES = ("new", "needs_review", "ai_failed")
 ITEM_STATUSES = FINAL_ITEM_STATUSES + PENDING_ITEM_STATUSES + ("filtered", "rejected")
 CONTENT_CLASSES = ("official_model_company", "project_tool", "community_social")
 
@@ -256,7 +258,23 @@ class UIReadRepository:
             ).all()
         }
         selected_items = sum(status_counts.get(status, 0) for status in FINAL_ITEM_STATUSES)
-        pending_items = sum(status_counts.get(status, 0) for status in PENDING_ITEM_STATUSES)
+        selected_items += int(
+            self.session.execute(
+                select(func.count())
+                .select_from(IntelItem)
+                .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
+                .where(IntelItem.status == "selected", AIItemReview.keep.is_(True))
+            ).scalar_one()
+        )
+        pending_items = sum(status_counts.get(status, 0) for status in DASHBOARD_PENDING_ITEM_STATUSES)
+        pending_items += int(
+            self.session.execute(
+                select(func.count())
+                .select_from(IntelItem)
+                .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
+                .where(IntelItem.status == "selected", AIItemReview.id.is_(None))
+            ).scalar_one()
+        )
         run_type = "run-once" if last_run else None
         if last_run and last_run.filters_json:
             try:
@@ -339,7 +357,7 @@ class UIReadRepository:
             return []
         safe_limit = min(limit, 100)
         retained_without_ai = (IntelItem.content_class == "project_tool") & (IntelItem.status == "hotspot")
-        retained_with_ai = AIItemReview.keep.is_(True) & IntelItem.status.in_(FINAL_ITEM_STATUSES)
+        retained_with_ai = AIItemReview.keep.is_(True) & IntelItem.status.in_(AI_VISIBLE_ITEM_STATUSES)
         stmt = (
             select(IntelItem, Source, AIItemReview, IntelItemVerification)
             .join(Source, IntelItem.source_id == Source.id)
@@ -506,7 +524,7 @@ class UIReadRepository:
 
     def _search_recommendations(self, *, like: str, limit: int) -> list[SearchResultRow]:
         retained_without_ai = (IntelItem.content_class == "project_tool") & (IntelItem.status == "hotspot")
-        retained_with_ai = AIItemReview.keep.is_(True) & IntelItem.status.in_(FINAL_ITEM_STATUSES)
+        retained_with_ai = AIItemReview.keep.is_(True) & IntelItem.status.in_(AI_VISIBLE_ITEM_STATUSES)
         stmt = (
             select(IntelItem, Source, AIItemReview)
             .join(Source, IntelItem.source_id == Source.id)

@@ -154,6 +154,61 @@ def test_read_repository_uses_v2_statuses_and_keeps_project_hotspots_without_ai(
     assert [row.title for row in filtered] == ["Demo project"]
 
 
+def test_ai_selected_without_verification_is_featured_and_searchable(tmp_path):
+    session_factory = _make_session_factory(tmp_path / "ai-selected.db")
+    with session_factory() as session:
+        source = Source(
+            id="official_ai_selected",
+            name="Official AI feed",
+            transport="feed",
+            url="https://example.test/feed.xml",
+            source_group="official_blog",
+            source_subtype="fixed_news",
+            source_role="official",
+            content_class="official_model_company",
+        )
+        item = IntelItem(
+            source_id=source.id,
+            external_id="ai-selected-1",
+            title="AI-selected update",
+            canonical_url="https://example.test/update",
+            summary="source summary",
+            content_class="official_model_company",
+            content_hash="ai-selected-contract",
+            selection_score=82,
+            status="selected",
+        )
+        session.add_all(
+            [
+                source,
+                item,
+                AIItemReview(
+                    item=item,
+                    status="success",
+                    keep=True,
+                    content_class="official_model_company",
+                    confidence=91,
+                    summary_cn="AI 生成摘要",
+                    reason="AI 保留",
+                    raw_response_json="{}",
+                ),
+            ]
+        )
+        session.commit()
+
+    with session_factory() as session:
+        repo = UIReadRepository(session)
+        cards = repo.list_featured_cards()
+        results = repo.search_content("AI-selected")
+        all_items = repo.list_all_items(filters=AllItemFilters(query="AI-selected"))
+
+    assert [card.title for card in cards] == ["AI-selected update"]
+    assert cards[0].ai_keep is True
+    assert cards[0].verification_status is None
+    assert results.selected_items[0].title == "AI-selected update"
+    assert all_items[0].summary_cn == "AI 生成摘要"
+
+
 def _make_session_factory(db_path):
     engine = create_engine_from_url(f"sqlite:///{db_path}")
     init_db(engine)

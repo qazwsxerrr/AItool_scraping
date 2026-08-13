@@ -47,6 +47,7 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class AIReviewResult:
+    run_id: int | None = None
     processed: int = 0
     selected: int = 0
     filtered: int = 0
@@ -75,6 +76,7 @@ def run_ai_review_job(
     output_dir: str | Path = "output/ai-review",
     http_client: Any | None = None,
     now: datetime | None = None,
+    run_id: int | None = None,
 ) -> AIReviewResult:
     """Run deterministic filtering plus structured AI review, without verify.
 
@@ -87,7 +89,7 @@ def run_ai_review_job(
     # Accepted for migration compatibility but deliberately unused: this
     # stage has no source/article verification HTTP boundary.
     del http_client
-    result = AIReviewResult(dry_run=dry_run)
+    result = AIReviewResult(run_id=run_id, dry_run=dry_run)
     result.candidate_path = str(Path(output_dir) / "ai_review_candidates.jsonl")
     result.audit_path = str(Path(output_dir) / "ai_review_audit.jsonl")
     result.markdown_path = str(Path(output_dir) / "ai_review_digest.md")
@@ -209,6 +211,7 @@ def run_ai_review_from_settings(
     force: bool = False,
     dry_run: bool = False,
     http_client: Any | None = None,
+    run_id: int | None = None,
 ) -> AIReviewResult:
     registry = load_source_registry(registry_path, env={"RSSHUB_BASE_URL": settings.rsshub_base_url or ""})
     specs = {source.id: source for source in registry.sources}
@@ -236,6 +239,7 @@ def run_ai_review_from_settings(
             force=force,
             dry_run=dry_run,
             output_dir=output_dir,
+            run_id=run_id,
         )
     finally:
         if own_client:

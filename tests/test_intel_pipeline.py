@@ -318,6 +318,47 @@ def test_export_contains_audit_fields_and_dry_run_does_not_write(tmp_path):
     assert record["verification"]["mode"] == "metadata_only"
 
 
+def test_standard_export_includes_ai_selected_without_verification(tmp_path):
+    sf = _db(tmp_path)
+    source = _community_source()
+    spec = source_spec_from_config(source)
+    with sf() as session:
+        repo = IntelRepository(session)
+        repo.upsert_source(source, policy=spec)
+        item = repo.insert_item(
+            FetchItem(
+                source_id=source.id,
+                external_id="ai-only-export:1",
+                title="AI-only export item",
+                url="https://community.example/ai-only-export",
+                published_at=NOW - timedelta(hours=1),
+                summary="raw summary",
+            )
+        )
+        row = session.get(IntelItem, item.item_id)
+        assert row is not None
+        row.status = "selected"
+        row.selection_score = 77
+        row.ai_review = AIItemReview(
+            status="success",
+            keep=True,
+            content_class="community_social",
+            confidence=89,
+            summary_cn="AI-only 摘要",
+            raw_response_json="{}",
+        )
+        session.commit()
+
+    result = run_intel_export_job(session_factory=sf, output_dir=tmp_path / "out")
+    assert result.exported == 1
+    record = json.loads((tmp_path / "out" / "intel_items.jsonl").read_text().splitlines()[0])
+    assert record["status"] == "selected"
+    assert record["ai"]["summary_cn"] == "AI-only 摘要"
+    assert record["evidence_status"] == "not_run"
+    assert record["verification_status"] == "not_run"
+    assert record["verification"] is None
+
+
 def test_community_links_are_retained_as_follow_up_candidates(tmp_path):
     sf = _db(tmp_path)
     source = SourceConfig(
