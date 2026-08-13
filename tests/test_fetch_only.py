@@ -100,3 +100,35 @@ def test_fetch_only_export_dry_run_does_not_write_files(tmp_path):
     result = run_fetch_only_export_job(session_factory=sf, output_dir=tmp_path / "none", dry_run=True)
     assert result.exported == 0
     assert not (tmp_path / "none").exists()
+
+
+def test_fetch_only_isolates_one_failed_source_from_successful_sources(tmp_path):
+    sf = _db(tmp_path)
+    good = _source("good_source")
+    bad = _source("bad_source")
+    good_batch = FetchBatch(
+        source=good,
+        items=[FetchItem(source_id=good.id, external_id="good:1", title="good item")],
+        http_status=200,
+        transport="httpx",
+    )
+    bad_batch = FetchBatch(
+        source=bad,
+        status="failed",
+        error_code="upstream_503",
+        error_message="HTTP 503",
+        http_status=503,
+        transport="httpx",
+    )
+    result = run_fetch_only_job(
+        session_factory=sf,
+        sources=[good, bad],
+        router=_Router({good.id: good_batch, bad.id: bad_batch}),
+        output_dir=tmp_path / "out",
+        force=True,
+    )
+    assert result.fetch.stats[good.id].inserted == 1
+    assert result.fetch.stats[bad.id].failed == 1
+    assert result.fetch.total_failed == 1
+    assert result.export is not None
+    assert result.export.exported == 1
