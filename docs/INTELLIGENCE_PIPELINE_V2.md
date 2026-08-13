@@ -10,6 +10,8 @@ source registry -> fetch -> ai-review -> candidate export -> (later) evidence/ve
 
 候选还会保留来源路由 `content_class`，并在导出层提供不落库的 `editorial_section`（五个 V3 日报栏目）。该字段由 `content_class`、标题和摘要的确定性映射生成，仅用于预分栏；它不表示 AI 已完成事实核实，后续 triage/evidence/verification 仍需独立运行。
 
+对于时间窗口内的 P1/P2 官方 feed，关键词未命中只作为 `official_keyword_missing` 风险信号，仍交给 AI 做初筛、分类和中文简要总结；过期条目及 GitHub/社区的既有硬阈值保持不变。
+
 ## 内容分流
 
 | 类别 | 典型来源 | 确定性筛选 | 轻量核实 | 输出语义 |

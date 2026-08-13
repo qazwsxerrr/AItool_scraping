@@ -176,6 +176,55 @@ def test_ai_review_failure_isolated_and_auditable(tmp_path):
     assert failed["evidence_status"] == "not_run"
 
 
+def test_ai_review_p1_official_without_keyword_reaches_ai_and_exports_summary(tmp_path):
+    sf = _db(tmp_path)
+    source = SourceConfig(
+        id="official_p1_review_test",
+        name="Official P1 review test",
+        transport="feed",
+        url="https://official.example/feed.xml",
+        feed={"format": "rss", "adapter": "generic"},
+        source_group="official_blog",
+        source_subtype="fixed_news",
+        source_role="official",
+        content_class="official_model_company",
+        tier="p1",
+        fetch_interval=1,
+    )
+    spec = source_spec_from_config(source)
+    with sf() as session:
+        repo = IntelRepository(session)
+        repo.upsert_source(source, policy=spec)
+        repo.insert_item(
+            FetchItem(
+                source_id=source.id,
+                external_id="openai:assistance-to-execution",
+                title="From assistance to execution: building agents",
+                url="https://official.example/assistance-to-execution",
+                published_at=NOW - timedelta(hours=2),
+                summary="A first-party article about building agents.",
+            )
+        )
+        session.commit()
+
+    ai = _AI()
+    result = run_ai_review_job(
+        session_factory=sf,
+        source_specs={source.id: spec},
+        ai_client=ai,
+        output_dir=tmp_path / "out",
+        limit=10,
+        now=NOW,
+    )
+
+    assert result.analyzed == 1
+    assert ai.calls == [1]
+    record = json.loads((tmp_path / "out" / "ai_review_candidates.jsonl").read_text().splitlines()[0])
+    assert record["summary_cn"] == "中文简要总结"
+    assert record["editorial_section"] == "model_product"
+    assert record["selection_reason"] == "selected:official_recent_no_keyword; risks=official_keyword_missing"
+
+
 def test_editorial_section_is_output_only_and_deterministic():
     assert _editorial_section_for_item(
         SimpleNamespace(

@@ -106,7 +106,11 @@ def run_ai_review_job(
         ranked: list[tuple[IntelItem, Any, SourceSpec]] = []
         for item in items:
             spec = specs.get(item.source_id) or _spec_from_row(item.source)
-            decision = selection_decision(_item_to_fetch_item(item), spec, now=stage_now)
+            decision = _ai_review_selection_decision(
+                _item_to_fetch_item(item),
+                spec,
+                now=stage_now,
+            )
             ranked.append((item, decision, spec))
         ranked.sort(key=_ranking_key, reverse=True)
         if limit is not None:
@@ -288,6 +292,39 @@ def _run_item_ai_review(
             "risk_flags": list(dict.fromkeys([*response.risk_flags, *extra_risks])),
         }
     )
+
+
+def _ai_review_selection_decision(
+    item: Any,
+    spec: SourceSpec,
+    *,
+    now: datetime,
+) -> Any:
+    """Apply the AI-review boundary on top of deterministic source policy.
+
+    First-party P1/P2 feeds are already bounded by source identity and
+    recency. A title without a deterministic keyword should still reach AI
+    for classification and summary; preserve the missing-keyword signal as a
+    risk instead of silently dropping the item. Other source classes keep
+    their existing hard gates, including GitHub thresholds.
+    """
+
+    decision = selection_decision(item, spec, now=now)
+    if (
+        not decision.selected
+        and decision.reason == "official_keyword_missing"
+        and spec.content_class == "official_model_company"
+        and spec.transport in {"feed", "rsshub"}
+        and spec.tier in {"p1", "p2"}
+    ):
+        return decision.model_copy(
+            update={
+                "selected": True,
+                "reason": "selected:official_recent_no_keyword",
+                "risk_flags": tuple(dict.fromkeys([*decision.risk_flags, "official_keyword_missing"])),
+            }
+        )
+    return decision
 
 
 def _list_ai_review_items(

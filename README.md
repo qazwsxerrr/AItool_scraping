@@ -10,6 +10,8 @@ source registry -> fetch -> ai-review -> candidate export -> (later) evidence/ve
 
 导出同时保留来源路由字段 `content_class`，并增加不落库的 `editorial_section` 栏目字段（`model_product`、`industry_infrastructure`、`research`、`open_source_tool`、`practice_opinion`）。栏目值只依据现有 `content_class`、标题和摘要做确定性映射，用于 V3 日报预分栏；它不是 AI 核实结果，也不替代后续 triage、evidence 或 verification。
 
+P1/P2 官方 feed 在时间窗口内即使标题未命中确定性关键词，也会进入 AI 初筛；此时保留 `official_keyword_missing` 风险标记，不把关键词缺失当作硬过滤。
+
 V3 日报链路以事件（`events`）为选入单元，按以下顺序运行：
 
 ```text
