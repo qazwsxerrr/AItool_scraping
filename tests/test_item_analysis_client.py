@@ -52,7 +52,7 @@ def test_generic_json_posts_item_and_normalizes_response():
     http = FakeHttpClient(FakeResponse({
         "keep": "true", "content_class": "project_tool", "summary_cn": "  一个 MCP 工具  ",
         "reason": "  有可复用代码  ", "risk_flags": "营销；缺少许可证, 营销",
-        "official_url": "https://example.test/docs", "confidence": 130,
+        "confidence": 130,
     }))
     client = ItemAnalysisClient.from_settings(
         Settings(ai_review_api_url="https://ai.example.test/analyze", ai_review_api_key="key", ai_review_model="model"),
@@ -72,7 +72,7 @@ def test_source_content_class_is_authoritative_and_score_clamps():
     http = FakeHttpClient(FakeResponse({
         "keep": False, "content_class": "official_model_company", "summary_cn": None,
         "reason": 123, "risk_flags": [" broken link ", "", "broken link"],
-        "official_url": "not-a-url", "confidence": -20,
+        "confidence": -20,
     }))
     result = ItemAnalysisClient(api_url="https://ai.example.test/analyze", api_key="key", http_client=http).analyze(
         _request(source_content_class="official_model_company")
@@ -81,14 +81,13 @@ def test_source_content_class_is_authoritative_and_score_clamps():
     assert result.summary_cn == ""
     assert result.reason == "123"
     assert result.risk_flags == ["broken link"]
-    assert result.official_url is None
     assert result.confidence == 0
 
 
 def test_openai_chat_and_responses_envelopes_are_supported():
     content = "```json\n" + json.dumps({
         "keep": True, "content_class": "community_social", "summary_cn": "社区线索",
-        "reason": "来源材料摘要", "risk_flags": ["social-only"], "official_url": None, "confidence": "88",
+        "reason": "来源材料摘要", "risk_flags": ["social-only"], "confidence": "88",
     }, ensure_ascii=False) + "\n```"
     http = FakeHttpClient(FakeResponse({"choices": [{"message": {"content": content}}]}))
     client = ItemAnalysisClient.from_settings(
@@ -100,7 +99,7 @@ def test_openai_chat_and_responses_envelopes_are_supported():
     assert result.content_class == "project_tool"
     assert result.confidence == 88
 
-    payload = {"keep": True, "content_class": "community_social", "summary_cn": "Responses API 社区线索", "reason": "来源材料摘要", "risk_flags": [], "official_url": None, "confidence": 82}
+    payload = {"keep": True, "content_class": "community_social", "summary_cn": "Responses API 社区线索", "reason": "来源材料摘要", "risk_flags": [], "confidence": 82}
     response_http = FakeHttpClient(FakeResponse({"output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(payload, ensure_ascii=False)}]}]}))
     response_client = ItemAnalysisClient.from_settings(
         Settings(ai_review_api_url="https://api.example.test/v1", ai_review_api_key="key", ai_review_model="response-model", ai_review_api_style="openai_responses"),

@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Literal, Mapping, TypeAlias
-from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -36,7 +35,6 @@ ITEM_ANALYSIS_RESPONSE_SCHEMA: dict[str, str] = {
     "summary_cn": "string",
     "reason": "string",
     "risk_flags": "array<string>",
-    "official_url": "string|null",
     "confidence": "integer 0-100",
 }
 
@@ -95,7 +93,6 @@ class ItemAnalysisResponse(BaseModel):
     summary_cn: str
     reason: str
     risk_flags: list[str] = Field(default_factory=list)
-    official_url: str | None = None
     confidence: int = 0
     raw_response: dict[str, Any] | None = None
 
@@ -117,7 +114,6 @@ class ItemAnalysisResponse(BaseModel):
             summary_cn=clean_text(data.get("summary_cn")),
             reason=clean_text(data.get("reason")),
             risk_flags=clean_string_list(data.get("risk_flags")),
-            official_url=clean_url(data.get("official_url")),
             confidence=clamp_int(data.get("confidence")),
         )
         return data
@@ -167,9 +163,7 @@ def parse_item_analysis_response(
 
     raw = _coerce_raw_mapping(data)
     result = _unwrap_response(raw)
-    # The direct-link field is optional, while the classification, summary and
-    # risk envelope remains mandatory.
-    required_fields = [key for key in ITEM_ANALYSIS_RESPONSE_SCHEMA if key != "official_url"]
+    required_fields = list(ITEM_ANALYSIS_RESPONSE_SCHEMA)
     missing = [key for key in required_fields if key not in result]
     if missing:
         raise ValueError("Item analysis response is missing required fields: " + ", ".join(missing))
@@ -183,7 +177,6 @@ def parse_item_analysis_response(
         summary_cn=clean_text(result.get("summary_cn")),
         reason=clean_text(result.get("reason")),
         risk_flags=clean_string_list(result.get("risk_flags")),
-        official_url=clean_url(result.get("official_url")),
         confidence=clamp_int(result.get("confidence")),
         raw_response=raw,
     )
@@ -211,7 +204,6 @@ def parse_project_summary_response(data: Any) -> ItemAnalysisResponse:
         summary_cn=summary,
         reason="github_project_summary",
         risk_flags=clean_string_list(result.get("risk_flags")),
-        official_url=None,
         confidence=0,
         raw_response=raw,
     )
@@ -392,24 +384,6 @@ def clean_string_list(value: Any) -> list[str]:
     return result
 
 
-def clean_url(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = clean_text(value)
-    if not text or text.lower() in {"null", "none", "n/a", "na", "-"}:
-        return None
-    try:
-        parsed = urlparse(text)
-        _ = parsed.port
-    except (TypeError, ValueError):
-        return None
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-        return None
-    if parsed.username is not None or parsed.password is not None:
-        return None
-    return text
-
-
 def coerce_bool(value: Any, *, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -450,7 +424,6 @@ __all__ = [
     "apply_local_guard",
     "clean_string_list",
     "clean_text",
-    "clean_url",
     "clamp_int",
     "coerce_bool",
     "content_to_text",

@@ -14,12 +14,6 @@ LOGGER = logging.getLogger(__name__)
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 DEFAULT_REGISTRY_PATH = Path(__file__).with_name("source_registry.yaml")
 
-# ``SourceSpec`` is the one runtime/configuration model.  Keep this import
-# alias for callers that still import ``SourceConfig`` while migrating; it is
-# intentionally not a second model with a legacy routing schema.
-SourceConfig = SourceSpec
-
-
 @dataclass(frozen=True)
 class SkippedSource:
     source_id: str

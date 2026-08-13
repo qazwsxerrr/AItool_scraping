@@ -220,6 +220,8 @@ def _row_from_record(record: dict[str, Any]) -> GitHubProjectRow | None:
         risk_flags.append("missing_readme")
 
     ai = _mapping(record.get("ai"))
+    if ai.get("status") != "success" or ai.get("keep") is not True:
+        return None
     for flag in _string_list(ai.get("risk_flags")):
         if flag not in risk_flags:
             risk_flags.append(flag)
@@ -260,14 +262,12 @@ def _row_from_record(record: dict[str, Any]) -> GitHubProjectRow | None:
 def _is_github_record(record: dict[str, Any]) -> bool:
     source_id = (_text(record.get("source_id")) or "").casefold()
     source_transport = (_text(record.get("source_transport")) or "").casefold()
-    source_type = (_text(record.get("source_type")) or "").casefold()
     external_id = (_text(record.get("external_id")) or "").casefold()
     url = (_text(record.get("url")) or "").casefold()
     metrics = _mapping(record.get("metrics"))
     payload = _mapping(record.get("raw_payload"))
     return bool(
         source_transport == "github"
-        or source_type in {"github", "github_api", "github_trending"}
         or source_id.startswith("github_")
         or external_id.startswith("github_repo:")
         or "github.com/" in url

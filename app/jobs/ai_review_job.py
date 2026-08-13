@@ -341,13 +341,13 @@ def _coerce_github_project_response(value: Any, request: ItemAnalysisRequest) ->
     if isinstance(value, ItemAnalysisResponse):
         if not value.summary_cn.strip():
             raise ValueError("GitHub project summary is empty")
-        return value.model_copy(update={"keep": False, "content_class": "project_tool", "reason": "github_project_summary", "official_url": None})
+        return value.model_copy(update={"keep": False, "content_class": "project_tool", "reason": "github_project_summary"})
     if isinstance(value, Mapping):
         try:
             response = _coerce_analysis_response(value, "project_tool")
         except (TypeError, ValueError):
             response = parse_project_summary_response(value)
-        return response.model_copy(update={"keep": False, "content_class": "project_tool", "reason": "github_project_summary", "official_url": None})
+        return response.model_copy(update={"keep": False, "content_class": "project_tool", "reason": "github_project_summary"})
     raise TypeError("AI client returned an unsupported project summary")
 
 
@@ -458,7 +458,7 @@ def _list_ai_review_items(
     )
     if not force:
         stmt = stmt.where(
-            IntelItem.status.in_(["new", "selected", "ai_failed"])
+            IntelItem.status.in_(["new", "selected", "hotspot", "ai_failed"])
             & ((~IntelItem.ai_review.has()) | (IntelItem.ai_review.has(AIItemReview.status == "ai_failed")))
         )
     if source_filter:

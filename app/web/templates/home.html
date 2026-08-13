@@ -8,7 +8,6 @@
     <h1>AI 热点精选</h1>
     <p class="muted-text">
       {{ stats.raw_items }} 条动态 · {{ stats.selected_items }} 条 AI 已选 ·
-      {{ stats.hotspots }} 个项目热点
       {% if stats.pending_items %} · {{ stats.pending_items }} 条待处理{% endif %}
     </p>
   </div>
@@ -22,9 +21,8 @@
 <section class="chips" aria-label="分类筛选">
   {% set categories = [('全部', None), ('官方发布', 'official_model_company'), ('项目 / 工具', 'project_tool'), ('社区线索', 'community_social')] %}
   {% for label, value in categories %}
-    <a class="chip {{ 'active' if category == value else '' }}" href="/?{% if value %}category={{ value }}&{% endif %}hide_stale={{ 1 if hide_stale else 0 }}">{{ label }}</a>
+    <a class="chip {{ 'active' if category == value else '' }}" href="/{% if value %}?category={{ value }}{% endif %}">{{ label }}</a>
   {% endfor %}
-  <a class="chip {{ 'active' if hide_stale else '' }}" href="/?hide_stale={{ 0 if hide_stale else 1 }}">{{ '隐藏失败条目' if hide_stale else '显示失败条目' }}</a>
 </section>
 
 {% if top_card %}

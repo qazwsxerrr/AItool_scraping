@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.config.settings import Settings
@@ -139,7 +139,10 @@ def _list_pending(
         .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
         .where(
             (IntelItem.status == "ai_failed")
-            | ((IntelItem.status == "hotspot") & (AIItemReview.status == "ai_failed"))
+            | (
+                (IntelItem.status == "hotspot")
+                & or_(AIItemReview.id.is_(None), AIItemReview.status != "success")
+            )
             | ((IntelItem.status == "selected") & AIItemReview.id.is_(None))
         )
         .order_by(IntelItem.selection_score.desc(), IntelItem.id.asc())
@@ -179,10 +182,6 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
         "name": source.name if source else None,
         "source_name": source.name if source else None,
         "source_transport": source_transport,
-        # Keep the historical export key as a transport-valued alias for
-        # readers consuming existing JSONL files. Routing no longer depends on
-        # this compatibility field; new code uses ``source_transport``.
-        "source_type": source_transport,
         "transport": source_transport,
         "source_group": source_group,
         "source_subtype": source_subtype,
@@ -217,7 +216,6 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
             "summary_cn": review.summary_cn,
             "reason": review.reason,
             "risk_flags": _json(review.risk_flags_json, []),
-            "official_url": review.official_url,
             "confidence": review.confidence,
             "error_message": review.error_message,
         }
@@ -317,7 +315,6 @@ def _readable_database_url(database_url: str, *, dry_run: bool) -> str:
 
 def _is_github_repository(record: dict[str, Any]) -> bool:
     source_transport = str(record.get("source_transport") or "").casefold()
-    source_type = str(record.get("source_type") or "").casefold()
     source_id = str(record.get("source_id") or "").casefold()
     external_id = str(record.get("external_id") or "").casefold()
     url = str(record.get("url") or "").casefold()
@@ -330,7 +327,6 @@ def _is_github_repository(record: dict[str, Any]) -> bool:
         and (
             payload_type == "repository"
             or source_transport == "github"
-            or source_type in {"github", "github_api", "github_trending"}
             or source_id.startswith("github_")
             or external_id.startswith("github_repo:")
             or "github.com/" in url

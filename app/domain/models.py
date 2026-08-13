@@ -195,7 +195,7 @@ class GitHubOptions(BaseModel):
 
     @property
     def search_query(self) -> str | None:
-        """Compatibility accessor for callers migrating to nested options."""
+        """Return the configured GitHub search query."""
 
         return self.query
 
@@ -217,8 +217,8 @@ class SourceSpec(BaseModel):
 
     ``transport`` is the only top-level routing discriminator.  Feed details
     live under :attr:`feed`; GitHub mode details live under :attr:`github`.
-    Legacy ``type``, ``parser_type`` and ``collector_type`` keys are rejected
-    instead of being silently inferred.
+    Unsupported ``type``, ``parser_type`` and ``collector_type`` keys are
+    rejected instead of being silently inferred.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)

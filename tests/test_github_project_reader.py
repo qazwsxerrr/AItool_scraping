@@ -77,6 +77,7 @@ def test_github_project_reader_uses_persisted_ai_summary_and_period_stars(tmp_pa
         "summary_cn": "持久化项目介绍：用于构建 AI 工作流。",
         "risk_flags": ["README 信息可能过时"],
         "status": "success",
+        "keep": True,
     }
     payload["metrics"]["trending"] = {
         "weekly": {"rank": 2, "stars_since": 180},
@@ -138,5 +139,5 @@ def _project_payload(
             "full_name": repo,
             "license": {"spdx_id": license_name} if license_name else None,
         },
-        "ai": None,
+        "ai": {"status": "success", "keep": True},
     }

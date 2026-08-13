@@ -53,7 +53,7 @@ class IntelRepository:
 
         The nested feed/GitHub options are intentionally stored as explicit
         columns. This keeps source rows useful to the fetch cooldown checks and
-        lets a fresh local database be inspected without legacy routing fields.
+        lets a fresh local database be inspected without obsolete routing fields.
         """
         row = self.session.get(Source, source.id)
         if row is None:
@@ -501,7 +501,6 @@ class IntelRepository:
         review.summary_cn = _text(getattr(response, "summary_cn", None))
         review.reason = _text(getattr(response, "reason", None))
         review.risk_flags_json = _dump_json(getattr(response, "risk_flags", []))
-        review.official_url = _text(getattr(response, "official_url", None))
         review.confidence = max(0, min(int(getattr(response, "confidence", 0) or 0), 100))
         raw = getattr(response, "raw_response", None) if response is not None else None
         review.raw_response_json = _dump_json(raw if raw is not None else {})
@@ -524,17 +523,15 @@ class IntelRepository:
         content_class: str | None = None,
         source_id: str | None = None,
     ) -> list[IntelItem]:
-        # AI-kept rows are exportable directly; GitHub hotspot rows remain
-        # deterministic selections without a second stage.
-        retained_without_ai = (IntelItem.content_class == "project_tool") & (IntelItem.status == "hotspot")
-        retained_with_ai = AIItemReview.keep.is_(True) & IntelItem.status.in_(
-            ["selected", "hotspot"]
-        )
         stmt = (
             select(IntelItem)
             .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
             .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
-            .where(retained_without_ai | retained_with_ai)
+            .where(
+                IntelItem.status == "selected",
+                AIItemReview.status == "success",
+                AIItemReview.keep.is_(True),
+            )
             .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
         )
         if content_class:
@@ -846,7 +843,7 @@ def _unique_strings(values: Iterable[Any]) -> list[str]:
 
 
 def _string_values(value: Any) -> list[Any]:
-    """Normalize legacy scalar/list metadata before merging it."""
+    """Normalize scalar/list metadata before merging it."""
 
     if value is None:
         return []

@@ -31,7 +31,7 @@
     <span>搜索：<strong>{{ results.query }}</strong></span>
     <span>{{ total_count }} 条结果</span>
     <span>GitHub {{ github_projects | length }}</span>
-    <span>精选 {{ results.selected_items | length }}</span>
+    <span>AI 已选 {{ results.selected_items | length }}</span>
     <span>动态 {{ results.items | length }}</span>
   </section>
 
@@ -46,7 +46,7 @@
 
   {% set groups = [
     ('AI 已选情报', results.selected_items),
-    ('全部动态', results.all_items),
+    ('全部动态', results.items),
   ] %}
   {% for group_title, rows in groups %}
     {% if rows %}

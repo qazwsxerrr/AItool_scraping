@@ -77,7 +77,7 @@ _SOCIAL_GROUPS = {"x_official", "x_social", "x_search", "reddit_fixed", "reddit_
 def classify_source(source: Any) -> ContentClass:
     """Classify a registry source, preferring an explicit ``content_class``.
 
-    ``source`` may be a current ``SourceConfig``, a future registry model, a
+    ``source`` may be a current ``SourceSpec``, a future registry model, a
     ``SourceSpec``, a mapping, or a lightweight object used in tests.
     """
 

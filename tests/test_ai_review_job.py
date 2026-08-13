@@ -6,8 +6,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 
 from app.ai.schemas import ItemAnalysisResponse
-from app.config.source_registry import SourceConfig
-from app.domain.models import FetchItem
+from app.domain.models import FetchItem, SourceSpec
 from app.domain.policies import source_spec_from_config
 from app.jobs.ai_review_job import run_ai_review_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
@@ -24,8 +23,8 @@ def _db(tmp_path):
     return create_session_factory(engine)
 
 
-def _source() -> SourceConfig:
-    return SourceConfig(
+def _source() -> SourceSpec:
+    return SourceSpec(
         id="official_review_test",
         name="Official review test",
         transport="feed",
@@ -56,7 +55,6 @@ class _AI:
             summary_cn="中文简要总结",
             reason="保留",
             risk_flags=[],
-            official_url=request.url,
             confidence=91,
             raw_response={"fixture": True},
         )
@@ -71,7 +69,6 @@ class _RejectingAI(_AI):
             summary_cn="与 AI 日报主题无关",
             reason="内容与 AI 工具情报无关",
             risk_flags=["irrelevant"],
-            official_url=None,
             confidence=94,
             raw_response={"fixture": True, "keep": False},
         )
@@ -232,7 +229,7 @@ def test_ai_review_ai_keep_false_rejects_item_and_excludes_candidate(tmp_path):
 
 def test_ai_review_p1_official_without_keyword_reaches_ai_and_exports_summary(tmp_path):
     sf = _db(tmp_path)
-    source = SourceConfig(
+    source = SourceSpec(
         id="official_p1_review_test",
         name="Official P1 review test",
         transport="feed",

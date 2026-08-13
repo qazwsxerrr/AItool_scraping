@@ -50,7 +50,6 @@ _CONTENT_CLASS_LABELS = {
 _STATUS_LABELS = {
     "new": "待处理",
     "selected": "AI 已选",
-    "hotspot": "热点项目",
     "ai_failed": "AI 处理失败",
     "filtered": "未入选",
     "rejected": "已排除",

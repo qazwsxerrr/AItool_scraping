@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from datetime import date
 
-from app.config.source_registry import SourceConfig
 from app.domain.models import FetchItem, SourceSpec
 from app.domain.policies import should_select
 from app.github.report import render_github_trending_report
@@ -41,7 +40,7 @@ def test_github_metrics_merge_preserves_daily_weekly_and_search_signals(tmp_path
     session_factory = create_session_factory(engine)
 
     configs = [
-        SourceConfig(
+        SourceSpec(
             id="github_trending_daily_native",
             name="GitHub Trending Daily",
             transport="github",
@@ -52,7 +51,7 @@ def test_github_metrics_merge_preserves_daily_weekly_and_search_signals(tmp_path
             content_class="project_tool",
             selection_policy={"mode": "github_trending"},
         ),
-        SourceConfig(
+        SourceSpec(
             id="github_trending_weekly_native",
             name="GitHub Trending Weekly",
             transport="github",
@@ -63,7 +62,7 @@ def test_github_metrics_merge_preserves_daily_weekly_and_search_signals(tmp_path
             content_class="project_tool",
             selection_policy={"mode": "github_trending"},
         ),
-        SourceConfig(
+        SourceSpec(
             id="github_search_topic_llm",
             name="GitHub Search Topic LLM",
             transport="github",
@@ -131,7 +130,7 @@ def test_github_search_and_trending_rows_dedupe_by_canonical_repository_url(tmp_
     engine = create_engine_from_url(f"sqlite:///{tmp_path / 'dedupe.db'}")
     init_db(engine)
     session_factory = create_session_factory(engine)
-    trending = SourceConfig(
+    trending = SourceSpec(
         id="github_trending_weekly_native",
         name="GitHub Trending Weekly",
         transport="github",
@@ -142,7 +141,7 @@ def test_github_search_and_trending_rows_dedupe_by_canonical_repository_url(tmp_
         content_class="project_tool",
         selection_policy={"mode": "github_trending"},
     )
-    search = SourceConfig(
+    search = SourceSpec(
         id="github_search_topic_llm",
         name="GitHub Search Topic LLM",
         transport="github",
@@ -193,7 +192,7 @@ def test_github_enrichment_persists_readme_and_does_not_expose_metrics_as_readme
     engine = create_engine_from_url(f"sqlite:///{tmp_path / 'enrichment.db'}")
     init_db(engine)
     session_factory = create_session_factory(engine)
-    source = SourceConfig(
+    source = SourceSpec(
         id="github_search_topic_llm",
         name="GitHub Search Topic LLM",
         transport="github",

@@ -164,5 +164,5 @@ def test_export_surfaces_hotspot_with_failed_project_summary_as_pending(tmp_path
 
     result = run_intel_export_job(session_factory=session_factory, output_dir=tmp_path / "out")
 
-    assert result.exported == 1
+    assert result.exported == 0
     assert result.pending == 1

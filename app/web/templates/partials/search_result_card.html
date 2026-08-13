@@ -1,11 +1,10 @@
 <article class="card search-result-card">
-  {% set is_hotspot_without_score = result.status == 'hotspot' and (result.score or 0) == 0 %}
-  <div class="score-pill {{ 'score-hot' if is_hotspot_without_score else 'score-' ~ ('high' if result.score is not none and result.score >= 80 else 'mid' if result.score is not none and result.score >= 60 else 'low') }}">
-    {{ 'HOT' if is_hotspot_without_score else (result.score if result.score is not none else '—') }}
+  <div class="score-pill score-{{ 'high' if result.score is not none and result.score >= 80 else 'mid' if result.score is not none and result.score >= 60 else 'low' }}">
+    {{ result.score if result.score is not none else '—' }}
   </div>
   <div class="card-body">
     <div class="card-meta">
-      <span>{{ 'AI 已选情报' if result.result_type == 'recommendation' else '全部动态' }}</span>
+      <span>{{ 'AI 已选情报' if result.result_type == 'selected' else '全部动态' }}</span>
       {% if result.source_name %}<span>{{ result.source_name }}</span>{% endif %}
       {% if result.content_class %}<span>{{ result.content_class | content_class_label }}</span>{% endif %}
       {% if result.published_at %}<span>{{ result.published_at | relative_time }}</span>{% endif %}
@@ -18,9 +17,8 @@
     {% if result.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ result.selection_reason }}</p>{% endif %}
     <div class="badges">
       {% for badge in result.badges %}
-        <span class="badge {{ 'danger' if badge in ['failed', 'broken', 'stale', 'ai_failed'] else 'primary' if loop.first else '' }}">{{ badge | status_label if badge in ['hotspot', 'ai_failed', 'filtered', 'rejected', 'new', 'selected'] else (badge | content_class_label if badge in ['official_model_company', 'project_tool', 'community_social'] else badge) }}</span>
+        <span class="badge {{ 'danger' if badge in ['failed', 'broken', 'stale', 'ai_failed'] else 'primary' if loop.first else '' }}">{{ badge | status_label if badge in ['ai_failed', 'filtered', 'rejected', 'new', 'selected'] else (badge | content_class_label if badge in ['official_model_company', 'project_tool', 'community_social'] else badge) }}</span>
       {% endfor %}
-      {% if result.ai_status == 'ai_failed' %}<span class="badge warning">AI 处理失败</span>{% endif %}
     </div>
   </div>
 </article>

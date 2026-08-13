@@ -1,7 +1,6 @@
 <article class="card recommendation-card {{ 'top' if is_top | default(false) else '' }}">
-  {% set is_hotspot_without_score = card.status == 'hotspot' and card.total_score == 0 %}
-  <div class="score-pill {{ 'score-hot' if is_hotspot_without_score else 'score-' ~ ('high' if card.total_score >= 80 else 'mid' if card.total_score >= 60 else 'low') }}">
-    {{ 'HOT' if is_hotspot_without_score else card.total_score }}
+  <div class="score-pill score-{{ 'high' if card.selection_score >= 80 else 'mid' if card.selection_score >= 60 else 'low' }}">
+    {{ card.selection_score }}
   </div>
   <div class="card-body">
     <div class="card-meta">
@@ -11,16 +10,15 @@
       {% if card.ai_keep and card.ai_status == 'success' %}<span>AI 已选</span>{% endif %}
     </div>
     <h3>
-      {% if card.how_to_try %}<a href="{{ card.how_to_try }}" target="_blank" rel="noopener noreferrer">{{ card.title }}</a>{% else %}{{ card.title }}{% endif %}
+      {% if card.url %}<a href="{{ card.url }}" target="_blank" rel="noopener noreferrer">{{ card.title }}</a>{% else %}{{ card.title }}{% endif %}
     </h3>
     {% if card.summary %}<p class="summary-clamp" title="{{ card.summary }}"><strong>AI 摘要：</strong>{{ card.summary }}</p>{% endif %}
-    {% if card.why_recommend %}<p class="note"><strong>筛选依据：</strong>{{ card.why_recommend }}</p>{% endif %}
-    {% if card.how_to_try %}<p class="note"><a class="inline-link" href="{{ card.how_to_try }}" target="_blank" rel="noopener noreferrer">打开来源</a></p>{% endif %}
+    {% if card.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ card.selection_reason }}</p>{% endif %}
+    {% if card.url %}<p class="note"><a class="inline-link" href="{{ card.url }}" target="_blank" rel="noopener noreferrer">打开来源</a></p>{% endif %}
     <div class="badges">
       <span class="badge primary">{{ card.status | status_label }}</span>
       {% if card.content_class %}<span class="badge">{{ card.content_class | content_class_label }}</span>{% endif %}
       {% if card.source_group %}<span class="badge">{{ card.source_group }}</span>{% endif %}
-      {% if card.ai_status == 'ai_failed' %}<span class="badge warning">AI 处理失败</span>{% endif %}
       {% if card.risk_flags %}
         <details class="risk-details">
           <summary class="badge warning">风险提示 {{ card.risk_flags | length }}</summary>

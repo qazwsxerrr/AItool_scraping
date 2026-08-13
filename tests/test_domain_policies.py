@@ -2,7 +2,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.config.source_registry import SourceConfig
 from app.domain import (
     COMMUNITY_SOCIAL,
     OFFICIAL_MODEL_COMPANY,
@@ -15,12 +14,13 @@ from app.domain import (
     should_select,
     source_spec_from_config,
 )
+from app.domain.models import SourceSpec
 
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
 
 
-def _source(**overrides) -> SourceConfig:
+def _source(**overrides) -> SourceSpec:
     values = {
         "id": "community_feed",
         "name": "Community Feed",
@@ -34,7 +34,7 @@ def _source(**overrides) -> SourceConfig:
     values.update(overrides)
     if values.get("transport") == "github":
         values.pop("feed", None)
-    return SourceConfig(**values)
+    return SourceSpec(**values)
 
 
 def _item(**overrides) -> FetchItem:

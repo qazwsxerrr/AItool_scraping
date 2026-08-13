@@ -189,15 +189,13 @@ def test_web_hotspot_zero_score_and_mobile_nav_contract(tmp_path):
 
     assert home_response.status_code == 200
     assert "精选时间线" in home_response.text
-    assert "暂无精选内容" not in home_response.text
-    assert "score-hot" in home_response.text
-    assert "HOT" in home_response.text
-    assert "score-low" not in home_response.text
-    assert "summary-clamp" in home_response.text
+    assert "暂无精选内容" in home_response.text
+    assert "score-hot" not in home_response.text
+    assert "HOT" not in home_response.text
+    assert "summary-clamp" not in home_response.text
     assert search_response.status_code == 200
-    assert "score-hot" in search_response.text
-    assert "HOT" in search_response.text
-    assert "score-low" not in search_response.text
+    assert "score-hot" not in search_response.text
+    assert "HOT" not in search_response.text
     assert css_response.status_code == 200
     assert ".sidebar .nav-item" in css_response.text
     assert "flex: 0 0 auto" in css_response.text
@@ -287,6 +285,6 @@ def _write_github_metadata(path) -> None:
             },
         },
         "raw_payload": {"github_item_type": "repository", "full_name": "example/OmniRoute"},
-        "ai": {"status": "success", "summary_cn": "持久化项目介绍：统一管理 LLM provider。"},
+        "ai": {"status": "success", "keep": True, "summary_cn": "持久化项目介绍：统一管理 LLM provider。"},
     }
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

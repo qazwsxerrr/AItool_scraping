@@ -37,7 +37,7 @@ def test_read_repository_maps_ai_items_and_source_attribution(tmp_path):
             content_hash="hash-ui-1", selection_score=88, status="selected",
         )
         item.ai_review = AIItemReview(
-            model="review-model", keep=True, content_class="official_model_company", confidence=92,
+            model="review-model", status="success", keep=True, content_class="official_model_company", confidence=92,
             reason="official release", summary_cn="Claude Code 发布了一次实用更新。", raw_response_json="{}",
         )
         session.add_all([source, item, IntelRun(status="completed")])
@@ -55,7 +55,7 @@ def test_read_repository_maps_ai_items_and_source_attribution(tmp_path):
     assert cards[0].ai_keep is True
     assert len(items) == 1
     assert items[0].source_name == "Official Feed"
-    assert results.recommendations[0].title == "Claude Code v2 发布"
+    assert results.selected_items[0].title == "Claude Code v2 发布"
     assert not hasattr(results, "evidence")
 
 
@@ -85,8 +85,7 @@ def test_project_hotspot_and_ai_failure_statuses(tmp_path):
         cards = repo.list_featured_cards()
         options = repo.list_filter_options()
 
-    assert stats.hotspots == 1
     assert stats.ai_failed_items == 1
-    assert cards[0].status == "hotspot"
-    assert "hotspot" in options.statuses
+    assert cards == []
+    assert "hotspot" not in options.statuses
     assert "ai_failed" in options.statuses

@@ -29,7 +29,7 @@ class Source(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # ``transport`` is the only persisted routing discriminator. Feed and
     # GitHub options are flattened into nullable columns so the local SQLite
-    # schema remains inspectable without a compatibility/migration layer.
+    # schema remains inspectable without a migration layer.
     transport: Mapped[str] = mapped_column(String(32), nullable=False)
     url: Mapped[str] = mapped_column(Text, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -203,7 +203,6 @@ class AIItemReview(Base):
     summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
-    official_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     raw_response_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="success")
