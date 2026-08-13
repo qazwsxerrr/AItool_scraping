@@ -157,16 +157,43 @@ def _list_pending(
 def _serialize(item: IntelItem) -> dict[str, Any]:
     review = item.ai_review
     verification = item.verification
+    source = item.source
+    source_group = source.source_group if source else None
+    source_subtype = source.source_subtype if source else None
+    source_transport = source.transport if source else None
+    source_tier = source.tier if source else None
+    source_role = source.source_role if source else None
+    source_ref = {
+        "id": item.source_id,
+        "name": source.name if source else None,
+        "source_id": item.source_id,
+        "transport": source_transport,
+        "source_group": source_group,
+        "source_subtype": source_subtype,
+        "tier": source_tier,
+        "role": source_role,
+        "x_official": source_group == "x_official",
+    }
     return {
         "id": item.id,
         "source_id": item.source_id,
-        "source_name": item.source.name if item.source else None,
-        "source_transport": item.source.transport if item.source else None,
+        "name": source.name if source else None,
+        "source_name": source.name if source else None,
+        "source_transport": source_transport,
         # Keep the historical export key as a transport-valued alias for
         # readers consuming existing JSONL files. Routing no longer depends on
         # this compatibility field; new code uses ``source_transport``.
-        "source_type": item.source.transport if item.source else None,
-        "source_priority": item.source.priority if item.source else None,
+        "source_type": source_transport,
+        "transport": source_transport,
+        "source_group": source_group,
+        "source_subtype": source_subtype,
+        "tier": source_tier,
+        "source_tier": source_tier,
+        "source_role": source_role,
+        "role": source_role,
+        "x_official": source_group == "x_official",
+        "source": source_ref,
+        "source_priority": source.priority if source else None,
         "external_id": item.external_id,
         "content_hash": item.content_hash,
         "content_class": item.content_class,
@@ -242,6 +269,12 @@ def _markdown(
                 f"## {index}. {record.get('title') or '(untitled)'}",
                 f"- 类别：`{record.get('content_class')}` | 状态：`{record.get('status')}` | 选择分：`{record.get('selection_score')}`",
                 f"- 来源：`{record.get('source_name') or record.get('source_id')}`",
+                (
+                    f"- 来源标识：`{record.get('source_id')}` | transport=`{record.get('source_transport')}` "
+                    f"group=`{record.get('source_group')}` subtype=`{record.get('source_subtype')}` "
+                    f"tier=`{record.get('tier')}` role=`{record.get('source_role')}` "
+                    f"x_official=`{str(bool(record.get('x_official'))).lower()}`"
+                ),
                 f"- 摘要：{ai.get('summary_cn') or record.get('summary') or '暂无摘要'}",
                 f"- 核实：`{verification.get('status') if verification else '未执行'}` / `{verification.get('mode') if verification else 'n/a'}`",
                 f"- 风险：{', '.join(ai.get('risk_flags') or verification.get('risk_flags') or []) or '无'}",

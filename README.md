@@ -74,7 +74,7 @@ app/
 └─ web/                    # 现有 FastAPI/Jinja UI，当前阶段不改
 ```
 
-旧 claim、evidence、recommendation 阶段和对应客户端、表模型、脚本已经移除。数据库只由当前 ORM metadata 初始化；本阶段不提供迁移框架。若本地数据库来自旧版本，建议先备份并删除 SQLite 文件，再运行 `python -m app.main fetch` 或 `python -m app.main run-daily` 让 `init_db()` 重建完整 schema。
+旧 claim、evidence、recommendation 阶段和对应客户端、表模型、脚本已经移除。数据库只由当前 ORM metadata 初始化；本阶段不提供迁移框架，也不对旧数据库做兼容迁移。若本地数据库来自旧版本，请先备份 SQLite 文件，再在停机窗口删除旧文件并运行 `python -m app.main fetch-only` 或 `python -m app.main run-daily`，由 `init_db()` 重建完整 schema。实现和测试期间使用临时隔离 SQLite 路径，不会删除仓库当前 `data/` 数据库。
 
 ## 数据表
 
@@ -184,6 +184,16 @@ python -m app.main fetch --class project_tool
 python -m app.main process --class project_tool --limit 100
 python -m app.main export --output-dir output/intel
 ```
+
+第一阶段抓取与导出可单独运行，不会调用 process、AI、evidence、triage、cluster、compose 或推荐阶段：
+
+```bash
+python -m app.main fetch-only --source openai_news --force --output-dir output/fetch
+```
+
+`fetch-only` 写出 `fetch_items.json`、`fetch_items.jsonl` 和 `fetch_items.md`。每条记录都包含
+`source_id`、来源名称、`transport`、`source_group`、`source_subtype`、`tier`、`role`；X 官方账号的
+`x_official` 为 `true`，`x_social`/`x_search` 保持发现性质并标为 `false`。抓取失败按来源隔离，单一来源失败不会中断批次。
 
 日常入口：
 

@@ -1611,6 +1611,7 @@ sources:
     adapter: generic
   source_group: x_official
   source_subtype: account
+  source_role: official
   tier: p2
   topic_scopes:
   - model_product
@@ -1633,6 +1634,7 @@ sources:
     adapter: generic
   source_group: x_official
   source_subtype: account
+  source_role: official
   tier: p2
   topic_scopes:
   - model_product
@@ -1655,6 +1657,7 @@ sources:
     adapter: generic
   source_group: x_official
   source_subtype: account
+  source_role: official
   tier: p2
   topic_scopes:
   - model_product

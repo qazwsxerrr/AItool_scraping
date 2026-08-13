@@ -5,6 +5,7 @@ import typer
 from app.config.settings import Settings
 from app.jobs.export_job import run_intel_export_from_settings
 from app.jobs.fetch_job import run_intel_fetch_from_settings
+from app.jobs.fetch_only_job import run_fetch_only_from_settings
 from app.jobs.process_job import run_intel_process_from_settings
 from app.jobs.run_job import run_intel_once_from_settings
 from app.jobs.daily_run_job import run_daily_from_settings
@@ -61,6 +62,54 @@ def fetch(
     )
     if result.skipped_sources:
         typer.echo(f"Registry skipped: {len(result.skipped_sources)}")
+
+
+@app.command("fetch-only")
+def fetch_only(
+    limit_per_source: int | None = typer.Option(
+        None,
+        "--limit",
+        "--limit-per-source",
+        min=1,
+        help="Maximum items to fetch per source.",
+    ),
+    source: str | None = typer.Option(None, help="Only fetch one source id."),
+    content_class: str | None = typer.Option(None, "--class", help="Only fetch one content class."),
+    force: bool = typer.Option(False, "--force", help="Ignore fetch_interval cooldown."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Fetch without database or export writes."),
+    output_dir: str = typer.Option("output/fetch", help="Raw/normalized JSON and Markdown output directory."),
+) -> None:
+    """Run only fetch and export raw/normalized items with source attribution."""
+
+    configure_logging()
+    _validate_content_class(content_class)
+    result = run_fetch_only_from_settings(
+        settings=Settings.from_env(),
+        limit_per_source=limit_per_source,
+        source_filter=source,
+        content_class=content_class,
+        force=force,
+        dry_run=dry_run,
+        output_dir=output_dir,
+    )
+    if result.fetch.not_due_sources:
+        typer.echo(f"Not due (use --force to retry): {', '.join(result.fetch.not_due_sources)}")
+    for source_id, stats in result.fetch.stats.items():
+        typer.echo(
+            f"{source_id}: fetched={stats.fetched} inserted={stats.inserted} "
+            f"skipped={stats.skipped} failed={stats.failed} status={stats.status}"
+        )
+    typer.echo(
+        f"Totals: fetched={result.fetch.total_fetched} inserted={result.fetch.total_inserted} "
+        f"skipped={result.fetch.total_skipped} failed={result.fetch.total_failed}"
+    )
+    if result.fetch.skipped_sources:
+        typer.echo(f"Registry skipped: {len(result.fetch.skipped_sources)}")
+    if result.export is not None:
+        typer.echo(f"exported={result.export.exported} dry_run={result.export.dry_run}")
+        typer.echo(f"json={result.export.json_path}")
+        typer.echo(f"jsonl={result.export.jsonl_path}")
+        typer.echo(f"markdown={result.export.markdown_path}")
 
 
 @app.command("process")
