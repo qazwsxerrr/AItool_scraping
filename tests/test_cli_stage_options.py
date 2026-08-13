@@ -8,22 +8,12 @@ from app import main
 runner = CliRunner()
 
 
-def test_cli_exposes_v2_and_v3_commands():
+def test_cli_exposes_ai_only_commands():
     result = runner.invoke(main.app, ["--help"])
     assert result.exit_code == 0
-    for command in ("fetch", "process", "ai-review", "export", "run-once"):
+    for command in ("fetch", "fetch-only", "ai-review", "export", "run-once", "source-health"):
         assert command in result.stdout
-    for command in (
-        "source-health",
-        "enrich",
-        "triage",
-        "cluster",
-        "compose",
-        "daily-export",
-        "run-daily",
-    ):
-        assert command in result.stdout
-    for legacy in ("claim-extract", "evidence-search", "ai-verify", "recommendation-write"):
+    for legacy in ("process", "run-daily", "enrich", "triage", "cluster", "compose", "daily-export", "claim-extract", "evidence-search", "ai-verify", "recommendation-write"):
         assert legacy not in result.stdout
 
 

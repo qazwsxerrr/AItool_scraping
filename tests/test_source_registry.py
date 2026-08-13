@@ -141,7 +141,7 @@ def test_default_registry_uses_canonical_github_modes_and_producthunt_atom():
     assert release_source.spam_risk == "low"
 
 
-def test_default_registry_includes_verified_official_feed_expansion():
+def test_default_registry_includes_official_feed_expansion():
     result = load_source_registry(env={})
     source_by_id = {source.id: source for source in result.sources}
 
@@ -163,8 +163,6 @@ def test_default_registry_includes_verified_official_feed_expansion():
         assert source.url == url
         assert source.source_group == group
         assert source.content_class == "official_model_company"
-        assert source.verification_policy.mode == "official_direct_link"
-        assert source.verification_policy.required is True
         assert source.selection_policy.keywords
 
 
@@ -274,14 +272,15 @@ def test_default_registry_contains_v3_official_feeds_and_x_handles():
     assert source_by_id["anthropic_news_rsshub"].source_group == "official_blog"
     assert source_by_id["anthropic_research_rsshub"].source_group == "official_research"
     assert source_by_id["anthropic_engineering_rsshub"].source_group == "official_research"
+    assert source_by_id["x_account_chatgpt"].url.endswith("/twitter/user/ChatGPT")
+    assert source_by_id["x_account_xai"].url.endswith("/twitter/user/spacexai")
     for source_id, handle in {
         "x_account_zai_org": "Zai_org",
         "x_account_kimi_moonshot": "Kimi_Moonshot",
-        "x_account_minimax_ai": "MiniMax__AI",
+        "x_account_minimax_ai": "MiniMax_AI",
     }.items():
         source = source_by_id[source_id]
         assert source.source_group == "x_official"
         assert source.primary_eligible is False
-        assert source.citation_policy == "supplementary"
         assert handle in source.url
-        assert source.account_verification_url == f"https://x.com/{handle}"
+        assert source.account_url == f"https://x.com/{handle}"

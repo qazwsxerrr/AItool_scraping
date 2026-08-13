@@ -80,7 +80,7 @@ def test_source_classification_uses_explicit_value_then_registry_metadata():
     assert classify_source({"id": "forced", "content_class": PROJECT_TOOL}) == PROJECT_TOOL
 
 
-def test_source_spec_resolves_default_selection_and_verification_policies():
+def test_source_spec_resolves_default_selection_policy():
     github = source_spec_from_config(
         _source(
             id="github_active",
@@ -107,13 +107,8 @@ def test_source_spec_resolves_default_selection_and_verification_policies():
     assert github.selection_policy.pushed_days == 30
     assert github.selection_policy.min_stars == 100
     assert github.selection_policy.sort_by == "stars"
-    assert github.verification_policy.mode == "metadata_only"
     assert official.selection_policy.max_age_days == 30
-    assert official.verification_policy.mode == "official_direct_link"
-    assert official.verification_policy.required is True
     assert community.selection_policy.max_age_days == 7
-    assert community.selection_policy.discovery_only is True
-    assert community.verification_policy.mode == "discovery_only"
 
 
 def test_explicit_policy_overrides_defaults_without_losing_class_defaults():
@@ -126,7 +121,6 @@ def test_explicit_policy_overrides_defaults_without_losing_class_defaults():
             "github": {"mode": "search", "query": "agent"},
             "content_class": PROJECT_TOOL,
             "selection_policy": {"min_stars": 500, "pushed_days": 14},
-            "verification_policy": {"mode": "metadata_only"},
         }
     )
 
@@ -134,6 +128,19 @@ def test_explicit_policy_overrides_defaults_without_losing_class_defaults():
     assert spec.selection_policy.min_stars == 500
     assert spec.selection_policy.pushed_days == 14
     assert spec.selection_policy.sort_by == "stars"
+
+
+def test_removed_selection_policy_fields_are_rejected():
+    with pytest.raises(ValueError, match="removed fields"):
+        source_spec_from_config(
+            {
+                "id": "legacy_policy",
+                "name": "Legacy policy",
+                "transport": "feed",
+                "url": "https://example.test/feed.xml",
+                "selection_policy": {"mode": "official_recent", "verification_policy": {"mode": "metadata_only"}},
+            }
+        )
 
 
 def test_fetch_dtos_accept_current_collector_aliases_and_transport_metadata():
@@ -255,15 +262,13 @@ def test_producthunt_uses_votes_and_time_with_configurable_threshold():
     assert score_item(_item(metrics={"votes": 500}), source, now=NOW) > score_item(low_votes, source, now=NOW)
 
 
-def test_community_is_seven_day_discovery_only_signal():
+def test_community_is_seven_day_signal():
     source = _source()
     recent = _item(published_at=NOW - timedelta(days=7))
     stale = _item(published_at=NOW - timedelta(days=8))
 
     decision = selection_decision(recent, source, now=NOW)
     assert decision.selected is True
-    assert decision.discovery_only is True
-    assert decision.verification_mode == "discovery_only"
     assert selection_decision(stale, source, now=NOW).reason == "community_item_too_old"
 
 

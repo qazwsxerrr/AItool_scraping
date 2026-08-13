@@ -1,283 +1,111 @@
 # AI 情报抓取与处理
 
-本项目当前实现数据抓取、确定性处理和结果展示。旧版链路仍保持兼容：
+本项目支持一条可重复执行的 AI-only 文字情报链路：
 
 ```text
-source registry -> fetch -> ai-review -> candidate export -> (later) evidence/verification
+source registry -> fetch/normalize -> AI relevance + classification + short summary -> export -> read-only UI
 ```
 
-`ai-review` 是独立的 AI 编辑预处理阶段：先按来源策略做确定性初筛，再对保留条目逐条分类并生成中文简要总结。它不会调用 `_verify`、文章/证据 HTTP、claim、entity、triage、cluster、compose 或推荐门禁。每条候选的导出记录显式写入 `evidence_status=not_run` 和 `verification_status=not_run`；筛除条目和 provider 失败条目仍在 `ai_review_audit.jsonl` 与数据库中保留。
+AI review 对每个候选条目执行一次结构化分析，输出 `keep`、`content_class`、中文摘要、理由、风险标记、可选官方链接候选和置信度。AI 结果是编辑分析输出，不是来源背书；系统不会再启动旧的 claim、entity、事件聚类或日报编辑阶段。
 
-导出同时保留来源路由字段 `content_class`，并增加不落库的 `editorial_section` 栏目字段（`model_product`、`industry_infrastructure`、`research`、`open_source_tool`、`practice_opinion`）。栏目值只依据现有 `content_class`、标题和摘要做确定性映射，用于 V3 日报预分栏；它不是 AI 核实结果，也不替代后续 triage、evidence 或 verification。
+## 内容类别与来源归因
 
-P1/P2 官方 feed 在时间窗口内即使标题未命中确定性关键词，也会进入 AI 初筛；此时保留 `official_keyword_missing` 风险标记，不把关键词缺失当作硬过滤。
+| `content_class` | 典型来源 | 处理方式 |
+| --- | --- | --- |
+| `official_model_company` | 官方模型、公司产品、API 和研究更新 | 按来源身份、时间窗口和关键词筛选，再交给 AI 分类和摘要 |
+| `project_tool` | GitHub、Product Hunt、AI 工具项目 | 按项目指标和时间窗口筛选；GitHub 项目可生成一次项目摘要 |
+| `community_social` | X、Reddit、RSSHub、论坛 | 作为社区线索参与 AI 分类；输出保留来源归因和风险标记 |
 
-V3 日报链路以事件（`events`）为选入单元，按以下顺序运行：
+导出和 UI 保留 `source_id`、`source_name`、`source_group`、`source_subtype`、`source_role`、`transport`、`tier` 与 `x_official` 等来源字段。X 官方账号可通过 `source_group=x_official`、`source_role=official` 和 `x_official=true` 归因；这些字段只描述来源身份。
 
-```text
-source registry -> fetch + source health -> enrich -> triage
--> cluster -> compose -> publication gates -> daily export
-```
+## 抓取来源
 
-`intel_items` 是来源信号；`documents` 保存最小内容快照；`events` 汇聚同一事件的多个来源；`daily_editions` 和 `daily_event_entries` 保存每日选稿、门禁结果和渲染快照。各阶段均可单独运行，重复执行使用幂等 upsert，不需要网页请求触发。
+来源配置位于 `app/config/source_registry.yaml`。唯一的抓取路由字段是 `transport`：`feed`、`rsshub` 或 `github`；Feed 细节在 `feed` 下，GitHub 细节在 `github` 下。当前保留原生 RSS/Atom、RSSHub、GitHub Trending/Search/Releases 和 Product Hunt Atom 采集器。
 
-## 内容分流
+本地 RSSHub 的 X 认证路径只有 `TWITTER_AUTH_TOKEN`。`scripts/start_rsshub.sh` 会保留该 token 和 `PROXY_URI`，并显式移除 OAuth 与第三方 X API 变量；脚本在默认 Node 不受支持时会优先尝试 NVM Node 24，再回退到 Node 22。
 
-| content_class | 适用内容 | 确定性筛选 | 处理语义 |
-| --- | --- | --- | --- |
-| `official_model_company` | 官方模型、模型卡、公司产品和 API 更新 | 最近 30 天 + 发布/模型/API/版本/价格关键词 | 一个官方直链成功才是 `verified`，否则 `needs_review` |
-| `project_tool` | GitHub Trending/Search、Product Hunt、AI 工具 | GitHub Trending 使用 daily/weekly 周期 Star；Search 使用最近 7 天 push 且 `stars > 100`；Product Hunt 按时间和热度 | metadata 驱动的 `hotspot`，不要求第三方证据 |
-| `community_social` | X、Reddit、RSSHub、论坛讨论 | 最近 7 天 + 关键词或互动信号 | `discovery_only`，不能单独形成高可信结论 |
+## 数据模型
 
-来源配置位于 `app/config/source_registry.yaml`，唯一的抓取路由字段是 `transport`：`feed`、`rsshub` 或 `github`。Feed 细节放在 `feed.format`（`rss`/`atom`）和 `feed.adapter`（`generic`/`producthunt`）中，GitHub 细节放在 `github.mode`（`search`/`releases`/`trending`）及其选项中；不再使用 `type`、`collector_type` 或 `parser_type`。
+新数据库只由当前 ORM metadata 初始化，旧数据库不提供迁移兼容。保留的五张核心表为：
 
-## 数据抓取途径
+- `sources`：来源配置、内容类别、来源归因和健康状态。
+- `fetch_attempts`：请求状态、HTTP 信息、重试和错误记录。
+- `intel_runs`：一次抓取、AI review 或 `run-once` 的运行汇总。
+- `intel_items`：标准化条目、原始 payload、指标、选择状态和来源关联。
+- `ai_item_reviews`：每条最多一条结构化 AI 分析结果和原始响应。
 
-当前 registry 共 67 条来源定义（63 条启用，4 条停用），实现方式如下：
-
-| transport | 具体途径 | 实现方式 | 典型来源 |
-| --- | --- | --- | --- |
-| `feed` | 原生 RSS | 共享 HTTP 客户端获取 RSS，通用 feed parser 标准化 | OpenAI、Google Research、OpenRouter、NVIDIA、AWS、Hugging Face、LINUX DO |
-| `feed` | 原生 Atom | 同一 feed parser 解析 Atom | Reddit LocalLLaMA |
-| `feed` | Product Hunt Atom | Atom feed + `producthunt` adapter；先从 feed 提取，发现 GitHub 链接时可复用 GitHub metadata enrichment | Product Hunt |
-| `rsshub` | RSSHub 配置路由 | `${RSSHUB_BASE_URL}` 解析模板 URL，响应仍按 RSS/Atom 解析 | X 账号、X 搜索、Anthropic 路由 |
-| `github` | Trending HTML | GitHub Trending daily/weekly 页面解析周期 Star | GitHub Trending Daily/Weekly |
-| `github` | REST Search API | `/search/repositories` 按 query、sort、order 和 pushed window 查询 | topic:llm、topic:rag 等 |
-| `github` | REST Releases API | 仓库 releases endpoint 读取近期版本 | Ollama、Transformers |
-
-未知 `transport` 或不匹配的嵌套选项会被配置校验拒绝，不会静默降级到 feed。
-
-registry 的来源组清单（启用时）：
-
-| 来源组 | 数量 | 配置/路由范围 |
-| --- | ---: | --- |
-| 官方博客 | 6 | `openai_news`、`google_deepmind_blog`、`huggingface_blog`、`openrouter_blog`、`nvidia_ai_blog`、`aws_machine_learning_blog`，原生 RSS |
-| 官方研究 | 1 | `google_research_blog`，原生 RSS |
-| Product Hunt | 1 | `producthunt_feed`，Atom + `producthunt` adapter |
-| LINUX DO | 2 | `linux_do_top`、`linux_do_hot`，原生 RSS |
-| Reddit LocalLLaMA | 14 | new/hot/top 及 9 个主题搜索，Atom |
-| RSSHub X | 26 | 21 个账号路由 + 5 个搜索路由，RSSHub 模板 URL |
-| RSSHub Anthropic | 3 | news/research/engineering 路由，RSSHub 模板 URL |
-| GitHub | 10 | Trending daily/weekly、6 个 topic Search、Ollama/Transformers Releases |
-
-合计 63 条启用来源；另有 4 条 registry 定义默认停用。RSSHub 组在未设置
-`RSSHUB_BASE_URL` 时按条目跳过，不影响其他 34 条非模板来源。
-
-## 代码边界
-
-```text
-app/
-├─ config/                 # Settings 和 source registry
-├─ collectors/             # 按 transport 拆分的 Feed/RSSHub/GitHub 请求与字段映射
-├─ parsers/                # feed 解析
-├─ domain/                 # DTO、来源策略、确定性筛选、轻量核实
-├─ ai/                     # 一条目一次结构化 AI 分析
-├─ storage/                # v2 ORM、Repository、数据库和 UI 只读查询
-├─ jobs/                   # v2 intel 与 V3 daily 阶段编排
-├─ github/report.py        # 按日期生成 GitHub Trending Markdown 报告
-├─ storage/github_reader.py # 从标准 intel_items.jsonl 读取 GitHub metadata
-├─ pipeline/normalize.py   # 无数据库依赖的基础文本/URL 标准化工具
-└─ web/                    # 现有 FastAPI/Jinja UI，当前阶段不改
-```
-
-旧 claim、evidence、recommendation 阶段和对应客户端、表模型、脚本已经移除。数据库只由当前 ORM metadata 初始化；本阶段不提供迁移框架，也不对旧数据库做兼容迁移。若本地数据库来自旧版本，请先备份 SQLite 文件，再在停机窗口删除旧文件并运行 `python -m app.main fetch-only` 或 `python -m app.main run-daily`，由 `init_db()` 重建完整 schema。实现和测试期间使用临时隔离 SQLite 路径，不会删除仓库当前 `data/` 数据库。
-
-## 数据表
-
-- `sources`：来源、调度间隔、内容类别和 JSON 策略。
-- `fetch_attempts`：每次请求的状态、HTTP 状态、传输方式、重试、字节数和错误。
-- `intel_runs`：一次 `run-once` 或单阶段执行的汇总状态。
-- `intel_items`：统一条目、canonical URL、指标、原始 payload、内容 hash 和选择状态。
-- `ai_item_reviews`：每条最多一条结构化模型结果，保留原始响应。
-- `item_verifications`：官方直链、项目 metadata 或社区 discovery 的轻量结果。
-- `documents`、`triage_reviews`：V3 最小文档快照、确定性预筛和结构化 triage 原始响应。
-- `events`、`event_evidence`、`cluster_decisions`：事件身份、来源证据关系和 exact/fuzzy 聚类判断。
-- `event_editorial_reviews`、`daily_editions`、`daily_event_entries`：带证据引用的事件文案、发布门禁和每日顺序快照。
-
-GitHub 项目使用稳定的 `github_repo:*` 标识或 canonical URL 去重；指标保存在 `metrics_json`，包括累计 stars、周期新增 Star、forks、pushed_at、Trending rank 和 Search topic。当前只保留最新合并指标，不建立历史 Star 快照表。
-
-## 安装
+## 安装与配置
 
 ```bash
 uv sync --extra test
-```
-
-也可以使用 Python 3.12 的虚拟环境安装项目依赖：
-
-```bash
+# 或
 python -m pip install -e ".[test]"
 ```
 
-## 配置
-
-复制 `.env.example` 为 `.env`。最小配置：
+复制 `.env.example` 为 `.env`，至少配置：
 
 ```env
 DATABASE_URL=sqlite:///./data/ai_tool_intel.db
 ```
 
-常用可选配置：
+常用配置：
 
 ```env
-HTTP_PROXY=http://127.0.0.1:2080
-HTTPS_PROXY=http://127.0.0.1:2080
-NO_PROXY=127.0.0.1,localhost,::1
 RSSHUB_BASE_URL=http://127.0.0.1:1200
 RSSHUB_PORT=1200
+TWITTER_AUTH_TOKEN=
 PROXY_URI=http://127.0.0.1:2080
-GITHUB_TOKEN=your-github-token
-AI_REVIEW_API_URL=https://api.deepseek.com
-AI_REVIEW_API_KEY=your-key
-AI_REVIEW_MODEL=deepseek-v4-flash
-AI_REVIEW_API_STYLE=openai_chat
+GITHUB_TOKEN=
+AI_REVIEW_API_URL=
+AI_REVIEW_API_KEY=
+AI_REVIEW_MODEL=
+AI_REVIEW_API_STYLE=generic_json
 AI_REVIEW_TIMEOUT_SECONDS=30
 ```
 
-### `.env` 参数说明
+真实 token、API key、Cookie 和代理地址只放在本地 `.env`，不要写入 README 或提交到 Git。Product Hunt 使用公开 Atom feed，不需要额外 token。
 
-项目只读取根目录的 `.env`；请先复制 `.env.example`，再填入本机配置。
-`.env` 已被 Git 忽略，真实 token、API key 和代理地址不要写入 README 或提交到仓库。
+## CLI
 
-| 参数 | 必填 | 默认值/示例 | 用途 |
-| --- | --- | --- | --- |
-| `DATABASE_URL` | 否 | `sqlite:///./data/ai_tool_intel.db` | SQLite 或其他 SQLAlchemy 数据库连接串。 |
-| `REQUEST_TIMEOUT_SECONDS` | 否 | `20` | Python 外部请求超时时间，单位为秒。 |
-| `REQUEST_RETRIES` | 否 | `2` | 单个来源的重试次数。 |
-| `USER_AGENT` | 否 | `AItool_scraping/0.1 (+https://example.local)` | Python HTTP 请求的 User-Agent。 |
-| `HTTP_PROXY` | 否 | 例如 `http://127.0.0.1:2080` | Reddit、LINUX DO、GitHub 等外部 Python 请求使用的 HTTP 代理。 |
-| `HTTPS_PROXY` | 否 | 例如 `http://127.0.0.1:2080` | 外部 HTTPS 请求使用的代理；通常与 `HTTP_PROXY` 保持一致。 |
-| `ALL_PROXY` | 否 | 留空 | httpx 可用的全协议代理兜底配置。 |
-| `NO_PROXY` | 否 | `127.0.0.1,localhost,::1` | 不走代理的地址列表；应包含本地 RSSHub 地址。 |
-| `RSSHUB_BASE_URL` | X/RSSHub 必填 | `http://127.0.0.1:1200` | Python 访问 RSSHub 的基础地址；为空时跳过 RSSHub 模板来源。 |
-| `RSSHUB_PORT` | 启动本地 RSSHub 时必填 | `1200` | `scripts/start_rsshub.sh` 传给 Node RSSHub 的监听端口，必须与 `RSSHUB_BASE_URL` 的端口一致。 |
-| `PROXY_URI` | X 使用外部代理时填写 | 例如 `http://127.0.0.1:2080` | RSSHub Node 进程访问 X 等外部服务时使用的代理；留空表示 RSSHub 直连。 |
-| `TWITTER_AUTH_TOKEN` | X 推荐 | 留空 | RSSHub 的 Web API 认证 token；配置后优先走 RSSHub Web API 路径。 |
-| `TWITTER_CONSUMER_KEY` | OAuth 备用 | 留空 | X OAuth 1.0a consumer key。 |
-| `TWITTER_CONSUMER_SECRET` | OAuth 备用 | 留空 | X OAuth 1.0a consumer secret。 |
-| `TWITTER_ACCESS_TOKEN` | OAuth 备用 | 留空 | X OAuth 1.0a access token。 |
-| `TWITTER_ACCESS_SECRET` | OAuth 备用 | 留空 | X OAuth 1.0a access secret。四个 OAuth 参数需要成组配置。 |
-| `GITHUB_API_BASE_URL` | 否 | `https://api.github.com` | GitHub API 地址。 |
-| `GITHUB_TOKEN` | GitHub API 推荐 | 留空 | GitHub API token。 |
-| `GITHUB_API_TOKEN` | 否 | 留空 | `GITHUB_TOKEN` 为空时使用的兼容别名。 |
-| `GITHUB_API_VERSION` | 否 | `2022-11-28` | GitHub API 版本请求头。 |
-| `GITHUB_TIMEOUT_SECONDS` | 否 | `20` | GitHub API 请求超时时间，单位为秒。 |
-| `AI_REVIEW_API_URL` | 否 | 留空 | AI review 服务地址；为空时不调用 AI review。 |
-| `AI_REVIEW_API_KEY` | 启用 AI review 时必填 | 留空 | AI review 服务密钥。 |
-| `AI_REVIEW_MODEL` | 启用 AI review 时填写 | 留空 | AI review 使用的模型名。 |
-| `AI_REVIEW_API_STYLE` | 否 | `generic_json` | AI review API 协议风格：`generic_json`、`openai_chat` 或 `openai_responses`。使用 `openai_responses` 时，`AI_REVIEW_API_URL=http://127.0.0.1:8317/v1` 会请求 `/v1/responses`。 |
-| `AI_REVIEW_TIMEOUT_SECONDS` | 否 | `30` | AI review 请求超时时间，单位为秒。 |
-
-代理和端口的关系固定如下：
-
-- Reddit、LINUX DO、GitHub 等外部来源由 Python 使用 `HTTP_PROXY`/`HTTPS_PROXY`；
-  Reddit 默认不追加 `raw_json=1`。
-- RSSHub/X 的 Python 请求直接访问 `RSSHUB_BASE_URL`，不继承外部 Python 代理；
-  RSSHub Node 进程自身使用 `PROXY_URI` 访问 X。
-- 本地启动时只执行 `bash scripts/start_rsshub.sh`。脚本只读取根 `.env` 的
-  `RSSHUB_PORT` 和 `PROXY_URI`，不读取其他目录的 `.env`，也不使用 Docker。
-
-未配置 `RSSHUB_BASE_URL` 时，依赖模板 URL 的来源会被跳过并记录原因。Product Hunt 始终使用公开 Atom feed，不读取或发送 API token。
-
-本地 RSSHub 当前需要 Node.js 22.22.2+ 或 24.15.0+。首次运行前在
-`../RSSHub` 执行 `corepack pnpm install --frozen-lockfile && corepack pnpm build`。
-
-## 运行
-
-逐阶段运行：
+保留的命令：
 
 ```bash
-python -m app.main fetch --class project_tool
-python -m app.main ai-review --class project_tool --limit 100 --output-dir output/ai-review
-python -m app.main process --class project_tool --limit 100
-python -m app.main export --output-dir output/intel
-```
-
-第一阶段抓取与导出可单独运行，不会调用 process、AI、evidence、triage、cluster、compose 或推荐阶段：
-
-```bash
-python -m app.main fetch-only --source openai_news --force --output-dir output/fetch
-```
-
-`fetch-only` 写出 `fetch_items.json`、`fetch_items.jsonl` 和 `fetch_items.md`。每条记录都包含
-`source_id`、来源名称、`transport`、`source_group`、`source_subtype`、`tier`、`role`；X 官方账号的
-`x_official` 为 `true`，`x_social`/`x_search` 保持发现性质并标为 `false`。抓取失败按来源隔离，单一来源失败不会中断批次。
-
-`ai-review` 写出 `ai_review_candidates.jsonl`（保留候选）、`ai_review_audit.jsonl`（包含 filtered/rejected/ai_failed 的全部审计记录）和 `ai_review_digest.md`。候选文件含标题、来源字段、`content_class`、输出层 `editorial_section`、AI 分类、中文简要总结、keep、confidence、风险以及明确的 `evidence_status/verification_status=not_run`。
-
-日常 AI-only 入口：
-
-```bash
-python -m app.main run-once --limit 100
-```
-
-`run-once` 固定执行 `fetch -> ai-review -> export`；显式 `process` 仍保留为
-后续核实兼容入口，普通入口不会调用 evidence/verification HTTP。
-
-常用参数：
-
-- `--source SOURCE_ID`：只处理一个来源。
-- `--class official_model_company|project_tool|community_social`：只处理一个内容类别。
-- `--limit N`：限制当前阶段条目数。
-- `--force`：忽略抓取冷却并重新处理已有条目。
-- `--dry-run`：使用临时 SQLite 和内存输出，不写目标数据库或输出目录。
-
-### V3 日报命令
-
-```bash
+python -m app.main fetch [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
+python -m app.main fetch-only [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
+python -m app.main ai-review [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
+python -m app.main export [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N]
+python -m app.main run-once [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
 python -m app.main source-health [--source SOURCE_ID]
-python -m app.main enrich [--source SOURCE_ID] [--limit N] [--force]
-python -m app.main triage [--source SOURCE_ID] [--limit N] [--force]
-python -m app.main cluster [--limit N] [--force]
-python -m app.main compose [--limit N] [--force]
-python -m app.main daily-export [--date YYYY-MM-DD] [--output-dir output/daily] [--force]
-python -m app.main run-daily [--date YYYY-MM-DD] [--limit N] [--force]
 ```
 
-`source-health` 只读输出来源状态、连续失败次数、错误码和下一次可抓取时间。`fetch` 对 RSS/Atom 来源会发送已保存的 `ETag` / `Last-Modified` 条件请求；HTTP 304 视为成功并推进冷却，403/429 等失败按来源隔离并指数退避。
+`run-once` 固定执行 `fetch -> ai-review -> export`。`fetch-only` 只抓取并输出标准化条目及来源归因，不调用 AI。`ai-review` 输出：
 
-来源治理字段位于 `app/config/source_registry.yaml`，包括 `tier`、`topic_scopes`、`primary_eligible` 和 `citation_policy`。每日配额、窗口、来源组上限和各 section 目标位于 `app/config/daily_profile.yaml`；修改后由严格模型校验，GitHub 还有跨子组 aggregate cap。
+- `ai_review_candidates.jsonl`：AI 选择且分析成功的候选。
+- `ai_review_audit.jsonl`：过滤、拒绝和 AI 失败等审计记录。
+- `ai_review_digest.md`：候选的中文摘要和来源信息。
 
-本地 RSSHub 启动入口：
+`export` 默认写入 `output/intel/`：
+
+- `intel_items.jsonl`：AI 选择结果与来源归因。
+- `intel_pending.jsonl`：尚未分析或 AI 失败的条目。
+- `intel_digest.md`：分类、状态、指标、风险和链接摘要。
+
+GitHub 项目保留抓取到的 stars、forks、Trending 周期指标、topics 和 README 摘要；AI 不替代项目指标筛选，也不会生成未提供的增长数据。
+
+本地 RSSHub 启动：
 
 ```bash
 bash scripts/start_rsshub.sh
 ```
 
-数据脚本入口：
+## Web UI
 
-```bash
-python scripts/init_db.py
-python scripts/run_fetch_once.py
-python scripts/run_intel_once.py
-```
-
-## 导出
-
-`export` 默认写入 `output/intel/`。AI review 的 `selected` 且 `keep=true`
-条目无需 evidence/verification 即可进入普通导出：
-
-- `intel_items.jsonl`：AI 已选条目（`selected`）以及兼容的 `verified`、`hotspot`、`discovery_only` 条目。
-- `intel_pending.jsonl`：`needs_review`、`ai_failed` 或尚未分析的条目。
-- `intel_digest.md`：分类、状态、指标、风险和链接摘要。
-- `output/github-trending/YYYY/MM/YYYYMMDD.md`：GitHub Trending daily/weekly 和 Search API 补充候选报告。
-
-GitHub 项目先按累计 Star、Trending daily/weekly 周期 Star、Fork 等已抓取指标做确定性筛选，AI 不参与保留决策。选中的唯一仓库最多执行一次项目摘要调用，生成项目介绍、主要能力、适用场景和风险提示；Trending HTML 的 `stars today`、`stars this week` 仍以原始周期指标写入报告，Search API 不生成虚假的周增长。
-
-V3 `daily-export` 默认写入：
-
-- 发布日报：`output/daily/YYYY/MM/YYYY-MM-DD.md`
-- 发布审计：`output/daily/YYYY/MM/YYYY-MM-DD.events.jsonl`
-- 门禁未通过：`output/daily/YYYY/MM/YYYY-MM-DD.draft.md`
-- 阻塞/待处理审计：`output/daily/YYYY/MM/YYYY-MM-DD.pending.jsonl`
-
-同一天已有 `published` edition 时，默认不会覆盖；只有传入 `--force` 才会重算。低信息日会保留明确的 machine-readable gate failures，不会用社交或噪声条目填充缺口。
+FastAPI/Jinja UI 只读取数据库和已生成报告，展示来源归因、AI 分类、摘要、风险和选择状态；请求过程中不会运行 collector、AI、搜索或其他处理任务。
 
 ## 验证
 
 ```bash
-RSSHUB_BASE_URL= uv run --extra test pytest -q
-uv run python -m compileall -q app scripts
-uv run python -m app.main --help
+TMPDIR=/tmp python -m pytest -q
+python -m compileall -q app scripts
+python -m app.main --help
 ```
-
-UI 只读取数据库和已生成的 `intel_items.jsonl`；本阶段不在请求中执行 collector、AI 或核实任务。

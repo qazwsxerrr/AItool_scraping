@@ -22,7 +22,6 @@ from .models import (
     SourceTransport,
     Transport,
     TrendingPeriod,
-    VerificationPolicy,
 )
 from .policies import (
     classify_source,
@@ -31,7 +30,6 @@ from .policies import (
     source_spec_from_config,
 )
 from .scoring import score_item
-from .verification import VerificationResult, verify_item
 
 __all__ = [
     "COMMUNITY_SOCIAL",
@@ -55,12 +53,9 @@ __all__ = [
     "SourceTransport",
     "Transport",
     "TrendingPeriod",
-    "VerificationPolicy",
     "classify_source",
     "selection_decision",
     "should_select",
     "source_spec_from_config",
     "score_item",
-    "VerificationResult",
-    "verify_item",
 ]

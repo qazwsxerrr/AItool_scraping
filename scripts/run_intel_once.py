@@ -1,4 +1,4 @@
-"""Thin scheduled-task wrapper for the v2 fetch -> process -> export flow."""
+"""Thin scheduled-task wrapper for the fetch -> AI review -> export flow."""
 
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ def main(
         f"skipped={result.fetch.total_skipped} failed={result.fetch.total_failed}"
     )
     typer.echo(
-        f"process: processed={result.process.processed} selected={result.process.selected} "
-        f"analyzed={result.process.analyzed} failed={result.process.failed}"
+        f"ai-review: processed={result.ai_review.processed} selected={result.ai_review.selected} "
+        f"analyzed={result.ai_review.analyzed} failed={result.ai_review.failed}"
     )
     typer.echo(f"export: exported={result.export.exported} pending={result.export.pending}")
     typer.echo(f"run_id={result.run_id} status={result.status}")

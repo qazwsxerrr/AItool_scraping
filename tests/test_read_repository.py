@@ -1,138 +1,82 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelItem, IntelItemVerification, IntelRun, Source
+from app.storage.models import AIItemReview, IntelItem, IntelRun, Source
 from app.storage.read_repository import AllItemFilters, UIReadRepository
+
+
+def _make_session_factory(db_path):
+    engine = create_engine_from_url(f"sqlite:///{db_path}")
+    init_db(engine)
+    return create_session_factory(engine)
 
 
 def test_read_repository_returns_empty_ui_state(tmp_path):
     session_factory = _make_session_factory(tmp_path / "empty.db")
     with session_factory() as session:
         repo = UIReadRepository(session)
-        stats = repo.get_dashboard_stats()
-        assert stats.raw_items == 0
-        assert stats.recommendations == 0
+        assert repo.get_dashboard_stats().raw_items == 0
         assert repo.list_featured_cards() == []
         assert repo.list_all_items() == []
 
 
-def test_read_repository_maps_v2_items_to_existing_ui_dtos(tmp_path):
+def test_read_repository_maps_ai_items_and_source_attribution(tmp_path):
     session_factory = _make_session_factory(tmp_path / "ui.db")
-    published_at = datetime(2026, 8, 4, 8, 0, tzinfo=timezone.utc)
     with session_factory() as session:
         source = Source(
-            id="github_releases",
-            name="GitHub Releases",
-            transport="feed",
-            url="https://example.com/feed.xml",
-            feed_format="rss",
-            feed_adapter="generic",
-            source_group="official_model_company",
-            source_subtype="official",
-            source_role="official",
-            content_class="official_model_company",
+            id="official_feed", name="Official Feed", transport="feed", url="https://example.com/feed.xml",
+            feed_format="rss", feed_adapter="generic", source_group="official_blog",
+            source_subtype="official", source_role="official", content_class="official_model_company",
         )
         item = IntelItem(
-            source_id=source.id,
-            external_id="release-1",
-            title="Claude Code v2 发布",
-            canonical_url="https://example.com/claude-code",
-            published_at=published_at,
-            summary="Claude Code release summary",
-            content_text="Claude Code supports MCP reconnect.",
-            content_class="official_model_company",
-            metrics_json=json.dumps({"stars": 100}),
-            raw_payload_json="{}",
-            content_hash="hash-ui-1",
-            selection_score=88,
-            status="verified",
+            source_id=source.id, external_id="release-1", title="Claude Code v2 发布",
+            canonical_url="https://example.com/claude-code", published_at=datetime(2026, 8, 4, 8, tzinfo=timezone.utc),
+            summary="source summary", content_text="supports MCP", content_class="official_model_company",
+            content_hash="hash-ui-1", selection_score=88, status="selected",
         )
-        session.add_all(
-            [
-                source,
-                item,
-                AIItemReview(
-                    item=item,
-                    model="review-model",
-                    keep=True,
-                    content_class="official_model_company",
-                    confidence=92,
-                    reason="official release",
-                    summary_cn="Claude Code 发布了一次实用更新。",
-                    raw_response_json="{}",
-                ),
-                IntelItemVerification(
-                    item=item,
-                    mode="official_direct_link",
-                    status="verified",
-                    verification_url="https://example.com/claude-code",
-                    source_domain="example.com",
-                    http_status=200,
-                    title="Claude Code v2 发布",
-                    supports_basic_fact=True,
-                    risk_flags_json="[]",
-                ),
-                IntelRun(status="completed"),
-            ]
+        item.ai_review = AIItemReview(
+            model="review-model", keep=True, content_class="official_model_company", confidence=92,
+            reason="official release", summary_cn="Claude Code 发布了一次实用更新。", raw_response_json="{}",
         )
+        session.add_all([source, item, IntelRun(status="completed")])
         session.commit()
 
     with session_factory() as session:
         repo = UIReadRepository(session)
         cards = repo.list_featured_cards(limit=10)
-        direct_cards = repo.list_featured_cards(direct_support_only=True, limit=10)
         items = repo.list_all_items(filters=AllItemFilters(query="Claude"))
         results = repo.search_content("Claude")
 
     assert len(cards) == 1
     assert cards[0].title == "Claude Code v2 发布"
-    assert cards[0].total_score == 88
-    assert cards[0].direct_support_count == 1
-    assert len(direct_cards) == 1
+    assert cards[0].source_group == "official_blog"
+    assert cards[0].ai_keep is True
     assert len(items) == 1
-    assert items[0].source_name == "GitHub Releases"
-    assert items[0].ai_keep is True
+    assert items[0].source_name == "Official Feed"
     assert results.recommendations[0].title == "Claude Code v2 发布"
-    assert results.claims == []
-    assert results.evidence == []
+    assert not hasattr(results, "evidence")
 
 
-def test_read_repository_uses_v2_statuses_and_keeps_project_hotspots_without_ai(tmp_path):
-    session_factory = _make_session_factory(tmp_path / "v2-contract.db")
+def test_project_hotspot_and_ai_failure_statuses(tmp_path):
+    session_factory = _make_session_factory(tmp_path / "status.db")
     with session_factory() as session:
         source = Source(
-            id="github_trending",
-            name="GitHub Trending",
-            transport="github",
-            url="https://github.com/trending",
-            source_group="github",
-            source_subtype="trending",
-            content_class="project_tool",
+            id="github_trending", name="GitHub Trending", transport="github", url="https://github.com/trending",
+            source_group="github_trending", source_subtype="trending", content_class="project_tool",
         )
         project = IntelItem(
-            source_id=source.id,
-            external_id="github_repo:demo/project",
-            title="Demo project",
-            canonical_url="https://github.com/demo/project",
-            published_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
-            content_class="project_tool",
-            content_hash="project-contract",
-            selection_score=0,
-            status="hotspot",
+            source_id=source.id, external_id="github_repo:demo/project", title="Demo project",
+            canonical_url="https://github.com/demo/project", content_class="project_tool",
+            content_hash="project-contract", status="hotspot",
         )
-        pending = IntelItem(
-            source_id=source.id,
-            external_id="github_repo:demo/pending",
-            title="Pending project",
-            canonical_url="https://github.com/demo/pending",
-            content_class="project_tool",
-            content_hash="pending-contract",
-            status="needs_review",
+        failed = IntelItem(
+            source_id=source.id, external_id="github_repo:demo/failed", title="Failed project",
+            canonical_url="https://github.com/demo/failed", content_class="project_tool",
+            content_hash="failed-contract", status="ai_failed",
         )
-        session.add_all([source, project, pending])
+        session.add_all([source, project, failed])
         session.commit()
 
     with session_factory() as session:
@@ -140,76 +84,9 @@ def test_read_repository_uses_v2_statuses_and_keeps_project_hotspots_without_ai(
         stats = repo.get_dashboard_stats()
         cards = repo.list_featured_cards()
         options = repo.list_filter_options()
-        filtered = repo.list_all_items(
-            filters=AllItemFilters(content_class="project_tool", status="hotspot")
-        )
 
-    assert stats.selected_items == 1
     assert stats.hotspots == 1
-    assert stats.needs_review_items == 1
+    assert stats.ai_failed_items == 1
     assert cards[0].status == "hotspot"
-    assert cards[0].content_class == "project_tool"
-    assert "project_tool" in options.content_classes
     assert "hotspot" in options.statuses
-    assert [row.title for row in filtered] == ["Demo project"]
-
-
-def test_ai_selected_without_verification_is_featured_and_searchable(tmp_path):
-    session_factory = _make_session_factory(tmp_path / "ai-selected.db")
-    with session_factory() as session:
-        source = Source(
-            id="official_ai_selected",
-            name="Official AI feed",
-            transport="feed",
-            url="https://example.test/feed.xml",
-            source_group="official_blog",
-            source_subtype="fixed_news",
-            source_role="official",
-            content_class="official_model_company",
-        )
-        item = IntelItem(
-            source_id=source.id,
-            external_id="ai-selected-1",
-            title="AI-selected update",
-            canonical_url="https://example.test/update",
-            summary="source summary",
-            content_class="official_model_company",
-            content_hash="ai-selected-contract",
-            selection_score=82,
-            status="selected",
-        )
-        session.add_all(
-            [
-                source,
-                item,
-                AIItemReview(
-                    item=item,
-                    status="success",
-                    keep=True,
-                    content_class="official_model_company",
-                    confidence=91,
-                    summary_cn="AI 生成摘要",
-                    reason="AI 保留",
-                    raw_response_json="{}",
-                ),
-            ]
-        )
-        session.commit()
-
-    with session_factory() as session:
-        repo = UIReadRepository(session)
-        cards = repo.list_featured_cards()
-        results = repo.search_content("AI-selected")
-        all_items = repo.list_all_items(filters=AllItemFilters(query="AI-selected"))
-
-    assert [card.title for card in cards] == ["AI-selected update"]
-    assert cards[0].ai_keep is True
-    assert cards[0].verification_status is None
-    assert results.selected_items[0].title == "AI-selected update"
-    assert all_items[0].summary_cn == "AI 生成摘要"
-
-
-def _make_session_factory(db_path):
-    engine = create_engine_from_url(f"sqlite:///{db_path}")
-    init_db(engine)
-    return create_session_factory(engine)
+    assert "ai_failed" in options.statuses

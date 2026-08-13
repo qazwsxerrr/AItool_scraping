@@ -1,8 +1,7 @@
 """Fetch-only orchestration and export for the first pipeline stage.
 
 This module intentionally stops after collectors persist normalized
-``intel_items``.  It does not import or invoke processing, AI, evidence,
-triage, clustering, composition, or recommendation jobs.
+``intel_items``. It does not invoke AI review or export jobs.
 """
 
 from __future__ import annotations
@@ -60,7 +59,7 @@ def run_fetch_only_job(
 
     ``run_intel_fetch_job`` is the existing source-isolated persistence
     boundary.  The export query deliberately reads every item, including
-    rows with status ``new``; no later process/AI stage is required.
+    rows with status ``new``; later AI review is an explicit separate command.
     """
 
     fetch = run_intel_fetch_job(
@@ -235,9 +234,8 @@ def _source_metadata(source: Source | None) -> dict[str, Any]:
         "x_official": group == "x_official",
         "source_url": source.url if source is not None else None,
         "content_class": source.content_class if source is not None else None,
-        "citation_policy": source.citation_policy if source is not None else None,
         "primary_eligible": bool(source.primary_eligible) if source is not None else False,
-        "account_verification_url": source.account_verification_url if source is not None else None,
+        "account_url": source.account_url if source is not None else None,
     }
 
 

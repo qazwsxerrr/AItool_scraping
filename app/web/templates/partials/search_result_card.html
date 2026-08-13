@@ -18,9 +18,8 @@
     {% if result.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ result.selection_reason }}</p>{% endif %}
     <div class="badges">
       {% for badge in result.badges %}
-        <span class="badge {{ 'danger' if badge in ['contradict', 'failed', 'broken', 'stale', 'ai_failed'] else 'success' if badge in ['support', 'direct_support', 'completed', 'verified'] else 'primary' if loop.first else '' }}">{{ badge | status_label if badge in ['verified', 'hotspot', 'discovery_only', 'needs_review', 'ai_failed', 'filtered', 'rejected', 'new', 'selected'] else (badge | content_class_label if badge in ['official_model_company', 'project_tool', 'community_social'] else badge) }}</span>
+        <span class="badge {{ 'danger' if badge in ['failed', 'broken', 'stale', 'ai_failed'] else 'primary' if loop.first else '' }}">{{ badge | status_label if badge in ['hotspot', 'ai_failed', 'filtered', 'rejected', 'new', 'selected'] else (badge | content_class_label if badge in ['official_model_company', 'project_tool', 'community_social'] else badge) }}</span>
       {% endfor %}
-      {% if result.verification_status == 'verified' %}<span class="badge success">直接核实</span>{% endif %}
       {% if result.ai_status == 'ai_failed' %}<span class="badge warning">AI 处理失败</span>{% endif %}
     </div>
   </div>

@@ -15,16 +15,11 @@ sources:
   selection_policy:
     mode: official_recent
     max_age_days: 30
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
   tier: p1
   topic_scopes:
   - model_product
   primary_eligible: true
-  citation_policy: primary
 - id: google_deepmind_blog
   name: Google DeepMind Blog
   transport: feed
@@ -41,16 +36,11 @@ sources:
   selection_policy:
     mode: official_recent
     max_age_days: 30
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
   tier: p1
   topic_scopes:
   - model_product
   primary_eligible: true
-  citation_policy: primary
 - id: huggingface_blog
   name: Hugging Face Blog
   transport: feed
@@ -67,16 +57,11 @@ sources:
   selection_policy:
     mode: official_recent
     max_age_days: 30
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
   tier: p1
   topic_scopes:
   - model_product
   primary_eligible: true
-  citation_policy: primary
 - id: openrouter_blog
   name: OpenRouter Blog
   transport: feed
@@ -92,7 +77,6 @@ sources:
   quality_weight: 0.9
   source_role: official
   spam_risk: low
-  requires_verification: true
   content_class: official_model_company
   selection_policy:
     mode: official_recent
@@ -108,16 +92,11 @@ sources:
     - launch
     - pricing
     - eval
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
   tier: p1
   topic_scopes:
   - model_product
   primary_eligible: true
-  citation_policy: primary
 - id: google_research_blog
   name: Google Research Blog
   transport: feed
@@ -133,7 +112,6 @@ sources:
   quality_weight: 0.9
   source_role: official
   spam_risk: low
-  requires_verification: true
   content_class: official_model_company
   selection_policy:
     mode: official_recent
@@ -154,16 +132,11 @@ sources:
     - generative
     - gemini
     - machine
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
   tier: p1
   topic_scopes:
   - research
   primary_eligible: true
-  citation_policy: primary
 - id: nvidia_ai_blog
   name: NVIDIA AI Blog
   transport: feed
@@ -179,7 +152,6 @@ sources:
   quality_weight: 0.85
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: official_model_company
   selection_policy:
     mode: official_recent
@@ -196,16 +168,11 @@ sources:
     - foundation
     - open weights
     - accelerated computing
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
   tier: p1
   topic_scopes:
   - model_product
   primary_eligible: true
-  citation_policy: primary
 - id: aws_machine_learning_blog
   name: AWS Machine Learning Blog
   transport: feed
@@ -221,7 +188,6 @@ sources:
   quality_weight: 0.85
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: official_model_company
   selection_policy:
     mode: official_recent
@@ -237,16 +203,11 @@ sources:
     - embedding
     - transformer
     - neuron
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
   tier: p1
   topic_scopes:
   - model_product
   primary_eligible: true
-  citation_policy: primary
 - id: microsoft_research_feed
   name: Microsoft Research
   transport: feed
@@ -264,12 +225,7 @@ sources:
   - research
   - industry_infrastructure
   primary_eligible: true
-  citation_policy: primary
   content_class: official_model_company
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
 - id: nvidia_ai_platforms_news
   name: NVIDIA AI and Platforms News
@@ -288,12 +244,7 @@ sources:
   - industry_infrastructure
   - model_product
   primary_eligible: true
-  citation_policy: primary
   content_class: official_model_company
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
 - id: aws_whats_new_feed
   name: AWS What's New
@@ -312,12 +263,7 @@ sources:
   - industry_infrastructure
   - model_product
   primary_eligible: true
-  citation_policy: primary
   content_class: official_model_company
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
 - id: arxiv_ai_cl_ml_feed
   name: arXiv AI CL LG ML
@@ -335,12 +281,7 @@ sources:
   topic_scopes:
   - research
   primary_eligible: true
-  citation_policy: primary
   content_class: official_model_company
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
 - id: producthunt_feed
   name: Product Hunt Feed
@@ -360,14 +301,11 @@ sources:
     max_age_days: 30
     min_votes: 0
     sort: votes
-  verification_policy:
-    mode: metadata_only
   default_limit: 8
   tier: p3
   topic_scopes:
   - open_source_tool
   primary_eligible: false
-  citation_policy: supplementary
 - id: github_trending_daily_native
   name: GitHub Trending Daily
   transport: github
@@ -383,20 +321,16 @@ sources:
   quality_weight: 0.9
   source_role: code_hosting
   spam_risk: medium
-  requires_verification: false
   content_class: project_tool
   selection_policy:
     mode: github_trending
     period: daily
     sort: stars_since
-  verification_policy:
-    mode: metadata_only
   default_limit: 12
   tier: p3
   topic_scopes:
   - open_source_tool
   primary_eligible: false
-  citation_policy: supplementary
 - id: github_trending_weekly_native
   name: GitHub Trending Weekly
   transport: github
@@ -412,20 +346,16 @@ sources:
   quality_weight: 0.95
   source_role: code_hosting
   spam_risk: medium
-  requires_verification: false
   content_class: project_tool
   selection_policy:
     mode: github_trending
     period: weekly
     sort: stars_since
-  verification_policy:
-    mode: metadata_only
   default_limit: 12
   tier: p3
   topic_scopes:
   - open_source_tool
   primary_eligible: false
-  citation_policy: supplementary
 - id: github_search_topic_llm
   name: GitHub Search Topic LLM
   transport: github
@@ -444,21 +374,17 @@ sources:
   quality_weight: 0.75
   source_role: code_hosting
   spam_risk: medium
-  requires_verification: false
   content_class: project_tool
   selection_policy:
     mode: github_active_high_star
     pushed_days: 7
     min_stars: 100
     sort: stars
-  verification_policy:
-    mode: metadata_only
   default_limit: 10
   tier: p3
   topic_scopes:
   - open_source_tool
   primary_eligible: false
-  citation_policy: supplementary
 - id: github_search_topic_ai_agent
   name: GitHub Search Topic AI Agent
   transport: github
@@ -477,21 +403,17 @@ sources:
   quality_weight: 0.75
   source_role: code_hosting
   spam_risk: medium
-  requires_verification: false
   content_class: project_tool
   selection_policy:
     mode: github_active_high_star
     pushed_days: 7
     min_stars: 100
     sort: stars
-  verification_policy:
-    mode: metadata_only
   default_limit: 10
   tier: p3
   topic_scopes:
   - open_source_tool
   primary_eligible: false
-  citation_policy: supplementary
 - id: github_search_topic_rag
   name: GitHub Search Topic RAG
   transport: github
@@ -510,7 +432,6 @@ sources:
   quality_weight: 0.75
   source_role: code_hosting
   spam_risk: medium
-  requires_verification: false
   content_class: project_tool
   selection_policy:
     mode: github_active_high_star
@@ -518,15 +439,11 @@ sources:
     min_stars: 100
     sort: stars
     reserve_only: true
-    discovery_only: true
-  verification_policy:
-    mode: metadata_only
   default_limit: 10
   tier: p3
   topic_scopes:
   - open_source_tool
   primary_eligible: false
-  citation_policy: supplementary
 - id: github_search_topic_vector_database
   name: GitHub Search Topic Vector Database
   transport: github
@@ -545,7 +462,6 @@ sources:
   quality_weight: 0.75
   source_role: code_hosting
   spam_risk: medium
-  requires_verification: false
   content_class: project_tool
   selection_policy:
     mode: github_active_high_star
@@ -553,15 +469,11 @@ sources:
     min_stars: 100
     sort: stars
     reserve_only: true
-    discovery_only: true
-  verification_policy:
-    mode: metadata_only
   default_limit: 10
   tier: p3
   topic_scopes:
   - open_source_tool
   primary_eligible: false
-  citation_policy: supplementary
 - id: github_search_topic_large_language_model
   name: GitHub Search Topic Large Language Model
   transport: github
@@ -580,7 +492,6 @@ sources:
   quality_weight: 0.75
   source_role: code_hosting
   spam_risk: medium
-  requires_verification: false
   content_class: project_tool
   selection_policy:
     mode: github_active_high_star
@@ -588,15 +499,11 @@ sources:
     min_stars: 100
     sort: stars
     reserve_only: true
-    discovery_only: true
-  verification_policy:
-    mode: metadata_only
   default_limit: 10
   tier: p3
   topic_scopes:
   - open_source_tool
   primary_eligible: false
-  citation_policy: supplementary
 - id: github_search_topic_machine_learning
   name: GitHub Search Topic Machine Learning
   transport: github
@@ -615,7 +522,6 @@ sources:
   quality_weight: 0.75
   source_role: code_hosting
   spam_risk: medium
-  requires_verification: false
   content_class: project_tool
   selection_policy:
     mode: github_active_high_star
@@ -623,15 +529,11 @@ sources:
     min_stars: 100
     sort: stars
     reserve_only: true
-    discovery_only: true
-  verification_policy:
-    mode: metadata_only
   default_limit: 15
   tier: p3
   topic_scopes:
   - open_source_tool
   primary_eligible: false
-  citation_policy: supplementary
 - id: github_releases_ollama
   name: GitHub Releases Ollama
   transport: github
@@ -646,20 +548,16 @@ sources:
   quality_weight: 0.8
   source_role: code_hosting
   spam_risk: low
-  requires_verification: false
   content_class: project_tool
   selection_policy:
     mode: project_recent
     max_age_days: 30
     sort: published_at
-  verification_policy:
-    mode: metadata_only
   default_limit: 10
   tier: p2
   topic_scopes:
   - open_source_tool
   primary_eligible: true
-  citation_policy: primary
 - id: github_releases_transformers
   name: GitHub Releases Hugging Face Transformers
   transport: github
@@ -674,20 +572,16 @@ sources:
   quality_weight: 0.8
   source_role: code_hosting
   spam_risk: low
-  requires_verification: false
   content_class: project_tool
   selection_policy:
     mode: project_recent
     max_age_days: 30
     sort: published_at
-  verification_policy:
-    mode: metadata_only
   default_limit: 10
   tier: p2
   topic_scopes:
   - open_source_tool
   primary_eligible: true
-  citation_policy: primary
 - id: linux_do_top
   name: LINUX DO Top Topics
   transport: feed
@@ -704,14 +598,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 30
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: linux_do_hot
   name: LINUX DO Hot Topics
   transport: feed
@@ -728,14 +619,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 30
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_new
   name: Reddit LocalLLaMA New
   transport: feed
@@ -752,14 +640,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 40
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_hot
   name: Reddit LocalLLaMA Hot
   transport: feed
@@ -776,14 +661,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 25
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_top_day
   name: Reddit LocalLLaMA Top Day
   transport: feed
@@ -800,14 +682,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 20
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_top_week
   name: Reddit LocalLLaMA Top Week
   transport: feed
@@ -824,14 +703,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 20
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_search_agent
   name: Reddit LocalLLaMA Search agent
   transport: feed
@@ -848,14 +724,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 10
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_search_open_weights
   name: Reddit LocalLLaMA Search open weights
   transport: feed
@@ -872,14 +745,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 10
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_search_gguf
   name: Reddit LocalLLaMA Search gguf
   transport: feed
@@ -896,14 +766,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 10
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_search_benchmark
   name: Reddit LocalLLaMA Search benchmark
   transport: feed
@@ -920,14 +787,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 10
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_search_mcp
   name: Reddit LocalLLaMA Search MCP
   transport: feed
@@ -944,14 +808,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 8
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_search_workflow
   name: Reddit LocalLLaMA Search workflow
   transport: feed
@@ -968,14 +829,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 8
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_search_2api
   name: Reddit LocalLLaMA Search 2API
   transport: feed
@@ -992,14 +850,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 8
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_search_claude_code
   name: Reddit LocalLLaMA Search Claude Code workflow
   transport: feed
@@ -1016,14 +871,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 8
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_search_comfyui
   name: Reddit LocalLLaMA Search ComfyUI workflow
   transport: feed
@@ -1040,14 +892,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 8
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: reddit_local_llama_search_n8n_dify
   name: Reddit LocalLLaMA Search n8n Dify
   transport: feed
@@ -1064,14 +913,11 @@ sources:
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 8
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: x_account_openai
   name: X OpenAI via RSSHub
   transport: rsshub
@@ -1087,23 +933,19 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_chatgpt
   name: X ChatGPT via RSSHub
   transport: rsshub
-  url: ${RSSHUB_BASE_URL}/twitter/user/ChatGPTapp
+  url: ${RSSHUB_BASE_URL}/twitter/user/ChatGPT
   enabled: true
   priority: 101
   fetch_interval: 7200
@@ -1115,19 +957,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_anthropic
   name: X Anthropic via RSSHub
   transport: rsshub
@@ -1143,19 +981,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_claude
   name: X Claude via RSSHub
   transport: rsshub
@@ -1171,19 +1005,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_google_deepmind
   name: X Google DeepMind via RSSHub
   transport: rsshub
@@ -1199,19 +1029,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_gemini
   name: X Gemini via RSSHub
   transport: rsshub
@@ -1227,23 +1053,19 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_xai
-  name: X xAI via RSSHub
+  name: X xAI (SpaceXAI) via RSSHub
   transport: rsshub
-  url: ${RSSHUB_BASE_URL}/twitter/user/xai
+  url: ${RSSHUB_BASE_URL}/twitter/user/spacexai
   enabled: true
   priority: 106
   fetch_interval: 7200
@@ -1255,19 +1077,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_grok
   name: X Grok via RSSHub
   transport: rsshub
@@ -1283,19 +1101,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_meta_ai
   name: X Meta AI via RSSHub (moved to AIatMeta)
   transport: rsshub
@@ -1311,13 +1125,10 @@ sources:
   quality_weight: 0.35
   source_role: social
   spam_risk: high
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
 - id: x_account_ai_at_meta
   name: X AI at Meta via RSSHub
@@ -1334,19 +1145,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_mistral_ai
   name: X Mistral AI via RSSHub
   transport: rsshub
@@ -1362,19 +1169,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_cohere
   name: X Cohere via RSSHub
   transport: rsshub
@@ -1390,19 +1193,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_perplexity_ai
   name: X Perplexity via RSSHub
   transport: rsshub
@@ -1418,19 +1217,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_msft_copilot
   name: X Microsoft Copilot via RSSHub
   transport: rsshub
@@ -1446,19 +1241,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_deepseek
   name: X DeepSeek via RSSHub
   transport: rsshub
@@ -1474,19 +1265,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_qwen
   name: X Qwen via RSSHub
   transport: rsshub
@@ -1502,19 +1289,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_huggingface
   name: X Hugging Face via RSSHub
   transport: rsshub
@@ -1530,19 +1313,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_ollama
   name: X Ollama via RSSHub
   transport: rsshub
@@ -1558,19 +1337,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_replicate
   name: X Replicate via RSSHub
   transport: rsshub
@@ -1586,19 +1361,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_zai_org
   name: X Z.ai official
   transport: rsshub
@@ -1616,11 +1387,8 @@ sources:
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
-  account_verification_url: https://x.com/Zai_org
+  account_url: https://x.com/Zai_org
   content_class: community_social
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
 - id: x_account_kimi_moonshot
   name: X Kimi Moonshot official
@@ -1639,16 +1407,13 @@ sources:
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
-  account_verification_url: https://x.com/Kimi_Moonshot
+  account_url: https://x.com/Kimi_Moonshot
   content_class: community_social
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
 - id: x_account_minimax_ai
   name: X MiniMax AI official
   transport: rsshub
-  url: ${RSSHUB_BASE_URL}/twitter/user/MiniMax__AI
+  url: ${RSSHUB_BASE_URL}/twitter/user/MiniMax_AI
   enabled: true
   priority: 124
   fetch_interval: 7200
@@ -1662,11 +1427,8 @@ sources:
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
-  account_verification_url: https://x.com/MiniMax__AI
+  account_url: https://x.com/MiniMax_AI
   content_class: community_social
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
 - id: x_account_sam_altman
   name: X Sam Altman via RSSHub
@@ -1683,19 +1445,15 @@ sources:
   quality_weight: 0.35
   source_role: social
   spam_risk: high
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_tibo
   name: X Tibo via RSSHub
   transport: rsshub
@@ -1711,19 +1469,15 @@ sources:
   quality_weight: 0.35
   source_role: social
   spam_risk: high
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_together_ai
   name: X Together AI via RSSHub
   transport: rsshub
@@ -1739,19 +1493,15 @@ sources:
   quality_weight: 0.75
   source_role: official
   spam_risk: medium
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
   tier: p2
   topic_scopes:
   - model_product
   primary_eligible: false
-  citation_policy: supplementary
 - id: x_account_local_llama
   name: X LocalLLaMA via RSSHub (inactive)
   transport: rsshub
@@ -1767,13 +1517,10 @@ sources:
   quality_weight: 0.35
   source_role: social
   spam_risk: high
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 5
 - id: x_search_github_launch
   name: X Search GitHub Launch via RSSHub
@@ -1790,19 +1537,15 @@ sources:
   quality_weight: 0.45
   source_role: social_search
   spam_risk: high
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 10
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: x_search_huggingface_model
   name: X Search Hugging Face Model via RSSHub
   transport: rsshub
@@ -1818,19 +1561,15 @@ sources:
   quality_weight: 0.45
   source_role: social_search
   spam_risk: high
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 10
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: x_search_ai_tool_launch
   name: X Search AI Tool Launch via RSSHub
   transport: rsshub
@@ -1846,19 +1585,15 @@ sources:
   quality_weight: 0.45
   source_role: social_search
   spam_risk: high
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 10
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: x_search_github_ai_tool
   name: X Search GitHub AI Tool via RSSHub
   transport: rsshub
@@ -1874,19 +1609,15 @@ sources:
   quality_weight: 0.45
   source_role: social_search
   spam_risk: high
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 10
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: x_search_mcp_agent
   name: X Search MCP Agent via RSSHub
   transport: rsshub
@@ -1902,19 +1633,15 @@ sources:
   quality_weight: 0.45
   source_role: social_search
   spam_risk: high
-  requires_verification: true
   content_class: community_social
   selection_policy:
     mode: community_recent
     max_age_days: 7
-  verification_policy:
-    mode: discovery_only
   default_limit: 10
   tier: p4
   topic_scopes:
   - practice_opinion
   primary_eligible: false
-  citation_policy: discovery_only
 - id: anthropic_news_rsshub
   name: Anthropic News via RSSHub
   transport: rsshub
@@ -1931,15 +1658,10 @@ sources:
   topic_scopes:
   - model_product
   primary_eligible: true
-  citation_policy: primary
   content_class: official_model_company
   selection_policy:
     mode: official_recent
     max_age_days: 30
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
 - id: anthropic_research_rsshub
   name: Anthropic Research via RSSHub
@@ -1957,15 +1679,10 @@ sources:
   topic_scopes:
   - research
   primary_eligible: true
-  citation_policy: primary
   content_class: official_model_company
   selection_policy:
     mode: official_recent
     max_age_days: 30
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
 - id: anthropic_engineering_rsshub
   name: Anthropic Engineering via RSSHub
@@ -1984,15 +1701,10 @@ sources:
   - industry_infrastructure
   - model_product
   primary_eligible: true
-  citation_policy: primary
   content_class: official_model_company
   selection_policy:
     mode: official_recent
     max_age_days: 30
-  verification_policy:
-    mode: official_direct_link
-    required: true
-    direct_link: true
   default_limit: 6
 - id: mistral_news_disabled
   name: Mistral News (disabled placeholder)

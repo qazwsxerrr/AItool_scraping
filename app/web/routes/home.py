@@ -14,7 +14,6 @@ router = APIRouter()
 def index(
     request: Request,
     category: str | None = None,
-    direct: bool = False,
     hide_stale: bool = True,
     repo: UIReadRepository = Depends(get_repository),
     github_reader: GitHubProjectReader = Depends(get_github_project_reader),
@@ -22,7 +21,6 @@ def index(
     stats = repo.get_dashboard_stats()
     cards = repo.list_featured_cards(
         category=category,
-        direct_support_only=direct,
         hide_stale=hide_stale,
         limit=30,
     )
@@ -37,7 +35,6 @@ def index(
             "cards": cards,
             "top_card": cards[0] if cards else None,
             "category": category,
-            "direct": direct,
             "hide_stale": hide_stale,
             "github_projects": github_projects.rows,
             "github_project_stats": github_projects.stats,

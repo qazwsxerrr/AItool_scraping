@@ -58,10 +58,6 @@ def test_run_once_ai_only_path_never_enters_legacy_verifier(tmp_path, monkeypatc
     engine = create_engine_from_url(f"sqlite:///{db_path}")
     init_db(engine)
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("run-once must not invoke legacy process verification")
-
-    monkeypatch.setattr("app.jobs.process_job._verify", forbidden)
     monkeypatch.setattr(
         run_job,
         "run_intel_fetch_from_settings",

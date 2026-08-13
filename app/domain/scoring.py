@@ -1,4 +1,4 @@
-"""Deterministic source signals used for processing order and audit only."""
+"""Deterministic source signals used for selection order and audit only."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def score_item(
     *,
     now: datetime | None = None,
 ) -> float:
-    """Return a deterministic 0-100 processing signal.
+    """Return a deterministic 0-100 selection signal.
 
     This value is never an AI score and is not a GitHub inclusion gate. GitHub
     rows are selected and displayed from their raw repository metrics in the

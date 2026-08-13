@@ -9,7 +9,6 @@
       {% if card.published_at %}<span>{{ card.published_at | relative_time }}</span>{% endif %}
       {% if card.content_class %}<span>{{ card.content_class | content_class_label }}</span>{% endif %}
       {% if card.ai_keep and card.ai_status == 'success' %}<span>AI 已选</span>{% endif %}
-      {% if card.supports_basic_fact %}<span>直接核实</span>{% endif %}
     </div>
     <h3>
       {% if card.how_to_try %}<a href="{{ card.how_to_try }}" target="_blank" rel="noopener noreferrer">{{ card.title }}</a>{% else %}{{ card.title }}{% endif %}
@@ -21,7 +20,6 @@
       <span class="badge primary">{{ card.status | status_label }}</span>
       {% if card.content_class %}<span class="badge">{{ card.content_class | content_class_label }}</span>{% endif %}
       {% if card.source_group %}<span class="badge">{{ card.source_group }}</span>{% endif %}
-      {% if card.supports_basic_fact %}<span class="badge success">官方直链直接核实</span>{% endif %}
       {% if card.ai_status == 'ai_failed' %}<span class="badge warning">AI 处理失败</span>{% endif %}
       {% if card.risk_flags %}
         <details class="risk-details">

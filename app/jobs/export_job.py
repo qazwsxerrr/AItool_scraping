@@ -16,7 +16,7 @@ from app.config.settings import Settings
 from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
-from app.storage.models import AIItemReview, IntelItem, IntelItemVerification
+from app.storage.models import AIItemReview, IntelItem
 
 
 @dataclass(frozen=True)
@@ -67,7 +67,7 @@ def run_intel_export_job(
     failure_counts = {
         status: count
         for status, count in status_counts.items()
-        if status in {"failed", "ai_failed", "needs_review"}
+        if status in {"failed", "ai_failed"}
     }
 
     github_report_path: Path | None = None
@@ -132,14 +132,13 @@ def _list_pending(
     source_filter: str | None,
     content_class: str | None,
 ) -> list[IntelItem]:
-    # Pending includes items needing official confirmation and per-item AI
-    # failures. It is intentionally separate from the strong export set.
+    # Pending includes per-item AI failures and selected rows without a review.
     stmt = (
         select(IntelItem)
-        .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review), joinedload(IntelItem.verification))
+        .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
         .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
         .where(
-            (IntelItem.status.in_(["needs_review", "ai_failed"]))
+            (IntelItem.status == "ai_failed")
             | ((IntelItem.status == "hotspot") & (AIItemReview.status == "ai_failed"))
             | ((IntelItem.status == "selected") & AIItemReview.id.is_(None))
         )
@@ -156,7 +155,6 @@ def _list_pending(
 
 def _serialize(item: IntelItem) -> dict[str, Any]:
     review = item.ai_review
-    verification = item.verification
     source = item.source
     source_group = source.source_group if source else None
     source_subtype = source.source_subtype if source else None
@@ -173,6 +171,7 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
         "tier": source_tier,
         "role": source_role,
         "x_official": source_group == "x_official",
+        "account_url": source.account_url if source else None,
     }
     return {
         "id": item.id,
@@ -192,14 +191,13 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
         "source_role": source_role,
         "role": source_role,
         "x_official": source_group == "x_official",
+        "account_url": source.account_url if source else None,
         "source": source_ref,
         "source_priority": source.priority if source else None,
         "external_id": item.external_id,
         "content_hash": item.content_hash,
         "content_class": item.content_class,
         "status": item.status,
-        "evidence_status": "not_run",
-        "verification_status": verification.status if verification else "not_run",
         "title": item.title,
         "url": item.canonical_url,
         "summary": item.summary,
@@ -219,27 +217,11 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
             "summary_cn": review.summary_cn,
             "reason": review.reason,
             "risk_flags": _json(review.risk_flags_json, []),
-            "needs_verification": review.needs_verification,
             "official_url": review.official_url,
             "confidence": review.confidence,
             "error_message": review.error_message,
         }
         if review
-        else None,
-        "verification": {
-            "mode": verification.mode,
-            "status": verification.status,
-            "verification_url": verification.verification_url,
-            "source_domain": verification.source_domain,
-            "http_status": verification.http_status,
-            "title": verification.title,
-            "content_preview": verification.content_preview,
-            "supports_basic_fact": verification.supports_basic_fact,
-            "risk_flags": _json(verification.risk_flags_json, []),
-            "reason": verification.reason,
-            "checked_at": _date(verification.checked_at),
-        }
-        if verification
         else None,
     }
 
@@ -261,11 +243,10 @@ def _markdown(
         lines.append("")
     if status_counts:
         lines.append("状态统计：" + "、".join(f"{key}={value}" for key, value in sorted(status_counts.items())))
-        lines.append("失败/待核实统计：" + ("、".join(f"{key}={value}" for key, value in sorted((failure_counts or {}).items())) or "无"))
+        lines.append("失败统计：" + ("、".join(f"{key}={value}" for key, value in sorted((failure_counts or {}).items())) or "无"))
         lines.append("")
     for index, record in enumerate(records, start=1):
         ai = record.get("ai") or {}
-        verification = record.get("verification") or {}
         lines.extend(
             [
                 f"## {index}. {record.get('title') or '(untitled)'}",
@@ -279,8 +260,7 @@ def _markdown(
                 ),
                 f"- AI 摘要：{ai.get('summary_cn') or record.get('summary') or '暂无摘要'}",
                 f"- AI 处理：`{ai.get('status') if ai else '未执行'}` / keep=`{str(bool(ai.get('keep'))).lower() if ai else 'n/a'}`",
-                f"- 核实状态（后续阶段）：`{record.get('verification_status') or (verification.get('status') if verification else 'not_run')}` / `{verification.get('mode') if verification else 'n/a'}`",
-                f"- 风险：{', '.join(ai.get('risk_flags') or verification.get('risk_flags') or []) or '无'}",
+                f"- 风险：{', '.join(ai.get('risk_flags') or []) or '无'}",
                 f"- 链接：{record.get('url') or '无'}",
                 "",
             ]

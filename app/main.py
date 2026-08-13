@@ -7,14 +7,7 @@ from app.jobs.ai_review_job import run_ai_review_from_settings
 from app.jobs.export_job import run_intel_export_from_settings
 from app.jobs.fetch_job import run_intel_fetch_from_settings
 from app.jobs.fetch_only_job import run_fetch_only_from_settings
-from app.jobs.process_job import run_intel_process_from_settings
 from app.jobs.run_job import run_intel_once_from_settings
-from app.jobs.daily_run_job import run_daily_from_settings
-from app.jobs.daily_export_job import run_daily_export_from_settings
-from app.jobs.enrich_job import run_enrich_from_settings
-from app.jobs.triage_job import run_triage_from_settings
-from app.jobs.cluster_job import run_cluster_from_settings
-from app.jobs.compose_job import run_compose_from_settings
 from app.jobs.source_health_job import run_source_health_from_settings
 from app.logging_config import configure_logging
 
@@ -113,31 +106,6 @@ def fetch_only(
         typer.echo(f"markdown={result.export.markdown_path}")
 
 
-@app.command("process")
-def process(
-    source: str | None = typer.Option(None, help="Only process one source id."),
-    content_class: str | None = typer.Option(None, "--class", help="Only process one content class."),
-    limit: int = typer.Option(100, min=1, help="Maximum items to process."),
-    force: bool = typer.Option(False, "--force", help="Reprocess existing items."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Run without AI or database writes."),
-) -> None:
-    configure_logging()
-    _validate_content_class(content_class)
-    result = run_intel_process_from_settings(
-        settings=Settings.from_env(),
-        source_filter=source,
-        content_class=content_class,
-        limit=limit,
-        force=force,
-        dry_run=dry_run,
-    )
-    typer.echo(
-        f"processed={result.processed} selected={result.selected} filtered={result.filtered} "
-        f"analyzed={result.analyzed} verified={result.verified} needs_review={result.needs_review} "
-        f"ai_failed={result.ai_failed} failed={result.failed}"
-    )
-
-
 @app.command("ai-review")
 def ai_review(
     source: str | None = typer.Option(None, "--source", help="Only review one source id."),
@@ -147,7 +115,7 @@ def ai_review(
     dry_run: bool = typer.Option(False, "--dry-run", help="Run selection without AI/database/output writes."),
     output_dir: str = typer.Option("output/ai-review", help="Candidate and audit output directory."),
 ) -> None:
-    """Run AI-only classification and Chinese summary; evidence is not run."""
+    """Run AI-only classification and Chinese summary."""
 
     configure_logging()
     _validate_content_class(content_class)
@@ -201,7 +169,7 @@ def run_once(
     source: str | None = typer.Option(None, help="Only run one source id."),
     content_class: str | None = typer.Option(None, "--class", help="Only run one content class."),
     limit: int = typer.Option(100, min=1, help="Per-stage item limit."),
-    force: bool = typer.Option(False, "--force", help="Ignore cooldown and reprocess items."),
+    force: bool = typer.Option(False, "--force", help="Ignore cooldown and re-review items."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Run without database or export writes."),
     output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
 ) -> None:
@@ -221,8 +189,8 @@ def run_once(
         f"skipped={result.fetch.total_skipped} failed={result.fetch.total_failed}"
     )
     typer.echo(
-        f"ai-review: processed={result.process.processed} selected={result.process.selected} "
-        f"analyzed={result.process.analyzed} ai_failed={result.process.ai_failed} failed={result.process.failed}"
+        f"ai-review: processed={result.ai_review.processed} selected={result.ai_review.selected} "
+        f"analyzed={result.ai_review.analyzed} ai_failed={result.ai_review.ai_failed} failed={result.ai_review.failed}"
     )
     typer.echo(f"export: exported={result.export.exported} pending={result.export.pending}")
     if result.export.github_report_path:
@@ -240,44 +208,6 @@ def source_health(source: str | None = typer.Option(None, "--source")) -> None:
     for row in run_source_health_from_settings(settings=Settings.from_env(), source_filter=source):
         next_time = row.next_fetch_at.isoformat() if row.next_fetch_at else "now"
         typer.echo(f"{row.source_id}: status={row.status} failures={row.consecutive_failures} next={next_time} error={row.error_code or '-'}")
-
-
-@app.command("enrich")
-def enrich(source: str | None = typer.Option(None, "--source"), limit: int = typer.Option(100, min=1), force: bool = typer.Option(False, "--force")) -> None:
-    result = run_enrich_from_settings(settings=Settings.from_env(), source_filter=source, limit=limit, force=force)
-    typer.echo(f"processed={result.processed} enriched={result.enriched} skipped={result.skipped} failed={result.failed}")
-
-
-@app.command("triage")
-def triage(source: str | None = typer.Option(None, "--source"), limit: int = typer.Option(100, min=1), force: bool = typer.Option(False, "--force")) -> None:
-    result = run_triage_from_settings(settings=Settings.from_env(), source_filter=source, limit=limit, force=force)
-    typer.echo(f"processed={result.processed} kept={result.kept} filtered={result.filtered} ai_failed={result.ai_failed} failed={result.failed}")
-
-
-@app.command("cluster")
-def cluster(limit: int = typer.Option(100, min=1), force: bool = typer.Option(False, "--force")) -> None:
-    result = run_cluster_from_settings(settings=Settings.from_env(), limit=limit, force=force)
-    typer.echo(f"processed={result.processed} events={result.events} merged={result.merged} uncertain={result.uncertain} failed={result.failed}")
-
-
-@app.command("compose")
-def compose(limit: int = typer.Option(200, min=1), force: bool = typer.Option(False, "--force")) -> None:
-    result = run_compose_from_settings(settings=Settings.from_env(), limit=limit, force=force)
-    typer.echo(f"candidates={result.candidates} selected={result.selected} written={result.written} failed={result.failed}")
-
-
-@app.command("daily-export")
-def daily_export(date: str | None = typer.Option(None, "--date"), output_dir: str = typer.Option("output/daily"), force: bool = typer.Option(False, "--force")) -> None:
-    result = run_daily_export_from_settings(settings=Settings.from_env(), edition_date=date, output_dir=output_dir, force=force)
-    typer.echo(f"date={result.edition_date} status={result.status} selected={result.selected} published={result.published}")
-    typer.echo(f"markdown={result.markdown_path}")
-    if result.draft_path: typer.echo(f"draft={result.draft_path}")
-
-
-@app.command("run-daily")
-def run_daily(source: str | None = typer.Option(None, "--source"), limit: int = typer.Option(100, min=1), force: bool = typer.Option(False, "--force"), output_dir: str = typer.Option("output/daily"), date: str | None = typer.Option(None, "--date")) -> None:
-    result = run_daily_from_settings(settings=Settings.from_env(), source=source, limit=limit, force=force, output_dir=output_dir, edition_date=date)
-    typer.echo(f"fetch_failed={result.fetch.total_failed} enriched={result.enrich.enriched} triage_kept={result.triage.kept} events={result.cluster.events} composed={result.compose.written} export={result.export.status} status={result.status}")
 
 
 def _validate_content_class(value: str | None) -> None:

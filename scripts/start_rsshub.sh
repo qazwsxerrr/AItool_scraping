@@ -18,17 +18,31 @@ if [[ ! -f "$RSSHUB_DIR/package.json" ]]; then
   exit 1
 fi
 
-if ! command -v node >/dev/null 2>&1; then
-  echo "Node.js is required (RSSHub currently supports Node 22.22.2+ or 24.15.0+)." >&2
-  exit 1
-fi
-
-if ! node -e '
+node_is_supported() {
+  "$1" -e '
   const [major, minor, patch] = process.versions.node.split(".").map(Number);
   const supported = (major === 22 && (minor > 22 || (minor === 22 && patch >= 2)))
     || (major === 24 && (minor > 15 || (minor === 15 && patch >= 0)));
   process.exit(supported ? 0 : 1);
-'; then
+  '
+}
+
+if ! command -v node >/dev/null 2>&1 || ! node_is_supported "$(command -v node)"; then
+  RSSHUB_NVM_DIR=${NVM_DIR:-"${HOME:-}/.nvm"}
+  if [[ -s "$RSSHUB_NVM_DIR/nvm.sh" ]]; then
+    set +u
+    # shellcheck disable=SC1090
+    . "$RSSHUB_NVM_DIR/nvm.sh"
+    set -u
+    for RSSHUB_NODE_MAJOR in 24 22; do
+      if nvm use --silent "$RSSHUB_NODE_MAJOR" >/dev/null 2>&1 && node_is_supported "$(command -v node)"; then
+        break
+      fi
+    done
+  fi
+fi
+
+if ! command -v node >/dev/null 2>&1 || ! node_is_supported "$(command -v node)"; then
   echo "Unsupported Node.js version: $(node --version). Use Node 22.22.2+ or 24.15.0+." >&2
   exit 1
 fi
@@ -64,6 +78,12 @@ fi
 if [[ -z "${PROXY_URI:-}" ]]; then
   unset PROXY_URI
 fi
+
+# This project intentionally uses RSSHub's TWITTER_AUTH_TOKEN web API path.
+# Do not pass OAuth or third-party API configuration to the local process.
+unset TWITTER_CONSUMER_KEY TWITTER_CONSUMER_SECRET
+unset TWITTER_ACCESS_TOKEN TWITTER_ACCESS_SECRET
+unset TWITTER_THIRD_PARTY_API
 export PORT="$RSSHUB_PORT"
 export NODE_ENV=production
 

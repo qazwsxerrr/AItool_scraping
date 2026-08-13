@@ -17,7 +17,6 @@ from app.domain.models import SourceSpec
 from app.storage.models import (
     AIItemReview,
     IntelItem,
-    IntelItemVerification,
     IntelRun,
     Source,
     FetchAttempt,
@@ -40,7 +39,6 @@ class IntelCounts:
     skipped: int = 0
     selected: int = 0
     analyzed: int = 0
-    verified: int = 0
     failed: int = 0
 
 
@@ -80,24 +78,18 @@ class IntelRepository:
         row.github_period = getattr(github, "period", None) if github is not None else None
         row.source_group = source.source_group or "general"
         row.source_subtype = source.source_subtype or "fixed"
+        row.account_url = source.account_url
         row.tier = getattr(source, "tier", None) or "p4"
         row.topic_scopes_json = _dump_json(list(getattr(source, "topic_scopes", ()) or ()))
         row.primary_eligible = bool(getattr(source, "primary_eligible", False))
-        row.citation_policy = getattr(source, "citation_policy", None) or "discovery_only"
-        row.account_verification_url = getattr(source, "account_verification_url", None)
         row.quality_weight = source.quality_weight
         row.source_role = source.source_role
         row.spam_risk = source.spam_risk
-        row.requires_verification = source.requires_verification
         row.content_class = source.content_class or "community_social"
         selection_policy = getattr(source, "selection_policy", {})
-        verification_policy = getattr(source, "verification_policy", {})
         if hasattr(selection_policy, "model_dump"):
             selection_policy = selection_policy.model_dump(exclude_none=True)
-        if hasattr(verification_policy, "model_dump"):
-            verification_policy = verification_policy.model_dump(exclude_none=True)
         row.selection_policy_json = _dump_json(selection_policy or {})
-        row.verification_policy_json = _dump_json(verification_policy or {})
         if policy is not None:
             # Resolved ``SourceSpec`` instances normally provide both values,
             # but callers may pass a lightweight policy object. Preserve the
@@ -110,7 +102,6 @@ class IntelRepository:
                 or "community_social"
             )
             row.selection_policy_json = _dump_json(_policy_dict(policy, "selection"))
-            row.verification_policy_json = _dump_json(_policy_dict(policy, "verification"))
         return row
 
     def update_source_health(
@@ -188,7 +179,7 @@ class IntelRepository:
         values = _counts_dict(counts)
         run.status = status
         run.finished_at = utcnow()
-        for name in ("fetched", "inserted", "selected", "analyzed", "verified", "failed"):
+        for name in ("fetched", "inserted", "selected", "analyzed", "failed"):
             if name in values:
                 setattr(run, name, int(values[name]))
         run.error = error[:4000] if error else None
@@ -283,7 +274,7 @@ class IntelRepository:
         existing = self._find_existing(fields)
         if existing is not None:
             # Refresh volatile metrics/payload while preserving a completed
-            # processing status. This lets a later fetch update star counts.
+            # selection status. This lets a later fetch update star counts.
             old_metrics = existing.metrics_json
             old_payload = existing.raw_payload_json
             merged_metrics = (
@@ -311,22 +302,18 @@ class IntelRepository:
             existing.original_title = fields["original_title"] or existing.original_title
             existing.source_url = fields["source_url"] or existing.source_url
             existing.content_depth = fields["content_depth"] or existing.content_depth
-            existing.event_hint = fields["event_hint"] or existing.event_hint
             existing.content_class = fields["content_class"]
             existing.metrics_json = new_metrics
             existing.raw_payload_json = new_payload
             if (class_changed or old_metrics != new_metrics or old_payload != new_payload) and existing.status in {
                 "hotspot",
-                "verified",
-                "discovery_only",
                 "rejected",
                 "filtered",
-                "needs_review",
                 "ai_failed",
             }:
                 # A refreshed item must pass deterministic selection again. Its
-                # previous AI result remains available for audit until process
-                # replaces it.
+                # previous AI result remains available for audit until the
+                # next AI review replaces it.
                 existing.status = "new"
                 existing.selection_score = 0
                 existing.selection_reason = None
@@ -351,7 +338,6 @@ class IntelRepository:
             original_title=fields["original_title"],
             source_url=fields["source_url"],
             content_depth=fields["content_depth"],
-            event_hint=fields["event_hint"],
             content_class=fields["content_class"],
             metrics_json=_dump_json(row_metrics),
             raw_payload_json=_dump_json(fields["raw_payload"]),
@@ -460,7 +446,7 @@ class IntelRepository:
     ) -> list[IntelItem]:
         stmt = (
             select(IntelItem)
-            .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review), joinedload(IntelItem.verification))
+            .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
             .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
         )
         if not force:
@@ -515,7 +501,6 @@ class IntelRepository:
         review.summary_cn = _text(getattr(response, "summary_cn", None))
         review.reason = _text(getattr(response, "reason", None))
         review.risk_flags_json = _dump_json(getattr(response, "risk_flags", []))
-        review.needs_verification = bool(getattr(response, "needs_verification", False))
         review.official_url = _text(getattr(response, "official_url", None))
         review.confidence = max(0, min(int(getattr(response, "confidence", 0) or 0), 100))
         raw = getattr(response, "raw_response", None) if response is not None else None
@@ -525,25 +510,6 @@ class IntelRepository:
         review.updated_at = utcnow()
         self.session.flush()
         return review
-
-    def upsert_verification(self, item_id: int, result: Any) -> IntelItemVerification:
-        verification = self.session.scalar(
-            select(IntelItemVerification).where(IntelItemVerification.item_id == item_id)
-        )
-        if verification is None:
-            verification = IntelItemVerification(item_id=item_id, mode="discovery_only", status="skipped")
-            self.session.add(verification)
-        values = _object_mapping(result)
-        for name in (
-            "mode", "status", "verification_url", "source_domain", "http_status", "title",
-            "content_preview", "supports_basic_fact", "reason",
-        ):
-            if name in values:
-                setattr(verification, name, values[name])
-        verification.risk_flags_json = _dump_json(values.get("risk_flags", []))
-        verification.checked_at = values.get("checked_at") or utcnow()
-        self.session.flush()
-        return verification
 
     def set_item_status(self, item_id: int, status: str) -> None:
         item = self.session.get(IntelItem, item_id)
@@ -558,15 +524,15 @@ class IntelRepository:
         content_class: str | None = None,
         source_id: str | None = None,
     ) -> list[IntelItem]:
-        # AI-kept rows are exportable before later evidence/verification. The
-        # legacy metadata-only GitHub hotspot path remains compatible.
+        # AI-kept rows are exportable directly; GitHub hotspot rows remain
+        # deterministic selections without a second stage.
         retained_without_ai = (IntelItem.content_class == "project_tool") & (IntelItem.status == "hotspot")
         retained_with_ai = AIItemReview.keep.is_(True) & IntelItem.status.in_(
-            ["selected", "verified", "hotspot", "discovery_only"]
+            ["selected", "hotspot"]
         )
         stmt = (
             select(IntelItem)
-            .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review), joinedload(IntelItem.verification))
+            .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
             .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
             .where(retained_without_ai | retained_with_ai)
             .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
@@ -621,7 +587,6 @@ def _item_fields(item: Any) -> dict[str, Any]:
     original_title = _text(values.get("original_title") or values.get("title"))
     source_url = _canonical_url(values.get("source_url") or values.get("url") or values.get("link"))
     content_depth = _text(values.get("content_depth")) or ("full" if values.get("content_text") or values.get("content") else "summary")
-    event_hint = _text(values.get("event_hint") or values.get("event_type"))
     content_hash = _text(values.get("content_hash")) or _identity_hash(external_id, canonical_url, title, content_text)
     # Keep GitHub repository identity stable as star/description metrics change.
     if external_id and external_id.startswith("github_repo:"):
@@ -639,7 +604,6 @@ def _item_fields(item: Any) -> dict[str, Any]:
         "original_title": original_title,
         "source_url": source_url,
         "content_depth": content_depth,
-        "event_hint": event_hint,
         "content_class": content_class,
         "metrics": metrics,
         "raw_payload": raw_payload,

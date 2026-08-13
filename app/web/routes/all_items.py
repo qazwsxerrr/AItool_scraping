@@ -34,7 +34,7 @@ def all_items(
         name="all_items.html",
         context={
             "request": request,
-            "active_nav": "pending" if status == "needs_review" else "runs" if status == "ai_failed" else "all",
+            "active_nav": "runs" if status == "ai_failed" else "all",
             "items": items,
             "filters": filters,
             "filter_options": filter_options,

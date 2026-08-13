@@ -41,11 +41,6 @@ class Settings:
     ai_review_model: str | None = None
     ai_review_api_style: str = "generic_json"
     ai_review_timeout_seconds: float = 30.0
-    # Optional V3 stage overrides.  They intentionally share the review
-    # provider configuration and fall back to its model when unset.
-    ai_triage_model: str | None = None
-    ai_cluster_model: str | None = None
-    ai_compose_model: str | None = None
 
     @classmethod
     def from_env(cls, dotenv_path: str | Path = ".env") -> "Settings":
@@ -67,9 +62,6 @@ class Settings:
             ai_review_model=ai_review_model,
             ai_review_api_style=os.getenv("AI_REVIEW_API_STYLE", "generic_json"),
             ai_review_timeout_seconds=float(os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "30")),
-            ai_triage_model=os.getenv("AI_TRIAGE_MODEL") or ai_review_model,
-            ai_cluster_model=os.getenv("AI_CLUSTER_MODEL") or ai_review_model,
-            ai_compose_model=os.getenv("AI_COMPOSE_MODEL") or ai_review_model,
         )
 
 

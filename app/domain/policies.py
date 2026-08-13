@@ -18,7 +18,6 @@ from .models import (
     SelectionDecision,
     SelectionPolicy,
     SourceSpec,
-    VerificationPolicy,
 )
 
 
@@ -165,11 +164,7 @@ def source_spec_from_config(source: Any) -> SourceSpec:
             source.selection_policy.mode != "default"
             or "mode" in source.selection_policy.model_fields_set
         )
-        verification_is_resolved = (
-            source.verification_policy.mode != "metadata_only"
-            or "mode" in source.verification_policy.model_fields_set
-        )
-        if selection_is_resolved and verification_is_resolved:
+        if selection_is_resolved:
             return source
 
     raw = _source_mapping(source)
@@ -192,20 +187,13 @@ def source_spec_from_config(source: Any) -> SourceSpec:
     selection_explicit = _policy_mapping(raw.get("selection_policy"))
     selection = SelectionPolicy.model_validate({**selection_defaults, **selection_explicit})
 
-    verification_defaults = _default_verification_policy(content_class)
-    verification_explicit = _policy_mapping(raw.get("verification_policy"))
-    verification = VerificationPolicy.model_validate(
-        {**verification_defaults, **verification_explicit}
-    )
-
-    data = canonical.model_dump(exclude={"selection_policy", "verification_policy"})
+    data = canonical.model_dump(exclude={"selection_policy"})
     data.update(
         {
             "id": source_id,
             "name": canonical.name or source_id,
             "content_class": content_class,
             "selection_policy": selection,
-            "verification_policy": verification,
         }
     )
     return SourceSpec.model_validate(data)
@@ -238,8 +226,6 @@ def selection_decision(
         "content_class": spec.content_class,
         "mode": policy.mode,
         "score": score,
-        "verification_mode": spec.verification_policy.mode,
-        "discovery_only": policy.discovery_only or spec.verification_policy.discovery_only,
     }
     if not spec.enabled:
         return SelectionDecision(selected=False, reason="source_disabled", **common)
@@ -441,7 +427,6 @@ def _default_selection_policy(raw: Mapping[str, Any], content_class: ContentClas
             "max_age_days": 7,
             "sort_by": "published_at",
             "sort_order": "desc",
-            "discovery_only": True,
         }
     if _is_github_trending(raw):
         return {
@@ -473,29 +458,6 @@ def _default_selection_policy(raw: Mapping[str, Any], content_class: ContentClas
     }
 
 
-def _default_verification_policy(content_class: ContentClass) -> dict[str, Any]:
-    if content_class == OFFICIAL_MODEL_COMPANY:
-        return {
-            "mode": "official_direct_link",
-            "required": True,
-            "direct_link": True,
-            "discovery_only": False,
-        }
-    if content_class == COMMUNITY_SOCIAL:
-        return {
-            "mode": "discovery_only",
-            "required": False,
-            "direct_link": False,
-            "discovery_only": True,
-        }
-    return {
-        "mode": "metadata_only",
-        "required": False,
-        "direct_link": False,
-        "discovery_only": False,
-    }
-
-
 def _source_mapping(source: Any) -> dict[str, Any]:
     if isinstance(source, Mapping):
         return dict(source)
@@ -503,11 +465,9 @@ def _source_mapping(source: Any) -> dict[str, Any]:
         # ``model_dump()`` materializes defaults and would make them look like
         # explicit registry overrides. Preserve only fields the caller set on
         # an unresolved spec; resolved specs are returned early above.
-        data = source.model_dump(exclude={"selection_policy", "verification_policy"})
+        data = source.model_dump(exclude={"selection_policy"})
         if source.selection_policy.model_fields_set:
             data["selection_policy"] = source.selection_policy.model_dump(exclude_unset=True)
-        if source.verification_policy.model_fields_set:
-            data["verification_policy"] = source.verification_policy.model_dump(exclude_unset=True)
         if source.model_extra:
             data.update(source.model_extra)
         return data
@@ -531,11 +491,9 @@ def _source_mapping(source: Any) -> dict[str, Any]:
         "quality_weight",
         "source_role",
         "spam_risk",
-        "requires_verification",
         "default_limit",
         "content_class",
         "selection_policy",
-        "verification_policy",
     )
     return {key: getattr(source, key) for key in keys if hasattr(source, key)}
 

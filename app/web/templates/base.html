@@ -10,7 +10,7 @@
     <header class="topbar">
       <div>
         <a class="brand" href="/">AI 热点内容台</a>
-        <p class="subtitle">抓取、AI 筛选与摘要后的情报流（核实为后续阶段）</p>
+        <p class="subtitle">抓取、AI 筛选与摘要后的情报流</p>
       </div>
       <form class="top-search" action="/search" method="get">
         <label class="sr-only" for="top-search-input">搜索情报</label>
@@ -24,7 +24,6 @@
         <a class="nav-item {{ 'active' if active_nav == 'github' else '' }}" href="/github">GitHub 项目热点</a>
         <a class="nav-item {{ 'active' if active_nav == 'search' else '' }}" href="/search">热点搜索</a>
         <span class="nav-section">数据视图</span>
-        <a class="nav-item {{ 'active' if active_nav == 'pending' else '' }}" href="/all?status=needs_review">待复核</a>
         <a class="nav-item {{ 'active' if active_nav == 'runs' else '' }}" href="/all?status=ai_failed">处理异常</a>
       </nav>
       <main class="content">

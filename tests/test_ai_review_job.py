@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 from sqlalchemy import select
 
@@ -10,9 +9,9 @@ from app.ai.schemas import ItemAnalysisResponse
 from app.config.source_registry import SourceConfig
 from app.domain.models import FetchItem
 from app.domain.policies import source_spec_from_config
-from app.jobs.ai_review_job import _editorial_section_for_item, run_ai_review_job
+from app.jobs.ai_review_job import run_ai_review_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelItem, IntelItemVerification
+from app.storage.models import AIItemReview, IntelItem
 from app.storage.repository import IntelRepository
 
 
@@ -57,7 +56,6 @@ class _AI:
             summary_cn="中文简要总结",
             reason="保留",
             risk_flags=[],
-            needs_verification=True,
             official_url=request.url,
             confidence=91,
             raw_response={"fixture": True},
@@ -73,7 +71,6 @@ class _RejectingAI(_AI):
             summary_cn="与 AI 日报主题无关",
             reason="内容与 AI 工具情报无关",
             risk_flags=["irrelevant"],
-            needs_verification=False,
             official_url=None,
             confidence=94,
             raw_response={"fixture": True, "keep": False},
@@ -109,10 +106,6 @@ def test_ai_review_never_calls_verification_and_exports_not_run(tmp_path, monkey
     _insert_items(sf, source, spec)
     ai = _AI()
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("verification must not run in ai-review")
-
-    monkeypatch.setattr("app.jobs.process_job._verify", forbidden)
     result = run_ai_review_job(
         session_factory=sf,
         source_specs={source.id: spec},
@@ -135,12 +128,10 @@ def test_ai_review_never_calls_verification_and_exports_not_run(tmp_path, monkey
     assert record["source_id"] == source.id
     assert record["source_group"] == "official_blog"
     assert record["source_subtype"] == "fixed_news"
-    assert record["evidence_status"] == "not_run"
-    assert record["verification_status"] == "not_run"
-    assert record["verification"] is None
+    assert "evidence_status" not in record
+    assert "verification_status" not in record
+    assert "verification" not in record
     assert record["summary_cn"] == "中文简要总结"
-    assert records_by_title["Announcing a new model release"]["editorial_section"] == "model_product"
-    assert records_by_title["API version update"]["editorial_section"] == "industry_infrastructure"
     assert record["content_class"] == "official_model_company"
 
     with sf() as session:
@@ -148,10 +139,8 @@ def test_ai_review_never_calls_verification_and_exports_not_run(tmp_path, monkey
         assert rows[0].status == "selected"
         assert rows[0].ai_review.status == "success"
         assert rows[0].ai_review.summary_cn == "中文简要总结"
-        assert rows[0].verification is None
         assert rows[1].status == "filtered"
         assert rows[2].status == "selected"
-        assert session.scalars(select(IntelItemVerification)).all() == []
 
 
 def test_ai_review_failure_isolated_and_auditable(tmp_path):
@@ -189,7 +178,7 @@ def test_ai_review_failure_isolated_and_auditable(tmp_path):
     assert {row["status"] for row in audit} == {"selected", "filtered", "ai_failed"}
     failed = next(row for row in audit if row["status"] == "ai_failed")
     assert failed["ai"]["status"] == "ai_failed"
-    assert failed["evidence_status"] == "not_run"
+    assert "evidence_status" not in failed
 
 
 def test_ai_review_ai_keep_false_rejects_item_and_excludes_candidate(tmp_path):
@@ -286,40 +275,24 @@ def test_ai_review_p1_official_without_keyword_reaches_ai_and_exports_summary(tm
     assert ai.calls == [1]
     record = json.loads((tmp_path / "out" / "ai_review_candidates.jsonl").read_text().splitlines()[0])
     assert record["summary_cn"] == "中文简要总结"
-    assert record["editorial_section"] == "model_product"
     assert record["selection_reason"] == "selected:official_recent_no_keyword; risks=official_keyword_missing"
 
 
-def test_editorial_section_is_output_only_and_deterministic():
-    assert _editorial_section_for_item(
-        SimpleNamespace(
-            content_class="project_tool",
-            title="A database tool",
-            summary="",
-            content_text="",
-        )
-    ) == "open_source_tool"
-    assert _editorial_section_for_item(
-        SimpleNamespace(
-            content_class="community_social",
-            title="New arXiv paper benchmark",
-            summary="",
-            content_text="",
-        )
-    ) == "research"
-    assert _editorial_section_for_item(
-        SimpleNamespace(
-            content_class="community_social",
-            title="GPU cloud platform launch",
-            summary="",
-            content_text="",
-        )
-    ) == "industry_infrastructure"
-    assert _editorial_section_for_item(
-        SimpleNamespace(
-            content_class="community_social",
-            title="Practical workflow notes",
-            summary="",
-            content_text="",
-        )
-    ) == "practice_opinion"
+def test_ai_review_export_keeps_source_attribution(tmp_path):
+    sf = _db(tmp_path)
+    source = _source()
+    spec = source_spec_from_config(source)
+    _insert_items(sf, source, spec)
+    result = run_ai_review_job(
+        session_factory=sf,
+        source_specs={source.id: spec},
+        ai_client=_AI(),
+        output_dir=tmp_path / "out",
+        limit=10,
+        now=NOW,
+    )
+    record = json.loads((tmp_path / "out" / "ai_review_candidates.jsonl").read_text().splitlines()[0])
+    assert result.exported == 2
+    assert record["source_name"] == source.name
+    assert record["source_group"] == "official_blog"
+    assert record["x_official"] is False

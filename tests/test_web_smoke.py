@@ -105,7 +105,7 @@ def test_web_v2_filters_escape_content_and_drop_removed_stage_copy(tmp_path):
             content_class="official_model_company",
             content_hash="web-contract-item",
             published_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
-            status="verified",
+            status="selected",
             selection_score=91,
         )
         session.add_all(
@@ -117,7 +117,7 @@ def test_web_v2_filters_escape_content_and_drop_removed_stage_copy(tmp_path):
                     keep=True,
                     content_class="official_model_company",
                     confidence=94,
-                    summary_cn="已核实的更新摘要",
+                    summary_cn="AI 生成的更新摘要",
                     risk_flags_json=json.dumps(["风险一", "风险二", "风险三"], ensure_ascii=False),
                     raw_response_json="{}",
                 ),
@@ -129,14 +129,14 @@ def test_web_v2_filters_escape_content_and_drop_removed_stage_copy(tmp_path):
     client = TestClient(app)
 
     home_response = client.get("/")
-    all_response = client.get("/all?status=verified&content_class=official_model_company")
+    all_response = client.get("/all?status=selected&content_class=official_model_company")
     search_response = client.get("/search?q=script")
 
     assert home_response.status_code == 200
     assert "风险提示 3" in home_response.text
     assert 'class="badge danger"' not in home_response.text
     assert all_response.status_code == 200
-    assert "verified" in all_response.text
+    assert "selected" in all_response.text
     assert "官方发布" in all_response.text
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in all_response.text
     assert "<script>alert(1)</script>" not in all_response.text
@@ -256,7 +256,7 @@ def test_web_home_renders_ai_selected_without_verification_gate(tmp_path):
     assert "AI-only homepage item" in response.text
     assert "首页 AI 摘要" in response.text
     assert "AI 已选" in response.text
-    assert "已核实" not in response.text
+    assert "核实" not in response.text
 
 
 def _write_github_metadata(path) -> None:

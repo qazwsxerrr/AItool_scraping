@@ -1,8 +1,8 @@
-"""Transport-neutral DTOs for the simplified intelligence pipeline.
+"""Transport-neutral DTOs for the AI-only intelligence pipeline.
 
 The models in this module deliberately have no database, HTTP, or job
 dependencies. They describe the boundaries between collectors, deterministic
-selection, and AI processing.
+selection, and structured item analysis.
 """
 
 from __future__ import annotations
@@ -28,9 +28,9 @@ CONTENT_CLASSES: tuple[ContentClass, ...] = (
     COMMUNITY_SOCIAL,
 )
 
-# Source governance vocabulary.  These aliases intentionally live in the
-# transport-neutral domain module so registry, daily composition and storage
-# consumers share one spelling without importing configuration code.
+# Source governance vocabulary. These aliases intentionally live in the
+# transport-neutral domain module so registry and storage consumers share one
+# spelling without importing configuration code.
 SourceTier: TypeAlias = Literal["p1", "p2", "p3", "p4"]
 TopicScope: TypeAlias = Literal[
     "model_product",
@@ -39,7 +39,6 @@ TopicScope: TypeAlias = Literal[
     "open_source_tool",
     "practice_opinion",
 ]
-CitationPolicy: TypeAlias = Literal["primary", "supplementary", "discovery_only"]
 CanonicalSourceGroup: TypeAlias = Literal[
     "official_blog",
     "official_research",
@@ -85,7 +84,6 @@ class SelectionPolicy(BaseModel):
     keywords: tuple[str, ...] = ()
     sort_by: str | None = None
     sort_order: Literal["asc", "desc"] = "desc"
-    discovery_only: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -96,6 +94,10 @@ class SelectionPolicy(BaseModel):
             raise TypeError("selection_policy must be a mapping or SelectionPolicy")
 
         data = dict(value)
+        removed_keys = {"verification_policy", "requires_verification", "citation_policy", "discovery_only"}
+        forbidden = sorted(removed_keys.intersection(data))
+        if forbidden:
+            raise ValueError("selection_policy contains removed fields: " + ", ".join(forbidden))
         if "window_days" in data and "max_age_days" not in data:
             data["max_age_days"] = data["window_days"]
         if "stars" in data and "min_stars" not in data and isinstance(data["stars"], (int, float)):
@@ -127,29 +129,6 @@ class SelectionPolicy(BaseModel):
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative when configured")
         return self
-
-
-class VerificationPolicy(BaseModel):
-    """Resolved verification requirements for one source."""
-
-    model_config = ConfigDict(extra="allow", frozen=True)
-
-    mode: str = "metadata_only"
-    required: bool = False
-    direct_link: bool = False
-    discovery_only: bool = False
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalise_input(cls, value: Any) -> Any:
-        if value is None or isinstance(value, cls):
-            return value or {}
-        if not isinstance(value, Mapping):
-            raise TypeError("verification_policy must be a mapping or VerificationPolicy")
-        data = dict(value)
-        if "verification_mode" in data and "mode" not in data:
-            data["mode"] = data["verification_mode"]
-        return data
 
 
 Transport: TypeAlias = Literal["feed", "rsshub", "github"]
@@ -258,16 +237,13 @@ class SourceSpec(BaseModel):
     tier: SourceTier = "p4"
     topic_scopes: tuple[TopicScope, ...] = ()
     primary_eligible: bool = False
-    citation_policy: CitationPolicy = "discovery_only"
-    account_verification_url: str | None = None
     quality_weight: float | None = None
     source_role: str | None = None
     spam_risk: Literal["low", "medium", "high"] | None = None
-    requires_verification: bool | None = None
+    account_url: str | None = None
     default_limit: int = 30
     content_class: ContentClass | None = None
     selection_policy: SelectionPolicy = Field(default_factory=SelectionPolicy)
-    verification_policy: VerificationPolicy = Field(default_factory=VerificationPolicy)
 
     @model_validator(mode="after")
     def _validate_transport(self) -> "SourceSpec":
@@ -286,13 +262,6 @@ class SourceSpec(BaseModel):
             raise ValueError("source_group must contain lowercase letters, numbers, underscore or dash")
         if self.source_subtype is not None and not _valid_source_token(self.source_subtype):
             raise ValueError("source_subtype must contain lowercase letters, numbers, underscore or dash")
-        if self.account_verification_url is not None:
-            verification_url = urlparse(self.account_verification_url)
-            if verification_url.scheme not in {"http", "https"} or not verification_url.netloc:
-                raise ValueError("account_verification_url must be an absolute http(s) URL")
-        if self.citation_policy == "discovery_only" and self.primary_eligible:
-            raise ValueError("discovery_only sources cannot be primary_eligible")
-
         if self.transport in {"feed", "rsshub"}:
             if self.github is not None:
                 raise ValueError(f"{self.transport} source cannot define github options")
@@ -335,7 +304,7 @@ GitHubConfig = GitHubOptions
 
 
 class FetchItem(BaseModel):
-    """Canonical item exchanged between a collector and a processing job."""
+    """Canonical item exchanged between collectors and AI review."""
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
@@ -517,8 +486,6 @@ class SelectionDecision(BaseModel):
     content_class: ContentClass
     mode: str
     score: float = 0.0
-    verification_mode: str = "metadata_only"
-    discovery_only: bool = False
     matched_keywords: tuple[str, ...] = ()
     risk_flags: tuple[str, ...] = ()
 

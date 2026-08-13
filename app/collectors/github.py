@@ -198,7 +198,7 @@ class GitHubCollector(Collector):
     ) -> dict[str, Any]:
         """Fetch bounded metadata and README text for one selected repository.
 
-        This is an enrichment boundary, not a verifier: a 404, rate-limit, or
+        This is a metadata enrichment boundary: a 404, rate-limit, or
         malformed README is returned as telemetry and never raises to the
         batch.  The caller can persist the partial result and retain the
         deterministic ``hotspot`` status.

@@ -1,9 +1,8 @@
-"""AI-only editorial pre-processing for fetched intelligence items.
+"""AI-only analysis for fetched intelligence items.
 
 This stage deliberately stops after deterministic selection and one structured
-AI call per retained item.  It does not invoke the lightweight verifier,
-evidence search/fetch, claims, or any later editorial job.  The output is a
-candidate digest plus an audit file containing filtered and failed rows.
+AI call per retained item. The output is a candidate digest plus an audit file
+containing filtered and failed rows.
 """
 
 from __future__ import annotations
@@ -20,24 +19,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.ai.client import ItemAnalysisClient
-from app.ai.schemas import ItemAnalysisRequest, ItemAnalysisResponse
+from app.ai.schemas import ItemAnalysisRequest, ItemAnalysisResponse, parse_item_analysis_response, parse_project_summary_response
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
-from app.domain.models import SourceSpec
+from app.domain.models import FetchItem, SourceSpec
 from app.domain.policies import selection_decision
 from app.jobs.export_job import _serialize as _serialize_intel_item
-from app.jobs.process_job import (
-    _coerce_analysis_response,
-    _coerce_github_project_response,
-    _github_project_summary_request,
-    _is_github_repository_item,
-    _is_github_source,
-    _item_to_fetch_item,
-    _latest_item_time,
-    _ranking_key,
-    _selection_reason,
-    _spec_from_row,
-)
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import AIItemReview, IntelItem
 from app.storage.repository import IntelRepository
@@ -78,16 +65,15 @@ def run_ai_review_job(
     now: datetime | None = None,
     run_id: int | None = None,
 ) -> AIReviewResult:
-    """Run deterministic filtering plus structured AI review, without verify.
+    """Run deterministic filtering plus structured AI review.
 
     ``ai_client`` may use an injected HTTP client for its provider request.
-    The client is never used for source/article verification here.  In
-    particular, GitHub projects are summarized from already-persisted fetch
-    material and do not trigger metadata enrichment HTTP.
+    GitHub projects are summarized from already-persisted fetch material and do
+    not trigger metadata enrichment HTTP.
     """
 
-    # Accepted for migration compatibility but deliberately unused: this
-    # stage has no source/article verification HTTP boundary.
+    # Kept as an injectable boundary for callers/tests; this stage does not
+    # issue enrichment requests.
     del http_client
     result = AIReviewResult(run_id=run_id, dry_run=dry_run)
     result.candidate_path = str(Path(output_dir) / "ai_review_candidates.jsonl")
@@ -152,7 +138,7 @@ def run_ai_review_job(
                     content_class=spec.content_class,
                 )
                 # This is intentionally the only durable item status for a
-                # retained AI candidate. Verification remains untouched.
+                # retained AI candidate.
                 repo.set_item_status(item.id, "selected" if response.keep else "rejected")
                 result.analyzed += 1
                 session.commit()
@@ -181,7 +167,7 @@ def run_ai_review_job(
                     LOGGER.exception("Failed to persist AI review error for intel item %s", item.id)
 
         if not dry_run:
-            # The processing loop loaded relationships before writing the
+            # The AI-review loop loaded relationships before writing the
             # review rows. Expire the identity map so the export query sees
             # the just-persisted AI result instead of a stale ``ai_review=None``.
             session.expire_all()
@@ -267,7 +253,6 @@ def _run_item_ai_review(
             update={
                 "keep": True,
                 "content_class": "project_tool",
-                "needs_verification": False,
                 "risk_flags": list(dict.fromkeys([*response.risk_flags, *[f"selection:{flag}" for flag in decision.risk_flags]])),
             }
         )
@@ -292,10 +277,137 @@ def _run_item_ai_review(
     return response.model_copy(
         update={
             "content_class": spec.content_class or response.content_class,
-            "needs_verification": response.needs_verification or spec.content_class in {"official_model_company", "community_social"},
             "risk_flags": list(dict.fromkeys([*response.risk_flags, *extra_risks])),
         }
     )
+
+
+def _item_to_fetch_item(item: IntelItem) -> FetchItem:
+    return FetchItem(
+        item_id=item.id,
+        source_id=item.source_id,
+        content_class=item.content_class,
+        external_id=item.external_id,
+        title=item.title,
+        url=item.canonical_url,
+        published_at=item.published_at,
+        captured_at=item.captured_at,
+        summary=item.summary,
+        content=item.content_text,
+        metrics=_json_dict(item.metrics_json),
+        raw_payload=_json_dict(item.raw_payload_json),
+    )
+
+
+def _is_github_repository_item(item: FetchItem) -> bool:
+    raw = item.raw_payload if isinstance(item.raw_payload, Mapping) else {}
+    kind = str(item.kind or "").casefold()
+    item_type = str(raw.get("github_item_type") or "").casefold()
+    return bool(
+        (item.external_id and item.external_id.casefold().startswith("github_repo:"))
+        or item_type == "repository"
+        or "github_repository" in kind
+        or "trending_repository" in kind
+    )
+
+
+def _is_github_source(spec: SourceSpec) -> bool:
+    mode = spec.selection_policy.mode.casefold().replace("-", "_")
+    return bool(spec.transport == "github" or mode in {"github_active_high_star", "active_high_star", "github_trending"})
+
+
+def _github_project_summary_request(item: IntelItem) -> ItemAnalysisRequest:
+    metrics = _json_dict(item.metrics_json)
+    topics = metrics.get("topics") if isinstance(metrics.get("topics"), list) else []
+    readme = item.content_text if metrics.get("readme_chars") else ""
+    description = item.summary or metrics.get("description") or ""
+    body_parts = [
+        f"项目简介：{description}" if description else "项目简介：暂无",
+        f"Topics：{', '.join(str(topic) for topic in topics[:100])}" if topics else "Topics：暂无",
+        f"README（最多 16000 字符）：\n{readme[:16_000]}" if readme else "README：暂无",
+    ]
+    return ItemAnalysisRequest(
+        item_id=item.id,
+        title=item.title,
+        url=item.canonical_url,
+        source_id=item.source_id,
+        source_content_class="project_tool",
+        body_preview="\n\n".join(body_parts)[:24_000],
+        metrics={**metrics, "analysis_scope": "github_project_summary"},
+    )
+
+
+def _coerce_github_project_response(value: Any, request: ItemAnalysisRequest) -> ItemAnalysisResponse:
+    if isinstance(value, ItemAnalysisResponse):
+        if not value.summary_cn.strip():
+            raise ValueError("GitHub project summary is empty")
+        return value.model_copy(update={"keep": False, "content_class": "project_tool", "reason": "github_project_summary", "official_url": None})
+    if isinstance(value, Mapping):
+        try:
+            response = _coerce_analysis_response(value, "project_tool")
+        except (TypeError, ValueError):
+            response = parse_project_summary_response(value)
+        return response.model_copy(update={"keep": False, "content_class": "project_tool", "reason": "github_project_summary", "official_url": None})
+    raise TypeError("AI client returned an unsupported project summary")
+
+
+def _coerce_analysis_response(value: Any, source_class: str) -> ItemAnalysisResponse:
+    if isinstance(value, ItemAnalysisResponse):
+        return value
+    if isinstance(value, Mapping):
+        return parse_item_analysis_response(value, source_class)
+    raise TypeError("AI client returned an unsupported response")
+
+
+def _ranking_key(entry: tuple[IntelItem, Any, SourceSpec]) -> tuple[int, float, float, float, int, float, int]:
+    item, decision, spec = entry
+    published = item.published_at
+    timestamp = published.timestamp() if published is not None else float("-inf")
+    metrics = _json_dict(item.metrics_json)
+    primary = float(decision.score)
+    secondary = _number(metrics.get("stars") or metrics.get("stargazers_count")) if spec.content_class == "project_tool" else 0.0
+    return (1 if decision.selected else 0, primary, secondary, timestamp, -int(spec.priority), float(decision.score), -int(item.id))
+
+
+def _selection_reason(decision: Any) -> str:
+    reason = str(decision.reason or "")
+    flags = [str(flag) for flag in (decision.risk_flags or ()) if str(flag)]
+    return reason if not flags else f"{reason}; risks={','.join(flags)}"
+
+
+def _latest_item_time(items: list[IntelItem]) -> datetime | None:
+    values = [item.published_at or item.discovered_at or item.captured_at for item in items]
+    return max(values) if values else None
+
+
+def _spec_from_row(row: Any) -> SourceSpec:
+    if row is None:
+        return SourceSpec.model_validate({"id": "unknown", "name": "unknown", "transport": "feed", "url": "https://invalid.local/", "content_class": "community_social"})
+    data: dict[str, Any] = {
+        "id": row.id, "name": row.name, "transport": row.transport, "url": row.url,
+        "enabled": row.enabled, "priority": row.priority, "fetch_interval": row.fetch_interval,
+        "default_limit": row.default_limit, "source_group": row.source_group,
+        "source_subtype": row.source_subtype, "source_role": row.source_role,
+        "spam_risk": row.spam_risk, "quality_weight": row.quality_weight,
+        "content_class": row.content_class, "selection_policy": _json_dict(row.selection_policy_json),
+    }
+    if row.transport in {"feed", "rsshub"}:
+        data["feed"] = {"format": row.feed_format or "rss", "adapter": row.feed_adapter or "generic"}
+    elif row.transport == "github":
+        github: dict[str, Any] = {"mode": row.github_mode or "search"}
+        for name in ("query", "sort", "order", "pushed_days", "period"):
+            value = getattr(row, f"github_{name}", None)
+            if value is not None:
+                github[name] = value
+        data["github"] = github
+    return SourceSpec.model_validate(data)
+
+
+def _number(value: Any) -> float:
+    try:
+        return max(0.0, float(str(value).replace(",", "")))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _ai_review_selection_decision(
@@ -341,7 +453,7 @@ def _list_ai_review_items(
 ) -> list[IntelItem]:
     stmt = (
         select(IntelItem)
-        .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review), joinedload(IntelItem.verification))
+        .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
         .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
     )
     if not force:
@@ -366,7 +478,7 @@ def _load_ai_review_exports(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     stmt = (
         select(IntelItem)
-        .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review), joinedload(IntelItem.verification))
+        .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
         .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
     )
     if source_filter:
@@ -389,12 +501,6 @@ def _serialize_candidate(item: IntelItem) -> dict[str, Any]:
     record = _serialize_intel_item(item)
     review_value = record.get("ai")
     review = dict(review_value) if review_value else {}
-    editorial_section = _editorial_section_for_item(item)
-    # ``content_class`` remains the source-routing class. This separate
-    # output-only label supplies the V3 daily editorial column without adding
-    # a persistence field or claiming that triage/verification has run.
-    if review:
-        review.update({"evidence_status": "not_run", "verification_status": "not_run"})
     record.update(
         {
             "record_type": "ai_review_candidate",
@@ -404,68 +510,9 @@ def _serialize_candidate(item: IntelItem) -> dict[str, Any]:
             "summary_cn": review.get("summary_cn") or item.summary,
             "ai_review_status": review.get("status") if review else "not_run",
             "ai": review or None,
-            "editorial_section": editorial_section,
-            "editorial_section_source": "deterministic_content_class_title_mapping",
-            "evidence_status": "not_run",
-            "verification_status": "not_run",
-            # Never expose a prior verification row as the result of this
-            # stage. It remains in the database for historical audit only.
-            "verification": None,
         }
     )
     return record
-
-
-def _editorial_section_for_item(item: IntelItem) -> str:
-    """Map a source class and existing text to a V3 editorial column.
-
-    This is intentionally deterministic and local.  It is not an AI field,
-    does not run triage, and must not be interpreted as evidence or
-    verification.
-    """
-
-    content_class = str(item.content_class or "community_social")
-    if content_class == "project_tool":
-        return "open_source_tool"
-    text = " ".join(
-        value
-        for value in (item.title, item.summary, item.content_text)
-        if value
-    ).casefold()
-    if any(
-        token in text
-        for token in (
-            "paper",
-            "arxiv",
-            "doi",
-            "research",
-            "benchmark",
-            "论文",
-            "研究",
-            "基准",
-        )
-    ):
-        return "research"
-    if any(
-        token in text
-        for token in (
-            "infra",
-            "database",
-            "gpu",
-            "cloud",
-            "platform",
-            "api",
-            "infrastructure",
-            "数据库",
-            "云",
-            "平台",
-            "算力",
-        )
-    ):
-        return "industry_infrastructure"
-    if content_class == "official_model_company":
-        return "model_product"
-    return "practice_opinion"
 
 
 def _write_ai_review_exports(
@@ -490,7 +537,7 @@ def _write_ai_review_exports(
         f"候选条目：{len(candidates)}",
         f"审计条目：{len(audit)}",
         "",
-        "> 本阶段只完成确定性初筛、AI 分类和中文简要总结；evidence/verification_status=not_run。",
+        "> 本阶段只完成确定性初筛、AI 分类和中文简要总结。",
         "",
     ]
     for index, record in enumerate(candidates, 1):
@@ -499,10 +546,9 @@ def _write_ai_review_exports(
             [
                 f"## {index}. {record.get('title') or '(untitled)' }",
                 f"- 来源：`{record.get('source_id')}` / `{record.get('source_group')}` / `{record.get('source_subtype')}` / x_official=`{str(bool(record.get('x_official'))).lower()}`",
-                f"- 类别：content_class=`{record.get('content_class')}` / editorial_section=`{record.get('editorial_section')}` | keep=`{str(bool(record.get('keep_decision'))).lower()}` | confidence=`{ai.get('confidence', 0)}`",
+                f"- 类别：content_class=`{record.get('content_class')}` | keep=`{str(bool(record.get('keep_decision'))).lower()}` | confidence=`{ai.get('confidence', 0)}`",
                 f"- 摘要：{record.get('summary_cn') or '暂无摘要'}",
                 f"- 风险：{', '.join(ai.get('risk_flags') or []) or '无'}",
-                f"- evidence_status=`not_run` | verification_status=`not_run`",
                 f"- 链接：{record.get('url') or '无'}",
                 "",
             ]

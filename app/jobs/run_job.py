@@ -1,7 +1,6 @@
 """Fixed-order fetch -> AI review -> export orchestration.
 
-The explicit ``process`` command remains available as a legacy verification
-path; the normal ``run-once`` entry point intentionally does not invoke it.
+    The normal ``run-once`` entry point is the complete AI-only orchestration.
 """
 
 from __future__ import annotations
@@ -9,7 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from tempfile import TemporaryDirectory
 from pathlib import Path
-from typing import Any
 
 from app.config.settings import Settings
 from app.jobs.ai_review_job import AIReviewResult, run_ai_review_from_settings
@@ -23,15 +21,10 @@ from app.storage.repository import IntelCounts, IntelRepository
 class IntelRunResult:
     run_id: int | None
     fetch: IntelFetchResult
-    process: AIReviewResult
+    ai_review: AIReviewResult
     export: IntelExportResult
     status: str
     error: str | None = None
-
-    @property
-    def ai_review(self) -> AIReviewResult:
-        return self.process
-
 
 def run_intel_once_from_settings(
     *,
@@ -45,7 +38,7 @@ def run_intel_once_from_settings(
 ) -> IntelRunResult:
     if dry_run:
         # Use one ephemeral SQLite file for the three stages.  The fetch stage
-        # may populate it so process/export can observe the same batch, while
+        # may populate it so the following stages can observe the same batch, while
         # the caller's configured database and output directory remain untouched.
         with TemporaryDirectory(prefix="intel-dry-run-") as temp_dir:
             ephemeral = replace(settings, database_url=f"sqlite:///{Path(temp_dir) / 'intel.db'}")
@@ -57,7 +50,7 @@ def run_intel_once_from_settings(
                 force=force,
                 dry_run=False,
             )
-            process = run_ai_review_from_settings(
+            ai_review = run_ai_review_from_settings(
                 settings=ephemeral,
                 source_filter=source,
                 content_class=content_class,
@@ -74,7 +67,7 @@ def run_intel_once_from_settings(
                 dry_run=True,
             )
         fetch = replace(fetch, dry_run=True)
-        return IntelRunResult(None, fetch, process, export, "dry_run")
+        return IntelRunResult(None, fetch, ai_review, export, "dry_run")
 
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
@@ -95,7 +88,7 @@ def run_intel_once_from_settings(
             force=force,
             run_id=run_id,
         )
-        process = run_ai_review_from_settings(
+        ai_review = run_ai_review_from_settings(
             settings=settings,
             source_filter=source,
             content_class=content_class,
@@ -112,7 +105,7 @@ def run_intel_once_from_settings(
         )
         # ``failed`` counts each failed item once; ``ai_failed`` is the
         # narrower audit counter for model failures and is already included.
-        status = "completed_with_errors" if (fetch.total_failed or process.failed) else "completed"
+        status = "completed_with_errors" if (fetch.total_failed or ai_review.failed) else "completed"
         with session_factory() as session:
             IntelRepository(session).finish_run(
                 run_id,
@@ -121,19 +114,18 @@ def run_intel_once_from_settings(
                     fetched=fetch.total_fetched,
                     inserted=fetch.total_inserted,
                     skipped=fetch.total_skipped,
-                    selected=process.selected,
-                    analyzed=process.analyzed,
-                    verified=0,
-                    failed=fetch.total_failed + process.failed,
+                    selected=ai_review.selected,
+                    analyzed=ai_review.analyzed,
+                    failed=fetch.total_failed + ai_review.failed,
                 ),
             )
             session.commit()
-        return IntelRunResult(run_id, fetch, process, export, status)
+        return IntelRunResult(run_id, fetch, ai_review, export, status)
     except Exception as exc:
         with session_factory() as session:
             IntelRepository(session).finish_run(run_id, status="failed", error=str(exc))
             session.commit()
         empty_fetch = IntelFetchResult(run_id=run_id)
-        empty_process = AIReviewResult()
+        empty_ai_review = AIReviewResult()
         empty_export = IntelExportResult(0, 0, f"{output_dir}/intel_items.jsonl", f"{output_dir}/intel_digest.md", f"{output_dir}/intel_pending.jsonl")
-        return IntelRunResult(run_id, empty_fetch, empty_process, empty_export, "failed", str(exc))
+        return IntelRunResult(run_id, empty_fetch, empty_ai_review, empty_export, "failed", str(exc))

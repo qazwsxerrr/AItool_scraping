@@ -18,7 +18,7 @@ def main(
     limit_per_source: int | None = typer.Option(
         None,
         min=1,
-        help="Maximum items to process per source. Defaults to each source's configured default_limit.",
+        help="Maximum items to fetch per source. Defaults to each source's configured default_limit.",
     ),
     source: str | None = typer.Option(None, help="Only fetch one source id, e.g. openai_news."),
     content_class: str | None = typer.Option(None, "--class", help="Only fetch one content class."),
