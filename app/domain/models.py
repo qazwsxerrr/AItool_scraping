@@ -94,10 +94,6 @@ class SelectionPolicy(BaseModel):
             raise TypeError("selection_policy must be a mapping or SelectionPolicy")
 
         data = dict(value)
-        removed_keys = {"verification_policy", "requires_verification", "citation_policy", "discovery_only"}
-        forbidden = sorted(removed_keys.intersection(data))
-        if forbidden:
-            raise ValueError("selection_policy contains removed fields: " + ", ".join(forbidden))
         if "window_days" in data and "max_age_days" not in data:
             data["max_age_days"] = data["window_days"]
         if "stars" in data and "min_stars" not in data and isinstance(data["stars"], (int, float)):

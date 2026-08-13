@@ -130,19 +130,6 @@ def test_explicit_policy_overrides_defaults_without_losing_class_defaults():
     assert spec.selection_policy.sort_by == "stars"
 
 
-def test_removed_selection_policy_fields_are_rejected():
-    with pytest.raises(ValueError, match="removed fields"):
-        source_spec_from_config(
-            {
-                "id": "legacy_policy",
-                "name": "Legacy policy",
-                "transport": "feed",
-                "url": "https://example.test/feed.xml",
-                "selection_policy": {"mode": "official_recent", "verification_policy": {"mode": "metadata_only"}},
-            }
-        )
-
-
 def test_fetch_dtos_accept_current_collector_aliases_and_transport_metadata():
     item = FetchItem(
         source_id="github_active",
