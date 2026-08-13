@@ -53,6 +53,37 @@ def test_run_once_passes_one_run_id_through_fetch_and_finishes_run(tmp_path, mon
         assert row.status == "completed"
 
 
+def test_run_once_ai_only_path_never_enters_legacy_verifier(tmp_path, monkeypatch):
+    db_path = tmp_path / "ai-only-run.db"
+    engine = create_engine_from_url(f"sqlite:///{db_path}")
+    init_db(engine)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("run-once must not invoke legacy process verification")
+
+    monkeypatch.setattr("app.jobs.process_job._verify", forbidden)
+    monkeypatch.setattr(
+        run_job,
+        "run_intel_fetch_from_settings",
+        lambda **kwargs: IntelFetchResult(run_id=kwargs.get("run_id"), stats={}),
+    )
+    monkeypatch.setattr(
+        run_job,
+        "run_ai_review_from_settings",
+        lambda **kwargs: AIReviewResult(run_id=kwargs.get("run_id"), selected=1, analyzed=1),
+    )
+    monkeypatch.setattr(
+        run_job,
+        "run_intel_export_from_settings",
+        lambda **kwargs: IntelExportResult(1, 0, "items", "digest", "pending"),
+    )
+
+    result = run_job.run_intel_once_from_settings(settings=_settings(db_path), limit=1)
+
+    assert result.status == "completed"
+    assert result.ai_review.selected == 1
+
+
 def test_run_once_dry_run_does_not_create_database(tmp_path, monkeypatch):
     db_path = tmp_path / "dry.db"
     monkeypatch.setattr(
