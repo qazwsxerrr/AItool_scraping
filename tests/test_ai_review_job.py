@@ -64,6 +64,22 @@ class _AI:
         )
 
 
+class _RejectingAI(_AI):
+    def analyze(self, request):
+        self.calls.append(request.item_id)
+        return ItemAnalysisResponse(
+            keep=False,
+            content_class=request.source_content_class,
+            summary_cn="与 AI 日报主题无关",
+            reason="内容与 AI 工具情报无关",
+            risk_flags=["irrelevant"],
+            needs_verification=False,
+            official_url=None,
+            confidence=94,
+            raw_response={"fixture": True, "keep": False},
+        )
+
+
 def _insert_items(sf, source, spec):
     with sf() as session:
         repo = IntelRepository(session)
@@ -174,6 +190,55 @@ def test_ai_review_failure_isolated_and_auditable(tmp_path):
     failed = next(row for row in audit if row["status"] == "ai_failed")
     assert failed["ai"]["status"] == "ai_failed"
     assert failed["evidence_status"] == "not_run"
+
+
+def test_ai_review_ai_keep_false_rejects_item_and_excludes_candidate(tmp_path):
+    sf = _db(tmp_path)
+    source = _source()
+    spec = source_spec_from_config(source)
+    with sf() as session:
+        repo = IntelRepository(session)
+        repo.upsert_source(source, policy=spec)
+        repo.insert_item(
+            FetchItem(
+                source_id=source.id,
+                external_id="irrelevant:1",
+                title="Announcing a new model release",
+                url="https://official.example/irrelevant",
+                published_at=NOW - timedelta(hours=2),
+                summary="A deliberately irrelevant entertainment item unrelated to the claimed release.",
+            )
+        )
+        session.commit()
+
+    ai = _RejectingAI()
+    result = run_ai_review_job(
+        session_factory=sf,
+        source_specs={source.id: spec},
+        ai_client=ai,
+        output_dir=tmp_path / "out",
+        limit=10,
+        now=NOW,
+    )
+
+    assert result.selected == 1
+    assert result.analyzed == 1
+    assert result.exported == 0
+    assert ai.calls == [1]
+
+    with sf() as session:
+        item = session.scalar(select(IntelItem))
+        assert item is not None
+        assert item.status == "rejected"
+        assert item.ai_review is not None
+        assert item.ai_review.status == "success"
+        assert item.ai_review.keep is False
+
+    audit = [json.loads(line) for line in (tmp_path / "out" / "ai_review_audit.jsonl").read_text().splitlines()]
+    assert len(audit) == 1
+    assert audit[0]["status"] == "rejected"
+    assert audit[0]["keep_decision"] is False
+    assert audit[0]["ai"]["risk_flags"] == ["irrelevant"]
 
 
 def test_ai_review_p1_official_without_keyword_reaches_ai_and_exports_summary(tmp_path):

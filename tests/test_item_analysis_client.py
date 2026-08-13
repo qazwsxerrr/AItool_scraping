@@ -170,6 +170,57 @@ def test_openai_chat_endpoint_and_json_fence_are_supported():
     assert "community_social" in result.raw_response["choices"][0]["message"]["content"]
 
 
+def test_openai_responses_endpoint_and_output_envelope_are_supported():
+    payload = {
+        "keep": True,
+        "content_class": "community_social",
+        "summary_cn": "Responses API 社区线索",
+        "reason": "需要核实",
+        "risk_flags": ["social-only"],
+        "needs_verification": True,
+        "official_url": None,
+        "confidence": 82,
+    }
+    http = FakeHttpClient(
+        FakeResponse(
+            {
+                "object": "response",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [],
+                    },
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": json.dumps(payload, ensure_ascii=False)}
+                        ],
+                    },
+                ],
+            }
+        )
+    )
+    client = ItemAnalysisClient.from_settings(
+        Settings(
+            ai_review_api_url="https://api.example.test/v1",
+            ai_review_api_key="key",
+            ai_review_model="response-model",
+            ai_review_api_style="openai_responses",
+        ),
+        http_client=http,
+    )
+
+    result = client.analyze(_request(source_content_class="official_model_company"))
+
+    call = http.calls[0]
+    assert call["url"] == "https://api.example.test/v1/responses"
+    assert call["json"]["input"][0]["role"] == "system"
+    assert call["json"]["text"]["format"] == {"type": "json_object"}
+    assert result.summary_cn == "Responses API 社区线索"
+    assert result.content_class == "official_model_company"
+    assert result.raw_response == http.response.payload
+
+
 def test_project_summary_parses_narrow_openai_response_without_keep_gate():
     content = json.dumps(
         {

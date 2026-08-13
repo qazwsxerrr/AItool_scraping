@@ -23,6 +23,7 @@ from app.ai.prompts import (
     TRIAGE_TASK,
     build_generic_json_payload,
     build_openai_chat_payload,
+    build_openai_responses_payload,
     build_stage_payload,
 )
 from app.ai.schemas import (
@@ -75,9 +76,7 @@ class ItemAnalysisClient:
         cluster_model: str | None = None,
         compose_model: str | None = None,
     ) -> None:
-        style = str(api_style or "generic_json").strip().lower()
-        if style not in {"generic_json", "openai_chat"}:
-            raise ValueError("api_style must be generic_json or openai_chat")
+        style = _normalize_api_style(api_style)
         self.api_url = api_url.rstrip("/") if api_url else None
         self.api_key = api_key
         self.model = model
@@ -342,6 +341,8 @@ class ItemAnalysisClient:
             raise RuntimeError("Item analysis API is not configured")
         if self.api_style == "openai_chat" and not self.api_url.lower().endswith("/chat/completions"):
             return f"{self.api_url}/chat/completions"
+        if self.api_style == "openai_responses" and not self.api_url.lower().endswith("/responses"):
+            return f"{self.api_url}/responses"
         return self.api_url
 
     def _build_payload(
@@ -354,6 +355,14 @@ class ItemAnalysisClient:
     ) -> dict[str, Any]:
         if self.api_style == "openai_chat":
             return build_openai_chat_payload(
+                request,
+                model=self.model,
+                task=task,
+                system_prompt=system_prompt,
+                response_schema=response_schema,
+            )
+        if self.api_style == "openai_responses":
+            return build_openai_responses_payload(
                 request,
                 model=self.model,
                 task=task,
@@ -400,6 +409,23 @@ __all__ = [
     "parse_event_editorial_response",
     "StageCallResult",
 ]
+
+
+def _normalize_api_style(value: Any) -> str:
+    """Normalize provider style aliases while keeping one internal spelling."""
+
+    style = str(value or "generic_json").strip().lower().replace("-", "_")
+    aliases = {
+        "responses": "openai_responses",
+        "openai_response": "openai_responses",
+        "openai_responses_api": "openai_responses",
+        "chat": "openai_chat",
+        "chat_completions": "openai_chat",
+    }
+    style = aliases.get(style, style)
+    if style not in {"generic_json", "openai_chat", "openai_responses"}:
+        raise ValueError("api_style must be generic_json, openai_chat, or openai_responses")
+    return style
 
 
 def _extract_evidence_ids(evidence: Any) -> set[str]:

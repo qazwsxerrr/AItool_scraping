@@ -164,7 +164,7 @@ AI_REVIEW_TIMEOUT_SECONDS=30
 | `AI_REVIEW_API_URL` | 否 | 留空 | AI review 服务地址；为空时不调用 AI review。 |
 | `AI_REVIEW_API_KEY` | 启用 AI review 时必填 | 留空 | AI review 服务密钥。 |
 | `AI_REVIEW_MODEL` | 启用 AI review 时填写 | 留空 | AI review 使用的模型名。 |
-| `AI_REVIEW_API_STYLE` | 否 | `generic_json` | AI review API 协议风格，例如 `openai_chat`。 |
+| `AI_REVIEW_API_STYLE` | 否 | `generic_json` | AI review API 协议风格：`generic_json`、`openai_chat` 或 `openai_responses`。使用 `openai_responses` 时，`AI_REVIEW_API_URL=http://127.0.0.1:8317/v1` 会请求 `/v1/responses`。 |
 | `AI_REVIEW_TIMEOUT_SECONDS` | 否 | `30` | AI review 请求超时时间，单位为秒。 |
 
 代理和端口的关系固定如下：

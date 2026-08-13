@@ -50,7 +50,7 @@ python -m app.main run-once --source github_search_topic_llm --force
 python -m app.main run-once --class official_model_company --dry-run
 ```
 
-AI provider 继续使用 `AI_REVIEW_API_URL`、`AI_REVIEW_API_KEY`、`AI_REVIEW_MODEL` 和 `AI_REVIEW_API_STYLE`。未配置或单条调用失败时，条目保留并标记 `ai_failed`，不会静默丢弃。
+AI provider 继续使用 `AI_REVIEW_API_URL`、`AI_REVIEW_API_KEY`、`AI_REVIEW_MODEL` 和 `AI_REVIEW_API_STYLE`。`AI_REVIEW_API_STYLE=openai_responses` 时，基础地址会规范化到 OpenAI-compatible `/v1/responses`，并解析 Responses API 的 `output` 文本；`openai_chat` 对应 `/v1/chat/completions`。未配置或单条调用失败时，条目保留并标记 `ai_failed`，不会静默丢弃。
 
 GitHub Trending/Search repository 已经包含结构化 stars、周期新增 Star、forks、language、topics 和 pushed_at（Search）。处理阶段先执行 registry 的 Star 规则，AI 不参与保留决策；选中的唯一仓库再补充 bounded metadata/README，并最多调用一次窄项目摘要 AI，生成项目介绍、主要能力、适用场景和风险提示，最终始终标记 `hotspot`，不执行 claim/evidence 核实。导出后由 `app/storage/github_reader.py` 展示周期指标和持久化项目介绍。
 

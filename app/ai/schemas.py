@@ -499,6 +499,14 @@ def _unwrap_response(data: dict[str, Any]) -> dict[str, Any]:
         value = data[key]
         if isinstance(value, Mapping):
             return dict(value)
+        if key == "output" and isinstance(value, list):
+            text = _responses_output_text(value)
+            if text is None:
+                raise ValueError("Item analysis Responses response has no output text")
+            parsed = _parse_json_text(text)
+            if not isinstance(parsed, Mapping):
+                raise ValueError("Item analysis Responses output must be a JSON object")
+            return dict(parsed)
         if isinstance(value, str):
             parsed = _parse_json_text(value)
             if isinstance(parsed, Mapping):
@@ -543,6 +551,29 @@ def _unwrap_response(data: dict[str, Any]) -> dict[str, Any]:
         return dict(parsed)
 
     return data
+
+
+def _responses_output_text(value: list[Any]) -> str | None:
+    """Extract text from the Responses API's heterogeneous ``output`` list."""
+
+    parts: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("type") == "output_text" and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+            continue
+        content = item.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, Mapping):
+                    continue
+                if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+                elif isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+    text = "".join(parts).strip()
+    return text or None
 
 
 def content_to_text(value: Any) -> str | None:

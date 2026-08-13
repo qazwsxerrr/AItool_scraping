@@ -130,6 +130,38 @@ def build_openai_chat_payload(
     }
 
 
+def build_openai_responses_payload(
+    request: ItemAnalysisRequest,
+    *,
+    model: str | None,
+    task: str = ITEM_ANALYSIS_TASK,
+    system_prompt: str = ITEM_ANALYSIS_SYSTEM_PROMPT,
+    response_schema: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build one OpenAI Responses-compatible JSON request.
+
+    The local proxy accepts the standard ``/v1/responses`` contract.  The
+    system prompt and serialized item are sent as input messages so both the
+    official Responses API and OpenAI-compatible gateways receive the same
+    instruction/data boundary.  JSON mode is used here because the existing
+    provider-neutral schemas are descriptive field maps rather than full JSON
+    Schema documents; the response is still parsed and validated locally.
+    """
+
+    del task, response_schema
+    return {
+        "model": model,
+        "input": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(request.model_dump(mode="json"), ensure_ascii=False, default=str),
+            },
+        ],
+        "text": {"format": {"type": "json_object"}},
+    }
+
+
 def _jsonable_input(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
@@ -165,6 +197,19 @@ def build_stage_payload(
             "response_format": {"type": "json_object"},
             "temperature": 0.2,
         }
+    if api_style == "openai_responses":
+        del task, response_schema
+        return {
+            "model": model,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(payload_input, ensure_ascii=False, default=str),
+                },
+            ],
+            "text": {"format": {"type": "json_object"}},
+        }
     return {
         "model": model,
         "task": task,
@@ -181,6 +226,7 @@ __all__ = [
     "PROJECT_SUMMARY_SYSTEM_PROMPT",
     "build_generic_json_payload",
     "build_openai_chat_payload",
+    "build_openai_responses_payload",
     "PROJECT_SUMMARY_TASK",
     "TRIAGE_TASK",
     "CLUSTER_TASK",
