@@ -8,6 +8,8 @@ source registry -> fetch -> ai-review -> candidate export -> (later) evidence/ve
 
 `ai-review` 只负责确定性来源策略筛选、AI 分类和逐条中文简要总结。它不会调用轻量验证 HTTP，也不会执行 evidence、claim、entity、triage、cluster、compose 或 recommendation。候选导出固定带 `evidence_status=not_run`、`verification_status=not_run`；filtered、rejected、ai_failed 记录保留在审计输出和 `intel_items`/`ai_item_reviews` 中。
 
+候选还会保留来源路由 `content_class`，并在导出层提供不落库的 `editorial_section`（五个 V3 日报栏目）。该字段由 `content_class`、标题和摘要的确定性映射生成，仅用于预分栏；它不表示 AI 已完成事实核实，后续 triage/evidence/verification 仍需独立运行。
+
 ## 内容分流
 
 | 类别 | 典型来源 | 确定性筛选 | 轻量核实 | 输出语义 |

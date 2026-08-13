@@ -346,9 +346,14 @@ def _load_ai_review_exports(
 
 def _serialize_candidate(item: IntelItem) -> dict[str, Any]:
     record = _serialize_intel_item(item)
-    review = record.get("ai") or {}
-    review = dict(review)
-    review.update({"evidence_status": "not_run", "verification_status": "not_run"})
+    review_value = record.get("ai")
+    review = dict(review_value) if review_value else {}
+    editorial_section = _editorial_section_for_item(item)
+    # ``content_class`` remains the source-routing class. This separate
+    # output-only label supplies the V3 daily editorial column without adding
+    # a persistence field or claiming that triage/verification has run.
+    if review:
+        review.update({"evidence_status": "not_run", "verification_status": "not_run"})
     record.update(
         {
             "record_type": "ai_review_candidate",
@@ -358,6 +363,8 @@ def _serialize_candidate(item: IntelItem) -> dict[str, Any]:
             "summary_cn": review.get("summary_cn") or item.summary,
             "ai_review_status": review.get("status") if review else "not_run",
             "ai": review or None,
+            "editorial_section": editorial_section,
+            "editorial_section_source": "deterministic_content_class_title_mapping",
             "evidence_status": "not_run",
             "verification_status": "not_run",
             # Never expose a prior verification row as the result of this
@@ -366,6 +373,58 @@ def _serialize_candidate(item: IntelItem) -> dict[str, Any]:
         }
     )
     return record
+
+
+def _editorial_section_for_item(item: IntelItem) -> str:
+    """Map a source class and existing text to a V3 editorial column.
+
+    This is intentionally deterministic and local.  It is not an AI field,
+    does not run triage, and must not be interpreted as evidence or
+    verification.
+    """
+
+    content_class = str(item.content_class or "community_social")
+    if content_class == "project_tool":
+        return "open_source_tool"
+    text = " ".join(
+        value
+        for value in (item.title, item.summary, item.content_text)
+        if value
+    ).casefold()
+    if any(
+        token in text
+        for token in (
+            "paper",
+            "arxiv",
+            "doi",
+            "research",
+            "benchmark",
+            "论文",
+            "研究",
+            "基准",
+        )
+    ):
+        return "research"
+    if any(
+        token in text
+        for token in (
+            "infra",
+            "database",
+            "gpu",
+            "cloud",
+            "platform",
+            "api",
+            "infrastructure",
+            "数据库",
+            "云",
+            "平台",
+            "算力",
+        )
+    ):
+        return "industry_infrastructure"
+    if content_class == "official_model_company":
+        return "model_product"
+    return "practice_opinion"
 
 
 def _write_ai_review_exports(
@@ -399,7 +458,7 @@ def _write_ai_review_exports(
             [
                 f"## {index}. {record.get('title') or '(untitled)' }",
                 f"- 来源：`{record.get('source_id')}` / `{record.get('source_group')}` / `{record.get('source_subtype')}` / x_official=`{str(bool(record.get('x_official'))).lower()}`",
-                f"- 类别：`{record.get('content_class')}` | keep=`{str(bool(record.get('keep_decision'))).lower()}` | confidence=`{ai.get('confidence', 0)}`",
+                f"- 类别：content_class=`{record.get('content_class')}` / editorial_section=`{record.get('editorial_section')}` | keep=`{str(bool(record.get('keep_decision'))).lower()}` | confidence=`{ai.get('confidence', 0)}`",
                 f"- 摘要：{record.get('summary_cn') or '暂无摘要'}",
                 f"- 风险：{', '.join(ai.get('risk_flags') or []) or '无'}",
                 f"- evidence_status=`not_run` | verification_status=`not_run`",

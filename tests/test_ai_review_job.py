@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from sqlalchemy import select
 
@@ -9,7 +10,7 @@ from app.ai.schemas import ItemAnalysisResponse
 from app.config.source_registry import SourceConfig
 from app.domain.models import FetchItem
 from app.domain.policies import source_spec_from_config
-from app.jobs.ai_review_job import run_ai_review_job
+from app.jobs.ai_review_job import _editorial_section_for_item, run_ai_review_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import AIItemReview, IntelItem, IntelItemVerification
 from app.storage.repository import IntelRepository
@@ -108,7 +109,12 @@ def test_ai_review_never_calls_verification_and_exports_not_run(tmp_path, monkey
     assert result.analyzed == 2
     assert result.filtered == 1
     assert result.exported == 2
-    record = json.loads((tmp_path / "out" / "ai_review_candidates.jsonl").read_text().splitlines()[0])
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "ai_review_candidates.jsonl").read_text().splitlines()
+    ]
+    records_by_title = {row["title"]: row for row in records}
+    record = records[0]
     assert record["stage"] == "ai_review"
     assert record["source_id"] == source.id
     assert record["source_group"] == "official_blog"
@@ -117,6 +123,9 @@ def test_ai_review_never_calls_verification_and_exports_not_run(tmp_path, monkey
     assert record["verification_status"] == "not_run"
     assert record["verification"] is None
     assert record["summary_cn"] == "中文简要总结"
+    assert records_by_title["Announcing a new model release"]["editorial_section"] == "model_product"
+    assert records_by_title["API version update"]["editorial_section"] == "industry_infrastructure"
+    assert record["content_class"] == "official_model_company"
 
     with sf() as session:
         rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
@@ -165,3 +174,38 @@ def test_ai_review_failure_isolated_and_auditable(tmp_path):
     failed = next(row for row in audit if row["status"] == "ai_failed")
     assert failed["ai"]["status"] == "ai_failed"
     assert failed["evidence_status"] == "not_run"
+
+
+def test_editorial_section_is_output_only_and_deterministic():
+    assert _editorial_section_for_item(
+        SimpleNamespace(
+            content_class="project_tool",
+            title="A database tool",
+            summary="",
+            content_text="",
+        )
+    ) == "open_source_tool"
+    assert _editorial_section_for_item(
+        SimpleNamespace(
+            content_class="community_social",
+            title="New arXiv paper benchmark",
+            summary="",
+            content_text="",
+        )
+    ) == "research"
+    assert _editorial_section_for_item(
+        SimpleNamespace(
+            content_class="community_social",
+            title="GPU cloud platform launch",
+            summary="",
+            content_text="",
+        )
+    ) == "industry_infrastructure"
+    assert _editorial_section_for_item(
+        SimpleNamespace(
+            content_class="community_social",
+            title="Practical workflow notes",
+            summary="",
+            content_text="",
+        )
+    ) == "practice_opinion"

@@ -8,6 +8,8 @@ source registry -> fetch -> ai-review -> candidate export -> (later) evidence/ve
 
 `ai-review` 是独立的 AI 编辑预处理阶段：先按来源策略做确定性初筛，再对保留条目逐条分类并生成中文简要总结。它不会调用 `_verify`、文章/证据 HTTP、claim、entity、triage、cluster、compose 或推荐门禁。每条候选的导出记录显式写入 `evidence_status=not_run` 和 `verification_status=not_run`；筛除条目和 provider 失败条目仍在 `ai_review_audit.jsonl` 与数据库中保留。
 
+导出同时保留来源路由字段 `content_class`，并增加不落库的 `editorial_section` 栏目字段（`model_product`、`industry_infrastructure`、`research`、`open_source_tool`、`practice_opinion`）。栏目值只依据现有 `content_class`、标题和摘要做确定性映射，用于 V3 日报预分栏；它不是 AI 核实结果，也不替代后续 triage、evidence 或 verification。
+
 V3 日报链路以事件（`events`）为选入单元，按以下顺序运行：
 
 ```text
@@ -198,7 +200,7 @@ python -m app.main fetch-only --source openai_news --force --output-dir output/f
 `source_id`、来源名称、`transport`、`source_group`、`source_subtype`、`tier`、`role`；X 官方账号的
 `x_official` 为 `true`，`x_social`/`x_search` 保持发现性质并标为 `false`。抓取失败按来源隔离，单一来源失败不会中断批次。
 
-`ai-review` 写出 `ai_review_candidates.jsonl`（保留候选）、`ai_review_audit.jsonl`（包含 filtered/rejected/ai_failed 的全部审计记录）和 `ai_review_digest.md`。候选文件含标题、来源字段、AI 分类、中文简要总结、keep、confidence、风险以及明确的 `evidence_status/verification_status=not_run`。
+`ai-review` 写出 `ai_review_candidates.jsonl`（保留候选）、`ai_review_audit.jsonl`（包含 filtered/rejected/ai_failed 的全部审计记录）和 `ai_review_digest.md`。候选文件含标题、来源字段、`content_class`、输出层 `editorial_section`、AI 分类、中文简要总结、keep、confidence、风险以及明确的 `evidence_status/verification_status=not_run`。
 
 日常入口：
 
