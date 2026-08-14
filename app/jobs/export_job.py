@@ -16,7 +16,7 @@ from app.config.settings import Settings
 from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
-from app.storage.models import AIItemReview, IntelItem
+from app.storage.models import AIItemReview, IntelEvent, IntelEventRankingSnapshot, IntelItem
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,7 @@ def run_intel_export_job(
     content_class: str | None = None,
     dry_run: bool = False,
     github_report_dir: str | Path | None = None,
+    snapshot_key: str = "latest",
 ) -> IntelExportResult:
     output = Path(output_dir)
     jsonl_path = output / "intel_items.jsonl"
@@ -49,7 +50,17 @@ def run_intel_export_job(
     report_root = Path(github_report_dir) if github_report_dir else output.parent / "github-trending"
     with session_factory() as session:
         repo = IntelRepository(session)
-        items = repo.list_export_items(
+        # Editorial snapshots are the export source of truth after Wave 3.
+        # Databases that have not run event/ranking yet retain the previous
+        # item export behavior for compatibility with existing deployments.
+        snapshot_rows = _list_export_events(
+            session,
+            snapshot_key=snapshot_key,
+            limit=limit,
+            source_filter=source_filter,
+            content_class=content_class,
+        )
+        items = [] if snapshot_rows is not None else repo.list_export_items(
             limit=limit,
             source_id=source_filter,
             content_class=content_class,
@@ -60,7 +71,7 @@ def run_intel_export_job(
             source_filter=source_filter,
             content_class=content_class,
         )
-        records = [_serialize(item) for item in items]
+        records = snapshot_rows if snapshot_rows is not None else [_serialize(item) for item in items]
         pending_records = [_serialize(item) for item in pending_items]
 
     status_counts = dict(Counter(str(record.get("status") or "unknown") for record in [*records, *pending_records]))
@@ -109,6 +120,7 @@ def run_intel_export_from_settings(
     content_class: str | None = None,
     dry_run: bool = False,
     github_report_dir: str | Path | None = None,
+    snapshot_key: str = "latest",
 ) -> IntelExportResult:
     database_url = _readable_database_url(settings.database_url, dry_run=dry_run)
     engine = create_engine_from_url(database_url)
@@ -122,7 +134,95 @@ def run_intel_export_from_settings(
         content_class=content_class,
         dry_run=dry_run,
         github_report_dir=github_report_dir,
+        snapshot_key=snapshot_key,
     )
+
+
+def _list_export_events(
+    session: Session,
+    *,
+    snapshot_key: str,
+    limit: int | None,
+    source_filter: str | None,
+    content_class: str | None,
+) -> list[dict[str, Any]] | None:
+    """Return selected event records, or ``None`` when no snapshot exists.
+
+    ``[]`` is meaningful: a completed editorial run with zero selected events
+    must export an empty file instead of silently falling back to old item
+    selection.  The distinction keeps cold-start compatibility while honoring
+    the no-padding policy.
+    """
+
+    exists = session.execute(
+        select(IntelEventRankingSnapshot.id)
+        .where(IntelEventRankingSnapshot.snapshot_key == snapshot_key)
+        .limit(1)
+    ).first()
+    if exists is None:
+        return None
+    stmt = (
+        select(IntelEventRankingSnapshot, IntelEvent)
+        .join(IntelEvent, IntelEvent.id == IntelEventRankingSnapshot.event_id)
+        .where(
+            IntelEventRankingSnapshot.snapshot_key == snapshot_key,
+            IntelEventRankingSnapshot.selected.is_(True),
+        )
+        .order_by(IntelEventRankingSnapshot.rank.asc(), IntelEvent.id.asc())
+    )
+    rows = list(session.execute(stmt).all())
+    records: list[dict[str, Any]] = []
+    for snapshot, event in rows:
+        record = _serialize_event(snapshot, event)
+        if content_class and record.get("content_class") != content_class:
+            continue
+        if source_filter:
+            source_ids = record.get("source_ids") if isinstance(record.get("source_ids"), list) else []
+            if source_filter not in source_ids:
+                continue
+        records.append(record)
+        if limit is not None and len(records) >= limit:
+            break
+    return records
+
+
+def _serialize_event(snapshot: IntelEventRankingSnapshot, event: IntelEvent) -> dict[str, Any]:
+    source_ids = _json_list(event.source_ids_json)
+    source_groups = _json_list(event.source_groups_json)
+    for relation in event.event_items:
+        if relation.source_id and relation.source_id not in source_ids:
+            source_ids.append(relation.source_id)
+        if relation.source_group and relation.source_group not in source_groups:
+            source_groups.append(relation.source_group)
+    risk_flags = _json_list(event.risk_flags_json)
+    return {
+        "record_type": "intel_event",
+        "stage": "editorial_rank",
+        "event_id": event.id,
+        "id": event.id,
+        "rank": snapshot.rank,
+        "selected": bool(snapshot.selected),
+        "status": "selected" if snapshot.selected else "rejected",
+        "display_score": float(snapshot.display_score or event.display_score or 0.0),
+        "selection_score": float(snapshot.display_score or event.display_score or 0.0),
+        "topic": snapshot.topic or event.topic,
+        "topics": _json_list(event.topics_json),
+        "content_class": snapshot.content_class or event.content_class,
+        "source_group": snapshot.source_group or event.source_group or (source_groups[0] if source_groups else None),
+        "source_groups": source_groups,
+        "source_ids": source_ids,
+        "title": event.title,
+        "summary": event.summary_cn,
+        "summary_cn": event.summary_cn,
+        "url": event.canonical_url,
+        "canonical_url": event.canonical_url,
+        "novelty_status": event.novelty_status,
+        "risk_flags": risk_flags,
+        "reason": snapshot.reason,
+        "metadata": _json(snapshot.metadata_json, {}),
+        "first_seen_at": _date(event.first_seen_at),
+        "last_seen_at": _date(event.last_seen_at),
+    }
 
 
 def _list_pending(
@@ -244,6 +344,25 @@ def _markdown(
         lines.append("失败统计：" + ("、".join(f"{key}={value}" for key, value in sorted((failure_counts or {}).items())) or "无"))
         lines.append("")
     for index, record in enumerate(records, start=1):
+        if record.get("record_type") == "intel_event":
+            lines.extend(
+                [
+                    f"## {index}. {record.get('title') or '(untitled)'}",
+                    (
+                        f"- 事件：`{record.get('event_id')}` | 排名：`{record.get('rank')}` | "
+                        f"display_score=`{record.get('display_score')}` | topic=`{record.get('topic')}`"
+                    ),
+                    (
+                        f"- 类别：`{record.get('content_class')}` | 来源组：`{record.get('source_group') or '-'}"
+                        f" | 状态：`selected`"
+                    ),
+                    f"- 摘要：{record.get('summary_cn') or record.get('summary') or '暂无摘要'}",
+                    f"- 风险：{', '.join(record.get('risk_flags') or []) or '无'}",
+                    f"- 链接：{record.get('url') or '无'}",
+                    "",
+                ]
+            )
+            continue
         ai = record.get("ai") or {}
         lines.extend(
             [
@@ -295,6 +414,15 @@ def _json(value: str | None, default: Any) -> Any:
         return json.loads(value)
     except (TypeError, ValueError):
         return default
+
+
+def _json_list(value: str | None) -> list[str]:
+    raw = _json(value, [])
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    return [str(item) for item in raw if item is not None and str(item).strip()]
 
 
 def _date(value: datetime | None) -> str | None:

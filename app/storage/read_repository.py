@@ -15,7 +15,14 @@ from urllib.parse import urlsplit
 from sqlalchemy import false, func, or_, select
 from sqlalchemy.orm import Session
 
-from app.storage.models import AIItemReview, IntelItem, IntelRun, Source
+from app.storage.models import (
+    AIItemReview,
+    IntelEvent,
+    IntelEventRankingSnapshot,
+    IntelItem,
+    IntelRun,
+    Source,
+)
 
 
 FINAL_ITEM_STATUSES = ("selected",)
@@ -57,6 +64,32 @@ class FeaturedItemRow:
     created_at: datetime | None
     ai_keep: bool | None = None
     ai_status: str | None = None
+
+
+@dataclass(frozen=True)
+class FeaturedEventRow:
+    """Event-level card backed by the selected editorial snapshot."""
+
+    event_id: int
+    rank: int
+    title: str
+    summary: str | None
+    url: str | None
+    display_score: float
+    topic: str | None
+    content_class: str | None
+    source_name: str | None
+    source_group: str | None
+    source_subtype: str | None
+    source_ids: tuple[str, ...]
+    risk_flags: list[str]
+    published_at: datetime | None
+
+    @property
+    def id(self) -> int:
+        """Compatibility alias for templates/card consumers."""
+
+        return self.event_id
 
 
 @dataclass(frozen=True)
@@ -247,6 +280,18 @@ class UIReadRepository:
         if limit <= 0:
             return []
         safe_limit = min(limit, 100)
+        # Wave 3 makes the editorial snapshot the homepage source of truth.
+        # Keep the item query as a compatibility fallback for databases created
+        # before the event/ranking tables existed or before the first ranking
+        # run.  Once any ``latest`` snapshot row exists, an intentionally empty
+        # selected set remains empty (no padding from raw item scores).
+        snapshot_exists = self.session.execute(
+            select(func.count())
+            .select_from(IntelEventRankingSnapshot)
+            .where(IntelEventRankingSnapshot.snapshot_key == "latest")
+        ).scalar_one()
+        if int(snapshot_exists or 0) > 0:
+            return self._list_featured_event_cards(category=category, limit=safe_limit)
         stmt = (
             select(IntelItem, Source, AIItemReview)
             .join(Source, IntelItem.source_id == Source.id)
@@ -290,6 +335,126 @@ class UIReadRepository:
             if len(rows) >= safe_limit:
                 break
         return rows
+
+    def list_featured_events(
+        self,
+        *,
+        snapshot_key: str = "latest",
+        topic: str | None = None,
+        content_class: str | None = None,
+        limit: int = 30,
+    ) -> list[FeaturedEventRow]:
+        """Read selected event cards from one immutable ranking snapshot."""
+
+        if limit <= 0:
+            return []
+        stmt = (
+            select(IntelEventRankingSnapshot, IntelEvent)
+            .join(IntelEvent, IntelEvent.id == IntelEventRankingSnapshot.event_id)
+            .where(
+                IntelEventRankingSnapshot.snapshot_key == snapshot_key,
+                IntelEventRankingSnapshot.selected.is_(True),
+            )
+            .order_by(IntelEventRankingSnapshot.rank.asc(), IntelEvent.id.asc())
+            .limit(min(limit, 100))
+        )
+        if topic:
+            stmt = stmt.where(IntelEventRankingSnapshot.topic == topic)
+        if content_class:
+            stmt = stmt.where(IntelEventRankingSnapshot.content_class == content_class)
+        rows: list[FeaturedEventRow] = []
+        for snapshot, event in self.session.execute(stmt).all():
+            rows.append(self._event_row(snapshot, event))
+        return rows
+
+    # Descriptive aliases used by route/integration callers.
+    list_homepage_events = list_featured_events
+    list_ranking_snapshot = list_featured_events
+
+    def _list_featured_event_cards(
+        self,
+        *,
+        category: str | None,
+        limit: int,
+    ) -> list[FeaturedItemRow]:
+        stmt = (
+            select(IntelEventRankingSnapshot, IntelEvent)
+            .join(IntelEvent, IntelEvent.id == IntelEventRankingSnapshot.event_id)
+            .where(
+                IntelEventRankingSnapshot.snapshot_key == "latest",
+                IntelEventRankingSnapshot.selected.is_(True),
+            )
+            .order_by(IntelEventRankingSnapshot.rank.asc(), IntelEvent.id.asc())
+            .limit(min(max(limit * 3, limit), 100))
+        )
+        if category:
+            stmt = stmt.where(IntelEventRankingSnapshot.content_class == category)
+        cards: list[FeaturedItemRow] = []
+        for snapshot, event in self.session.execute(stmt).all():
+            row = self._event_row(snapshot, event)
+            cards.append(
+                FeaturedItemRow(
+                    id=row.event_id,
+                    title=row.title,
+                    summary=row.summary,
+                    selection_reason=f"editorial_rank:{row.rank}",
+                    url=row.url,
+                    risk_note=("；".join(row.risk_flags) if row.risk_flags else None),
+                    status="selected",
+                    selection_score=int(round(row.display_score)),
+                    ai_confidence=100,
+                    content_class=row.content_class,
+                    source_name=row.source_name,
+                    source_group=row.source_group,
+                    source_subtype=row.source_subtype,
+                    risk_flags=row.risk_flags,
+                    published_at=row.published_at,
+                    created_at=event.created_at,
+                    ai_keep=True,
+                    ai_status="editorial_snapshot",
+                )
+            )
+            if len(cards) >= limit:
+                break
+        return cards
+
+    def _event_row(
+        self,
+        snapshot: IntelEventRankingSnapshot,
+        event: IntelEvent,
+    ) -> FeaturedEventRow:
+        source_ids = _json_list(event.source_ids_json)
+        source_names: list[str] = []
+        source_groups: list[str] = []
+        source_subtype: str | None = None
+        for relation in event.event_items:
+            source = relation.source or (relation.item.source if relation.item is not None else None)
+            if source is not None:
+                source_subtype = source_subtype or source.source_subtype
+                if source.name and source.name not in source_names:
+                    source_names.append(source.name)
+                if source.source_group and source.source_group not in source_groups:
+                    source_groups.append(source.source_group)
+            if relation.source_id and relation.source_id not in source_ids:
+                source_ids.append(relation.source_id)
+        source_name = "、".join(source_names) or (source_ids[0] if source_ids else None)
+        published_at = event.last_seen_at or event.first_seen_at or event.created_at
+        return FeaturedEventRow(
+            event_id=int(event.id),
+            rank=int(snapshot.rank or 0),
+            title=event.title,
+            summary=event.summary_cn,
+            url=_safe_url(event.canonical_url),
+            display_score=float(snapshot.display_score or event.display_score or 0.0),
+            topic=snapshot.topic or event.topic,
+            content_class=snapshot.content_class or event.content_class,
+            source_name=source_name,
+            source_group=snapshot.source_group or event.source_group or (source_groups[0] if source_groups else None),
+            source_subtype=source_subtype,
+            source_ids=tuple(source_ids),
+            risk_flags=_json_list(event.risk_flags_json),
+            published_at=published_at,
+        )
 
     def list_all_items(
         self,

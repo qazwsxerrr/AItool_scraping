@@ -4,6 +4,7 @@ import typer
 
 from app.config.settings import Settings
 from app.jobs.ai_review_job import run_ai_review_from_settings
+from app.jobs.editorial_rank_job import run_editorial_rank_from_settings
 from app.jobs.export_job import run_intel_export_from_settings
 from app.jobs.fetch_job import run_intel_fetch_from_settings
 from app.jobs.fetch_only_job import run_fetch_only_from_settings
@@ -145,6 +146,7 @@ def export(
     limit: int = typer.Option(100, min=1, help="Maximum retained items to export."),
     output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Build records without writing files."),
+    snapshot_key: str = typer.Option("latest", "--snapshot", help="Editorial ranking snapshot key."),
 ) -> None:
     configure_logging()
     _validate_content_class(content_class)
@@ -155,6 +157,7 @@ def export(
         limit=limit,
         output_dir=output_dir,
         dry_run=dry_run,
+        snapshot_key=snapshot_key,
     )
     typer.echo(f"exported={result.exported} pending={result.pending} dry_run={result.dry_run}")
     typer.echo(f"jsonl={result.jsonl_path}")
@@ -162,6 +165,32 @@ def export(
     typer.echo(f"pending_jsonl={result.pending_path}")
     if result.github_report_path:
         typer.echo(f"github_report={result.github_report_path}")
+
+
+@app.command("editorial-rank")
+def editorial_rank(
+    limit: int | None = typer.Option(None, min=1, help="Maximum events to rank."),
+    force: bool = typer.Option(False, "--force", help="Rebuild the snapshot from all candidate events."),
+    snapshot_key: str = typer.Option("latest", "--snapshot", help="Ranking snapshot key."),
+    profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
+) -> None:
+    """Rank aggregated events and enforce the daily editorial quotas."""
+
+    configure_logging()
+    result = run_editorial_rank_from_settings(
+        settings=Settings.from_env(),
+        profile_path=profile,
+        limit=limit,
+        force=force,
+        snapshot_key=snapshot_key,
+    )
+    typer.echo(
+        f"processed={result.processed} selected={result.selected} rejected={result.rejected} "
+        f"snapshots={result.snapshots} ai_ranked={result.ai_ranked} ai_failed={result.ai_failed} "
+        f"fallback={result.used_fallback} snapshot={result.snapshot_key}"
+    )
+    for error in result.errors:
+        typer.echo(f"error={error}")
 
 
 @app.command("run-once")
@@ -172,6 +201,8 @@ def run_once(
     force: bool = typer.Option(False, "--force", help="Ignore cooldown and re-review items."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Run without database or export writes."),
     output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
+    profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
+    snapshot_key: str = typer.Option("latest", "--snapshot", help="Editorial ranking snapshot key."),
 ) -> None:
     configure_logging()
     _validate_content_class(content_class)
@@ -183,6 +214,8 @@ def run_once(
         force=force,
         dry_run=dry_run,
         output_dir=output_dir,
+        profile_path=profile,
+        snapshot_key=snapshot_key,
     )
     typer.echo(
         f"fetch: fetched={result.fetch.total_fetched} inserted={result.fetch.total_inserted} "
@@ -193,6 +226,16 @@ def run_once(
         f"analyzed={result.ai_review.analyzed} ai_failed={result.ai_review.ai_failed} failed={result.ai_review.failed}"
     )
     typer.echo(f"export: exported={result.export.exported} pending={result.export.pending}")
+    if result.event_cluster is not None:
+        typer.echo(
+            f"event-cluster: processed={result.event_cluster.processed} events={result.event_cluster.events} "
+            f"failed={result.event_cluster.failed}"
+        )
+    if result.editorial_rank is not None:
+        typer.echo(
+            f"editorial-rank: selected={result.editorial_rank.selected} rejected={result.editorial_rank.rejected} "
+            f"ai_failed={result.editorial_rank.ai_failed}"
+        )
     if result.export.github_report_path:
         typer.echo(f"github_report={result.export.github_report_path}")
     typer.echo(f"run_id={result.run_id} status={result.status}")

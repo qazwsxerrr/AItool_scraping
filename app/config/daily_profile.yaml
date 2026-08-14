@@ -1,0 +1,38 @@
+version: wave3-v1
+snapshot_key: latest
+
+# Hard editorial pool size.  There is intentionally no minimum: an empty or
+# fully gated day produces an empty snapshot rather than padded content.
+total_max: 60
+
+# Seven-topic hard caps (sum = 60).
+topic_caps:
+  model: 16
+  product: 12
+  project: 12
+  industry: 8
+  tutorial: 5
+  opinion: 4
+  paper: 3
+
+# Source diversity caps.  A wildcard applies to source groups/IDs not listed
+# explicitly; deployments may replace these maps with source-specific caps.
+content_class_maxima:
+  official_model_company: 30
+  project_tool: 20
+  community_social: 10
+source_group_maxima:
+  "*": 16
+source_id_maxima:
+  "*": 4
+
+# Preferred minima are soft ordering hints.  They never force padding and are
+# allowed to remain unmet when no eligible event exists.
+preferred_minima:
+  topic:
+    model: 1
+    product: 1
+    project: 1
+
+paper:
+  hard_gate: true
