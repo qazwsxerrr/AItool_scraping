@@ -490,17 +490,64 @@ def _item_candidate(item: IntelItem, triage: Any | None) -> dict[str, Any]:
     triage_values = _coerce_triage_values(triage)
     review_values: dict[str, Any] = {}
     review = item.ai_review
+    has_persisted_triage = False
     if review is not None:
-        review_values = {
+        raw_review = _load_json(review.raw_response_json, {})
+        if isinstance(raw_review, Mapping):
+            # ``raw_response_json`` is retained for audit, but explicit columns
+            # below take precedence whenever the row came from Wave 1 triage.
+            review_values = dict(raw_review)
+        persisted_topics = _load_json(getattr(review, "topics_json", "[]"), [])
+        persisted_keywords = _load_json(getattr(review, "keywords_json", "[]"), [])
+        persisted_scores = _load_json(getattr(review, "scores_json", "{}"), {})
+        persisted_paper = _load_json(getattr(review, "paper_support_json", "{}"), {})
+        has_persisted_triage = bool(
+            getattr(review, "topic", None)
+            or persisted_topics
+            or persisted_keywords
+            or persisted_scores
+            or persisted_paper
+            or getattr(review, "novelty", None)
+        )
+        explicit_review = {
+            "topic": getattr(review, "topic", None),
+            "topics": persisted_topics,
+            "keywords": persisted_keywords,
+            "selection_score": getattr(review, "selection_score", None),
+            "scores": persisted_scores,
+            "novelty": getattr(review, "novelty", None),
+            "novelty_score": getattr(review, "novelty_score", 0),
+            "paper_support": persisted_paper,
             "summary_cn": review.summary_cn,
             "risk_flags": _load_json(review.risk_flags_json, []),
             "content_class": review.content_class,
             "keep": review.keep,
             "confidence": review.confidence,
+            "status": review.status,
         }
-        raw_review = _load_json(review.raw_response_json, {})
-        if isinstance(raw_review, Mapping):
-            review_values = {**raw_review, **review_values}
+        # Only non-empty triage projections override raw legacy values.  This
+        # keeps historical ItemAnalysis rows readable without inventing topic
+        # or novelty values for them.
+        review_values.update(
+            {
+                key: value
+                for key, value in explicit_review.items()
+                if value is not None
+                and (
+                    key not in {"topics", "keywords", "scores", "paper_support", "risk_flags"}
+                    or bool(value)
+                )
+            }
+        )
+        if not has_persisted_triage:
+            # A legacy raw payload may contain provider-specific keys that
+            # happen to look like triage.  Do not let those keys bypass the
+            # explicit projection requirement.
+            for key in (
+                "topic", "topics", "keywords", "selection_score", "scores",
+                "novelty", "novelty_status", "novelty_score", "paper_support",
+            ):
+                review_values.pop(key, None)
     merged = {**review_values, **triage_values}
     raw_item = _load_json(item.raw_payload_json, {})
     metrics = _load_json(item.metrics_json, {})
@@ -534,7 +581,7 @@ def _item_candidate(item: IntelItem, triage: Any | None) -> dict[str, Any]:
         "keywords": _clean_strings(merged.get("keywords")),
         "risk_flags": _clean_strings(merged.get("risk_flags")),
         "novelty": _normalize_novelty(merged.get("novelty") or merged.get("novelty_status")),
-        "triage_status": _text(merged.get("status")) or "success",
+        "triage_status": _text(merged.get("status")) if (triage_values or has_persisted_triage) else None,
         "keep": bool(merged.get("keep", item.status in {"selected", "hotspot"})),
         "confidence": _number(merged.get("confidence")),
         "selection_score": score,
@@ -798,7 +845,9 @@ def _event_values(
         "normalized_title": normalize_event_title(title),
         "title": title,
         "summary_cn": primary.get("summary_cn") or primary.get("title"),
-        "topic": primary.get("topic") or (topics[0] if topics else "opinion"),
+        # ``unknown`` is explicit cold-start state.  A missing triage record
+        # must never be silently published as an opinion event.
+        "topic": primary.get("topic") or (topics[0] if topics else "unknown"),
         "topics": topics,
         "content_class": primary.get("content_class"),
         "source_group": primary.get("source_group"),

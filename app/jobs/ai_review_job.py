@@ -18,8 +18,12 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
-from app.ai.client import ItemAnalysisClient
-from app.ai.schemas import ItemAnalysisRequest, ItemAnalysisResponse, parse_item_analysis_response, parse_project_summary_response
+from app.ai.client import IntelTriageClient
+from app.ai.schemas import (
+    RawIntelEnvelope,
+    TriageResult,
+)
+from app.ai.skills.intel_triage.client import triage_item
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
 from app.domain.models import FetchItem, SourceSpec
@@ -54,7 +58,7 @@ def run_ai_review_job(
     *,
     session_factory: sessionmaker[Session],
     source_specs: Mapping[str, SourceSpec] | None = None,
-    ai_client: ItemAnalysisClient | Any | None = None,
+    ai_client: IntelTriageClient | Any | None = None,
     limit: int | None = 100,
     source_filter: str | None = None,
     content_class: str | None = None,
@@ -127,8 +131,26 @@ def run_ai_review_job(
                 result.selected += 1
 
                 if ai_client is None:
-                    raise RuntimeError("item analysis client is not configured")
+                    raise RuntimeError("intel triage client is not configured")
                 response = _run_item_ai_review(item, spec, ai_client, decision)
+                response_status = _response_status(response)
+                if response_status in {"ai_failed", "invalid"}:
+                    repo.upsert_ai_review(
+                        item.id,
+                        response,
+                        model=getattr(ai_client, "model", None),
+                        content_class=spec.content_class,
+                        status=response_status,
+                        error_message=getattr(response, "error_message", None),
+                    )
+                    repo.set_item_status(item.id, "ai_failed")
+                    result.failed += 1
+                    result.ai_failed += 1
+                    result.errors.append(
+                        f"intel_item_id={item.id}: {getattr(response, 'error_message', None) or response_status}"
+                    )
+                    session.commit()
+                    continue
                 if not response.summary_cn.strip() and response.keep:
                     raise ValueError("AI review returned an empty summary_cn")
                 repo.upsert_ai_review(
@@ -197,6 +219,7 @@ def run_ai_review_from_settings(
     force: bool = False,
     dry_run: bool = False,
     http_client: Any | None = None,
+    ai_client: Any | None = None,
     run_id: int | None = None,
 ) -> AIReviewResult:
     registry = load_source_registry(registry_path, env={"RSSHUB_BASE_URL": settings.rsshub_base_url or ""})
@@ -205,20 +228,26 @@ def run_ai_review_from_settings(
     engine = create_engine_from_url(database_url)
     if not dry_run or database_url == "sqlite:///:memory:":
         init_db(engine)
-    own_client = http_client is None
-    client = http_client or httpx.Client(
-        timeout=settings.request_timeout_seconds,
-        follow_redirects=True,
-        http2=True,
-        trust_env=True,
-        headers={"User-Agent": settings.user_agent},
+    own_client = http_client is None and ai_client is None
+    client = http_client or (
+        httpx.Client(
+            timeout=settings.request_timeout_seconds,
+            follow_redirects=True,
+            http2=True,
+            trust_env=True,
+            headers={"User-Agent": settings.user_agent},
+        )
+        if ai_client is None
+        else None
     )
     try:
-        ai_client = ItemAnalysisClient.from_settings(settings, http_client=client)
+        # Pass-1 is intentionally triage-only.  The legacy item-analysis
+        # adapter is not constructed by this settings/run-once boundary.
+        provider = ai_client or IntelTriageClient.from_settings(settings, http_client=client)
         return run_ai_review_job(
             session_factory=create_session_factory(engine),
             source_specs=specs,
-            ai_client=ai_client,
+            ai_client=provider,
             limit=limit,
             source_filter=source_filter,
             content_class=content_class,
@@ -237,49 +266,50 @@ def _run_item_ai_review(
     spec: SourceSpec,
     ai_client: Any,
     decision: Any,
-) -> ItemAnalysisResponse:
-    if spec.content_class == "project_tool" and _is_github_repository_item(_item_to_fetch_item(item)):
-        request = _github_project_summary_request(item)
-        analyzer = getattr(ai_client, "summarize_project", None)
-        if not callable(analyzer):
-            analyzer = getattr(ai_client, "analyze", None)
-        if not callable(analyzer):
-            raise TypeError("AI client does not expose summarize_project/analyze")
-        response = _coerce_github_project_response(analyzer(request), request)
-        # GitHub retention is deterministic.  The summary call does not own
-        # the keep decision, so a selected project is a kept candidate even
-        # though the provider-neutral project-summary parser uses keep=False.
-        return response.model_copy(
-            update={
-                "keep": True,
-                "content_class": "project_tool",
-                "risk_flags": list(dict.fromkeys([*response.risk_flags, *[f"selection:{flag}" for flag in decision.risk_flags]])),
-            }
+) -> TriageResult:
+    if not callable(getattr(ai_client, "triage", None)):
+        raise TypeError("AI client does not expose triage")
+    envelope = _item_to_triage_envelope(item, spec)
+    response = triage_item(ai_client, envelope)
+    extra_risks = [f"selection:{flag}" for flag in decision.risk_flags]
+    if extra_risks:
+        response = response.model_copy(
+            update={"risk_flags": list(dict.fromkeys([*response.risk_flags, *extra_risks]))}
         )
+    return response
 
-    fetch_item = _item_to_fetch_item(item)
-    request = ItemAnalysisRequest(
+
+def _item_to_triage_envelope(item: IntelItem, spec: SourceSpec) -> RawIntelEnvelope:
+    """Project one persisted item into the strict Wave 1 provider envelope."""
+
+    source = item.source
+    source_class = spec.content_class or item.content_class or "community_social"
+    return RawIntelEnvelope(
         item_id=item.id,
+        source_id=item.source_id,
+        source_name=source.name if source is not None else spec.name,
+        source_group=spec.source_group or (source.source_group if source is not None else None),
+        source_subtype=spec.source_subtype or (source.source_subtype if source is not None else None),
+        source_role=spec.source_role or (source.source_role if source is not None else None),
+        source_tier=spec.tier or (source.tier if source is not None else None),
+        source_content_class=source_class,
+        external_id=item.external_id,
+        content_hash=item.content_hash,
         title=item.title,
         url=item.canonical_url,
-        source_id=item.source_id,
-        source_content_class=spec.content_class or "community_social",
-        body_preview=(item.content_text or item.summary or "")[:8000],
+        published_at=item.published_at,
+        captured_at=item.captured_at,
+        summary=item.summary,
+        body_text=item.content_text or item.summary,
+        language=None,
         metrics=_json_dict(item.metrics_json),
+        raw_payload=_json_dict(item.raw_payload_json),
     )
-    response_value = ai_client.analyze(request)
-    response = (
-        response_value
-        if isinstance(response_value, ItemAnalysisResponse)
-        else _coerce_analysis_response(response_value, request.source_content_class)
-    )
-    extra_risks = [f"selection:{flag}" for flag in decision.risk_flags]
-    return response.model_copy(
-        update={
-            "content_class": spec.content_class or response.content_class,
-            "risk_flags": list(dict.fromkeys([*response.risk_flags, *extra_risks])),
-        }
-    )
+
+
+def _response_status(response: Any) -> str:
+    status = getattr(response, "status", None)
+    return str(status or "success").strip().casefold()
 
 
 def _item_to_fetch_item(item: IntelItem) -> FetchItem:
@@ -299,64 +329,9 @@ def _item_to_fetch_item(item: IntelItem) -> FetchItem:
     )
 
 
-def _is_github_repository_item(item: FetchItem) -> bool:
-    raw = item.raw_payload if isinstance(item.raw_payload, Mapping) else {}
-    kind = str(item.kind or "").casefold()
-    item_type = str(raw.get("github_item_type") or "").casefold()
-    return bool(
-        (item.external_id and item.external_id.casefold().startswith("github_repo:"))
-        or item_type == "repository"
-        or "github_repository" in kind
-        or "trending_repository" in kind
-    )
-
-
 def _is_github_source(spec: SourceSpec) -> bool:
     mode = spec.selection_policy.mode.casefold().replace("-", "_")
     return bool(spec.transport == "github" or mode in {"github_active_high_star", "active_high_star", "github_trending"})
-
-
-def _github_project_summary_request(item: IntelItem) -> ItemAnalysisRequest:
-    metrics = _json_dict(item.metrics_json)
-    topics = metrics.get("topics") if isinstance(metrics.get("topics"), list) else []
-    readme = item.content_text if metrics.get("readme_chars") else ""
-    description = item.summary or metrics.get("description") or ""
-    body_parts = [
-        f"项目简介：{description}" if description else "项目简介：暂无",
-        f"Topics：{', '.join(str(topic) for topic in topics[:100])}" if topics else "Topics：暂无",
-        f"README（最多 16000 字符）：\n{readme[:16_000]}" if readme else "README：暂无",
-    ]
-    return ItemAnalysisRequest(
-        item_id=item.id,
-        title=item.title,
-        url=item.canonical_url,
-        source_id=item.source_id,
-        source_content_class="project_tool",
-        body_preview="\n\n".join(body_parts)[:24_000],
-        metrics={**metrics, "analysis_scope": "github_project_summary"},
-    )
-
-
-def _coerce_github_project_response(value: Any, request: ItemAnalysisRequest) -> ItemAnalysisResponse:
-    if isinstance(value, ItemAnalysisResponse):
-        if not value.summary_cn.strip():
-            raise ValueError("GitHub project summary is empty")
-        return value.model_copy(update={"keep": False, "content_class": "project_tool", "reason": "github_project_summary"})
-    if isinstance(value, Mapping):
-        try:
-            response = _coerce_analysis_response(value, "project_tool")
-        except (TypeError, ValueError):
-            response = parse_project_summary_response(value)
-        return response.model_copy(update={"keep": False, "content_class": "project_tool", "reason": "github_project_summary"})
-    raise TypeError("AI client returned an unsupported project summary")
-
-
-def _coerce_analysis_response(value: Any, source_class: str) -> ItemAnalysisResponse:
-    if isinstance(value, ItemAnalysisResponse):
-        return value
-    if isinstance(value, Mapping):
-        return parse_item_analysis_response(value, source_class)
-    raise TypeError("AI client returned an unsupported response")
 
 
 def _ranking_key(entry: tuple[IntelItem, Any, SourceSpec]) -> tuple[int, float, float, float, int, float, int]:
@@ -501,6 +476,23 @@ def _serialize_candidate(item: IntelItem) -> dict[str, Any]:
     record = _serialize_intel_item(item)
     review_value = record.get("ai")
     review = dict(review_value) if review_value else {}
+    persisted_review = item.ai_review
+    if persisted_review is not None and persisted_review.prompt_version == "intel_triage_v1":
+        # Keep the candidate/audit export aligned with the durable projection;
+        # event clustering still reads the database row directly.
+        review.update(
+            {
+                "topic": persisted_review.topic,
+                "topics": _json_value(persisted_review.topics_json, []),
+                "keywords": _json_value(persisted_review.keywords_json, []),
+                "selection_score": persisted_review.selection_score,
+                "scores": _json_value(persisted_review.scores_json, {}),
+                "novelty": persisted_review.novelty,
+                "novelty_score": persisted_review.novelty_score,
+                "paper_support": _json_value(persisted_review.paper_support_json, {}),
+                "raw_response": _json_value(persisted_review.raw_response_json, {}),
+            }
+        )
     record.update(
         {
             "record_type": "ai_review_candidate",
@@ -574,6 +566,15 @@ def _json_dict(value: str | None) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _json_value(value: str | None, default: Any) -> Any:
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
 
 
 def _readable_database_url(database_url: str, *, dry_run: bool) -> str:

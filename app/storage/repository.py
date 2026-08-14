@@ -516,17 +516,52 @@ class IntelRepository:
         if review is None:
             review = AIItemReview(item_id=item_id, content_class=content_class or "community_social")
             self.session.add(review)
+        is_triage = _is_triage_response(response)
         review.model = model
-        review.keep = bool(getattr(response, "keep", False)) if response is not None else False
-        review.content_class = str(getattr(response, "content_class", None) or content_class or "community_social")
-        review.summary_cn = _text(getattr(response, "summary_cn", None))
-        review.reason = _text(getattr(response, "reason", None))
-        review.risk_flags_json = _dump_json(getattr(response, "risk_flags", []))
-        review.confidence = max(0, min(int(getattr(response, "confidence", 0) or 0), 100))
-        raw = getattr(response, "raw_response", None) if response is not None else None
+        review.keep = bool(_response_value(response, "keep", False)) if response is not None else False
+        review.content_class = str(_response_value(response, "content_class") or content_class or "community_social")
+        review.summary_cn = _text(_response_value(response, "summary_cn"))
+        review.reason = _text(_response_value(response, "reason"))
+        review.risk_flags_json = _dump_json(_structured_json(_response_value(response, "risk_flags", [])))
+        review.confidence = max(0, min(int(_response_value(response, "confidence", 0) or 0), 100))
+        raw = _response_value(response, "raw_response") if response is not None else None
+        if raw is None and isinstance(response, Mapping):
+            raw = dict(response)
         review.raw_response_json = _dump_json(raw if raw is not None else {})
-        review.status = status
-        review.error_message = error_message[:4000] if error_message else None
+        if is_triage:
+            # Persist every Wave 1 field explicitly.  The raw response remains
+            # intact for forensic replay; these columns give event clustering
+            # an auditable/queryable projection without JSON1 requirements.
+            review.prompt_version = "intel_triage_v1"
+            review.topic = _text(_response_value(response, "topic"))
+            review.topics_json = _dump_json(_structured_json(_response_value(response, "topics", [])))
+            review.keywords_json = _dump_json(_structured_json(_response_value(response, "keywords", [])))
+            score = _response_value(response, "selection_score")
+            review.selection_score = _bounded_int(score) if score is not None else None
+            review.scores_json = _dump_json(_structured_json(_response_value(response, "scores", {})))
+            review.novelty = _text(_response_value(response, "novelty"))
+            review.novelty_score = _bounded_int(_response_value(response, "novelty_score", 0))
+            review.paper_support_json = _dump_json(_structured_json(_response_value(response, "paper_support", {})))
+            response_status = _text(_response_value(response, "status"))
+            review.status = response_status or status
+            response_error = _text(_response_value(response, "error_message"))
+            review.error_message = (response_error or error_message or "")[:4000] or None
+        else:
+            # Legacy ItemAnalysis rows remain readable.  Do not manufacture a
+            # topic/novelty when no triage result was produced.
+            if response is None and status in {"ai_failed", "invalid"}:
+                # A retry failure must not leave a previous successful triage
+                # projection looking current to the event stage.
+                review.topic = None
+                review.topics_json = "[]"
+                review.keywords_json = "[]"
+                review.selection_score = None
+                review.scores_json = "{}"
+                review.novelty = None
+                review.novelty_score = 0
+                review.paper_support_json = "{}"
+            review.status = status
+            review.error_message = error_message[:4000] if error_message else None
         review.updated_at = utcnow()
         self.session.flush()
         return review
@@ -1056,6 +1091,45 @@ def _counts_dict(counts: IntelCounts | Mapping[str, int] | None) -> dict[str, in
 
 def _dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+
+
+def _is_triage_response(value: Any) -> bool:
+    """Return whether ``value`` exposes the Wave 1 triage projection."""
+
+    if isinstance(value, Mapping):
+        return any(name in value for name in ("topic", "topics", "keywords", "paper_support", "novelty"))
+    return value is not None and any(
+        hasattr(value, name)
+        for name in ("topic", "topics", "keywords", "paper_support", "novelty")
+    )
+
+
+def _response_value(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _structured_json(value: Any) -> Any:
+    """Convert Pydantic/dataclass values before JSON text persistence."""
+
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump(mode="json")
+        except TypeError:
+            return value.model_dump()
+    if isinstance(value, Mapping):
+        return {str(key): _structured_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_structured_json(item) for item in value]
+    return value
+
+
+def _bounded_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, min(100, int(float(value))))
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def _normalize_event_title(value: Any) -> str:

@@ -80,6 +80,36 @@ def test_run_once_ai_only_path_never_enters_legacy_verifier(tmp_path, monkeypatc
     assert result.ai_review.selected == 1
 
 
+def test_run_once_threads_injected_triage_provider(tmp_path, monkeypatch):
+    db_path = tmp_path / "triage-provider-run.db"
+    engine = create_engine_from_url(f"sqlite:///{db_path}")
+    init_db(engine)
+    provider = object()
+    captured = {}
+
+    monkeypatch.setattr(
+        run_job,
+        "run_intel_fetch_from_settings",
+        lambda **kwargs: IntelFetchResult(run_id=kwargs.get("run_id"), stats={}),
+    )
+
+    def fake_ai_review(**kwargs):
+        captured["ai_client"] = kwargs.get("ai_client")
+        return AIReviewResult(run_id=kwargs.get("run_id"))
+
+    monkeypatch.setattr(run_job, "run_ai_review_from_settings", fake_ai_review)
+    monkeypatch.setattr(
+        run_job,
+        "run_intel_export_from_settings",
+        lambda **kwargs: IntelExportResult(0, 0, "items", "digest", "pending"),
+    )
+
+    result = run_job.run_intel_once_from_settings(settings=_settings(db_path), ai_client=provider)
+
+    assert result.status == "completed"
+    assert captured["ai_client"] is provider
+
+
 def test_run_once_dry_run_does_not_create_database(tmp_path, monkeypatch):
     db_path = tmp_path / "dry.db"
     monkeypatch.setattr(

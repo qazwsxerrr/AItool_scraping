@@ -36,11 +36,11 @@ class SupportsPost(Protocol):
 
 
 class ItemAnalysisClient:
-    """Analyze one item with exactly one provider request.
+    """Compatibility adapter for triage and GitHub summary provider calls.
 
-    Retries and multi-stage model work are intentionally absent from this
-    boundary.  A job may record and retry a failed item later, but one invocation
-    of :meth:`analyze` performs only one HTTP call.
+    Pass-1 callers should use :meth:`triage`; the historical item-analysis
+    interface was intentionally removed so a run cannot silently take the old
+    contract path.
     """
 
     def __init__(
@@ -82,25 +82,8 @@ class ItemAnalysisClient:
     def is_configured(self) -> bool:
         return bool(self.api_url and self.api_key)
 
-    def analyze(self, request: ItemAnalysisRequest) -> ItemAnalysisResponse:
-        if not self.is_configured:
-            raise RuntimeError("Item analysis API is not configured")
-        if not isinstance(request, ItemAnalysisRequest):
-            raise TypeError("request must be an ItemAnalysisRequest")
-
-        response = self._post_once(self._endpoint_url(), self._build_payload(request))
-        try:
-            data = response.json()
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Item analysis API returned invalid JSON") from exc
-        return parse_item_analysis_response(data, request.source_content_class)
-
     def triage(self, envelope: Any):
-        """Run the newer Intel Triage contract through the same adapter.
-
-        This additive method preserves the legacy ``analyze(ItemAnalysisRequest)``
-        semantics while allowing callers to migrate incrementally.
-        """
+        """Run the Wave 1 Intel Triage contract through the adapter."""
 
         from app.ai.skills.intel_triage.client import IntelTriageClient
 

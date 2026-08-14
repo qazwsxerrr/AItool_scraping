@@ -41,7 +41,13 @@ def run_intel_once_from_settings(
     output_dir: str = "output/intel",
     profile_path: str | Path | None = None,
     snapshot_key: str = "latest",
+    ai_client: object | None = None,
 ) -> IntelRunResult:
+    """Run the fixed-order pipeline with an optional triage provider.
+
+    ``ai_client`` is primarily a deterministic test/integration seam; when it
+    is omitted the settings boundary constructs ``IntelTriageClient``.
+    """
     if dry_run:
         # Use one ephemeral SQLite file for the three stages.  The fetch stage
         # may populate it so the following stages can observe the same batch, while
@@ -63,6 +69,7 @@ def run_intel_once_from_settings(
                 limit=limit,
                 force=force,
                 dry_run=True,
+                ai_client=ai_client,
             )
             event_cluster = run_event_cluster_from_settings(
                 settings=ephemeral,
@@ -115,6 +122,7 @@ def run_intel_once_from_settings(
             limit=limit,
             force=force,
             run_id=run_id,
+            ai_client=ai_client,
         )
         event_cluster = run_event_cluster_from_settings(
             settings=settings,

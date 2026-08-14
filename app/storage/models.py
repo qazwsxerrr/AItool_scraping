@@ -8,6 +8,7 @@ recreated from this metadata.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
@@ -189,13 +190,22 @@ class IntelItem(Base):
 
 
 class AIItemReview(Base):
-    """At most one structured model result for each intelligence item."""
+    """At most one structured model result for each intelligence item.
+
+    The Wave 1 triage contract is stored explicitly instead of requiring event
+    clustering to reverse-engineer fields from ``raw_response_json``.  JSON is
+    kept as text to preserve the repository's SQLite-first schema and to avoid
+    a dialect-specific migration; event jobs decode these fields through the
+    repository boundary.
+    """
 
     __tablename__ = "ai_item_reviews"
     __table_args__ = (
         UniqueConstraint("item_id", name="uq_ai_item_reviews_item_id"),
         Index("ix_ai_item_reviews_status", "status"),
         Index("ix_ai_item_reviews_keep", "keep"),
+        Index("ix_ai_item_reviews_topic", "topic"),
+        Index("ix_ai_item_reviews_novelty", "novelty"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -204,6 +214,16 @@ class AIItemReview(Base):
     prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="item_analysis_v1")
     keep: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     content_class: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Explicit Wave 1 Intel Triage fields.  Nullable values preserve
+    # compatibility with historical ItemAnalysis rows that predate triage.
+    topic: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    topics_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    keywords_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    selection_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scores_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    novelty: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    novelty_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    paper_support_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -217,6 +237,44 @@ class AIItemReview(Base):
     )
 
     item: Mapped[IntelItem] = relationship(back_populates="ai_review")
+
+    @staticmethod
+    def _decode_json(value: str, default):
+        try:
+            parsed = json.loads(value or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return default
+        return parsed if parsed is not None else default
+
+    @property
+    def topics(self) -> list[str]:
+        value = self._decode_json(self.topics_json, [])
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    @property
+    def keywords(self) -> list[str]:
+        value = self._decode_json(self.keywords_json, [])
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    @property
+    def scores(self) -> dict[str, object]:
+        value = self._decode_json(self.scores_json, {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    @property
+    def paper_support(self) -> dict[str, object]:
+        value = self._decode_json(self.paper_support_json, {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    @property
+    def risk_flags(self) -> list[str]:
+        value = self._decode_json(self.risk_flags_json, [])
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    @property
+    def raw_response(self) -> dict[str, object]:
+        value = self._decode_json(self.raw_response_json, {})
+        return dict(value) if isinstance(value, dict) else {}
 
 
 class IntelEvent(Base):
@@ -245,7 +303,7 @@ class IntelEvent(Base):
     normalized_title: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
     title: Mapped[str] = mapped_column(Text, nullable=False, default="(untitled)")
     summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
-    topic: Mapped[str] = mapped_column(String(32), nullable=False, default="opinion")
+    topic: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
     topics_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     content_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_group: Mapped[str | None] = mapped_column(String(64), nullable=True)

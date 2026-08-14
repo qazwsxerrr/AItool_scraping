@@ -77,6 +77,7 @@ def test_exact_identity_dedupe_preserves_member_and_source_lineage_on_rerun():
     assert len(members) == 2
     assert len(snapshots) == 1
     assert events[0].novelty_status == "unknown"
+    assert events[0].topic == "unknown"
     assert set(__import__("json").loads(events[0].source_ids_json)) == {"source_a", "source_b"}
 
 

@@ -74,9 +74,6 @@ class IntelTriageClient:
             raise ValueError("Intel triage API returned invalid JSON") from exc
         return strict_parse_triage(data, envelope=item)
 
-    # ``analyze`` mirrors ItemAnalysisClient and makes adapters interchangeable.
-    analyze = triage
-
     def triage_batch(self, envelopes: Iterable[RawIntelEnvelope | dict[str, Any]]) -> list[TriageResult]:
         return run_triage_batch(self, envelopes)
 
@@ -158,10 +155,10 @@ def triage_item(
 
     item = envelope if isinstance(envelope, RawIntelEnvelope) else RawIntelEnvelope.model_validate(envelope)
     try:
-        analyzer = getattr(client, "triage", None) or getattr(client, "analyze", None)
-        if not callable(analyzer):
-            raise TypeError("AI triage client does not expose triage/analyze")
-        value = analyzer(item)
+        triage_fn = getattr(client, "triage", None)
+        if not callable(triage_fn):
+            raise TypeError("AI triage client does not expose triage")
+        value = triage_fn(item)
         if isinstance(value, TriageResult):
             result = value.with_item(item)
         else:

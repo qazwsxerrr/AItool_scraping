@@ -128,6 +128,7 @@ def test_provider_payloads_and_client_one_call():
     )
     result = client.triage(item)
     assert result.keep is True
+    assert not hasattr(IntelTriageClient, "analyze")
     assert http.calls[0]["url"].endswith("/chat/completions")
     assert http.calls[0]["json"]["response_format"]["type"] == "json_schema"
     assert build_provider_payload(item, api_style="generic_json")["task"] == "intel_triage"

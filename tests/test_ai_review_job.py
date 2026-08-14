@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
-from app.ai.schemas import ItemAnalysisResponse
+from app.ai.schemas import TriageResult
 from app.domain.models import FetchItem, SourceSpec
 from app.domain.policies import source_spec_from_config
 from app.jobs.ai_review_job import run_ai_review_job
@@ -45,28 +45,42 @@ class _AI:
         self.fail_ids = set(fail_ids)
         self.calls: list[int] = []
 
-    def analyze(self, request):
-        self.calls.append(request.item_id)
-        if request.item_id in self.fail_ids:
+    def triage(self, envelope):
+        self.calls.append(envelope.item_id)
+        if envelope.item_id in self.fail_ids:
             raise RuntimeError("provider timeout")
-        return ItemAnalysisResponse(
+        return TriageResult(
+            item_id=envelope.item_id,
             keep=True,
-            content_class=request.source_content_class,
+            topic="product",
+            topics=["product"],
             summary_cn="中文简要总结",
-            reason="保留",
+            keywords=["model", "release"],
+            selection_score=91,
+            scores={"relevance": 90, "total": 91},
+            novelty="new",
+            paper_support={"is_paper": False},
             risk_flags=[],
+            reason="保留",
             confidence=91,
             raw_response={"fixture": True},
         )
 
 
 class _RejectingAI(_AI):
-    def analyze(self, request):
-        self.calls.append(request.item_id)
-        return ItemAnalysisResponse(
+    def triage(self, envelope):
+        self.calls.append(envelope.item_id)
+        return TriageResult(
+            item_id=envelope.item_id,
             keep=False,
-            content_class=request.source_content_class,
+            topic="product",
+            topics=["product"],
             summary_cn="与 AI 日报主题无关",
+            keywords=["noise"],
+            selection_score=4,
+            scores={"relevance": 2, "total": 4},
+            novelty="repeat",
+            paper_support={"is_paper": False},
             reason="内容与 AI 工具情报无关",
             risk_flags=["irrelevant"],
             confidence=94,
@@ -136,6 +150,12 @@ def test_ai_review_never_calls_verification_and_exports_not_run(tmp_path, monkey
         assert rows[0].status == "selected"
         assert rows[0].ai_review.status == "success"
         assert rows[0].ai_review.summary_cn == "中文简要总结"
+        assert rows[0].ai_review.topic == "product"
+        assert json.loads(rows[0].ai_review.topics_json) == ["product"]
+        assert json.loads(rows[0].ai_review.keywords_json) == ["model", "release"]
+        assert rows[0].ai_review.selection_score == 91
+        assert rows[0].ai_review.novelty == "new"
+        assert json.loads(rows[0].ai_review.paper_support_json)["is_paper"] is False
         assert rows[1].status == "filtered"
         assert rows[2].status == "selected"
 
