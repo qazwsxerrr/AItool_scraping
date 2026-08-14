@@ -5,7 +5,7 @@ import json
 from app.jobs.editorial_rank_job import run_editorial_rank_job
 from app.jobs.export_job import run_intel_export_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem, Source
+from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem, Source
 from app.storage.read_repository import UIReadRepository
 
 
@@ -116,3 +116,42 @@ def test_homepage_and_export_read_selected_ranking_snapshot(tmp_path):
 
     result = run_intel_export_job(session_factory=sf, output_dir=tmp_path / "editorial-export")
     assert result.exported == 1
+
+
+def test_paper_gate_reads_explicit_support_when_raw_response_omits_paper_support():
+    sf = _db()
+    with sf() as session:
+        event = _add_event(
+            session,
+            "source_official_research",
+            "supported-paper",
+            topic="paper",
+            score=90,
+            url="https://research.example/papers/supported-paper",
+        )
+        item = session.get(IntelItem, event.primary_item_id)
+        assert item is not None
+        item.ai_review = AIItemReview(
+            content_class="official_model_company",
+            keep=True,
+            status="success",
+            raw_response_json="{}",
+            paper_support_json=json.dumps(
+                {
+                    "is_paper": True,
+                    "supported": True,
+                    "support_level": "supported",
+                    "paper_url": "https://research.example/papers/supported-paper",
+                    "official_url": "https://official.example/research/supported-paper",
+                }
+            ),
+        )
+        session.commit()
+
+    result = run_editorial_rank_job(session_factory=sf)
+
+    assert result.selected == 1
+    with sf() as session:
+        snapshot = session.query(IntelEventRankingSnapshot).one()
+        assert snapshot.selected is True
+        assert snapshot.reason == "selected"

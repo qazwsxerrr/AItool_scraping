@@ -496,6 +496,15 @@ def _paper_gate(event: IntelEvent) -> tuple[bool, str | None]:
                 supports.append(value)
     for relation in event.event_items:
         review = relation.item.ai_review if relation.item is not None else None
+        # Wave 1 persists the normalized paper projection separately from the
+        # provider raw payload.  Prefer that explicit field, while retaining
+        # raw-response compatibility for historical rows.
+        explicit_support = _json_value(
+            getattr(review, "paper_support_json", None) if review is not None else None,
+            {},
+        )
+        if isinstance(explicit_support, Mapping) and explicit_support:
+            supports.append(explicit_support)
         raw_review = _json_value(review.raw_response_json, {}) if review is not None else {}
         if isinstance(raw_review, Mapping):
             value = raw_review.get("paper_support", raw_review.get("paper", raw_review.get("paper_evidence")))
