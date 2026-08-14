@@ -260,3 +260,76 @@ def test_paper_gate_rejects_explicit_arxiv_only_projection():
         snapshot = session.query(IntelEventRankingSnapshot).one()
         assert snapshot.selected is False
         assert snapshot.reason == "paper_gate:arxiv_only"
+
+
+def test_paper_gate_rejects_arxiv_evidence_url_without_paper_url():
+    sf = _db()
+    with sf() as session:
+        event = _add_event(
+            session,
+            "source_official_research",
+            "arxiv-evidence-url-only",
+            topic="paper",
+            score=90,
+            url="https://research.example/papers/arxiv-evidence-url-only",
+        )
+        item = session.get(IntelItem, event.primary_item_id)
+        assert item is not None
+        item.ai_review = AIItemReview(
+            content_class="official_model_company",
+            keep=True,
+            status="success",
+            raw_response_json="{}",
+            paper_support_json=json.dumps(
+                {
+                    "evidence_url": "https://arxiv.org/abs/2608.11111",
+                    "supported": True,
+                    "hard_gate_pass": True,
+                }
+            ),
+        )
+        session.commit()
+
+    result = run_editorial_rank_job(session_factory=sf)
+
+    assert result.selected == 0
+    with sf() as session:
+        snapshot = session.query(IntelEventRankingSnapshot).one()
+        assert snapshot.selected is False
+        assert snapshot.reason == "paper_gate:arxiv_only"
+
+
+def test_paper_gate_rejects_arxiv_evidence_links_without_non_arxiv_support():
+    sf = _db()
+    with sf() as session:
+        event = _add_event(
+            session,
+            "source_project",
+            "arxiv-evidence-links-only",
+            topic="paper",
+            score=90,
+            url="https://research.example/papers/arxiv-evidence-links-only",
+        )
+        item = session.get(IntelItem, event.primary_item_id)
+        assert item is not None
+        item.ai_review = AIItemReview(
+            content_class="project_tool",
+            keep=True,
+            status="success",
+            raw_response_json="{}",
+            paper_support_json=json.dumps(
+                {
+                    "evidence_links": ["https://arxiv.org/abs/2608.22222"],
+                    "support_level": "supported",
+                }
+            ),
+        )
+        session.commit()
+
+    result = run_editorial_rank_job(session_factory=sf)
+
+    assert result.selected == 0
+    with sf() as session:
+        snapshot = session.query(IntelEventRankingSnapshot).one()
+        assert snapshot.selected is False
+        assert snapshot.reason == "paper_gate:arxiv_only"

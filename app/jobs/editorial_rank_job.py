@@ -591,14 +591,28 @@ def _paper_support_is_arxiv_only(support: Mapping[str, Any]) -> bool:
             support.get("paper_link", support.get("url", support.get("arxiv_url"))),
         )
     )
-    if not paper_url or "arxiv.org" not in paper_url.casefold():
-        return False
-    evidence_url = _support_evidence_url(support)
+    evidence_urls = _support_evidence_urls(support)
     evidence_links = _support_links(support.get("evidence_links"))
     non_arxiv_links = [
-        link for link in (evidence_url, *evidence_links) if link and "arxiv.org" not in link.casefold()
+        link for link in (*evidence_urls, *evidence_links) if "arxiv.org" not in link.casefold()
     ]
-    return not non_arxiv_links
+    arxiv_links = [
+        link for link in (*evidence_urls, *evidence_links) if "arxiv.org" in link.casefold()
+    ]
+    has_official_source = _coerce_bool(
+        support.get("has_official_source", support.get("official")),
+        False,
+    )
+    has_code = _coerce_bool(
+        support.get("has_code", support.get("code_available")),
+        False,
+    )
+    arxiv_paper = bool(paper_url and "arxiv.org" in paper_url.casefold())
+    return (
+        (arxiv_paper or bool(arxiv_links))
+        and not non_arxiv_links
+        and not (has_official_source or has_code)
+    )
 
 
 def _support_text(value: Any) -> str | None:
@@ -609,6 +623,12 @@ def _support_text(value: Any) -> str | None:
 
 
 def _support_evidence_url(support: Mapping[str, Any]) -> str | None:
+    values = _support_evidence_urls(support)
+    return values[0] if values else None
+
+
+def _support_evidence_urls(support: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
     for key in (
         "evidence_url",
         "support_url",
@@ -620,9 +640,9 @@ def _support_evidence_url(support: Mapping[str, Any]) -> str | None:
         "source_url",
     ):
         value = _support_text(support.get(key))
-        if value:
-            return value
-    return None
+        if value and value not in values:
+            values.append(value)
+    return values
 
 
 def _support_links(value: Any) -> list[str]:
