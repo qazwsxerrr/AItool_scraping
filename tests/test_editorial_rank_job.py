@@ -155,3 +155,108 @@ def test_paper_gate_reads_explicit_support_when_raw_response_omits_paper_support
         snapshot = session.query(IntelEventRankingSnapshot).one()
         assert snapshot.selected is True
         assert snapshot.reason == "selected"
+
+
+def test_paper_gate_accepts_persisted_evidence_url_and_official_projection():
+    sf = _db()
+    with sf() as session:
+        event = _add_event(
+            session,
+            "source_official_research",
+            "supported-paper-minimal-projection",
+            topic="paper",
+            score=90,
+            url="https://research.example/papers/minimal-projection",
+        )
+        item = session.get(IntelItem, event.primary_item_id)
+        assert item is not None
+        item.ai_review = AIItemReview(
+            content_class="official_model_company",
+            keep=True,
+            status="success",
+            raw_response_json="{}",
+            paper_support_json=json.dumps(
+                {
+                    "evidence_url": "https://official.example/research/minimal-projection",
+                    "has_official_source": True,
+                }
+            ),
+        )
+        session.commit()
+
+    result = run_editorial_rank_job(session_factory=sf)
+
+    assert result.selected == 1
+    with sf() as session:
+        snapshot = session.query(IntelEventRankingSnapshot).one()
+        assert snapshot.selected is True
+
+
+def test_paper_gate_accepts_evidence_links_and_code_projection():
+    sf = _db()
+    with sf() as session:
+        event = _add_event(
+            session,
+            "source_project",
+            "supported-paper-code-projection",
+            topic="paper",
+            score=90,
+            url="https://research.example/papers/code-projection",
+        )
+        item = session.get(IntelItem, event.primary_item_id)
+        assert item is not None
+        item.ai_review = AIItemReview(
+            content_class="project_tool",
+            keep=True,
+            status="success",
+            raw_response_json="{}",
+            paper_support_json=json.dumps(
+                {
+                    "evidence_links": ["https://github.com/example/code-projection"],
+                    "has_code": True,
+                }
+            ),
+        )
+        session.commit()
+
+    result = run_editorial_rank_job(session_factory=sf)
+
+    assert result.selected == 1
+
+
+def test_paper_gate_rejects_explicit_arxiv_only_projection():
+    sf = _db()
+    with sf() as session:
+        event = _add_event(
+            session,
+            "source_official_research",
+            "arxiv-only-projection",
+            topic="paper",
+            score=90,
+            url="https://research.example/papers/arxiv-only-projection",
+        )
+        item = session.get(IntelItem, event.primary_item_id)
+        assert item is not None
+        item.ai_review = AIItemReview(
+            content_class="official_model_company",
+            keep=True,
+            status="success",
+            raw_response_json="{}",
+            paper_support_json=json.dumps(
+                {
+                    "is_paper": True,
+                    "paper_url": "https://arxiv.org/abs/2608.99999",
+                    "arxiv_only": True,
+                    "evidence_url": "https://arxiv.org/abs/2608.99999",
+                }
+            ),
+        )
+        session.commit()
+
+    result = run_editorial_rank_job(session_factory=sf)
+
+    assert result.selected == 0
+    with sf() as session:
+        snapshot = session.query(IntelEventRankingSnapshot).one()
+        assert snapshot.selected is False
+        assert snapshot.reason == "paper_gate:arxiv_only"

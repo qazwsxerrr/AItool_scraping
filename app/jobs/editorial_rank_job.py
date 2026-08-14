@@ -515,17 +515,122 @@ def _paper_gate(event: IntelEvent) -> tuple[bool, str | None]:
             flags.add("paper:arxiv_only")
     if "paper:arxiv_only" in flags:
         return False, "paper_gate:arxiv_only"
+    saw_arxiv_only_support = False
     for support in supports:
-        if bool(support.get("arxiv_only")):
+        support_arxiv_only = _paper_support_is_arxiv_only(support)
+        saw_arxiv_only_support = saw_arxiv_only_support or support_arxiv_only
+        if support_arxiv_only:
             continue
-        if not bool(support.get("is_paper", True)):
-            continue
-        level = str(support.get("support_level", support.get("level", "none"))).casefold()
-        hard_pass = support.get("hard_gate_pass")
-        has_link = any(support.get(key) for key in ("paper_url", "official_url", "code_url", "source_url", "github_url"))
-        if hard_pass is True or (level in {"supported", "strong"} and has_link):
+        if _paper_support_passes(support):
             return True, None
+    if saw_arxiv_only_support:
+        return False, "paper_gate:arxiv_only"
     return False, "paper_gate:unsupported"
+
+
+def _paper_support_passes(support: Mapping[str, Any]) -> bool:
+    """Evaluate the persisted PaperSupport projection without provider raw data.
+
+    Wave 1 stores normalized evidence under ``evidence_url``/``evidence_links``
+    and source booleans rather than the historical ``official_url``/``code_url``
+    aliases.  Treat an explicit positive projection as sufficient evidence,
+    while honoring explicit negative hard-gate/support/arXiv flags.
+    """
+
+    if not isinstance(support, Mapping):
+        return False
+    if _paper_support_is_arxiv_only(support):
+        return False
+
+    is_paper = support.get("is_paper", support.get("paper"))
+    if is_paper is not None and not _coerce_bool(is_paper, False):
+        return False
+
+    hard_pass = support.get("hard_gate_pass")
+    if hard_pass is not None:
+        return _coerce_bool(hard_pass, False)
+
+    supported = support.get(
+        "supported",
+        support.get("is_supported", support.get("eligible")),
+    )
+    if supported is not None and not _coerce_bool(supported, False):
+        return False
+
+    level = support.get("support_level", support.get("level", support.get("paper_support_level")))
+    if level is not None:
+        normalized_level = str(level).strip().casefold().replace("-", "_")
+        if normalized_level not in {"supported", "strong", "pass", "true"}:
+            return False
+
+    evidence_url = _support_evidence_url(support)
+    evidence_links = _support_links(support.get("evidence_links"))
+    has_official_source = _coerce_bool(
+        support.get("has_official_source", support.get("official")),
+        False,
+    )
+    has_code = _coerce_bool(
+        support.get("has_code", support.get("code_available")),
+        False,
+    )
+    has_evidence = bool(evidence_url or evidence_links or has_official_source or has_code)
+    if not has_evidence:
+        return False
+
+    return True
+
+
+def _paper_support_is_arxiv_only(support: Mapping[str, Any]) -> bool:
+    if not isinstance(support, Mapping):
+        return False
+    if _coerce_bool(support.get("arxiv_only", support.get("only_arxiv")), False):
+        return True
+    paper_url = _support_text(
+        support.get(
+            "paper_url",
+            support.get("paper_link", support.get("url", support.get("arxiv_url"))),
+        )
+    )
+    if not paper_url or "arxiv.org" not in paper_url.casefold():
+        return False
+    evidence_url = _support_evidence_url(support)
+    evidence_links = _support_links(support.get("evidence_links"))
+    non_arxiv_links = [
+        link for link in (evidence_url, *evidence_links) if link and "arxiv.org" not in link.casefold()
+    ]
+    return not non_arxiv_links
+
+
+def _support_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _support_evidence_url(support: Mapping[str, Any]) -> str | None:
+    for key in (
+        "evidence_url",
+        "support_url",
+        "official_url",
+        "official_x_url",
+        "community_url",
+        "code_url",
+        "github_url",
+        "source_url",
+    ):
+        value = _support_text(support.get(key))
+        if value:
+            return value
+    return None
+
+
+def _support_links(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [link for raw in value if (link := _support_text(raw))]
 
 
 def _preference_bonus(candidate: Mapping[str, Any], profile: EditorialProfile) -> float:
