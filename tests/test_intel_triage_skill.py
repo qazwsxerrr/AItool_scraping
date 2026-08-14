@@ -12,6 +12,7 @@ from app.ai.skills.intel_triage import (
     TriageResult,
     build_provider_payload,
     normalize_html,
+    normalize_text,
     parse_triage_result,
     run_triage_batch,
 )
@@ -77,6 +78,14 @@ def test_raw_envelope_normalizes_html_and_aliases():
     assert item.url == "https://example.test/project"
     assert item.body_text == "Hello world"
     assert "script" not in normalize_html(item.raw_html or "")
+
+
+def test_html_fragment_normalization_is_one_way_for_fixture_like_literals():
+    fixture_like = "<article><p>Use &lt; foo&gt; and version 1.2.</p><p>Next line</p></article>"
+    normalized = normalize_html(fixture_like)
+    assert normalized == "Use < foo> and version 1.2.\n\nNext line"
+    assert normalize_text(fixture_like) == normalized
+    assert normalize_html(normalized) == normalized
 
 
 def test_strict_parse_has_seven_topics_and_preserves_raw_audit():

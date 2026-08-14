@@ -42,8 +42,16 @@ def normalize_text(value: Any, *, preserve_newlines: bool = True) -> str:
     text = unicodedata.normalize("NFKC", str(value)).replace("\r\n", "\n").replace("\r", "\n")
     if re.search(r"<\s*/?[A-Za-z][^>]*>", text):
         # Text callers occasionally pass an RSS HTML fragment.  Normalize it
-        # here as a convenience; normalize_html calls back with tag-free text.
+        # here as a convenience; normalize_html uses the one-way plain-text
+        # helper below and therefore cannot recurse back into this branch.
         return normalize_html(text)
+    return _normalize_plain_text(text, preserve_newlines=preserve_newlines)
+
+
+def _normalize_plain_text(text: str, *, preserve_newlines: bool = True) -> str:
+    """Normalize text after HTML has already been removed."""
+
+    text = unicodedata.normalize("NFKC", text).replace("\r\n", "\n").replace("\r", "\n")
     text = html.unescape(text).replace("\u200b", "").replace("\ufeff", "")
     text = _CONTROL_RE.sub("", text)
     if not preserve_newlines:
@@ -77,13 +85,13 @@ def normalize_html(value: Any) -> str:
         for node in soup.find_all(("p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "article", "section", "blockquote", "pre")):
             node.insert_before("\n")
             node.insert_after("\n")
-        return normalize_text(soup.get_text(" ", strip=False))
+        return _normalize_plain_text(soup.get_text(" ", strip=False))
 
     # Dependency-light fallback for environments that intentionally omit bs4.
     text = re.sub(r"(?is)<\s*(script|style|noscript|template|svg)\b.*?</\s*\1\s*>", " ", raw)
     text = re.sub(r"(?i)<\s*(br|p|div|li|tr|h[1-6]|article|section|blockquote|pre)\b[^>]*>", "\n", text)
     text = _TAG_RE.sub(" ", text)
-    return normalize_text(text)
+    return _normalize_plain_text(text)
 
 
 def html_to_text(value: Any) -> str:
