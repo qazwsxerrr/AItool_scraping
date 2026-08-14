@@ -432,4 +432,42 @@ __all__ = [
     "parse_item_analysis_response",
     "parse_project_summary_response",
     "strip_json_fence",
+    "PaperSupport",
+    "RawIntelEnvelope",
+    "TriageResult",
+    "TriageScores",
+    "normalize_topic",
+    "normalize_html",
+    "normalize_text",
+    "parse_triage_response",
+    "parse_triage_result",
+    "strict_parse_triage",
+    "apply_deterministic_guards",
 ]
+
+
+# The triage contract lives in ``app.ai.skills.intel_triage`` so it remains
+# independent from the legacy item-analysis schema.  Lazy aliases keep the
+# common ``from app.ai.schemas import RawIntelEnvelope`` import working without
+# introducing a module-import cycle.
+_TRIAGE_EXPORTS = {
+    "PaperSupport",
+    "RawIntelEnvelope",
+    "TriageResult",
+    "TriageScores",
+    "normalize_topic",
+    "normalize_html",
+    "normalize_text",
+    "parse_triage_response",
+    "parse_triage_result",
+    "strict_parse_triage",
+    "apply_deterministic_guards",
+}
+
+
+def __getattr__(name: str):
+    if name in _TRIAGE_EXPORTS:
+        from app.ai.skills import intel_triage
+
+        return getattr(intel_triage, name)
+    raise AttributeError(name)

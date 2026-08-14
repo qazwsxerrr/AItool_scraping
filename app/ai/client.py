@@ -95,6 +95,30 @@ class ItemAnalysisClient:
             raise ValueError("Item analysis API returned invalid JSON") from exc
         return parse_item_analysis_response(data, request.source_content_class)
 
+    def triage(self, envelope: Any):
+        """Run the newer Intel Triage contract through the same adapter.
+
+        This additive method preserves the legacy ``analyze(ItemAnalysisRequest)``
+        semantics while allowing callers to migrate incrementally.
+        """
+
+        from app.ai.skills.intel_triage.client import IntelTriageClient
+
+        adapter = IntelTriageClient(
+            api_url=self.api_url,
+            api_key=self.api_key,
+            model=self.model,
+            api_style=self.api_style,
+            timeout_seconds=self.timeout_seconds,
+            http_client=self._http_client,
+        )
+        return adapter.triage(envelope)
+
+    def triage_batch(self, envelopes: Any):
+        from app.ai.skills.intel_triage.client import run_triage_batch
+
+        return run_triage_batch(self, envelopes)
+
     def summarize_project(self, request: ItemAnalysisRequest) -> ItemAnalysisResponse:
         """Run one GitHub project-summary request using the same schema/audit path."""
 
@@ -212,6 +236,15 @@ __all__ = [
     "SupportsPost",
     "parse_item_analysis_response",
     "parse_project_summary_response",
+    "IntelTriageClient",
+    "TriageClient",
+    "run_triage_batch",
+    "triage_item",
+    "triage_items",
+    "safe_triage",
+    "isolate_ai_failures",
+    "isolate_ai_failure",
+    "run_triage_isolated",
 ]
 
 
@@ -230,3 +263,24 @@ def _normalize_api_style(value: Any) -> str:
     if style not in {"generic_json", "openai_chat", "openai_responses"}:
         raise ValueError("api_style must be generic_json, openai_chat, or openai_responses")
     return style
+
+
+_TRIAGE_CLIENT_EXPORTS = {
+    "IntelTriageClient",
+    "TriageClient",
+    "run_triage_batch",
+    "triage_item",
+    "triage_items",
+    "safe_triage",
+    "isolate_ai_failures",
+    "isolate_ai_failure",
+    "run_triage_isolated",
+}
+
+
+def __getattr__(name: str):
+    if name in _TRIAGE_CLIENT_EXPORTS:
+        from app.ai.skills import intel_triage
+
+        return getattr(intel_triage, name)
+    raise AttributeError(name)

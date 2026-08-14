@@ -124,4 +124,34 @@ __all__ = [
     "build_openai_chat_payload",
     "build_openai_responses_payload",
     "PROJECT_SUMMARY_TASK",
+    "INTEL_TRIAGE_JSON_SCHEMA",
+    "INTEL_TRIAGE_RESPONSE_SCHEMA",
+    "INTEL_TRIAGE_SYSTEM_PROMPT",
+    "INTEL_TRIAGE_TASK",
+    "build_generic_triage_payload",
+    "build_openai_chat_triage_payload",
+    "build_openai_responses_triage_payload",
+    "build_provider_payload",
+    "build_triage_payload",
 ]
+
+
+_TRIAGE_PROMPT_EXPORTS = {
+    "INTEL_TRIAGE_JSON_SCHEMA",
+    "INTEL_TRIAGE_RESPONSE_SCHEMA",
+    "INTEL_TRIAGE_SYSTEM_PROMPT",
+    "INTEL_TRIAGE_TASK",
+    "build_generic_triage_payload",
+    "build_openai_chat_triage_payload",
+    "build_openai_responses_triage_payload",
+    "build_provider_payload",
+    "build_triage_payload",
+}
+
+
+def __getattr__(name: str):
+    if name in _TRIAGE_PROMPT_EXPORTS:
+        from app.ai.skills import intel_triage
+
+        return getattr(intel_triage, name)
+    raise AttributeError(name)
