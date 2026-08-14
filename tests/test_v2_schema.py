@@ -19,4 +19,13 @@ def test_fresh_database_contains_only_ai_core_tables(tmp_path):
             )
         ]
 
-    assert tables == ["ai_item_reviews", "fetch_attempts", "intel_items", "intel_runs", "sources"]
+    assert tables == [
+        "ai_item_reviews",
+        "fetch_attempts",
+        "intel_event_items",
+        "intel_event_ranking_snapshots",
+        "intel_events",
+        "intel_items",
+        "intel_runs",
+        "sources",
+    ]

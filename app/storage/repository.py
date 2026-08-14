@@ -16,6 +16,9 @@ from sqlalchemy.orm import Session, joinedload
 from app.domain.models import SourceSpec
 from app.storage.models import (
     AIItemReview,
+    IntelEvent,
+    IntelEventItem,
+    IntelEventRankingSnapshot,
     IntelItem,
     IntelRun,
     Source,
@@ -40,6 +43,24 @@ class IntelCounts:
     selected: int = 0
     analyzed: int = 0
     failed: int = 0
+
+
+@dataclass(frozen=True)
+class EventItemUpsertResult:
+    """Result wrapper retained for callers that need created/updated flags."""
+
+    relation: IntelEventItem
+    created: bool
+
+    @property
+    def event_item(self) -> IntelEventItem:
+        return self.relation
+
+
+@dataclass(frozen=True)
+class EventRankingSnapshotUpsertResult:
+    snapshot: IntelEventRankingSnapshot
+    created: bool
 
 
 class IntelRepository:
@@ -542,6 +563,393 @@ class IntelRepository:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).unique().all())
 
+    # ------------------------------------------------------------------
+    # Event aggregation and ranking snapshot persistence
+    # ------------------------------------------------------------------
+
+    def upsert_event(
+        self,
+        event: Any | None = None,
+        *,
+        event_key: str | None = None,
+        canonical_key: str | None = None,
+        canonical_url: str | None = None,
+        external_id: str | None = None,
+        normalized_title: str | None = None,
+        title: str | None = None,
+        summary_cn: str | None = None,
+        topic: str | None = None,
+        topics: Iterable[str] | None = None,
+        content_class: str | None = None,
+        source_group: str | None = None,
+        source_ids: Iterable[str] | None = None,
+        source_groups: Iterable[str] | None = None,
+        identity_keys: Iterable[str] | None = None,
+        display_score: float | None = None,
+        novelty_status: str | None = None,
+        state: str | None = None,
+        resolution_method: str | None = None,
+        resolution_confidence: int | None = None,
+        resolution_raw: Any | None = None,
+        risk_flags: Iterable[str] | None = None,
+        primary_item_id: int | None = None,
+        first_seen_at: datetime | None = None,
+        last_seen_at: datetime | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> IntelEvent:
+        """Create or refresh one canonical event without duplicate rows.
+
+        ``event_key`` is the deterministic key selected by the clustering job.
+        ``identity_keys`` stores every exact alias observed for the event; this
+        lets a later fetch that only exposes a URL (or only an external id)
+        resolve the existing title-based event during a rerun.
+        """
+
+        values = _object_mapping(event)
+        key = _text(event_key or canonical_key or values.get("event_key") or values.get("canonical_key"))
+        if not key:
+            key = _event_key_from_values(values)
+
+        canonical = _canonical_url(canonical_url or values.get("canonical_url") or values.get("url"))
+        external = _normalize_event_external_id(external_id or values.get("external_id"))
+        norm_title = _normalize_event_title(normalized_title or values.get("normalized_title") or values.get("title"))
+        aliases = _unique_strings(
+            [
+                *(identity_keys or ()),
+                *(_string_values(values.get("identity_keys"))),
+                _identity_alias_url(canonical),
+                _identity_alias_external(external),
+                _identity_alias_title(norm_title),
+                key,
+            ]
+        )
+
+        row = self.session.scalar(select(IntelEvent).where(IntelEvent.event_key == key))
+        if row is None:
+            # Prefer an existing membership, then exact indexed identities,
+            # and finally the persisted alias list.  The latter is intentionally
+            # read in Python because SQLite JSON1 is not required.
+            candidate_item_ids = [
+                int(item_id)
+                for item_id in [primary_item_id, values.get("primary_item_id")]
+                if item_id is not None
+            ]
+            if candidate_item_ids:
+                row = self.session.scalar(
+                    select(IntelEvent)
+                    .join(IntelEventItem, IntelEventItem.event_id == IntelEvent.id)
+                    .where(IntelEventItem.item_id.in_(candidate_item_ids))
+                    .order_by(IntelEvent.id.asc())
+                )
+            if row is None and canonical:
+                row = self.session.scalar(select(IntelEvent).where(IntelEvent.canonical_url == canonical))
+            if row is None and external:
+                row = self.session.scalar(select(IntelEvent).where(IntelEvent.external_id == external))
+            if row is None and norm_title:
+                row = self.session.scalar(select(IntelEvent).where(IntelEvent.normalized_title == norm_title))
+            if row is None and aliases:
+                rows = list(self.session.scalars(select(IntelEvent).order_by(IntelEvent.id.asc())).all())
+                alias_set = set(aliases)
+                for candidate in rows:
+                    existing_aliases = set(_load_json(candidate.identity_keys_json, []))
+                    if existing_aliases & alias_set:
+                        row = candidate
+                        break
+
+        if row is None:
+            row = IntelEvent(event_key=key)
+            self.session.add(row)
+
+        values_topics = _unique_strings([*(topics or ()), *(_string_values(values.get("topics"))), values.get("topic")])
+        values_sources = _unique_strings([*(source_ids or ()), *(_string_values(values.get("source_ids"))), values.get("source_id")])
+        values_source_groups = _unique_strings(
+            [*(source_groups or ()), *(_string_values(values.get("source_groups"))), source_group, values.get("source_group")]
+        )
+        previous_topics = _load_json(row.topics_json, [])
+        previous_sources = _load_json(row.source_ids_json, [])
+        previous_source_groups = _load_json(row.source_groups_json, [])
+        previous_aliases = _load_json(row.identity_keys_json, [])
+        merged_topics = _unique_strings([*(_string_values(previous_topics)), *values_topics])
+        merged_sources = _unique_strings([*(_string_values(previous_sources)), *values_sources])
+        merged_source_groups = _unique_strings([*(_string_values(previous_source_groups)), *values_source_groups])
+        merged_aliases = _unique_strings([*(_string_values(previous_aliases)), *aliases])
+
+        def _assign(name: str, value: Any, *, allow_empty: bool = False) -> None:
+            if value is not None and (allow_empty or value != ""):
+                setattr(row, name, value)
+
+        _assign("canonical_url", canonical)
+        _assign("external_id", external)
+        _assign("normalized_title", norm_title, allow_empty=True)
+        _assign("title", _text(title or values.get("title")))
+        _assign("summary_cn", _text(summary_cn or values.get("summary_cn") or values.get("summary")))
+        _assign("topic", _text(topic or values.get("topic")))
+        _assign("content_class", _text(content_class or values.get("content_class")))
+        _assign("source_group", _text(source_group or values.get("source_group")))
+        if merged_topics:
+            row.topics_json = _dump_json(merged_topics)
+            if not row.topic or row.topic == "opinion":
+                row.topic = merged_topics[0]
+        if merged_sources:
+            row.source_ids_json = _dump_json(merged_sources)
+        if merged_source_groups:
+            row.source_groups_json = _dump_json(merged_source_groups)
+        if merged_aliases:
+            row.identity_keys_json = _dump_json(merged_aliases)
+        if display_score is not None or "display_score" in values:
+            score = display_score if display_score is not None else values.get("display_score")
+            try:
+                row.display_score = max(float(row.display_score or 0.0), max(0.0, min(100.0, float(score))))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        novelty = _normalize_novelty_status(novelty_status or values.get("novelty_status") or values.get("novelty"))
+        if novelty is not None:
+            # ``unknown`` is the safe first-run value, but never erase a known
+            # history result during an idempotent refresh.
+            if row.novelty_status in {None, "unknown"} or novelty != "unknown":
+                row.novelty_status = novelty
+        _assign("state", _text(state or values.get("state")))
+        _assign("resolution_method", _text(resolution_method or values.get("resolution_method")))
+        if resolution_confidence is not None or values.get("resolution_confidence") is not None:
+            try:
+                row.resolution_confidence = max(
+                    0,
+                    min(100, int(resolution_confidence if resolution_confidence is not None else values.get("resolution_confidence"))),
+                )
+            except (TypeError, ValueError, OverflowError):
+                row.resolution_confidence = 0
+        if resolution_raw is not None or "resolution_raw" in values:
+            row.resolution_raw_json = _dump_json(resolution_raw if resolution_raw is not None else values.get("resolution_raw"))
+        flags = _unique_strings([*(_string_values(_load_json(row.risk_flags_json, []))), *(risk_flags or ()), *(_string_values(values.get("risk_flags")))])
+        row.risk_flags_json = _dump_json(flags)
+        if primary_item_id is not None or values.get("primary_item_id") is not None:
+            candidate_primary = int(primary_item_id if primary_item_id is not None else values.get("primary_item_id"))
+            if row.primary_item_id is None:
+                row.primary_item_id = candidate_primary
+        first_seen = _as_utc(first_seen_at or values.get("first_seen_at"))
+        last_seen = _as_utc(last_seen_at or values.get("last_seen_at"))
+        existing_first_seen = _as_utc(row.first_seen_at)
+        existing_last_seen = _as_utc(row.last_seen_at)
+        if first_seen is not None and (existing_first_seen is None or first_seen < existing_first_seen):
+            row.first_seen_at = first_seen
+        if last_seen is not None and (existing_last_seen is None or last_seen > existing_last_seen):
+            row.last_seen_at = last_seen
+        if metadata:
+            existing_metadata = _load_json(row.resolution_raw_json, {})
+            if isinstance(existing_metadata, Mapping):
+                row.resolution_raw_json = _dump_json({**existing_metadata, **dict(metadata)})
+        row.updated_at = utcnow()
+        self.session.flush()
+        return row
+
+    save_event = upsert_event
+
+    def get_event(self, event_id: int) -> IntelEvent | None:
+        return self.session.get(IntelEvent, event_id)
+
+    def get_event_by_key(self, event_key: str) -> IntelEvent | None:
+        return self.session.scalar(select(IntelEvent).where(IntelEvent.event_key == event_key))
+
+    def get_event_by_identity(self, identity_key: str) -> IntelEvent | None:
+        """Find an event by one persisted exact identity alias."""
+
+        identity = _text(identity_key)
+        if not identity:
+            return None
+        rows = list(self.session.scalars(select(IntelEvent).order_by(IntelEvent.id.asc())).all())
+        for row in rows:
+            if identity in set(_load_json(row.identity_keys_json, [])):
+                return row
+        return None
+
+    def find_event_for_item(self, item_id: int) -> IntelEvent | None:
+        return self.session.scalar(
+            select(IntelEvent)
+            .join(IntelEventItem, IntelEventItem.event_id == IntelEvent.id)
+            .where(IntelEventItem.item_id == int(item_id))
+            .order_by(IntelEvent.id.asc())
+        )
+
+    def upsert_event_item(
+        self,
+        event_id: int,
+        item_id: int,
+        *,
+        source_id: str | None = None,
+        source_group: str | None = None,
+        identity_key: str | None = None,
+        match_type: str = "deterministic",
+        match_confidence: int = 100,
+        is_primary: bool = False,
+        lineage: Mapping[str, Any] | None = None,
+    ) -> EventItemUpsertResult:
+        """Attach one member item to an event idempotently.
+
+        An item belongs to at most one event.  If a rerun discovers a stronger
+        identity, the existing relation is moved to the selected event rather
+        than creating a second membership row.
+        """
+
+        item = self.session.get(IntelItem, int(item_id))
+        if item is None:
+            raise ValueError(f"intel item {item_id} does not exist")
+        relation = self.session.scalar(
+            select(IntelEventItem).where(
+                IntelEventItem.event_id == int(event_id),
+                IntelEventItem.item_id == int(item_id),
+            )
+        )
+        created = relation is None
+        if relation is None:
+            relation = self.session.scalar(select(IntelEventItem).where(IntelEventItem.item_id == int(item_id)))
+        if relation is None:
+            relation = IntelEventItem(event_id=int(event_id), item_id=int(item_id), source_id=source_id or item.source_id)
+            self.session.add(relation)
+        else:
+            relation.event_id = int(event_id)
+            relation.source_id = source_id or relation.source_id or item.source_id
+        relation.source_group = source_group or relation.source_group or (item.source.source_group if item.source else None)
+        relation.identity_key = identity_key or relation.identity_key
+        relation.match_type = _text(match_type) or "deterministic"
+        try:
+            relation.match_confidence = max(0, min(100, int(match_confidence)))
+        except (TypeError, ValueError, OverflowError):
+            relation.match_confidence = 0
+        relation.is_primary = bool(is_primary)
+        if lineage is not None:
+            relation.lineage_json = _dump_json(dict(lineage))
+        relation.updated_at = utcnow()
+        self.session.flush()
+        return EventItemUpsertResult(relation, created)
+
+    add_event_item = upsert_event_item
+    attach_event_item = upsert_event_item
+    upsert_event_member = upsert_event_item
+    add_event_member = upsert_event_item
+
+    def list_event_items(self, event_id: int) -> list[IntelEventItem]:
+        stmt = (
+            select(IntelEventItem)
+            .where(IntelEventItem.event_id == int(event_id))
+            .options(joinedload(IntelEventItem.item).joinedload(IntelItem.source))
+            .order_by(IntelEventItem.is_primary.desc(), IntelEventItem.id.asc())
+        )
+        return list(self.session.scalars(stmt).unique().all())
+
+    list_event_members = list_event_items
+
+    def list_events(
+        self,
+        *,
+        topic: str | None = None,
+        state: str | None = None,
+        snapshot_key: str | None = None,
+        limit: int | None = None,
+    ) -> list[IntelEvent]:
+        stmt = select(IntelEvent).order_by(IntelEvent.display_score.desc(), IntelEvent.id.asc())
+        if topic:
+            stmt = stmt.where(IntelEvent.topic == topic)
+        if state:
+            stmt = stmt.where(IntelEvent.state == state)
+        if snapshot_key:
+            stmt = stmt.join(IntelEventRankingSnapshot, IntelEventRankingSnapshot.event_id == IntelEvent.id).where(
+                IntelEventRankingSnapshot.snapshot_key == snapshot_key,
+                IntelEventRankingSnapshot.selected.is_(True),
+            )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).unique().all())
+
+    def upsert_event_ranking_snapshot(
+        self,
+        event_id: int,
+        *,
+        snapshot_key: str = "latest",
+        run_id: int | None = None,
+        rank: int = 0,
+        display_score: float = 0.0,
+        selected: bool = False,
+        topic: str | None = None,
+        source_group: str | None = None,
+        content_class: str | None = None,
+        reason: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> EventRankingSnapshotUpsertResult:
+        row = self.session.scalar(
+            select(IntelEventRankingSnapshot).where(
+                IntelEventRankingSnapshot.snapshot_key == snapshot_key,
+                IntelEventRankingSnapshot.event_id == int(event_id),
+            )
+        )
+        created = row is None
+        if row is None:
+            row = IntelEventRankingSnapshot(snapshot_key=snapshot_key, event_id=int(event_id))
+            self.session.add(row)
+        row.run_id = run_id
+        row.rank = max(0, int(rank))
+        try:
+            row.display_score = max(0.0, min(100.0, float(display_score)))
+        except (TypeError, ValueError, OverflowError):
+            row.display_score = 0.0
+        row.selected = bool(selected)
+        row.topic = _text(topic)
+        row.source_group = _text(source_group)
+        row.content_class = _text(content_class)
+        row.reason = _text(reason)
+        row.metadata_json = _dump_json(metadata or {})
+        row.updated_at = utcnow()
+        self.session.flush()
+        return EventRankingSnapshotUpsertResult(row, created)
+
+    save_event_ranking_snapshot = upsert_event_ranking_snapshot
+    upsert_event_rank_snapshot = upsert_event_ranking_snapshot
+
+    def get_event_ranking_snapshot(
+        self,
+        event_id: int,
+        *,
+        snapshot_key: str = "latest",
+    ) -> IntelEventRankingSnapshot | None:
+        return self.session.scalar(
+            select(IntelEventRankingSnapshot).where(
+                IntelEventRankingSnapshot.event_id == int(event_id),
+                IntelEventRankingSnapshot.snapshot_key == snapshot_key,
+            )
+        )
+
+    def list_event_ranking_snapshots(
+        self,
+        *,
+        snapshot_key: str = "latest",
+        selected_only: bool = False,
+        limit: int | None = None,
+    ) -> list[IntelEventRankingSnapshot]:
+        stmt = (
+            select(IntelEventRankingSnapshot)
+            .where(IntelEventRankingSnapshot.snapshot_key == snapshot_key)
+            .order_by(IntelEventRankingSnapshot.rank.asc(), IntelEventRankingSnapshot.event_id.asc())
+        )
+        if selected_only:
+            stmt = stmt.where(IntelEventRankingSnapshot.selected.is_(True))
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    list_event_rankings = list_event_ranking_snapshots
+
+    def clear_event_ranking_snapshot(self, *, snapshot_key: str = "latest") -> int:
+        """Remove stale rows for a snapshot key before rebuilding it."""
+
+        rows = list(
+            self.session.scalars(
+                select(IntelEventRankingSnapshot).where(IntelEventRankingSnapshot.snapshot_key == snapshot_key)
+            ).all()
+        )
+        for row in rows:
+            self.session.delete(row)
+        self.session.flush()
+        return len(rows)
+
     def count_by_status(self) -> dict[str, int]:
         rows = self.session.execute(
             select(IntelItem.status).order_by(IntelItem.status)
@@ -648,6 +1056,69 @@ def _counts_dict(counts: IntelCounts | Mapping[str, int] | None) -> dict[str, in
 
 def _dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+
+
+def _normalize_event_title(value: Any) -> str:
+    """Normalize title identity without changing the display title."""
+
+    if value is None:
+        return ""
+    text = re.sub(r"\s+", " ", str(value).strip()).casefold()
+    # Keep Unicode letters/numbers (including Chinese) while dropping
+    # punctuation and feed-specific separators.  This makes ``Foo – v1`` and
+    # ``foo v1`` share an exact title identity without fuzzy matching.
+    text = re.sub(r"[^\w\u4e00-\u9fff]+", " ", text, flags=re.UNICODE)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_event_external_id(value: Any) -> str | None:
+    text = _text(value)
+    if not text:
+        return None
+    return re.sub(r"\s+", "", text).casefold()
+
+
+def _identity_alias_url(value: str | None) -> str | None:
+    return f"url:{value}" if value else None
+
+
+def _identity_alias_external(value: str | None) -> str | None:
+    return f"external:{value}" if value else None
+
+
+def _identity_alias_title(value: str | None) -> str | None:
+    return f"title:{value}" if value else None
+
+
+def _event_key_from_values(values: Mapping[str, Any]) -> str:
+    canonical = _canonical_url(values.get("canonical_url") or values.get("url") or values.get("source_url"))
+    if canonical:
+        return _identity_alias_url(canonical) or "title:unknown"
+    external = _normalize_event_external_id(values.get("external_id"))
+    if external:
+        return _identity_alias_external(external) or "title:unknown"
+    title = _normalize_event_title(values.get("normalized_title") or values.get("title"))
+    return _identity_alias_title(title) or "title:unknown"
+
+
+def _normalize_novelty_status(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().casefold().replace("-", "_")
+    aliases = {
+        "new_item": "new",
+        "novel": "new",
+        "fresh": "new",
+        "updated": "update",
+        "version_update": "update",
+        "duplicate": "repeat",
+        "old": "repeat",
+        "undetermined": "unknown",
+        "": "unknown",
+    }
+    text = aliases.get(text, text)
+    return text if text in {"new", "update", "repeat", "unknown"} else "unknown"
 
 
 def _load_json(value: str, default: Any) -> Any:
