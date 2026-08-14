@@ -97,7 +97,9 @@ class IntelTriageClient:
             except TypeError:
                 # Minimal fake clients used by tests often omit timeout.
                 response = self._http_client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
+            raise_for_status = getattr(response, "raise_for_status", None)
+            if callable(raise_for_status):
+                raise_for_status()
             return response
         with httpx.Client(
             timeout=self.timeout_seconds,
@@ -106,7 +108,9 @@ class IntelTriageClient:
             trust_env=True,
         ) as client:
             response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
+            raise_for_status = getattr(response, "raise_for_status", None)
+            if callable(raise_for_status):
+                raise_for_status()
             return response
 
     def _endpoint_url(self) -> str:
