@@ -57,7 +57,7 @@ def analysis_payload(**overrides):
         "topics": ["project"],
         "summary_cn": "一个可复用的 MCP 服务项目",
         "keywords": ["MCP", "开源"],
-        "entities": [{"name": "MCP", "type": "technology"}],
+        "entities": [{"name": "MCP", "type": "technology", "aliases": []}],
         "selection_score": 87,
         "score_components": {
             "relevance": 90,
@@ -124,6 +124,8 @@ def test_payloads_are_stage_specific_and_provider_styles_are_supported():
     assert chat["response_format"]["json_schema"]["name"] == "intel_screen"
     responses = build_analysis_provider_payload(item, api_style="openai_responses")
     assert responses["text"]["format"]["name"] == "intel_analysis"
+    entity_schema = responses["text"]["format"]["schema"]["properties"]["entities"]["items"]
+    assert entity_schema["required"] == ["name", "type", "aliases"]
 
 
 def test_client_calls_independent_stage_endpoints_and_isolates_failures():
