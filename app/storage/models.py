@@ -19,6 +19,19 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _decode_json(value: str | None, default):
+    try:
+        parsed = json.loads(value or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+    return parsed if parsed is not None else default
+
+
+def _decode_list(value: str | None) -> list[str]:
+    parsed = _decode_json(value, [])
+    return [str(item) for item in parsed] if isinstance(parsed, list) else []
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -121,7 +134,14 @@ class FetchAttempt(Base):
 
 
 class IntelRun(Base):
-    """Summary of one v2 run or one individually invoked stage."""
+    """Summary and item scope for one intelligence run.
+
+    A run is intentionally a durable processing boundary.  Stage jobs record
+    the IDs fetched by that run through :class:`IntelRunItem`; downstream
+    stages can therefore query only the current scope instead of scanning all
+    historical items.  The explicit counters make partial/capped runs
+    auditable without deriving state from provider payloads.
+    """
 
     __tablename__ = "intel_runs"
     __table_args__ = (
@@ -133,13 +153,79 @@ class IntelRun(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    run_type: Mapped[str] = mapped_column(String(32), nullable=False, default="run_once")
+    scope_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    source_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    item_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     fetched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     inserted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    selected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    screened: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    screened_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    screen_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     analyzed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    analysis_filtered: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    analysis_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    candidate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    partial: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    partial_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ``selected`` remains a generic count for callers that still report a
+    # legacy aggregate; it is not an AI keep/triage decision and is not used
+    # by the new persistence APIs.
+    selected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     filters_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    run_items: Mapped[list["IntelRunItem"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+    @property
+    def scope(self) -> dict[str, object]:
+        value = _decode_json(self.scope_json, {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    @property
+    def source_ids(self) -> list[str]:
+        return _decode_list(self.source_ids_json)
+
+    @property
+    def item_ids(self) -> list[int]:
+        value = _decode_json(self.item_ids_json, [])
+        result: list[int] = []
+        if isinstance(value, list):
+            for item in value:
+                try:
+                    result.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+        return result
+
+
+class IntelRunItem(Base):
+    """Run-local scope relation retaining every fetched item lineage."""
+
+    __tablename__ = "intel_run_items"
+    __table_args__ = (
+        UniqueConstraint("run_id", "item_id", name="uq_intel_run_items_run_item"),
+        Index("ix_intel_run_items_run", "run_id"),
+        Index("ix_intel_run_items_item", "item_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id"), nullable=False)
+    item_id: Mapped[int] = mapped_column(ForeignKey("intel_items.id"), nullable=False)
+    source_id: Mapped[str | None] = mapped_column(ForeignKey("sources.id"), nullable=True)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="fetched")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="fetched")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    run: Mapped[IntelRun] = relationship(back_populates="run_items")
+    item: Mapped["IntelItem"] = relationship(back_populates="run_items")
+    source: Mapped[Source | None] = relationship()
 
 
 class IntelItem(Base):
@@ -153,10 +239,12 @@ class IntelItem(Base):
         Index("ix_intel_items_content_class", "content_class"),
         Index("ix_intel_items_published_at", "published_at"),
         Index("ix_intel_items_selection_score", "selection_score"),
+        Index("ix_intel_items_latest_run", "latest_run_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False)
+    latest_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     external_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     canonical_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     title: Mapped[str] = mapped_column(Text, nullable=False)
@@ -182,6 +270,11 @@ class IntelItem(Base):
     )
 
     source: Mapped[Source] = relationship(back_populates="intel_items")
+    latest_run: Mapped[IntelRun | None] = relationship(foreign_keys=[latest_run_id])
+    run_items: Mapped[list[IntelRunItem]] = relationship(
+        back_populates="item", cascade="all, delete-orphan"
+    )
+    ai_screen: Mapped["AIItemScreen | None"] = relationship(back_populates="item", uselist=False)
     ai_review: Mapped["AIItemReview | None"] = relationship(back_populates="item", uselist=False)
     event_items: Mapped[list["IntelEventItem"]] = relationship(
         back_populates="item",
@@ -189,50 +282,84 @@ class IntelItem(Base):
     )
 
 
-class AIItemReview(Base):
-    """At most one structured model result for each intelligence item.
+class AIItemScreen(Base):
+    """Durable Stage A screen result and raw provider audit payload."""
 
-    The Wave 1 triage contract is stored explicitly instead of requiring event
-    clustering to reverse-engineer fields from ``raw_response_json``.  JSON is
-    kept as text to preserve the repository's SQLite-first schema and to avoid
-    a dialect-specific migration; event jobs decode these fields through the
-    repository boundary.
-    """
+    __tablename__ = "ai_item_screens"
+    __table_args__ = (
+        UniqueConstraint("item_id", name="uq_ai_item_screens_item_id"),
+        Index("ix_ai_item_screens_status", "status"),
+        Index("ix_ai_item_screens_decision", "decision"),
+        Index("ix_ai_item_screens_run", "run_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("intel_items.id"), nullable=False)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="intel_screen_v1")
+    decision: Mapped[str] = mapped_column(String(16), nullable=False, default="uncertain")
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    raw_response_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="success")
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    item: Mapped[IntelItem] = relationship(back_populates="ai_screen")
+
+    @property
+    def risk_flags(self) -> list[str]:
+        return _decode_list(self.risk_flags_json)
+
+    @property
+    def raw_response(self) -> dict[str, object]:
+        value = _decode_json(self.raw_response_json, {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    @property
+    def raw_payload(self) -> dict[str, object]:
+        return self.raw_response
+
+
+class AIItemReview(Base):
+    """At most one structured Stage B analysis projection for each item."""
 
     __tablename__ = "ai_item_reviews"
     __table_args__ = (
         UniqueConstraint("item_id", name="uq_ai_item_reviews_item_id"),
         Index("ix_ai_item_reviews_status", "status"),
-        Index("ix_ai_item_reviews_keep", "keep"),
         Index("ix_ai_item_reviews_topic", "topic"),
-        Index("ix_ai_item_reviews_novelty", "novelty"),
+        Index("ix_ai_item_reviews_score", "selection_score"),
+        Index("ix_ai_item_reviews_run", "run_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     item_id: Mapped[int] = mapped_column(ForeignKey("intel_items.id"), nullable=False)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="item_analysis_v1")
-    keep: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="intel_analysis_v1")
     content_class: Mapped[str] = mapped_column(String(64), nullable=False)
-    # Explicit Wave 1 Intel Triage fields.  Nullable values preserve
-    # compatibility with historical ItemAnalysis rows that predate triage.
     topic: Mapped[str | None] = mapped_column(String(32), nullable=True)
     topics_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     keywords_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    entities_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     selection_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    scores_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
-    novelty: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    novelty_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    score_components_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     paper_support_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
-    # Editorial topic, deliberately separate from ``content_class`` which
-    # describes the source/signal type (official, project, community).
-    topic_category: Mapped[str | None] = mapped_column(String(128), nullable=True)
     summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     raw_response_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="success")
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -261,8 +388,17 @@ class AIItemReview(Base):
 
     @property
     def scores(self) -> dict[str, object]:
-        value = self._decode_json(self.scores_json, {})
+        value = self._decode_json(self.score_components_json, {})
         return dict(value) if isinstance(value, dict) else {}
+
+    @property
+    def score_components(self) -> dict[str, object]:
+        return self.scores
+
+    @property
+    def entities(self) -> list[dict[str, object]]:
+        value = self._decode_json(self.entities_json, [])
+        return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
     @property
     def paper_support(self) -> dict[str, object]:
@@ -278,6 +414,10 @@ class AIItemReview(Base):
     def raw_response(self) -> dict[str, object]:
         value = self._decode_json(self.raw_response_json, {})
         return dict(value) if isinstance(value, dict) else {}
+
+    @property
+    def raw_payload(self) -> dict[str, object]:
+        return self.raw_response
 
 
 class IntelEvent(Base):
@@ -308,6 +448,8 @@ class IntelEvent(Base):
     summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
     topic: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
     topics_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    keywords_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    entities_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     content_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_group: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -320,6 +462,9 @@ class IntelEvent(Base):
     resolution_confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     resolution_raw_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    first_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
+    last_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
+    new_in_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     primary_item_id: Mapped[int | None] = mapped_column(ForeignKey("intel_items.id"), nullable=True)
     first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -353,6 +498,15 @@ class IntelEvent(Base):
     def novelty(self) -> str:
         return self.novelty_status
 
+    @property
+    def keywords(self) -> list[str]:
+        return _decode_list(self.keywords_json)
+
+    @property
+    def entities(self) -> list[dict[str, object]]:
+        value = _decode_json(self.entities_json, [])
+        return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
 
 class IntelEventItem(Base):
     """Lineage relation between an event and every contributing item."""
@@ -371,6 +525,8 @@ class IntelEventItem(Base):
     item_id: Mapped[int] = mapped_column(ForeignKey("intel_items.id"), nullable=False)
     source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False)
     source_group: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_title: Mapped[str | None] = mapped_column(Text, nullable=True)
     identity_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     match_type: Mapped[str] = mapped_column(String(32), nullable=False, default="deterministic")
     match_confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
