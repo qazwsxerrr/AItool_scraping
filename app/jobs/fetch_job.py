@@ -165,7 +165,16 @@ def run_intel_fetch_job(
                     stats.attempt_id = attempt_id
 
             request_headers = _conditional_headers(source_row if not dry_run else None)
-            batch = _router_collect(router, spec, limit_per_source or spec.default_limit, request_headers)
+            # The orchestration default is a uniform 30 items per source.
+            # Registry ``default_limit`` remains available to callers that
+            # pass an explicit value, but ``None`` must not silently fall back
+            # to a smaller source-specific cap.
+            effective_limit = (
+                DEFAULT_FETCH_LIMIT_PER_SOURCE
+                if limit_per_source is None
+                else max(1, int(limit_per_source))
+            )
+            batch = _router_collect(router, spec, effective_limit, request_headers)
             _apply_batch_stats(stats, batch)
             stats.etag = batch.etag
             stats.last_modified = batch.last_modified
@@ -186,7 +195,17 @@ def run_intel_fetch_job(
                         item = raw_item.model_copy(update={"content_class": spec.content_class})
                         try:
                             with session.begin_nested():
-                                insert = repo.insert_item(item)
+                                # Attach every fetched identity (including an
+                                # idempotent duplicate) to the current run so
+                                # downstream Stage A/B jobs can stay scoped to
+                                # this fetch.  The repository performs the
+                                # exact identity/content-hash check and keeps
+                                # duplicate source lineage intact.
+                                insert = repo.insert_item(
+                                    item,
+                                    run_id=result.run_id,
+                                    run_role="fetched",
+                                )
                             if insert.inserted:
                                 stats.inserted += 1
                             else:

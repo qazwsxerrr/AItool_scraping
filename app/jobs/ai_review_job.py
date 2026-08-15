@@ -1,37 +1,43 @@
-"""AI-only analysis for fetched intelligence items.
+"""Stage A/B AI orchestration for fetched intelligence items.
 
-This stage deliberately stops after deterministic selection and one structured
-AI call per retained item. The output is a candidate digest plus an audit file
-containing filtered and failed rows.
+No source keyword, star, or engagement gate runs before Stage A. Provider calls
+run outside SQLAlchemy sessions; all database writes remain serial in this job.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import httpx
-from sqlalchemy import select
-from sqlalchemy.orm import Session, joinedload, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.client import IntelTriageClient
-from app.ai.schemas import (
+from app.ai.skills.intel_triage import (
+    AnalysisResult,
     RawIntelEnvelope,
-    TriageResult,
+    ScreenResult,
+    analysis_guard_failure,
+    apply_analysis_guards,
+    apply_screen_guard,
+    strict_parse_analysis,
+    strict_parse_screen,
 )
-from app.ai.skills.intel_triage.client import triage_item
-from app.config.limits import DEFAULT_AI_REVIEW_LIMIT
+from app.config.limits import (
+    DEFAULT_AI_ANALYSIS_MIN_SCORE,
+    DEFAULT_AI_REVIEW_CONCURRENCY,
+    DEFAULT_AI_REVIEW_LIMIT,
+    DEFAULT_AI_SCREEN_REJECT_THRESHOLD,
+)
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
-from app.domain.models import FetchItem, SourceSpec
-from app.domain.policies import selection_decision
-from app.jobs.export_job import _serialize as _serialize_intel_item
+from app.domain.models import SourceSpec
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelItem
+from app.storage.models import IntelItem, IntelRun
 from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
@@ -41,11 +47,17 @@ LOGGER = logging.getLogger(__name__)
 class AIReviewResult:
     run_id: int | None = None
     processed: int = 0
-    selected: int = 0
-    filtered: int = 0
+    screened: int = 0
+    screened_out: int = 0
+    screen_failed: int = 0
     analyzed: int = 0
-    ai_failed: int = 0
-    failed: int = 0
+    analysis_filtered: int = 0
+    analysis_failed: int = 0
+    candidate: int = 0
+    candidate_ids: list[int] = field(default_factory=list)
+    partial: bool = False
+    partial_reason: str | None = None
+    ai_limit: int | None = None
     errors: list[str] = field(default_factory=list)
     candidate_path: str = "output/ai-review/ai_review_candidates.jsonl"
     audit_path: str = "output/ai-review/ai_review_audit.jsonl"
@@ -54,6 +66,37 @@ class AIReviewResult:
     audit_exported: int = 0
     dry_run: bool = False
 
+    @property
+    def selected(self) -> int:
+        return self.candidate
+
+    @property
+    def filtered(self) -> int:
+        return self.screened_out + self.analysis_filtered
+
+    @property
+    def ai_failed(self) -> int:
+        return self.screen_failed + self.analysis_failed
+
+    @property
+    def failed(self) -> int:
+        return self.ai_failed
+
+    @property
+    def run_counts(self) -> dict[str, Any]:
+        return {
+            "processed": self.processed,
+            "screened": self.screened,
+            "screened_out": self.screened_out,
+            "screen_failed": self.screen_failed,
+            "analyzed": self.analyzed,
+            "analysis_filtered": self.analysis_filtered,
+            "analysis_failed": self.analysis_failed,
+            "candidate": self.candidate,
+            "partial": self.partial,
+            "partial_reason": self.partial_reason,
+        }
+
 
 def run_ai_review_job(
     *,
@@ -61,151 +104,200 @@ def run_ai_review_job(
     source_specs: Mapping[str, SourceSpec] | None = None,
     ai_client: IntelTriageClient | Any | None = None,
     limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
+    ai_limit: int | None = None,
     source_filter: str | None = None,
     content_class: str | None = None,
     force: bool = False,
     dry_run: bool = False,
     output_dir: str | Path = "output/ai-review",
     http_client: Any | None = None,
-    now: datetime | None = None,
+    now: Any | None = None,
     run_id: int | None = None,
+    screen_reject_threshold: int = DEFAULT_AI_SCREEN_REJECT_THRESHOLD,
+    analysis_min_score: int = DEFAULT_AI_ANALYSIS_MIN_SCORE,
+    concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY,
 ) -> AIReviewResult:
-    """Run deterministic filtering plus structured AI review.
+    """Run structural prefilter, Stage A screen, then Stage B analysis.
 
-    ``ai_client`` may use an injected HTTP client for its provider request.
-    GitHub projects are summarized from already-persisted fetch material and do
-    not trigger metadata enrichment HTTP.
+    A supplied limit is an explicit safety cap. The default None processes the
+    whole selected scope; capped runs remain auditable as partial.
     """
+    del http_client, now
+    if ai_limit is not None:
+        limit = ai_limit
+    limit = _normalise_limit(limit)
+    reject_threshold = _bounded_score(screen_reject_threshold, DEFAULT_AI_SCREEN_REJECT_THRESHOLD)
+    min_score = _bounded_score(analysis_min_score, DEFAULT_AI_ANALYSIS_MIN_SCORE)
+    max_workers = min(4, max(1, int(concurrency or DEFAULT_AI_REVIEW_CONCURRENCY)))
 
-    # Kept as an injectable boundary for callers/tests; this stage does not
-    # issue enrichment requests.
-    del http_client
-    result = AIReviewResult(run_id=run_id, dry_run=dry_run)
-    result.candidate_path = str(Path(output_dir) / "ai_review_candidates.jsonl")
-    result.audit_path = str(Path(output_dir) / "ai_review_audit.jsonl")
-    result.markdown_path = str(Path(output_dir) / "ai_review_digest.md")
+    result = AIReviewResult(run_id=run_id, dry_run=dry_run, ai_limit=limit)
+    output_path = Path(output_dir)
+    result.candidate_path = str(output_path / "ai_review_candidates.jsonl")
+    result.audit_path = str(output_path / "ai_review_audit.jsonl")
+    result.markdown_path = str(output_path / "ai_review_digest.md")
     specs = dict(source_specs or {})
 
     with session_factory() as session:
         repo = IntelRepository(session)
-        items = _list_ai_review_items(
-            session,
+        items = repo.list_pending_items(
             limit=None,
-            source_filter=source_filter,
+            source_id=source_filter,
             content_class=content_class,
             force=force,
+            run_id=run_id,
+            stage="screen",
         )
-        stage_now = now or _latest_item_time(items) or datetime.now(timezone.utc)
-        ranked: list[tuple[IntelItem, Any, SourceSpec]] = []
+        if limit is not None and len(items) > limit:
+            result.partial = True
+            result.partial_reason = f"ai_limit:{limit}"
+            items = items[:limit]
+        result.processed = len(items)
+        if dry_run:
+            # Dry-run is intentionally side-effect free: do not invoke a
+            # provider, create screen/analysis rows, or write audit files.
+            return result
+        envelopes: list[tuple[IntelItem, SourceSpec, RawIntelEnvelope]] = []
+        structural: list[tuple[IntelItem, ScreenResult]] = []
         for item in items:
             spec = specs.get(item.source_id) or _spec_from_row(item.source)
-            decision = _ai_review_selection_decision(
-                _item_to_fetch_item(item),
-                spec,
-                now=stage_now,
-            )
-            ranked.append((item, decision, spec))
-        ranked.sort(key=_ranking_key, reverse=True)
-        if limit is not None:
-            ranked = ranked[:limit]
-
-        for item, decision, spec in ranked:
-            result.processed += 1
+            if not _structurally_valid(item):
+                structural.append((item, _structural_screen(item)))
+                continue
             try:
-                if dry_run:
-                    if decision.selected:
-                        result.selected += 1
-                    else:
-                        result.filtered += 1
-                    continue
+                envelopes.append((item, spec, _item_to_envelope(item, spec)))
+            except Exception as exc:
+                structural.append((item, _structural_screen(item, error=str(exc))))
 
-                repo.save_selection(
-                    item.id,
-                    keep=decision.selected,
-                    score=0 if _is_github_source(spec) else round(decision.score),
-                    reason=_selection_reason(decision),
-                )
-                session.commit()
-                if not decision.selected:
-                    result.filtered += 1
-                    continue
-                result.selected += 1
+    screen_results = _parallel_map(
+        envelopes,
+        lambda entry: _screen_one(ai_client, entry[2], reject_threshold),
+        max_workers=max_workers,
+    )
 
-                if ai_client is None:
-                    raise RuntimeError("intel triage client is not configured")
-                response = _run_item_ai_review(item, spec, ai_client, decision)
-                response_status = _response_status(response)
-                if response_status in {"ai_failed", "invalid"}:
-                    repo.upsert_ai_review(
+    stage_b: list[tuple[IntelItem, SourceSpec, RawIntelEnvelope]] = []
+    envelope_by_id = {entry[0].id: entry for entry in envelopes}
+    all_screen_results = [
+        *structural,
+        *[(entry[0], value) for entry, value in zip(envelopes, screen_results)],
+    ]
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        for item, screen in all_screen_results:
+            try:
+                with session.begin_nested():
+                    repo.save_screen(
                         item.id,
-                        response,
+                        screen,
+                        run_id=run_id,
+                        model=getattr(ai_client, "model", None),
+                        status=screen.status,
+                        error_message=screen.error_message,
+                    )
+                    if screen.status == "screen_failed":
+                        repo.set_item_status(item.id, "screen_failed", run_id=run_id)
+                        result.screen_failed += 1
+                    elif screen.decision == "reject" and screen.confidence >= reject_threshold:
+                        repo.set_item_status(item.id, "screened_out", run_id=run_id)
+                        result.screened_out += 1
+                        result.screened += 1
+                    else:
+                        result.screened += 1
+                        match = envelope_by_id.get(item.id)
+                        if match is not None:
+                            stage_b.append(match)
+            except Exception as exc:
+                result.screen_failed += 1
+                result.errors.append(f"intel_item_id={item.id}: screen persistence failed: {exc}")
+                LOGGER.exception("Stage A persistence failed for intel item %s", item.id)
+        session.commit()
+
+    analysis_results = _parallel_map(
+        stage_b,
+        lambda entry: _analysis_one(ai_client, entry[2]),
+        max_workers=max_workers,
+    )
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        for (item, spec, _envelope), analysis in zip(stage_b, analysis_results):
+            try:
+                if analysis.status == "analysis_failed":
+                    repo.save_analysis(
+                        item.id,
+                        analysis,
+                        run_id=run_id,
                         model=getattr(ai_client, "model", None),
                         content_class=spec.content_class,
-                        status=response_status,
-                        error_message=getattr(response, "error_message", None),
+                        status="analysis_failed",
+                        error_message=analysis.error_message,
                     )
-                    repo.set_item_status(item.id, "ai_failed")
-                    result.failed += 1
-                    result.ai_failed += 1
+                    repo.set_item_status(item.id, "analysis_failed", run_id=run_id)
+                    result.analysis_failed += 1
                     result.errors.append(
-                        f"intel_item_id={item.id}: {getattr(response, 'error_message', None) or response_status}"
+                        f"intel_item_id={item.id}: {analysis.error_message or 'analysis_failed'}"
                     )
-                    session.commit()
                     continue
-                if not response.summary_cn.strip() and response.keep:
-                    raise ValueError("AI review returned an empty summary_cn")
-                repo.upsert_ai_review(
+
+                result.analyzed += 1
+                guard_reason = analysis_guard_failure(analysis)
+                score = int(analysis.selection_score or 0)
+                if guard_reason or score < min_score:
+                    reason = guard_reason or "score_below_threshold"
+                    response = analysis.model_copy(update={"reason": f"analysis_filtered:{reason}"})
+                    repo.save_analysis(
+                        item.id,
+                        response,
+                        run_id=run_id,
+                        model=getattr(ai_client, "model", None),
+                        content_class=spec.content_class,
+                        status="success",
+                    )
+                    managed_item = session.get(IntelItem, item.id)
+                    if managed_item is not None:
+                        managed_item.selection_score = score
+                        managed_item.selection_reason = f"analysis_filtered:{reason}"
+                    repo.set_item_status(item.id, "analysis_filtered", run_id=run_id)
+                    result.analysis_filtered += 1
+                    continue
+
+                repo.save_analysis(
                     item.id,
-                    response,
+                    analysis,
+                    run_id=run_id,
                     model=getattr(ai_client, "model", None),
                     content_class=spec.content_class,
+                    status="success",
                 )
-                # This is intentionally the only durable item status for a
-                # retained AI candidate.
-                repo.set_item_status(item.id, "selected" if response.keep else "rejected")
-                result.analyzed += 1
-                session.commit()
+                managed_item = session.get(IntelItem, item.id)
+                if managed_item is not None:
+                    managed_item.selection_score = score
+                    managed_item.selection_reason = analysis.reason[:4000] if analysis.reason else "analysis_candidate"
+                repo.set_item_status(item.id, "candidate", run_id=run_id)
+                result.candidate += 1
+                result.candidate_ids.append(int(item.id))
             except Exception as exc:
-                result.failed += 1
-                result.ai_failed += 1
-                message = f"intel_item_id={item.id}: {exc}"
-                result.errors.append(message)
-                LOGGER.exception("AI review failed for intel item %s", item.id)
-                if dry_run:
-                    continue
-                try:
-                    session.rollback()
-                    repo.upsert_ai_review(
-                        item.id,
-                        None,
-                        model=getattr(ai_client, "model", None) if ai_client is not None else None,
-                        content_class=spec.content_class,
-                        status="ai_failed",
-                        error_message=str(exc),
-                    )
-                    repo.set_item_status(item.id, "ai_failed")
-                    session.commit()
-                except Exception:
-                    session.rollback()
-                    LOGGER.exception("Failed to persist AI review error for intel item %s", item.id)
+                result.analysis_failed += 1
+                result.errors.append(f"intel_item_id={item.id}: analysis persistence failed: {exc}")
+                LOGGER.exception("Stage B persistence failed for intel item %s", item.id)
+                session.rollback()
+        session.commit()
 
-        if not dry_run:
-            # The AI-review loop loaded relationships before writing the
-            # review rows. Expire the identity map so the export query sees
-            # the just-persisted AI result instead of a stale ``ai_review=None``.
-            session.expire_all()
-            candidates, audit = _load_ai_review_exports(
-                session,
-                source_filter=source_filter,
-                content_class=content_class,
-            )
-        else:
-            candidates, audit = [], []
+    if run_id is not None and not dry_run:
+        _persist_run_counts(session_factory, run_id, result)
 
+    if dry_run:
+        return result
+
+    with session_factory() as session:
+        candidates, audit = _load_stage_exports(
+            session,
+            run_id=run_id,
+            source_filter=source_filter,
+            content_class=content_class,
+        )
     result.exported = len(candidates)
     result.audit_exported = len(audit)
-    if not dry_run:
-        _write_ai_review_exports(candidates, audit, output_dir=output_dir)
+    _write_stage_exports(candidates, audit, output_dir=output_path, result=result)
     return result
 
 
@@ -215,6 +307,7 @@ def run_ai_review_from_settings(
     registry_path=DEFAULT_REGISTRY_PATH,
     output_dir: str | Path = "output/ai-review",
     limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
+    ai_limit: int | None = None,
     source_filter: str | None = None,
     content_class: str | None = None,
     force: bool = False,
@@ -229,6 +322,7 @@ def run_ai_review_from_settings(
     engine = create_engine_from_url(database_url)
     if not dry_run or database_url == "sqlite:///:memory:":
         init_db(engine)
+
     own_client = http_client is None and ai_client is None
     client = http_client or (
         httpx.Client(
@@ -242,49 +336,118 @@ def run_ai_review_from_settings(
         else None
     )
     try:
-        # Pass-1 is intentionally triage-only.  The legacy item-analysis
-        # adapter is not constructed by this settings/run-once boundary.
         provider = ai_client or IntelTriageClient.from_settings(settings, http_client=client)
         return run_ai_review_job(
             session_factory=create_session_factory(engine),
             source_specs=specs,
             ai_client=provider,
             limit=limit,
+            ai_limit=ai_limit,
             source_filter=source_filter,
             content_class=content_class,
             force=force,
             dry_run=dry_run,
             output_dir=output_dir,
             run_id=run_id,
+            screen_reject_threshold=settings.ai_screen_reject_threshold,
+            analysis_min_score=settings.ai_analysis_min_score,
+            concurrency=settings.ai_review_concurrency,
         )
     finally:
-        if own_client:
+        if own_client and client is not None:
             client.close()
 
 
-def _run_item_ai_review(
-    item: IntelItem,
-    spec: SourceSpec,
-    ai_client: Any,
-    decision: Any,
-) -> TriageResult:
-    if not callable(getattr(ai_client, "triage", None)):
-        raise TypeError("AI client does not expose triage")
-    envelope = _item_to_triage_envelope(item, spec)
-    response = triage_item(ai_client, envelope)
-    extra_risks = [f"selection:{flag}" for flag in decision.risk_flags]
-    if extra_risks:
-        response = response.model_copy(
-            update={"risk_flags": list(dict.fromkeys([*response.risk_flags, *extra_risks]))}
+def _parallel_map(entries: Sequence[Any], func: Any, *, max_workers: int) -> list[Any]:
+    if not entries:
+        return []
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="intel-ai") as executor:
+        futures = [executor.submit(func, entry) for entry in entries]
+        return [future.result() for future in futures]
+
+
+def _screen_one(client: Any, envelope: RawIntelEnvelope, reject_threshold: int) -> ScreenResult:
+    try:
+        method = getattr(client, "screen", None)
+        if not callable(method):
+            raise TypeError("AI client does not expose screen")
+        value = method(envelope)
+        if isinstance(value, ScreenResult):
+            parsed = value.with_item(envelope)
+        else:
+            parsed = strict_parse_screen(value, envelope=envelope, reject_threshold=reject_threshold)
+        return apply_screen_guard(parsed.with_item(envelope), envelope, reject_threshold=reject_threshold)
+    except Exception as exc:
+        return ScreenResult(
+            item_id=envelope.item_id,
+            decision="uncertain",
+            reason_code="provider_failure",
+            reason="Stage A provider call failed",
+            confidence=0,
+            risk_flags=["ai:screen_failed"],
+            status="screen_failed",
+            error_code=exc.__class__.__name__,
+            error_message=str(exc)[:4000] or exc.__class__.__name__,
+            raw_response=None,
         )
-    return response
 
 
-def _item_to_triage_envelope(item: IntelItem, spec: SourceSpec) -> RawIntelEnvelope:
-    """Project one persisted item into the strict Wave 1 provider envelope."""
+def _analysis_one(client: Any, envelope: RawIntelEnvelope) -> AnalysisResult:
+    try:
+        method = getattr(client, "analyze", None)
+        if not callable(method):
+            raise TypeError("AI client does not expose analyze")
+        value = method(envelope)
+        if isinstance(value, AnalysisResult):
+            parsed = value.with_item(envelope)
+        else:
+            parsed = strict_parse_analysis(value, envelope=envelope)
+        return apply_analysis_guards(parsed.with_item(envelope), envelope)
+    except Exception as exc:
+        return AnalysisResult(
+            item_id=envelope.item_id,
+            topic="opinion",
+            topics=["opinion"],
+            summary_cn="",
+            keywords=[],
+            entities=[],
+            selection_score=0,
+            score_components={},
+            paper_support={"is_paper": False},
+            risk_flags=["ai:analysis_failed"],
+            reason="Stage B provider call failed",
+            confidence=0,
+            source_content_class=envelope.source_content_class,
+            source_group=envelope.source_group,
+            status="analysis_failed",
+            error_code=exc.__class__.__name__,
+            error_message=str(exc)[:4000] or exc.__class__.__name__,
+            raw_response=None,
+        )
 
+
+def _structurally_valid(item: IntelItem) -> bool:
+    return bool(
+        str(item.source_id or "").strip()
+        and str(item.title or "").strip()
+        and str(item.content_hash or "").strip()
+    )
+
+
+def _structural_screen(item: IntelItem, *, error: str | None = None) -> ScreenResult:
+    return ScreenResult(
+        item_id=item.id,
+        decision="reject",
+        reason_code="structural_invalid",
+        reason=error[:4000] if error else "item failed the structural prefilter",
+        confidence=100,
+        risk_flags=["prefilter:structural_invalid"],
+        raw_response={"prefilter": "structural_invalid", "error": error} if error else {"prefilter": "structural_invalid"},
+    )
+
+
+def _item_to_envelope(item: IntelItem, spec: SourceSpec) -> RawIntelEnvelope:
     source = item.source
-    source_class = spec.content_class or item.content_class or "community_social"
     return RawIntelEnvelope(
         item_id=item.id,
         source_id=item.source_id,
@@ -293,7 +456,7 @@ def _item_to_triage_envelope(item: IntelItem, spec: SourceSpec) -> RawIntelEnvel
         source_subtype=spec.source_subtype or (source.source_subtype if source is not None else None),
         source_role=spec.source_role or (source.source_role if source is not None else None),
         source_tier=spec.tier or (source.tier if source is not None else None),
-        source_content_class=source_class,
+        source_content_class=spec.content_class or item.content_class or "community_social",
         external_id=item.external_id,
         content_hash=item.content_hash,
         title=item.title,
@@ -302,70 +465,32 @@ def _item_to_triage_envelope(item: IntelItem, spec: SourceSpec) -> RawIntelEnvel
         captured_at=item.captured_at,
         summary=item.summary,
         body_text=item.content_text or item.summary,
-        language=None,
         metrics=_json_dict(item.metrics_json),
         raw_payload=_json_dict(item.raw_payload_json),
     )
-
-
-def _response_status(response: Any) -> str:
-    status = getattr(response, "status", None)
-    return str(status or "success").strip().casefold()
-
-
-def _item_to_fetch_item(item: IntelItem) -> FetchItem:
-    return FetchItem(
-        item_id=item.id,
-        source_id=item.source_id,
-        content_class=item.content_class,
-        external_id=item.external_id,
-        title=item.title,
-        url=item.canonical_url,
-        published_at=item.published_at,
-        captured_at=item.captured_at,
-        summary=item.summary,
-        content=item.content_text,
-        metrics=_json_dict(item.metrics_json),
-        raw_payload=_json_dict(item.raw_payload_json),
-    )
-
-
-def _is_github_source(spec: SourceSpec) -> bool:
-    mode = spec.selection_policy.mode.casefold().replace("-", "_")
-    return bool(spec.transport == "github" or mode in {"github_active_high_star", "active_high_star", "github_trending"})
-
-
-def _ranking_key(entry: tuple[IntelItem, Any, SourceSpec]) -> tuple[int, float, float, float, int, float, int]:
-    item, decision, spec = entry
-    published = item.published_at
-    timestamp = published.timestamp() if published is not None else float("-inf")
-    metrics = _json_dict(item.metrics_json)
-    primary = float(decision.score)
-    secondary = _number(metrics.get("stars") or metrics.get("stargazers_count")) if spec.content_class == "project_tool" else 0.0
-    return (1 if decision.selected else 0, primary, secondary, timestamp, -int(spec.priority), float(decision.score), -int(item.id))
-
-
-def _selection_reason(decision: Any) -> str:
-    reason = str(decision.reason or "")
-    flags = [str(flag) for flag in (decision.risk_flags or ()) if str(flag)]
-    return reason if not flags else f"{reason}; risks={','.join(flags)}"
-
-
-def _latest_item_time(items: list[IntelItem]) -> datetime | None:
-    values = [item.published_at or item.discovered_at or item.captured_at for item in items]
-    return max(values) if values else None
 
 
 def _spec_from_row(row: Any) -> SourceSpec:
     if row is None:
-        return SourceSpec.model_validate({"id": "unknown", "name": "unknown", "transport": "feed", "url": "https://invalid.local/", "content_class": "community_social"})
+        return SourceSpec.model_validate(
+            {"id": "unknown", "name": "unknown", "transport": "feed", "url": "https://invalid.local/", "content_class": "community_social"}
+        )
     data: dict[str, Any] = {
-        "id": row.id, "name": row.name, "transport": row.transport, "url": row.url,
-        "enabled": row.enabled, "priority": row.priority, "fetch_interval": row.fetch_interval,
-        "default_limit": row.default_limit, "source_group": row.source_group,
-        "source_subtype": row.source_subtype, "source_role": row.source_role,
-        "spam_risk": row.spam_risk, "quality_weight": row.quality_weight,
-        "content_class": row.content_class, "selection_policy": _json_dict(row.selection_policy_json),
+        "id": row.id,
+        "name": row.name,
+        "transport": row.transport,
+        "url": row.url,
+        "enabled": row.enabled,
+        "priority": row.priority,
+        "fetch_interval": row.fetch_interval,
+        "default_limit": row.default_limit,
+        "source_group": row.source_group,
+        "source_subtype": row.source_subtype,
+        "source_role": row.source_role,
+        "spam_risk": row.spam_risk,
+        "quality_weight": row.quality_weight,
+        "content_class": row.content_class,
+        "selection_policy": _json_dict(row.selection_policy_json),
     }
     if row.transport in {"feed", "rsshub"}:
         data["feed"] = {"format": row.feed_format or "rss", "adapter": row.feed_adapter or "generic"}
@@ -379,184 +504,179 @@ def _spec_from_row(row: Any) -> SourceSpec:
     return SourceSpec.model_validate(data)
 
 
-def _number(value: Any) -> float:
-    try:
-        return max(0.0, float(str(value).replace(",", "")))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _ai_review_selection_decision(
-    item: Any,
-    spec: SourceSpec,
-    *,
-    now: datetime,
-) -> Any:
-    """Apply the AI-review boundary on top of deterministic source policy.
-
-    First-party P1/P2 feeds are already bounded by source identity and
-    recency. A title without a deterministic keyword should still reach AI
-    for classification and summary; preserve the missing-keyword signal as a
-    risk instead of silently dropping the item. Other source classes keep
-    their existing hard gates, including GitHub thresholds.
-    """
-
-    decision = selection_decision(item, spec, now=now)
-    if (
-        not decision.selected
-        and decision.reason == "official_keyword_missing"
-        and spec.content_class == "official_model_company"
-        and spec.transport in {"feed", "rsshub"}
-        and spec.tier in {"p1", "p2"}
-    ):
-        return decision.model_copy(
-            update={
-                "selected": True,
-                "reason": "selected:official_recent_no_keyword",
-                "risk_flags": tuple(dict.fromkeys([*decision.risk_flags, "official_keyword_missing"])),
-            }
-        )
-    return decision
-
-
-def _list_ai_review_items(
+def _load_stage_exports(
     session: Session,
     *,
-    limit: int | None,
-    source_filter: str | None,
-    content_class: str | None,
-    force: bool,
-) -> list[IntelItem]:
-    stmt = (
-        select(IntelItem)
-        .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
-        .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
-    )
-    if not force:
-        stmt = stmt.where(
-            IntelItem.status.in_(["new", "selected", "hotspot", "ai_failed"])
-            & ((~IntelItem.ai_review.has()) | (IntelItem.ai_review.has(AIItemReview.status == "ai_failed")))
-        )
-    if source_filter:
-        stmt = stmt.where(IntelItem.source_id == source_filter)
-    if content_class:
-        stmt = stmt.where(IntelItem.content_class == content_class)
-    if limit is not None:
-        stmt = stmt.limit(limit)
-    return list(session.scalars(stmt).unique().all())
-
-
-def _load_ai_review_exports(
-    session: Session,
-    *,
+    run_id: int | None,
     source_filter: str | None,
     content_class: str | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    stmt = (
-        select(IntelItem)
-        .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
-        .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
-    )
+    repo = IntelRepository(session)
+    if run_id is not None:
+        items = repo.list_run_items(run_id, role="fetched")
+    else:
+        items = repo.list_pending_items(limit=None, force=True, stage="screen")
     if source_filter:
-        stmt = stmt.where(IntelItem.source_id == source_filter)
+        items = [item for item in items if item.source_id == source_filter]
     if content_class:
-        stmt = stmt.where(IntelItem.content_class == content_class)
-    items = list(session.scalars(stmt).unique().all())
-    records = [_serialize_candidate(item) for item in items]
-    candidates = [
-        record
-        for record in records
-        if record.get("status") == "selected"
-        and record["keep_decision"] is True
-        and (record.get("ai") or {}).get("status") == "success"
-    ]
-    return candidates, records
+        items = [item for item in items if item.content_class == content_class]
+    records = [_serialize_stage_item(item) for item in items]
+    return [record for record in records if record.get("status") == "candidate"], records
 
 
-def _serialize_candidate(item: IntelItem) -> dict[str, Any]:
-    record = _serialize_intel_item(item)
-    review_value = record.get("ai")
-    review = dict(review_value) if review_value else {}
-    persisted_review = item.ai_review
-    if persisted_review is not None and persisted_review.prompt_version == "intel_triage_v1":
-        # Keep the candidate/audit export aligned with the durable projection;
-        # event clustering still reads the database row directly.
-        review.update(
-            {
-                "topic": persisted_review.topic,
-                "topics": _json_value(persisted_review.topics_json, []),
-                "keywords": _json_value(persisted_review.keywords_json, []),
-                "selection_score": persisted_review.selection_score,
-                "scores": _json_value(persisted_review.scores_json, {}),
-                "novelty": persisted_review.novelty,
-                "novelty_score": persisted_review.novelty_score,
-                "paper_support": _json_value(persisted_review.paper_support_json, {}),
-                "raw_response": _json_value(persisted_review.raw_response_json, {}),
-            }
-        )
-    record.update(
-        {
-            "record_type": "ai_review_candidate",
-            "stage": "ai_review",
-            "ai_review_stage": "ai_review",
-            "keep_decision": bool(review.get("keep")) if review else False,
-            "summary_cn": review.get("summary_cn") or item.summary,
-            "ai_review_status": review.get("status") if review else "not_run",
-            "ai": review or None,
+def _serialize_stage_item(item: IntelItem) -> dict[str, Any]:
+    source = item.source
+    screen = item.ai_screen
+    review = item.ai_review
+    source_group = source.source_group if source else None
+    source_ref = {
+        "id": item.source_id,
+        "name": source.name if source else None,
+        "transport": source.transport if source else None,
+        "source_group": source_group,
+        "source_subtype": source.source_subtype if source else None,
+        "tier": source.tier if source else None,
+        "role": source.source_role if source else None,
+        "x_official": source_group == "x_official",
+    }
+    screen_record = None
+    if screen is not None:
+        screen_record = {
+            "decision": screen.decision,
+            "reason_code": screen.reason_code,
+            "reason": screen.reason,
+            "confidence": screen.confidence,
+            "risk_flags": screen.risk_flags,
+            "status": screen.status,
+            "error_message": screen.error_message,
+            "raw_response": screen.raw_response,
         }
-    )
-    return record
+    analysis_record = None
+    if review is not None:
+        analysis_record = {
+            "topic": review.topic,
+            "topics": review.topics,
+            "summary_cn": review.summary_cn,
+            "keywords": review.keywords,
+            "entities": review.entities,
+            "selection_score": review.selection_score,
+            "score_components": review.score_components,
+            "paper_support": review.paper_support,
+            "risk_flags": review.risk_flags,
+            "reason": review.reason,
+            "confidence": review.confidence,
+            "status": review.status,
+            "error_message": review.error_message,
+            "raw_response": review.raw_response,
+        }
+    return {
+        "record_type": "ai_review_candidate" if item.status == "candidate" else "ai_review_audit",
+        "stage": "ai_review",
+        "id": item.id,
+        "item_id": item.id,
+        "source_id": item.source_id,
+        "source": source_ref,
+        "source_name": source.name if source else None,
+        "source_group": source_group,
+        "source_subtype": source.source_subtype if source else None,
+        "content_class": item.content_class,
+        "status": item.status,
+        "title": item.title,
+        "url": item.canonical_url,
+        "summary": item.summary,
+        "summary_cn": review.summary_cn if review and review.summary_cn else item.summary,
+        "published_at": item.published_at.isoformat() if item.published_at else None,
+        "captured_at": item.captured_at.isoformat() if item.captured_at else None,
+        "selection_score": item.selection_score,
+        "selection_reason": item.selection_reason,
+        "metrics": _json_dict(item.metrics_json),
+        "screen": screen_record,
+        "analysis": analysis_record,
+        "ai": analysis_record,
+    }
 
 
-def _write_ai_review_exports(
+def _write_stage_exports(
     candidates: list[dict[str, Any]],
     audit: list[dict[str, Any]],
     *,
-    output_dir: str | Path,
+    output_dir: Path,
+    result: AIReviewResult,
 ) -> None:
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    (output / "ai_review_candidates.jsonl").write_text(
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for record in [*candidates, *audit]:
+        record["run_partial"] = bool(result.partial)
+        record["run_partial_reason"] = result.partial_reason
+        record["candidate_ids"] = list(result.candidate_ids)
+        record["run_counts"] = result.run_counts
+    (output_dir / "ai_review_candidates.jsonl").write_text(
         "".join(json.dumps(record, ensure_ascii=False, default=str) + "\n" for record in candidates),
         encoding="utf-8",
     )
-    (output / "ai_review_audit.jsonl").write_text(
+    (output_dir / "ai_review_audit.jsonl").write_text(
         "".join(json.dumps(record, ensure_ascii=False, default=str) + "\n" for record in audit),
         encoding="utf-8",
     )
     lines = [
-        "# AI Review 候选日报",
+        "# AI Stage A/B 审计",
         "",
         f"候选条目：{len(candidates)}",
         f"审计条目：{len(audit)}",
-        "",
-        "> 本阶段只完成确定性初筛、AI 分类和中文简要总结。",
+        f"候选 IDs：{','.join(str(item_id) for item_id in result.candidate_ids) or '无'}",
+        f"运行计数：{json.dumps(result.run_counts, ensure_ascii=False)}",
         "",
     ]
     for index, record in enumerate(candidates, 1):
-        ai = record.get("ai") or {}
+        analysis = record.get("analysis") or {}
         lines.extend(
             [
-                f"## {index}. {record.get('title') or '(untitled)' }",
-                f"- 来源：`{record.get('source_id')}` / `{record.get('source_group')}` / `{record.get('source_subtype')}` / x_official=`{str(bool(record.get('x_official'))).lower()}`",
-                f"- 类别：content_class=`{record.get('content_class')}` | keep=`{str(bool(record.get('keep_decision'))).lower()}` | confidence=`{ai.get('confidence', 0)}`",
-                f"- 摘要：{record.get('summary_cn') or '暂无摘要'}",
-                f"- 风险：{', '.join(ai.get('risk_flags') or []) or '无'}",
+                f"## {index}. {record.get('title') or '(untitled)'}",
+                f"- 状态：{record.get('status')} | score={analysis.get('selection_score', 0)} | topic={analysis.get('topic') or '-'}",
+                f"- 来源：{record.get('source_id')} / {record.get('source_group') or '-'}",
+                f"- 摘要：{analysis.get('summary_cn') or record.get('summary') or '暂无摘要'}",
+                f"- 风险：{', '.join(analysis.get('risk_flags') or []) or '无'}",
                 f"- 链接：{record.get('url') or '无'}",
                 "",
             ]
         )
-    if audit:
-        lines.extend(["## 审计/待处理", ""])
-        for record in audit:
-            if record in candidates:
-                continue
-            ai = record.get("ai") or {}
-            lines.append(
-                f"- `{record.get('status')}` {record.get('title') or '(untitled)'}："
-                f"ai_status=`{ai.get('status') if ai else 'not_run'}`，来源=`{record.get('source_id')}`"
-            )
-    (output / "ai_review_digest.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if result.partial:
+        lines.extend([f"> 本次运行是 partial：{result.partial_reason or 'explicit ai limit'}", ""])
+    (output_dir / "ai_review_digest.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def _persist_run_counts(session_factory: sessionmaker[Session], run_id: int, result: AIReviewResult) -> None:
+    with session_factory() as session:
+        run = session.get(IntelRun, int(run_id))
+        if run is None:
+            return
+        run.screened = result.screened
+        run.screened_out = result.screened_out
+        run.screen_failed = result.screen_failed
+        run.analyzed = result.analyzed
+        run.analysis_filtered = result.analysis_filtered
+        run.analysis_failed = result.analysis_failed
+        run.candidate = result.candidate
+        run.selected = result.candidate
+        run.partial = bool(result.partial)
+        run.partial_reason = result.partial_reason
+        run.failed = result.failed
+        session.commit()
+
+
+def _bounded_score(value: Any, default: int) -> int:
+    try:
+        return max(0, min(100, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalise_limit(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _json_dict(value: str | None) -> dict[str, Any]:
@@ -564,18 +684,9 @@ def _json_dict(value: str | None) -> dict[str, Any]:
         return {}
     try:
         parsed = json.loads(value)
-    except (TypeError, ValueError):
-        return {}
-    return dict(parsed) if isinstance(parsed, dict) else {}
-
-
-def _json_value(value: str | None, default: Any) -> Any:
-    if not value:
-        return default
-    try:
-        return json.loads(value)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return default
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
 
 
 def _readable_database_url(database_url: str, *, dry_run: bool) -> str:

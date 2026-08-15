@@ -5,6 +5,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.domain.categories import DEFAULT_TOPIC_CATEGORIES
+from app.config.limits import (
+    DEFAULT_AI_ANALYSIS_MIN_SCORE,
+    DEFAULT_AI_REVIEW_CONCURRENCY,
+    DEFAULT_AI_SCREEN_REJECT_THRESHOLD,
+)
 
 
 DEFAULT_DATABASE_URL = "sqlite:///./data/ai_tool_intel.db"
@@ -44,6 +49,9 @@ class Settings:
     ai_review_model: str | None = None
     ai_review_api_style: str = "generic_json"
     ai_review_timeout_seconds: float = 30.0
+    ai_screen_reject_threshold: int = DEFAULT_AI_SCREEN_REJECT_THRESHOLD
+    ai_analysis_min_score: int = DEFAULT_AI_ANALYSIS_MIN_SCORE
+    ai_review_concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY
     ai_review_categories: tuple[str, ...] = DEFAULT_AI_REVIEW_CATEGORIES
     ai_review_category_mode: str = "ai"
 
@@ -71,6 +79,16 @@ class Settings:
             ai_review_model=ai_review_model,
             ai_review_api_style=os.getenv("AI_REVIEW_API_STYLE", "generic_json"),
             ai_review_timeout_seconds=float(os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "30")),
+            ai_screen_reject_threshold=_bounded_int(
+                os.getenv("AI_SCREEN_REJECT_THRESHOLD"), DEFAULT_AI_SCREEN_REJECT_THRESHOLD
+            ),
+            ai_analysis_min_score=_bounded_int(
+                os.getenv("AI_ANALYSIS_MIN_SCORE"), DEFAULT_AI_ANALYSIS_MIN_SCORE
+            ),
+            ai_review_concurrency=max(
+                1,
+                _bounded_int(os.getenv("AI_REVIEW_CONCURRENCY"), DEFAULT_AI_REVIEW_CONCURRENCY),
+            ),
             ai_review_categories=categories,
             ai_review_category_mode=category_mode,
         )
@@ -88,3 +106,10 @@ def _parse_categories(value: str | None) -> tuple[str, ...]:
     # Keep order stable for the UI and prompts while avoiding duplicate labels.
     unique = tuple(dict.fromkeys(parts))
     return unique or DEFAULT_AI_REVIEW_CATEGORIES
+
+
+def _bounded_int(value: str | None, default: int) -> int:
+    try:
+        return max(0, min(100, int(str(value).strip()))) if value is not None else default
+    except (TypeError, ValueError):
+        return default
