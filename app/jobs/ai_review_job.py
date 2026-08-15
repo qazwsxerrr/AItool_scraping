@@ -87,12 +87,16 @@ class AIReviewResult:
         return {
             "processed": self.processed,
             "screened": self.screened,
+            "screen_count": self.screened,
             "screened_out": self.screened_out,
             "screen_failed": self.screen_failed,
             "analyzed": self.analyzed,
+            "analyze_count": self.analyzed,
             "analysis_filtered": self.analysis_filtered,
             "analysis_failed": self.analysis_failed,
             "candidate": self.candidate,
+            "filtered_count": self.filtered,
+            "failure_count": self.failed,
             "partial": self.partial,
             "partial_reason": self.partial_reason,
         }
