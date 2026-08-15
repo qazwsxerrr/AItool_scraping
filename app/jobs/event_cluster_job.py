@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
-from app.ai.event_resolution import resolve_event_group
+from app.ai.event_resolution import event_resolution_client_from_settings, resolve_event_group
 from app.ai.skills.intel_triage import normalize_url
 from app.config.limits import DEFAULT_AI_REVIEW_LIMIT
 from app.config.settings import Settings
@@ -25,6 +25,8 @@ from app.storage.repository import IntelRepository
 LOGGER = logging.getLogger(__name__)
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
 _STOPWORDS = {"a", "an", "and", "for", "from", "new", "the", "to", "of", "in", "on", "with", "发布", "推出", "上线", "更新", "官方", "ai", "model", "release", "update"}
+SEMANTIC_REPEAT_THRESHOLD = 0.70
+SEMANTIC_AMBIGUITY_THRESHOLD = 0.45
 
 
 @dataclass
@@ -137,6 +139,82 @@ def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
     return len(left & right) / len(left | right)
 
 
+def _normalized_keyword_terms(values: Any) -> frozenset[str]:
+    """Return stable, casefolded keyword labels for conservative matching."""
+
+    if values is None:
+        return frozenset()
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, Iterable) or isinstance(values, Mapping):
+        values = [values]
+    result: set[str] = set()
+    for value in values:
+        normalized = normalize_event_title(value)
+        if normalized and normalized not in _STOPWORDS:
+            result.add(normalized)
+    return frozenset(result)
+
+
+def _typed_entity_keys(values: Any) -> frozenset[str]:
+    """Normalize typed entities as ``type:name`` keys for overlap scoring."""
+
+    if values is None:
+        return frozenset()
+    if isinstance(values, Mapping) or isinstance(values, str):
+        values = [values]
+    if not isinstance(values, Iterable):
+        values = [values]
+    result: set[str] = set()
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        entity_type = value.get("type") or value.get("entity_type") or value.get("kind") or value.get("category")
+        entity_name = value.get("name") or value.get("text") or value.get("value") or value.get("entity")
+        name = normalize_event_title(entity_name)
+        if not name:
+            continue
+        result.add(f"{normalize_event_title(entity_type) if entity_type else ''}:{name}")
+    return frozenset(result)
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _json_objects(value: Any) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = []
+    if not isinstance(parsed, list):
+        return []
+    return [dict(item) for item in parsed if isinstance(item, Mapping)]
+
+
+def _semantic_match_components(left: Any, right: Any) -> tuple[float, float, float, float]:
+    """Return title, keyword, entity, and combined semantic match scores."""
+
+    title_score = _jaccard(_title_tokens(_field(left, "title") or _field(left, "normalized_title")), _title_tokens(_field(right, "title") or _field(right, "normalized_title")))
+    left_keywords = _field(left, "keywords", [])
+    right_keywords = _field(right, "keywords", _json_list(_field(right, "keywords_json")))
+    keyword_score = _jaccard(_normalized_keyword_terms(left_keywords), _normalized_keyword_terms(right_keywords))
+    left_entities = _field(left, "entities", [])
+    right_entities = _field(right, "entities", _json_objects(_field(right, "entities_json")))
+    entity_score = _jaccard(_typed_entity_keys(left_entities), _typed_entity_keys(right_entities))
+    # Title remains the strongest deterministic signal; metadata can rescue a
+    # close paraphrase only when both normalized keywords and typed entities
+    # agree.  Auto-repeat is gated at SEMANTIC_REPEAT_THRESHOLD below.
+    combined_score = max(title_score, 0.50 * title_score + 0.30 * keyword_score + 0.20 * entity_score)
+    return title_score, keyword_score, entity_score, combined_score
+
+
+def _semantic_match_score(left: Any, right: Any) -> float:
+    return _semantic_match_components(left, right)[3]
+
+
 def cluster_candidates(candidates: Iterable[Any], *, title_threshold: float = 0.45, fuzzy: bool = True) -> list[list[Any]]:
     rows = [_candidate(value) for value in candidates]
     if not rows:
@@ -168,7 +246,7 @@ def cluster_candidates(candidates: Iterable[Any], *, title_threshold: float = 0.
             for right in range(left + 1, len(rows)):
                 if find(left) == find(right) or not _compatible_candidate(rows[left], rows[right]):
                     continue
-                if _jaccard(rows[left]["title_tokens"], rows[right]["title_tokens"]) >= title_threshold:
+                if _semantic_match_score(rows[left], rows[right]) >= title_threshold:
                     union(left, right, "fuzzy")
     grouped: dict[int, list[Any]] = {}
     order: list[int] = []
@@ -188,7 +266,7 @@ def build_candidate_clusters(candidates: Iterable[Any], **kwargs: Any) -> list[l
 def _candidate(value: Any) -> dict[str, Any]:
     values = _mapping(value)
     title = values.get("title") or values.get("original_title") or ""
-    return {"item": value, "identity_keys": exact_identity_keys(values), "title": str(title), "title_tokens": _title_tokens(title), "topic": _text(values.get("topic")), "content_class": _text(values.get("content_class"))}
+    return {"item": value, "identity_keys": exact_identity_keys(values), "title": str(title), "title_tokens": _title_tokens(title), "topic": _text(values.get("topic")), "content_class": _text(values.get("content_class")), "keywords": values.get("keywords", []), "entities": values.get("entities", [])}
 
 
 def _compatible_candidate(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
@@ -222,7 +300,7 @@ def run_event_cluster_job(*, session_factory: sessionmaker[Session], ai_client: 
                     if "resolver_failed" in resolution.risk_flags:
                         result.ai_failed += 1
                     for subgroup in resolution.groups:
-                        event, is_new, _ = _persist_group(session, subgroup, current=current, run_id=run_id, history_events=history_events, in_run_events=in_run_events, resolver=resolution)
+                        event, is_new, _ = _persist_group(session, subgroup, current=current, run_id=run_id, history_events=history_events, in_run_events=in_run_events, resolver=resolution, ai_client=ai_client)
                         if is_new:
                             result.events += 1
                             if run_id is None or event.new_in_run_id == run_id:
@@ -256,7 +334,10 @@ def run_cluster_job(**kwargs: Any) -> EventClusterResult:
 def run_event_cluster_from_settings(*, settings: Settings, ai_client: Any | None = None, **kwargs: Any) -> EventClusterResult:
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
-    return run_event_cluster_job(session_factory=create_session_factory(engine), ai_client=ai_client, **kwargs)
+    resolver = ai_client
+    if resolver is None:
+        resolver = event_resolution_client_from_settings(settings)
+    return run_event_cluster_job(session_factory=create_session_factory(engine), ai_client=resolver, **kwargs)
 
 
 def _load_cluster_items(session: Session, *, run_id: int | None, item_ids: Iterable[int] | None, limit: int | None) -> list[IntelItem]:
@@ -323,8 +404,9 @@ def _cluster_rows(candidates: Sequence[dict[str, Any]]) -> list[tuple[list[dict[
         for right in range(left + 1, len(candidates)):
             if find(left) == find(right) or not _compatible_candidate(candidates[left], candidates[right]):
                 continue
-            if _jaccard(_title_tokens(candidates[left]["title"]), _title_tokens(candidates[right]["title"])) >= 0.45:
-                union(left, right, "fuzzy")
+            score = _semantic_match_score(candidates[left], candidates[right])
+            if score >= SEMANTIC_AMBIGUITY_THRESHOLD:
+                union(left, right, "semantic_strong" if score >= SEMANTIC_REPEAT_THRESHOLD else "semantic_ambiguous")
     groups: dict[int, list[dict[str, Any]]] = {}
     order: list[int] = []
     for index, candidate in enumerate(candidates):
@@ -336,8 +418,8 @@ def _cluster_rows(candidates: Sequence[dict[str, Any]]) -> list[tuple[list[dict[
     result: list[tuple[list[dict[str, Any]], bool]] = []
     for root in order:
         members = groups[root]
-        fuzzy = any(kinds.get(tuple(sorted((left, right)))) == "fuzzy" for left in range(len(candidates)) for right in range(left + 1, len(candidates)) if find(left) == root and find(right) == root)
-        result.append((members, fuzzy))
+        ambiguous = any(kinds.get(tuple(sorted((left, right)))) == "semantic_ambiguous" for left in range(len(candidates)) for right in range(left + 1, len(candidates)) if find(left) == root and find(right) == root)
+        result.append((members, ambiguous))
     return result
 
 
@@ -371,10 +453,13 @@ def _find_resolver(client: Any) -> Callable[..., Any] | None:
     return client if callable(client) else None
 
 
-def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, current: datetime, run_id: int | None, history_events: Sequence[IntelEvent], in_run_events: Mapping[int, IntelEvent], resolver: _GroupResolution) -> tuple[IntelEvent, bool, str]:
+def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, current: datetime, run_id: int | None, history_events: Sequence[IntelEvent], in_run_events: Mapping[int, IntelEvent], resolver: _GroupResolution, ai_client: Any | None) -> tuple[IntelEvent, bool, str]:
     projection = _event_projection(values, current=current)
+    group_resolution_method = resolver.method
     match, match_kind = _match_history_event(values, history_events, current=current, run_id=run_id, in_run_events=in_run_events)
-    if resolver.method == "ai_separate" and match_kind == "repeat_semantic":
+    if match is not None and match_kind == "ambiguous_semantic":
+        match, match_kind, resolver = _resolve_history_ambiguity(values, match, resolver=resolver, ai_client=ai_client)
+    if group_resolution_method == "ai_separate" and match_kind in {"repeat_semantic", "repeat_semantic_ai"}:
         match, match_kind = None, "new"
     is_new = match is None
     if match is not None:
@@ -389,6 +474,8 @@ def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, cur
         projection.update(run_id=run_id, new_in_run_id=run_id, resolution_method=resolver.method, resolution_confidence=resolver.confidence)
         if resolver.risk_flags:
             projection["risk_flags"] = _clean_strings([*projection.get("risk_flags", []), *resolver.risk_flags])
+    if resolver.raw is not None:
+        projection["resolution_raw"] = resolver.raw
     repo = IntelRepository(session)
     event = repo.upsert_event(**projection)
     for member in values:
@@ -397,6 +484,36 @@ def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, cur
         repo.upsert_event_item(event.id, int(member["id"]), source_id=member.get("source_id"), source_group=member.get("source_group"), identity_key=_strongest_identity(member), match_type=relation_type, match_confidence=100 if relation_type in {"exact", "repeat_exact"} else max(0, resolver.confidence), is_primary=int(member["id"]) == int(projection["primary_item_id"]), lineage={"run_id": run_id, "provenance": "new" if is_new else "repeat", "match_type": relation_type, "source_id": member.get("source_id"), "source_group": member.get("source_group"), "canonical_url": member.get("canonical_url"), "external_id": member.get("external_id"), "title": member.get("title")})
     session.flush()
     return event, is_new, match_kind
+
+
+def _resolve_history_ambiguity(values: Sequence[Mapping[str, Any]], event: IntelEvent, *, resolver: _GroupResolution, ai_client: Any | None) -> tuple[IntelEvent | None, str, _GroupResolution]:
+    """Resolve a sub-threshold history candidate without inventing event copy."""
+
+    if ai_client is None:
+        return None, "new_ambiguous", _GroupResolution(resolver.groups, "deterministic_fallback", 0, risk_flags=("history:ambiguous",))
+    client_resolver = _find_resolver(ai_client)
+    if client_resolver is None:
+        return None, "new_ambiguous", _GroupResolution(resolver.groups, "deterministic_fallback", 0, risk_flags=("history:resolver_missing",))
+    evidence = resolve_event_group([*values, _event_resolution_value(event)], client_resolver)
+    if evidence.decision == "merge" and evidence.confidence >= 60:
+        return event, "repeat_semantic_ai", _GroupResolution(resolver.groups, "ai_merge", evidence.confidence, evidence.raw)
+    if evidence.decision == "separate":
+        return None, "new", _GroupResolution(resolver.groups, "ai_separate", evidence.confidence, evidence.raw)
+    return None, "new_ambiguous", _GroupResolution(resolver.groups, "deterministic_fallback", 0, evidence.raw, ("history:resolver_failed",))
+
+
+def _event_resolution_value(event: IntelEvent) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "title": event.title,
+        "summary_cn": event.summary_cn,
+        "topic": event.topic,
+        "topics": _json_list(event.topics_json),
+        "keywords": _json_list(event.keywords_json),
+        "entities": _json_objects(event.entities_json),
+        "content_class": event.content_class,
+        "source_group": event.source_group,
+    }
 
 
 def _match_history_event(values: Sequence[Mapping[str, Any]], history_events: Sequence[IntelEvent], *, current: datetime, run_id: int | None, in_run_events: Mapping[int, IntelEvent]) -> tuple[IntelEvent | None, str]:
@@ -410,7 +527,6 @@ def _match_history_event(values: Sequence[Mapping[str, Any]], history_events: Se
         if any(int(relation.item_id) in item_ids for relation in event.event_items) or candidate_ids & set(_json_list(event.identity_keys_json)):
             return event, "repeat_exact" if (run_id is None or event.new_in_run_id != run_id) else "same_run"
     primary = max(values, key=lambda value: (_number(value.get("selection_score")), _as_utc(value.get("published_at")) or datetime.min.replace(tzinfo=timezone.utc)))
-    primary_tokens = _title_tokens(primary.get("title"))
     topic, content_class = _text(primary.get("topic")), _text(primary.get("content_class"))
     candidates: list[tuple[float, IntelEvent]] = []
     for event in [*in_run_events.values(), *history_events]:
@@ -421,13 +537,13 @@ def _match_history_event(values: Sequence[Mapping[str, Any]], history_events: Se
             continue
         if content_class and event.content_class and content_class != event.content_class:
             continue
-        similarity = _jaccard(primary_tokens, _title_tokens(event.title))
-        if similarity >= 0.70:
+        similarity = _semantic_match_score(primary, event)
+        if similarity >= SEMANTIC_AMBIGUITY_THRESHOLD:
             candidates.append((similarity, event))
     if not candidates:
         return None, "new"
     candidates.sort(key=lambda pair: (-pair[0], pair[1].id))
-    return candidates[0][1], "repeat_semantic"
+    return candidates[0][1], "repeat_semantic" if candidates[0][0] >= SEMANTIC_REPEAT_THRESHOLD else "ambiguous_semantic"
 
 
 def _event_projection(values: Sequence[Mapping[str, Any]], *, current: datetime) -> dict[str, Any]:
