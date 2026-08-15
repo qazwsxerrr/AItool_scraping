@@ -123,6 +123,7 @@ def run_ai_review_job(
     whole selected scope; capped runs remain auditable as partial.
     """
     del http_client, now
+    explicit_cap = ai_limit is not None or limit is not None
     if ai_limit is not None:
         limit = ai_limit
     limit = _normalise_limit(limit)
@@ -147,10 +148,11 @@ def run_ai_review_job(
             run_id=run_id,
             stage="screen",
         )
-        if limit is not None and len(items) > limit:
+        if explicit_cap and limit is not None:
             result.partial = True
             result.partial_reason = f"ai_limit:{limit}"
-            items = items[:limit]
+            if len(items) > limit:
+                items = items[:limit]
         result.processed = len(items)
         if dry_run:
             # Dry-run is intentionally side-effect free: do not invoke a
