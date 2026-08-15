@@ -18,7 +18,7 @@ from app.domain.categories import fallback_topic_category
 from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
-from app.storage.models import AIItemReview, IntelEvent, IntelEventRankingSnapshot, IntelItem
+from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,8 @@ class IntelExportResult:
     github_report_path: str | None = None
     status_counts: dict[str, int] = field(default_factory=dict)
     failure_counts: dict[str, int] = field(default_factory=dict)
+    partial: bool = False
+    partial_reason: str | None = None
 
 
 def run_intel_export_job(
@@ -44,6 +46,8 @@ def run_intel_export_job(
     dry_run: bool = False,
     github_report_dir: str | Path | None = None,
     snapshot_key: str = "latest",
+    partial: bool = False,
+    partial_reason: str | None = None,
 ) -> IntelExportResult:
     output = Path(output_dir)
     effective_limit = _normalise_export_limit(limit)
@@ -53,19 +57,11 @@ def run_intel_export_job(
     report_root = Path(github_report_dir) if github_report_dir else output.parent / "github-trending"
     with session_factory() as session:
         repo = IntelRepository(session)
-        # Editorial snapshots are the export source of truth after Wave 3.
-        # Databases that have not run event/ranking yet retain the previous
-        # item export behavior for compatibility with existing deployments.
         snapshot_rows = _list_export_events(
             session,
             snapshot_key=snapshot_key,
             limit=effective_limit,
             source_filter=source_filter,
-            content_class=content_class,
-        )
-        items = [] if snapshot_rows is not None else repo.list_export_items(
-            limit=effective_limit,
-            source_id=source_filter,
             content_class=content_class,
         )
         pending_items = _list_pending(
@@ -74,14 +70,14 @@ def run_intel_export_job(
             source_filter=source_filter,
             content_class=content_class,
         )
-        records = snapshot_rows if snapshot_rows is not None else [_serialize(item) for item in items]
+        records = snapshot_rows
         pending_records = [_serialize(item) for item in pending_items]
 
     status_counts = dict(Counter(str(record.get("status") or "unknown") for record in [*records, *pending_records]))
     failure_counts = {
         status: count
         for status, count in status_counts.items()
-        if status in {"failed", "ai_failed"}
+        if status in {"failed", "screen_failed", "analysis_failed"}
     }
 
     github_report_path: Path | None = None
@@ -96,7 +92,14 @@ def run_intel_export_job(
             encoding="utf-8",
         )
         markdown_path.write_text(
-            _markdown(records, pending_records, status_counts=status_counts, failure_counts=failure_counts),
+            _markdown(
+                records,
+                pending_records,
+                status_counts=status_counts,
+                failure_counts=failure_counts,
+                partial=partial,
+                partial_reason=partial_reason,
+            ),
             encoding="utf-8",
         )
         github_report_path = write_github_trending_report(records, output_root=report_root)
@@ -111,6 +114,8 @@ def run_intel_export_job(
         github_report_path=str(github_report_path) if github_report_path else None,
         status_counts=status_counts,
         failure_counts=failure_counts,
+        partial=bool(partial),
+        partial_reason=partial_reason,
     )
 
 
@@ -124,6 +129,8 @@ def run_intel_export_from_settings(
     dry_run: bool = False,
     github_report_dir: str | Path | None = None,
     snapshot_key: str = "latest",
+    partial: bool = False,
+    partial_reason: str | None = None,
 ) -> IntelExportResult:
     database_url = _readable_database_url(settings.database_url, dry_run=dry_run)
     engine = create_engine_from_url(database_url)
@@ -138,6 +145,8 @@ def run_intel_export_from_settings(
         dry_run=dry_run,
         github_report_dir=github_report_dir,
         snapshot_key=snapshot_key,
+        partial=partial,
+        partial_reason=partial_reason,
     )
 
 
@@ -148,32 +157,24 @@ def _list_export_events(
     limit: int | None,
     source_filter: str | None,
     content_class: str | None,
-) -> list[dict[str, Any]] | None:
-    """Return selected event records, or ``None`` when no snapshot exists.
-
-    ``[]`` is meaningful: a completed editorial run with zero selected events
-    must export an empty file instead of silently falling back to old item
-    selection.  The distinction keeps cold-start compatibility while honoring
-    the no-padding policy.
-    """
-
-    exists = session.execute(
-        select(IntelEventRankingSnapshot.id)
-        .where(IntelEventRankingSnapshot.snapshot_key == snapshot_key)
-        .limit(1)
-    ).first()
-    if exists is None:
-        return None
+) -> list[dict[str, Any]]:
+    """Return selected event records from the requested snapshot only."""
     stmt = (
         select(IntelEventRankingSnapshot, IntelEvent)
         .join(IntelEvent, IntelEvent.id == IntelEventRankingSnapshot.event_id)
+        .options(
+            joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_screen),
+            joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_review),
+            joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.source),
+            joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source),
+        )
         .where(
             IntelEventRankingSnapshot.snapshot_key == snapshot_key,
             IntelEventRankingSnapshot.selected.is_(True),
         )
         .order_by(IntelEventRankingSnapshot.rank.asc(), IntelEvent.id.asc())
     )
-    rows = list(session.execute(stmt).all())
+    rows = list(session.execute(stmt).unique().all())
     records: list[dict[str, Any]] = []
     for snapshot, event in rows:
         record = _serialize_event(snapshot, event)
@@ -192,12 +193,48 @@ def _list_export_events(
 def _serialize_event(snapshot: IntelEventRankingSnapshot, event: IntelEvent) -> dict[str, Any]:
     source_ids = _json_list(event.source_ids_json)
     source_groups = _json_list(event.source_groups_json)
+    source_refs: list[dict[str, Any]] = []
+    screen_audit: list[dict[str, Any]] = []
+    member_statuses: list[str] = []
     for relation in event.event_items:
         if relation.source_id and relation.source_id not in source_ids:
             source_ids.append(relation.source_id)
         if relation.source_group and relation.source_group not in source_groups:
             source_groups.append(relation.source_group)
+        item = relation.item
+        source = relation.source or (item.source if item is not None else None)
+        if item is not None:
+            member_statuses.append(item.status)
+            screen = item.ai_screen
+            if screen is not None:
+                screen_audit.append(
+                    {
+                        "item_id": item.id,
+                        "decision": screen.decision,
+                        "reason_code": screen.reason_code,
+                        "reason": screen.reason,
+                        "confidence": screen.confidence,
+                        "risk_flags": _json_list(screen.risk_flags_json),
+                        "status": screen.status,
+                    }
+                )
+        source_refs.append(
+            {
+                "item_id": item.id if item is not None else relation.item_id,
+                "source_id": relation.source_id,
+                "source_name": source.name if source is not None else None,
+                "source_group": relation.source_group or (source.source_group if source is not None else None),
+                "source_url": relation.source_url or (item.canonical_url if item is not None else None),
+                "title": relation.source_title or (item.title if item is not None else None),
+                "match_type": relation.match_type,
+                "match_confidence": relation.match_confidence,
+                "is_primary": bool(relation.is_primary),
+                "lineage": _json(relation.lineage_json, {}),
+            }
+        )
     risk_flags = _json_list(event.risk_flags_json)
+    metadata = _json(snapshot.metadata_json, {})
+    provenance_kind = "new" if event.new_in_run_id == snapshot.run_id else "repeat"
     return {
         "record_type": "intel_event",
         "stage": "editorial_rank",
@@ -219,10 +256,19 @@ def _serialize_event(snapshot: IntelEventRankingSnapshot, event: IntelEvent) -> 
         "summary_cn": event.summary_cn,
         "url": event.canonical_url,
         "canonical_url": event.canonical_url,
-        "novelty_status": event.novelty_status,
+        "provenance": {
+            "kind": provenance_kind,
+            "new_in_run_id": event.new_in_run_id,
+            "snapshot_run_id": snapshot.run_id,
+        },
         "risk_flags": risk_flags,
         "reason": snapshot.reason,
-        "metadata": _json(snapshot.metadata_json, {}),
+        "metadata": metadata,
+        "keywords": _json_list(event.keywords_json),
+        "entities": _json(event.entities_json, []),
+        "source_refs": source_refs,
+        "member_statuses": sorted(set(member_statuses)),
+        "screen_audit": screen_audit,
         "first_seen_at": _date(event.first_seen_at),
         "last_seen_at": _date(event.last_seen_at),
     }
@@ -235,18 +281,13 @@ def _list_pending(
     source_filter: str | None,
     content_class: str | None,
 ) -> list[IntelItem]:
-    # Pending includes per-item AI failures and selected rows without a review.
+    # Pending is an audit projection for items that did not reach a candidate.
     stmt = (
         select(IntelItem)
         .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
         .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
         .where(
-            (IntelItem.status == "ai_failed")
-            | (
-                (IntelItem.status == "hotspot")
-                & or_(AIItemReview.id.is_(None), AIItemReview.status != "success")
-            )
-            | ((IntelItem.status == "selected") & AIItemReview.id.is_(None))
+            IntelItem.status.in_(("screen_failed", "analysis_failed", "screened_out", "analysis_filtered"))
         )
         .order_by(IntelItem.selection_score.desc(), IntelItem.id.asc())
     )
@@ -280,8 +321,8 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
         "account_url": source.account_url if source else None,
     }
     topic_category = (
-        review.topic_category
-        if review and review.topic_category and review.topic_category != "未分类"
+        review.topic
+        if review and review.topic and review.topic != "未分类"
         else fallback_topic_category(
             title=item.title,
             summary=item.summary,
@@ -328,12 +369,15 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
         "ai": {
             "model": review.model,
             "status": review.status,
-            "keep": review.keep,
             "content_class": review.content_class,
-            "topic_category": topic_category,
+            "topic": review.topic,
+            "topics": review.topics,
+            "keywords": review.keywords,
+            "entities": review.entities,
             "summary_cn": review.summary_cn,
             "reason": review.reason,
-            "risk_flags": _json(review.risk_flags_json, []),
+            "risk_flags": review.risk_flags,
+            "selection_score": review.selection_score,
             "confidence": review.confidence,
             "error_message": review.error_message,
         }
@@ -348,12 +392,16 @@ def _markdown(
     *,
     status_counts: dict[str, int] | None = None,
     failure_counts: dict[str, int] | None = None,
+    partial: bool = False,
+    partial_reason: str | None = None,
 ) -> str:
     counts: dict[str, int] = {}
     for record in records:
         key = str(record.get("topic_category") or record.get("content_class") or "未分类")
         counts[key] = counts.get(key, 0) + 1
     lines = ["# AI 情报导出", "", f"保留条目：{len(records)}", f"待处理：{len(pending)}", ""]
+    if partial:
+        lines.extend([f"运行状态：partial（{partial_reason or 'explicit_ai_limit'}）", ""])
     if counts:
         lines.append("主题分类统计：" + "、".join(f"{key}={value}" for key, value in sorted(counts.items())))
         lines.append("")
@@ -394,7 +442,7 @@ def _markdown(
                     f"x_official=`{str(bool(record.get('x_official'))).lower()}`"
                 ),
                 f"- AI 摘要：{ai.get('summary_cn') or record.get('summary') or '暂无摘要'}",
-                f"- AI 处理：`{ai.get('status') if ai else '未执行'}` / keep=`{str(bool(ai.get('keep'))).lower() if ai else 'n/a'}`",
+                f"- Stage B：`{ai.get('status') if ai else '未执行'}` / confidence=`{ai.get('confidence') if ai else 'n/a'}`",
                 f"- 风险：{', '.join(ai.get('risk_flags') or []) or '无'}",
                 f"- 链接：{record.get('url') or '无'}",
                 "",

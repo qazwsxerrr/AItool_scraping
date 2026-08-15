@@ -38,13 +38,14 @@
       <option value="{{ value }}" {{ 'selected' if filters.status == value else '' }}>{{ value | status_label }}</option>
     {% endfor %}
   </select>
-  <select name="ai_keep">
-    <option value="">AI 处理</option>
-    <option value="keep" {{ 'selected' if filters.ai_keep is sameas true else '' }}>keep</option>
-    <option value="drop" {{ 'selected' if filters.ai_keep is sameas false else '' }}>drop</option>
+  <select name="screen_decision">
+    <option value="">Stage A 决策</option>
+    <option value="pass" {{ 'selected' if filters.screen_decision == 'pass' else '' }}>pass</option>
+    <option value="uncertain" {{ 'selected' if filters.screen_decision == 'uncertain' else '' }}>uncertain</option>
+    <option value="reject" {{ 'selected' if filters.screen_decision == 'reject' else '' }}>reject</option>
   </select>
   <button type="submit">应用筛选</button>
-  {% if filters.query or filters.source_group or filters.content_class or filters.topic_category or filters.status or filters.ai_keep is not none %}
+  {% if filters.query or filters.source_group or filters.content_class or filters.topic_category or filters.status or filters.screen_decision %}
     <a class="button secondary" href="/all">清除</a>
   {% endif %}
 </form>

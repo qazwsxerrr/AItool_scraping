@@ -217,11 +217,11 @@ def run_once(
         min=1,
         help=f"Maximum items to fetch per source (default: {DEFAULT_FETCH_LIMIT_PER_SOURCE}).",
     ),
-    ai_limit: int = typer.Option(
-        DEFAULT_AI_REVIEW_LIMIT,
+    ai_limit: int | None = typer.Option(
+        None,
         "--ai-limit",
         min=1,
-        help=f"Maximum existing items for AI review/ranking (default: {DEFAULT_AI_REVIEW_LIMIT}).",
+        help="Optional AI safety cap; omitted means no global cap. A supplied cap marks the run partial.",
     ),
     force: bool = typer.Option(False, "--force", help="Ignore cooldown and re-review items."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Run without database or export writes."),
@@ -248,10 +248,14 @@ def run_once(
         f"skipped={result.fetch.total_skipped} failed={result.fetch.total_failed}"
     )
     typer.echo(
-        f"ai-review: processed={result.ai_review.processed} selected={result.ai_review.selected} "
-        f"analyzed={result.ai_review.analyzed} ai_failed={result.ai_review.ai_failed} failed={result.ai_review.failed}"
+        f"ai-review: processed={result.ai_review.processed} screened={result.ai_review.screened} "
+        f"screened_out={result.ai_review.screened_out} analyzed={result.ai_review.analyzed} "
+        f"candidate={result.ai_review.candidate} failed={result.ai_review.failed} partial={result.ai_review.partial}"
     )
-    typer.echo(f"export: exported={result.export.exported} pending={result.export.pending}")
+    typer.echo(
+        f"export: exported={result.export.exported} pending={result.export.pending} "
+        f"partial={result.export.partial}"
+    )
     if result.event_cluster is not None:
         typer.echo(
             f"event-cluster: processed={result.event_cluster.processed} events={result.event_cluster.events} "

@@ -41,7 +41,7 @@ def run_intel_once_from_settings(
     source: str | None = None,
     content_class: str | None = None,
     limit: int = DEFAULT_FETCH_LIMIT_PER_SOURCE,
-    ai_limit: int = DEFAULT_AI_REVIEW_LIMIT,
+    ai_limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
     force: bool = False,
     dry_run: bool = False,
     output_dir: str = "output/intel",
@@ -75,22 +75,27 @@ def run_intel_once_from_settings(
                 source_filter=source,
                 content_class=content_class,
                 limit=ai_limit,
+                ai_limit=ai_limit,
                 force=force,
                 dry_run=True,
                 ai_client=ai_client,
             )
             event_cluster = run_event_cluster_from_settings(
                 settings=ephemeral,
-                limit=ai_limit,
+                limit=None,
                 force=force,
                 snapshot_key=snapshot_key,
+                run_id=ai_review.run_id,
+                item_ids=ai_review.candidate_ids,
             )
             editorial_rank = run_editorial_rank_from_settings(
                 settings=ephemeral,
                 profile_path=profile_path,
-                limit=ai_limit,
+                limit=None,
                 force=force,
                 snapshot_key=snapshot_key,
+                run_id=ai_review.run_id,
+                event_ids=event_cluster.event_ids,
             )
             export = run_intel_export_from_settings(
                 settings=ephemeral,
@@ -100,6 +105,8 @@ def run_intel_once_from_settings(
                 output_dir=output_dir,
                 dry_run=True,
                 snapshot_key=snapshot_key,
+                partial=ai_review.partial,
+                partial_reason=ai_review.partial_reason,
             )
         fetch = replace(fetch, dry_run=True)
         return IntelRunResult(None, fetch, ai_review, export, "dry_run", None, event_cluster, editorial_rank)
@@ -128,24 +135,27 @@ def run_intel_once_from_settings(
             source_filter=source,
             content_class=content_class,
             limit=ai_limit,
+            ai_limit=ai_limit,
             force=force,
             run_id=run_id,
             ai_client=ai_client,
         )
         event_cluster = run_event_cluster_from_settings(
             settings=settings,
-            limit=ai_limit,
+            limit=None,
             force=force,
             snapshot_key=snapshot_key,
             run_id=run_id,
+            item_ids=ai_review.candidate_ids,
         )
         editorial_rank = run_editorial_rank_from_settings(
             settings=settings,
             profile_path=profile_path,
-            limit=ai_limit,
+            limit=None,
             force=force,
             snapshot_key=snapshot_key,
             run_id=run_id,
+            event_ids=event_cluster.event_ids,
         )
         export = run_intel_export_from_settings(
             settings=settings,
@@ -154,9 +164,9 @@ def run_intel_once_from_settings(
             limit=DEFAULT_DAILY_REPORT_LIMIT,
             output_dir=output_dir,
             snapshot_key=snapshot_key,
+            partial=ai_review.partial,
+            partial_reason=ai_review.partial_reason,
         )
-        # ``failed`` counts each failed item once; ``ai_failed`` is the
-        # narrower audit counter for model failures and is already included.
         status = "completed_with_errors" if (fetch.total_failed or ai_review.failed) else "completed"
         with session_factory() as session:
             IntelRepository(session).finish_run(
@@ -167,9 +177,18 @@ def run_intel_once_from_settings(
                     inserted=fetch.total_inserted,
                     skipped=fetch.total_skipped,
                     selected=ai_review.selected,
+                    screened=ai_review.screened,
+                    screened_out=ai_review.screened_out,
+                    screen_failed=ai_review.screen_failed,
                     analyzed=ai_review.analyzed,
+                    analysis_filtered=ai_review.analysis_filtered,
+                    analysis_failed=ai_review.analysis_failed,
+                    candidate=ai_review.candidate,
                     failed=fetch.total_failed + ai_review.failed,
+                    partial=int(ai_review.partial),
                 ),
+                partial=ai_review.partial,
+                partial_reason=ai_review.partial_reason,
             )
             session.commit()
         return IntelRunResult(run_id, fetch, ai_review, export, status, None, event_cluster, editorial_rank)

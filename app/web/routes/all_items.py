@@ -17,7 +17,7 @@ def all_items(
     content_class: str | None = None,
     topic_category: str | None = None,
     status: str | None = None,
-    ai_keep: str | None = Query(default=None),
+    screen_decision: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     repo: UIReadRepository = Depends(get_repository),
 ):
@@ -27,7 +27,7 @@ def all_items(
         content_class=content_class,
         topic_category=topic_category,
         status=status,
-        ai_keep=_parse_bool(ai_keep),
+        screen_decision=screen_decision,
     )
     items = repo.list_all_items(filters=filters, page=page, page_size=50)
     filter_options = repo.list_filter_options()
@@ -36,7 +36,7 @@ def all_items(
         name="all_items.html",
         context={
             "request": request,
-            "active_nav": "runs" if status == "ai_failed" else "all",
+            "active_nav": "runs" if status in {"screen_failed", "analysis_failed"} else "all",
             "items": items,
             "filters": filters,
             "filter_options": filter_options,
@@ -44,14 +44,3 @@ def all_items(
             "has_next_page": len(items) == 50,
         },
     )
-
-
-def _parse_bool(value: str | None) -> bool | None:
-    if value is None or value == "":
-        return None
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "y", "on", "keep"}:
-        return True
-    if normalized in {"0", "false", "no", "n", "off", "drop"}:
-        return False
-    return None
