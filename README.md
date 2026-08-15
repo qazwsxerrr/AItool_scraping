@@ -82,9 +82,12 @@ AI_REVIEW_API_KEY=
 AI_REVIEW_MODEL=
 AI_REVIEW_API_STYLE=generic_json
 AI_REVIEW_TIMEOUT_SECONDS=30
+AI_REVIEW_CONCURRENCY=4
 AI_REVIEW_CATEGORIES=模型,产品,行业,论文,教程,观点
 AI_REVIEW_CATEGORY_MODE=ai
 ```
+
+`AI_REVIEW_CONCURRENCY` 取值为 `1..4`，默认 `4`，表示 Stage A/B provider 请求的并发上限。
 
 真实 token、API key、Cookie 和代理地址只放在本地 `.env`，不要写入 README 或提交到 Git。Product Hunt 使用公开 Atom feed，不需要额外 token。
 

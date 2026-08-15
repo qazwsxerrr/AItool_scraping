@@ -8,6 +8,8 @@ from app import main
 from app.config.settings import Settings
 from app.jobs.fetch_job import IntelFetchResult
 from app.jobs import pipeline_orchestrator as orchestrator
+from app.jobs.stage_a_screen_job import StageAScreenResult
+from app.jobs.stage_b_analysis_job import StageBAnalysisResult
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
 
@@ -71,3 +73,24 @@ def test_retry_stage_b_targets_only_stage_b_tasks(tmp_path, monkeypatch):
     assert value is not None
     assert seen["run_id"] == run_id
     assert seen["task_ids"] == [task_id]
+
+
+def test_stage_wrappers_forward_configured_ai_concurrency(tmp_path, monkeypatch):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'pipeline.db'}", ai_review_concurrency=7)
+    seen: dict[str, int] = {}
+
+    monkeypatch.setattr(orchestrator, "_registry", lambda *args, **kwargs: {})
+
+    def fake_screen(**kwargs):
+        seen["screen"] = kwargs["concurrency"]
+        return StageAScreenResult(run_id=1)
+
+    def fake_analysis(**kwargs):
+        seen["analysis"] = kwargs["concurrency"]
+        return StageBAnalysisResult(run_id=1)
+
+    monkeypatch.setattr(orchestrator, "run_stage_a_screen_job", fake_screen)
+    monkeypatch.setattr(orchestrator, "run_stage_b_analysis_job", fake_analysis)
+    orchestrator.run_pipeline_stage_a_from_settings(settings=settings, run_id=1, ai_client=object())
+    orchestrator.run_pipeline_stage_b_from_settings(settings=settings, run_id=1, ai_client=object())
+    assert seen == {"screen": 7, "analysis": 7}

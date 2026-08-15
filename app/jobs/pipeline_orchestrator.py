@@ -327,6 +327,7 @@ def run_pipeline_stage_a_from_settings(
             item_ids=item_ids,
             task_ids=task_ids,
             screen_reject_threshold=settings.ai_screen_reject_threshold,
+            concurrency=settings.ai_review_concurrency,
         )
 
 
@@ -362,6 +363,7 @@ def run_pipeline_stage_b_from_settings(
             item_ids=item_ids,
             task_ids=task_ids,
             analysis_min_score=settings.ai_analysis_min_score,
+            concurrency=settings.ai_review_concurrency,
         )
 
 
