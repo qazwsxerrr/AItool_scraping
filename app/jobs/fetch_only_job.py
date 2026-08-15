@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
+from app.config.limits import DEFAULT_FETCH_LIMIT_PER_SOURCE
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
 from app.domain.models import SourceSpec
@@ -48,7 +49,7 @@ def run_fetch_only_job(
     sources: list[SourceSpec] | tuple[SourceSpec, ...],
     router: Any,
     output_dir: str | Path = "output/fetch",
-    limit_per_source: int | None = None,
+    limit_per_source: int | None = DEFAULT_FETCH_LIMIT_PER_SOURCE,
     source_filter: str | None = None,
     content_class: str | None = None,
     force: bool = False,
@@ -89,7 +90,7 @@ def run_fetch_only_from_settings(
     settings: Settings,
     registry_path=DEFAULT_REGISTRY_PATH,
     output_dir: str | Path = "output/fetch",
-    limit_per_source: int | None = None,
+    limit_per_source: int | None = DEFAULT_FETCH_LIMIT_PER_SOURCE,
     source_filter: str | None = None,
     content_class: str | None = None,
     force: bool = False,

@@ -9,6 +9,11 @@ from dataclasses import dataclass, replace
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
+from app.config.limits import (
+    DEFAULT_AI_REVIEW_LIMIT,
+    DEFAULT_DAILY_REPORT_LIMIT,
+    DEFAULT_FETCH_LIMIT_PER_SOURCE,
+)
 from app.config.settings import Settings
 from app.jobs.ai_review_job import AIReviewResult, run_ai_review_from_settings
 from app.jobs.editorial_rank_job import EditorialRankResult, run_editorial_rank_from_settings
@@ -35,7 +40,8 @@ def run_intel_once_from_settings(
     settings: Settings,
     source: str | None = None,
     content_class: str | None = None,
-    limit: int = 100,
+    limit: int = DEFAULT_FETCH_LIMIT_PER_SOURCE,
+    ai_limit: int = DEFAULT_AI_REVIEW_LIMIT,
     force: bool = False,
     dry_run: bool = False,
     output_dir: str = "output/intel",
@@ -43,10 +49,12 @@ def run_intel_once_from_settings(
     snapshot_key: str = "latest",
     ai_client: object | None = None,
 ) -> IntelRunResult:
-    """Run the fixed-order pipeline with an optional triage provider.
+    """Run the fixed-order pipeline with independent fetch and review limits.
 
     ``ai_client`` is primarily a deterministic test/integration seam; when it
     is omitted the settings boundary constructs ``IntelTriageClient``.
+    ``limit`` controls the per-source fetch request, while ``ai_limit`` controls
+    the existing-item review, event aggregation, and editorial ranking pool.
     """
     if dry_run:
         # Use one ephemeral SQLite file for the three stages.  The fetch stage
@@ -66,21 +74,21 @@ def run_intel_once_from_settings(
                 settings=ephemeral,
                 source_filter=source,
                 content_class=content_class,
-                limit=limit,
+                limit=ai_limit,
                 force=force,
                 dry_run=True,
                 ai_client=ai_client,
             )
             event_cluster = run_event_cluster_from_settings(
                 settings=ephemeral,
-                limit=limit,
+                limit=ai_limit,
                 force=force,
                 snapshot_key=snapshot_key,
             )
             editorial_rank = run_editorial_rank_from_settings(
                 settings=ephemeral,
                 profile_path=profile_path,
-                limit=limit,
+                limit=ai_limit,
                 force=force,
                 snapshot_key=snapshot_key,
             )
@@ -88,7 +96,7 @@ def run_intel_once_from_settings(
                 settings=ephemeral,
                 source_filter=source,
                 content_class=content_class,
-                limit=limit,
+                limit=DEFAULT_DAILY_REPORT_LIMIT,
                 output_dir=output_dir,
                 dry_run=True,
                 snapshot_key=snapshot_key,
@@ -119,14 +127,14 @@ def run_intel_once_from_settings(
             settings=settings,
             source_filter=source,
             content_class=content_class,
-            limit=limit,
+            limit=ai_limit,
             force=force,
             run_id=run_id,
             ai_client=ai_client,
         )
         event_cluster = run_event_cluster_from_settings(
             settings=settings,
-            limit=limit,
+            limit=ai_limit,
             force=force,
             snapshot_key=snapshot_key,
             run_id=run_id,
@@ -134,7 +142,7 @@ def run_intel_once_from_settings(
         editorial_rank = run_editorial_rank_from_settings(
             settings=settings,
             profile_path=profile_path,
-            limit=limit,
+            limit=ai_limit,
             force=force,
             snapshot_key=snapshot_key,
             run_id=run_id,
@@ -143,7 +151,7 @@ def run_intel_once_from_settings(
             settings=settings,
             source_filter=source,
             content_class=content_class,
-            limit=limit,
+            limit=DEFAULT_DAILY_REPORT_LIMIT,
             output_dir=output_dir,
             snapshot_key=snapshot_key,
         )

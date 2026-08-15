@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.ai.skills.intel_triage import TriageResult, normalize_url, parse_triage_result
+from app.config.limits import DEFAULT_AI_REVIEW_LIMIT
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import IntelEvent, IntelItem
@@ -283,7 +284,7 @@ def run_event_cluster_job(
     *,
     session_factory: sessionmaker[Session],
     ai_client: Any | None = None,
-    limit: int | None = 100,
+    limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
     force: bool = False,
     now: datetime | None = None,
     history_hook: Callable[..., Any] | None = None,

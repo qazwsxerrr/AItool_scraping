@@ -15,6 +15,7 @@ def all_items(
     q: str | None = None,
     source_group: str | None = None,
     content_class: str | None = None,
+    topic_category: str | None = None,
     status: str | None = None,
     ai_keep: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
@@ -24,6 +25,7 @@ def all_items(
         query=q,
         source_group=source_group,
         content_class=content_class,
+        topic_category=topic_category,
         status=status,
         ai_keep=_parse_bool(ai_keep),
     )

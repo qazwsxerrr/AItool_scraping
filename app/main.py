@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import typer
 
+from app.config.limits import (
+    DEFAULT_AI_REVIEW_LIMIT,
+    DEFAULT_DAILY_REPORT_LIMIT,
+    DEFAULT_FETCH_LIMIT_PER_SOURCE,
+)
 from app.config.settings import Settings
 from app.jobs.ai_review_job import run_ai_review_from_settings
 from app.jobs.editorial_rank_job import run_editorial_rank_from_settings
@@ -20,11 +25,11 @@ _CONTENT_CLASSES = {"official_model_company", "project_tool", "community_social"
 @app.command("fetch")
 def fetch(
     limit_per_source: int | None = typer.Option(
-        None,
+        DEFAULT_FETCH_LIMIT_PER_SOURCE,
         "--limit",
         "--limit-per-source",
         min=1,
-        help="Maximum items to fetch per source.",
+        help=f"Maximum items to fetch per source (default: {DEFAULT_FETCH_LIMIT_PER_SOURCE}).",
     ),
     source: str | None = typer.Option(None, help="Only fetch one source id."),
     content_class: str | None = typer.Option(None, "--class", help="Only fetch one content class."),
@@ -62,11 +67,11 @@ def fetch(
 @app.command("fetch-only")
 def fetch_only(
     limit_per_source: int | None = typer.Option(
-        None,
+        DEFAULT_FETCH_LIMIT_PER_SOURCE,
         "--limit",
         "--limit-per-source",
         min=1,
-        help="Maximum items to fetch per source.",
+        help=f"Maximum items to fetch per source (default: {DEFAULT_FETCH_LIMIT_PER_SOURCE}).",
     ),
     source: str | None = typer.Option(None, help="Only fetch one source id."),
     content_class: str | None = typer.Option(None, "--class", help="Only fetch one content class."),
@@ -111,7 +116,11 @@ def fetch_only(
 def ai_review(
     source: str | None = typer.Option(None, "--source", help="Only review one source id."),
     content_class: str | None = typer.Option(None, "--class", help="Only review one content class."),
-    limit: int = typer.Option(100, min=1, help="Maximum items to review."),
+    limit: int = typer.Option(
+        DEFAULT_AI_REVIEW_LIMIT,
+        min=1,
+        help=f"Maximum existing items to review (default: {DEFAULT_AI_REVIEW_LIMIT}).",
+    ),
     force: bool = typer.Option(False, "--force", help="Re-review previously handled items."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Run selection without AI/database/output writes."),
     output_dir: str = typer.Option("output/ai-review", help="Candidate and audit output directory."),
@@ -143,7 +152,11 @@ def ai_review(
 def export(
     source: str | None = typer.Option(None, help="Only export one source id."),
     content_class: str | None = typer.Option(None, "--class", help="Only export one content class."),
-    limit: int = typer.Option(100, min=1, help="Maximum retained items to export."),
+    limit: int = typer.Option(
+        DEFAULT_DAILY_REPORT_LIMIT,
+        min=1,
+        help=f"Maximum retained items to export (default: {DEFAULT_DAILY_REPORT_LIMIT}; explicit values override).",
+    ),
     output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Build records without writing files."),
     snapshot_key: str = typer.Option("latest", "--snapshot", help="Editorial ranking snapshot key."),
@@ -197,7 +210,19 @@ def editorial_rank(
 def run_once(
     source: str | None = typer.Option(None, help="Only run one source id."),
     content_class: str | None = typer.Option(None, "--class", help="Only run one content class."),
-    limit: int = typer.Option(100, min=1, help="Per-stage item limit."),
+    limit: int = typer.Option(
+        DEFAULT_FETCH_LIMIT_PER_SOURCE,
+        "--limit",
+        "--fetch-limit",
+        min=1,
+        help=f"Maximum items to fetch per source (default: {DEFAULT_FETCH_LIMIT_PER_SOURCE}).",
+    ),
+    ai_limit: int = typer.Option(
+        DEFAULT_AI_REVIEW_LIMIT,
+        "--ai-limit",
+        min=1,
+        help=f"Maximum existing items for AI review/ranking (default: {DEFAULT_AI_REVIEW_LIMIT}).",
+    ),
     force: bool = typer.Option(False, "--force", help="Ignore cooldown and re-review items."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Run without database or export writes."),
     output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
@@ -211,6 +236,7 @@ def run_once(
         source=source,
         content_class=content_class,
         limit=limit,
+        ai_limit=ai_limit,
         force=force,
         dry_run=dry_run,
         output_dir=output_dir,

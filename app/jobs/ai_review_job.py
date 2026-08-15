@@ -24,6 +24,7 @@ from app.ai.schemas import (
     TriageResult,
 )
 from app.ai.skills.intel_triage.client import triage_item
+from app.config.limits import DEFAULT_AI_REVIEW_LIMIT
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
 from app.domain.models import FetchItem, SourceSpec
@@ -59,7 +60,7 @@ def run_ai_review_job(
     session_factory: sessionmaker[Session],
     source_specs: Mapping[str, SourceSpec] | None = None,
     ai_client: IntelTriageClient | Any | None = None,
-    limit: int | None = 100,
+    limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
     source_filter: str | None = None,
     content_class: str | None = None,
     force: bool = False,
@@ -213,7 +214,7 @@ def run_ai_review_from_settings(
     settings: Settings,
     registry_path=DEFAULT_REGISTRY_PATH,
     output_dir: str | Path = "output/ai-review",
-    limit: int | None = 100,
+    limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
     source_filter: str | None = None,
     content_class: str | None = None,
     force: bool = False,

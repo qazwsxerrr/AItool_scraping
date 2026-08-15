@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.config.limits import DEFAULT_FETCH_LIMIT_PER_SOURCE
 from app.config.settings import Settings
 from app.jobs.fetch_job import run_intel_fetch_from_settings
 from app.logging_config import configure_logging
@@ -16,9 +17,9 @@ from app.logging_config import configure_logging
 
 def main(
     limit_per_source: int | None = typer.Option(
-        None,
+        DEFAULT_FETCH_LIMIT_PER_SOURCE,
         min=1,
-        help="Maximum items to fetch per source. Defaults to each source's configured default_limit.",
+        help=f"Maximum items to fetch per source (default: {DEFAULT_FETCH_LIMIT_PER_SOURCE}).",
     ),
     source: str | None = typer.Option(None, help="Only fetch one source id, e.g. openai_news."),
     content_class: str | None = typer.Option(None, "--class", help="Only fetch one content class."),

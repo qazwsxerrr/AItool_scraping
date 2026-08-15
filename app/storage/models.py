@@ -224,6 +224,9 @@ class AIItemReview(Base):
     novelty: Mapped[str | None] = mapped_column(String(16), nullable=True)
     novelty_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     paper_support_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    # Editorial topic, deliberately separate from ``content_class`` which
+    # describes the source/signal type (official, project, community).
+    topic_category: Mapped[str | None] = mapped_column(String(128), nullable=True)
     summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")

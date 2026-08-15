@@ -24,14 +24,17 @@ def test_run_once_passes_one_run_id_through_fetch_and_finishes_run(tmp_path, mon
 
     def fake_fetch(**kwargs):
         calls["fetch_run_id"] = kwargs.get("run_id")
+        calls["fetch_limit"] = kwargs.get("limit_per_source")
         return IntelFetchResult(run_id=kwargs.get("run_id"), stats={})
 
     def fake_ai_review(**kwargs):
         calls["ai_review_source"] = kwargs.get("source_filter")
         calls["ai_review_run_id"] = kwargs.get("run_id")
+        calls["ai_review_limit"] = kwargs.get("limit")
         return AIReviewResult(run_id=kwargs.get("run_id"))
 
     def fake_export(**kwargs):
+        calls["export_limit"] = kwargs.get("limit")
         return IntelExportResult(0, 0, "items", "digest", "pending")
 
     monkeypatch.setattr(run_job, "run_intel_fetch_from_settings", fake_fetch)
@@ -43,11 +46,15 @@ def test_run_once_passes_one_run_id_through_fetch_and_finishes_run(tmp_path, mon
         source="github_source",
         content_class="project_tool",
         limit=5,
+        ai_limit=77,
     )
     assert result.status == "completed"
     assert result.run_id == calls["fetch_run_id"]
     assert calls["ai_review_source"] == "github_source"
     assert calls["ai_review_run_id"] == result.run_id
+    assert calls["fetch_limit"] == 5
+    assert calls["ai_review_limit"] == 77
+    assert calls["export_limit"] == 30
     with create_session_factory(engine)() as session:
         row = session.scalar(select(IntelRun))
         assert row.status == "completed"

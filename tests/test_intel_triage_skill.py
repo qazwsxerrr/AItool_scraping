@@ -7,6 +7,7 @@ import pytest
 from app.ai import ItemAnalysisClient
 from app.ai.client import IntelTriageClient
 from app.ai.skills.intel_triage import (
+    INTEL_TRIAGE_JSON_SCHEMA,
     INTEL_TOPICS,
     RawIntelEnvelope,
     TriageResult,
@@ -70,6 +71,19 @@ def triage_payload(**overrides):
     }
     value.update(overrides)
     return value
+
+
+def _assert_strict_object_requirements(schema, path: str = "$"):
+    if not isinstance(schema, dict):
+        return
+    properties = schema.get("properties")
+    if schema.get("type") == "object" and isinstance(properties, dict):
+        assert set(schema.get("required", [])) == set(properties), path
+        for name, child in properties.items():
+            _assert_strict_object_requirements(child, f"{path}.properties.{name}")
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _assert_strict_object_requirements(items, f"{path}.items")
 
 
 def test_raw_envelope_normalizes_html_and_aliases():
@@ -141,6 +155,12 @@ def test_provider_payloads_and_client_one_call():
         http_client=FakeHttp(FakeResponse(triage_payload())),
     )
     assert legacy_adapter.triage(item).topic == "project"
+
+
+def test_openai_strict_schema_requires_every_object_property():
+    _assert_strict_object_requirements(INTEL_TRIAGE_JSON_SCHEMA)
+    payload = build_provider_payload(envelope(), api_style="openai_responses")
+    assert payload["text"]["format"]["schema"] == INTEL_TRIAGE_JSON_SCHEMA
 
 
 def test_batch_isolates_provider_failures():

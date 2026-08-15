@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}来源目录 - AI 热点内容台{% endblock %}
+
+{% block content %}
+<section class="page-head source-page-head">
+  <div>
+    <p class="eyebrow">PROVENANCE / SOURCE CATALOG</p>
+    <h1>来源目录</h1>
+    <p class="muted-text">每条情报都保留来源名称、来源组、抓取通道和来源层级。来源身份不等于事实背书，主题分类由 AI 编辑模型完成。</p>
+  </div>
+  <div class="source-legend"><span class="legend-dot healthy"></span> healthy <span class="legend-dot warning"></span> needs attention</div>
+</section>
+
+{% if sources %}
+  <section class="source-grid">
+    {% for source in sources %}
+      <article class="source-card">
+        <div class="source-card-head">
+          <div class="source-avatar source-avatar-large">{{ source.name[:1] }}</div>
+          <div>
+            <h2>{{ source.name }}</h2>
+            <p class="source-id">{{ source.source_id }}</p>
+          </div>
+          <span class="health-pill {{ 'healthy' if source.health_status == 'healthy' else 'warning' if source.health_status == 'failed' or source.consecutive_failures else 'neutral' }}">{{ source.health_status or 'unknown' }}</span>
+        </div>
+        <div class="source-card-tags">
+          {% if source.source_group %}<span class="badge primary">{{ source.source_group | source_group_label }}</span>{% endif %}
+          {% if source.transport %}<span class="badge">{{ source.transport | transport_label }}</span>{% endif %}
+          {% if source.tier %}<span class="badge">{{ source.tier | tier_label }}</span>{% endif %}
+          {% if source.content_class %}<span class="badge badge-source">{{ source.content_class | content_class_label }}</span>{% endif %}
+        </div>
+        <dl class="source-facts">
+          <div><dt>已入库</dt><dd>{{ source.item_count }} 条</dd></div>
+          <div><dt>子类型</dt><dd>{{ source.source_subtype or '—' }}</dd></div>
+          <div><dt>来源角色</dt><dd>{{ source.source_role | source_role_label if source.source_role else '—' }}</dd></div>
+          <div><dt>连续失败</dt><dd>{{ source.consecutive_failures }}</dd></div>
+        </dl>
+        <div class="source-card-links">
+          {% if source.url %}<a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">打开 Feed / API ↗</a>{% endif %}
+          {% if source.account_url %}<a href="{{ source.account_url }}" target="_blank" rel="noopener noreferrer">打开账号 ↗</a>{% endif %}
+        </div>
+      </article>
+    {% endfor %}
+  </section>
+{% else %}
+  <div class="empty-state empty-state-large"><div class="empty-icon">◎</div><h3>还没有来源</h3><p>载入 source registry 后，这里会展示来源健康状态和归因信息。</p></div>
+{% endif %}
+{% endblock %}

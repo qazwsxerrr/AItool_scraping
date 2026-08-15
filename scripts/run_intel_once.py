@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.config.limits import DEFAULT_AI_REVIEW_LIMIT, DEFAULT_FETCH_LIMIT_PER_SOURCE
 from app.config.settings import Settings
 from app.jobs.run_job import run_intel_once_from_settings
 from app.logging_config import configure_logging
@@ -19,7 +20,8 @@ from app.logging_config import configure_logging
 def main(
     source: str | None = typer.Option(None),
     content_class: str | None = typer.Option(None, "--class"),
-    limit: int = typer.Option(100, min=1),
+    limit: int = typer.Option(DEFAULT_FETCH_LIMIT_PER_SOURCE, "--limit", "--fetch-limit", min=1),
+    ai_limit: int = typer.Option(DEFAULT_AI_REVIEW_LIMIT, "--ai-limit", min=1),
     force: bool = typer.Option(False, "--force"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     output_dir: str = typer.Option("output/intel"),
@@ -30,6 +32,7 @@ def main(
         source=source,
         content_class=content_class,
         limit=limit,
+        ai_limit=ai_limit,
         force=force,
         dry_run=dry_run,
         output_dir=output_dir,

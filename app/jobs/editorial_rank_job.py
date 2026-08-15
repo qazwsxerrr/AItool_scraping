@@ -20,6 +20,7 @@ import yaml
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
+from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import IntelEvent, IntelEventItem, IntelItem
@@ -50,7 +51,7 @@ class EditorialProfile:
     """
 
     snapshot_key: str = "latest"
-    total_max: int = 60
+    total_max: int = DEFAULT_DAILY_REPORT_LIMIT
     topic_caps: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_TOPIC_CAPS))
     content_class_maxima: dict[str, int] = field(default_factory=dict)
     source_group_maxima: dict[str, int] = field(default_factory=dict)
@@ -94,11 +95,14 @@ class EditorialProfile:
         preferred = data.get("preferred_minima", data.get("preferred", {}))
         if not isinstance(preferred, Mapping):
             preferred = {}
-        total_value = data.get("total_max", data.get("max_total", quotas.get("total_max", 60)))
+        total_value = data.get(
+            "total_max",
+            data.get("max_total", quotas.get("total_max", DEFAULT_DAILY_REPORT_LIMIT)),
+        )
         try:
-            total_max = min(60, max(0, int(total_value)))
+            total_max = max(0, int(total_value))
         except (TypeError, ValueError, OverflowError):
-            total_max = 60
+            total_max = DEFAULT_DAILY_REPORT_LIMIT
         paper = data.get("paper") if isinstance(data.get("paper"), Mapping) else {}
         paper_gate = _coerce_bool(data.get("paper_hard_gate", paper.get("hard_gate", True)), True)
         return cls(

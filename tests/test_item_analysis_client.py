@@ -97,6 +97,22 @@ def test_generic_json_posts_item_and_normalizes_response():
     assert http.calls[0]["json"]["task"] == "intel_triage"
 
 
+def test_triage_uses_fixed_topic_taxonomy():
+    http = FakeHttpClient(FakeResponse(_triage_payload(
+        topic="paper", summary_cn="一篇研究摘要", reason="研究价值", confidence=91,
+    )))
+    settings = Settings(
+        ai_review_api_url="https://ai.example.test/triage",
+        ai_review_api_key="key",
+        ai_review_model="model",
+    )
+    result = ItemAnalysisClient.from_settings(settings, http_client=http).triage(
+        _envelope(source_content_class="official_model_company")
+    )
+    assert result.topic == "paper"
+    assert http.calls[0]["json"]["task"] == "intel_triage"
+
+
 def test_source_content_class_is_authoritative_and_score_clamps():
     http = FakeHttpClient(FakeResponse(_triage_payload(
         keep=False, topic="product", summary_cn=None, reason=123,

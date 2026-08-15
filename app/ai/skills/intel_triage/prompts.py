@@ -19,6 +19,11 @@ INTEL_TRIAGE_SYSTEM_PROMPT = (
     "论文必须填写 paper_support；只有明确的 GitHub、官方 X 或社区来源支持记录才可能通过硬门槛，"
     "arXiv-only 论文必须保留为 keep=false 并标记风险。"
     "score 与各分项均为 0-100 的编辑优先级信号，不是事实可信度。"
+    "schema 中的所有字段都必须返回：不适用的数组返回 []，普通文本返回空字符串，"
+    "可空链接、evidence_type 和 notes 返回 null，布尔值返回 false，整数返回 0。"
+    "非论文的 paper_support 必须使用 is_paper=false、support_level=none、supported=false、"
+    "source_type=unknown、空链接/空数组及 false 的默认值；scores 的每个分项均应按内容实际评估，"
+    "不得仅因字段可选而省略。"
     "只返回符合 schema 的 JSON 对象，不要返回 Markdown、代码围栏或额外说明。"
 )
 
@@ -26,22 +31,35 @@ INTEL_TRIAGE_SYSTEM_PROMPT = (
 INTEL_TRIAGE_RESPONSE_SCHEMA: dict[str, str] = {
     "keep": "boolean",
     "topic": "model|product|project|industry|tutorial|opinion|paper",
-    "topics": "array<string> (optional)",
+    "topics": "array<string>; always present, use [] when not applicable",
     "summary_cn": "string",
     "keywords": "array<string>",
     "selection_score": "integer 0-100",
-    "scores": "object with 0-100 integer components (optional)",
+    "scores": "object with all 0-100 integer components; always present",
     "novelty": "new|update|repeat|unknown",
-    "paper_support": "object (required for paper; optional otherwise)",
+    "paper_support": "object; always present, use explicit non-paper defaults when not applicable",
     "risk_flags": "array<string>",
-    "reason": "string (optional)",
-    "confidence": "integer 0-100 (optional)",
+    "reason": "string; always present, use empty string when not applicable",
+    "confidence": "integer 0-100; always present, use 0 when not applicable",
 }
 
 INTEL_TRIAGE_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["keep", "topic", "summary_cn", "keywords", "selection_score", "novelty", "paper_support", "risk_flags"],
+    "required": [
+        "keep",
+        "topic",
+        "topics",
+        "summary_cn",
+        "keywords",
+        "selection_score",
+        "scores",
+        "novelty",
+        "paper_support",
+        "risk_flags",
+        "reason",
+        "confidence",
+    ],
     "properties": {
         "keep": {"type": "boolean"},
         "topic": {"type": "string", "enum": ["model", "product", "project", "industry", "tutorial", "opinion", "paper"]},
@@ -52,6 +70,7 @@ INTEL_TRIAGE_JSON_SCHEMA: dict[str, Any] = {
         "scores": {
             "type": "object",
             "additionalProperties": False,
+            "required": ["relevance", "novelty", "impact", "actionability", "total"],
             "properties": {
                 "relevance": {"type": "integer", "minimum": 0, "maximum": 100},
                 "novelty": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -64,6 +83,21 @@ INTEL_TRIAGE_JSON_SCHEMA: dict[str, Any] = {
         "paper_support": {
             "type": "object",
             "additionalProperties": False,
+            "required": [
+                "is_paper",
+                "support_level",
+                "supported",
+                "support_score",
+                "source_type",
+                "paper_url",
+                "evidence_url",
+                "evidence_links",
+                "evidence_type",
+                "has_official_source",
+                "has_code",
+                "arxiv_only",
+                "notes",
+            ],
             "properties": {
                 "is_paper": {"type": "boolean"},
                 "support_level": {"type": "string", "enum": ["none", "weak", "supported", "strong"]},

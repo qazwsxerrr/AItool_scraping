@@ -12,7 +12,9 @@ from typing import Any
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
+from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
 from app.config.settings import Settings
+from app.domain.categories import fallback_topic_category
 from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
@@ -36,7 +38,7 @@ def run_intel_export_job(
     *,
     session_factory: sessionmaker[Session],
     output_dir: str | Path = "output/intel",
-    limit: int | None = 100,
+    limit: int | None = DEFAULT_DAILY_REPORT_LIMIT,
     source_filter: str | None = None,
     content_class: str | None = None,
     dry_run: bool = False,
@@ -44,6 +46,7 @@ def run_intel_export_job(
     snapshot_key: str = "latest",
 ) -> IntelExportResult:
     output = Path(output_dir)
+    effective_limit = _normalise_export_limit(limit)
     jsonl_path = output / "intel_items.jsonl"
     markdown_path = output / "intel_digest.md"
     pending_path = output / "intel_pending.jsonl"
@@ -56,18 +59,18 @@ def run_intel_export_job(
         snapshot_rows = _list_export_events(
             session,
             snapshot_key=snapshot_key,
-            limit=limit,
+            limit=effective_limit,
             source_filter=source_filter,
             content_class=content_class,
         )
         items = [] if snapshot_rows is not None else repo.list_export_items(
-            limit=limit,
+            limit=effective_limit,
             source_id=source_filter,
             content_class=content_class,
         )
         pending_items = _list_pending(
             session,
-            limit=limit,
+            limit=effective_limit,
             source_filter=source_filter,
             content_class=content_class,
         )
@@ -115,7 +118,7 @@ def run_intel_export_from_settings(
     *,
     settings: Settings,
     output_dir: str | Path = "output/intel",
-    limit: int | None = 100,
+    limit: int | None = DEFAULT_DAILY_REPORT_LIMIT,
     source_filter: str | None = None,
     content_class: str | None = None,
     dry_run: bool = False,
@@ -129,7 +132,7 @@ def run_intel_export_from_settings(
     return run_intel_export_job(
         session_factory=create_session_factory(engine),
         output_dir=output_dir,
-        limit=limit,
+        limit=_normalise_export_limit(limit),
         source_filter=source_filter,
         content_class=content_class,
         dry_run=dry_run,
@@ -276,6 +279,19 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
         "x_official": source_group == "x_official",
         "account_url": source.account_url if source else None,
     }
+    topic_category = (
+        review.topic_category
+        if review and review.topic_category and review.topic_category != "未分类"
+        else fallback_topic_category(
+            title=item.title,
+            summary=item.summary,
+            content=item.content_text,
+            source_group=source_group,
+            source_subtype=source_subtype,
+            transport=source_transport,
+            content_class=item.content_class,
+        )
+    )
     return {
         "id": item.id,
         "source_id": item.source_id,
@@ -296,6 +312,7 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
         "external_id": item.external_id,
         "content_hash": item.content_hash,
         "content_class": item.content_class,
+        "topic_category": topic_category,
         "status": item.status,
         "title": item.title,
         "url": item.canonical_url,
@@ -313,6 +330,7 @@ def _serialize(item: IntelItem) -> dict[str, Any]:
             "status": review.status,
             "keep": review.keep,
             "content_class": review.content_class,
+            "topic_category": topic_category,
             "summary_cn": review.summary_cn,
             "reason": review.reason,
             "risk_flags": _json(review.risk_flags_json, []),
@@ -333,11 +351,11 @@ def _markdown(
 ) -> str:
     counts: dict[str, int] = {}
     for record in records:
-        key = str(record.get("content_class") or "unknown")
+        key = str(record.get("topic_category") or record.get("content_class") or "未分类")
         counts[key] = counts.get(key, 0) + 1
     lines = ["# AI 情报导出", "", f"保留条目：{len(records)}", f"待处理：{len(pending)}", ""]
     if counts:
-        lines.append("分类统计：" + "、".join(f"{key}={value}" for key, value in sorted(counts.items())))
+        lines.append("主题分类统计：" + "、".join(f"{key}={value}" for key, value in sorted(counts.items())))
         lines.append("")
     if status_counts:
         lines.append("状态统计：" + "、".join(f"{key}={value}" for key, value in sorted(status_counts.items())))
@@ -367,7 +385,7 @@ def _markdown(
         lines.extend(
             [
                 f"## {index}. {record.get('title') or '(untitled)'}",
-                f"- 类别：`{record.get('content_class')}` | 状态：`{record.get('status')}` | 选择分：`{record.get('selection_score')}`",
+                f"- 主题：`{record.get('topic_category') or '未分类'}` | 来源类型：`{record.get('content_class')}` | 状态：`{record.get('status')}` | 选择分：`{record.get('selection_score')}`",
                 f"- 来源：`{record.get('source_name') or record.get('source_id')}`",
                 (
                     f"- 来源标识：`{record.get('source_id')}` | transport=`{record.get('source_transport')}` "
@@ -423,6 +441,17 @@ def _json_list(value: str | None) -> list[str]:
     if not isinstance(raw, (list, tuple, set)):
         return []
     return [str(item) for item in raw if item is not None and str(item).strip()]
+
+
+def _normalise_export_limit(value: int | None) -> int:
+    """Use the configured default while allowing explicit caller overrides."""
+
+    if value is None:
+        return DEFAULT_DAILY_REPORT_LIMIT
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_DAILY_REPORT_LIMIT
 
 
 def _date(value: datetime | None) -> str | None:

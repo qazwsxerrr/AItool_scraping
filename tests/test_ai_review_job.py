@@ -144,6 +144,7 @@ def test_ai_review_never_calls_verification_and_exports_not_run(tmp_path, monkey
     assert "verification" not in record
     assert record["summary_cn"] == "中文简要总结"
     assert record["content_class"] == "official_model_company"
+    assert record["topic_category"] == "产品"
 
     with sf() as session:
         rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
@@ -156,6 +157,7 @@ def test_ai_review_never_calls_verification_and_exports_not_run(tmp_path, monkey
         assert rows[0].ai_review.selection_score == 91
         assert rows[0].ai_review.novelty == "new"
         assert json.loads(rows[0].ai_review.paper_support_json)["is_paper"] is False
+        assert rows[0].ai_review.topic_category == "产品"
         assert rows[1].status == "filtered"
         assert rows[2].status == "selected"
 

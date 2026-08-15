@@ -27,9 +27,23 @@ ITEM_ANALYSIS_SYSTEM_PROMPT = (
     "risk_flags 只能记录材料中可见的风险提示；不要输出排序建议或其他类别判断。"
     "official_model_company 用于官方模型、公司、产品或 API 发布；"
     "community_social 用于社区讨论、社交内容和仅供发现的线索。"
-    "输出字段必须为：keep(boolean), content_class(string), summary_cn(string), "
+    "输出字段必须为：keep(boolean), content_class(string), topic_category(string), summary_cn(string), "
     "reason(string), risk_flags(array of strings), confidence(integer 0-100)。"
 )
+
+
+def build_item_analysis_system_prompt(categories: tuple[str, ...] | list[str] | None = None) -> str:
+    """Return the item prompt with the deployment's editorial taxonomy."""
+
+    labels = tuple(str(item).strip() for item in (categories or ()) if str(item).strip())
+    if not labels:
+        return ITEM_ANALYSIS_SYSTEM_PROMPT
+    choices = "、".join(labels)
+    return (
+        ITEM_ANALYSIS_SYSTEM_PROMPT
+        + f"topic_category 必须且只能从以下主题分类中选择：{choices}。"
+        + "这是编辑主题分类，不是来源可信度；如果材料不足，选择最接近的类别。"
+    )
 
 PROJECT_SUMMARY_SYSTEM_PROMPT = (
     "你是 GitHub 项目摘要器，只能依据输入的标题、描述、topics 和 README 生成中文项目介绍。"
@@ -118,6 +132,7 @@ def build_openai_responses_payload(
 __all__ = [
     "ITEM_ANALYSIS_RESPONSE_SCHEMA",
     "ITEM_ANALYSIS_SYSTEM_PROMPT",
+    "build_item_analysis_system_prompt",
     "ITEM_ANALYSIS_TASK",
     "PROJECT_SUMMARY_SYSTEM_PROMPT",
     "build_generic_json_payload",

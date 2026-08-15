@@ -4,9 +4,12 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.domain.categories import DEFAULT_TOPIC_CATEGORIES
+
 
 DEFAULT_DATABASE_URL = "sqlite:///./data/ai_tool_intel.db"
 DEFAULT_USER_AGENT = "AItool_scraping/0.1 (+https://example.local)"
+DEFAULT_AI_REVIEW_CATEGORIES = DEFAULT_TOPIC_CATEGORIES
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -41,12 +44,18 @@ class Settings:
     ai_review_model: str | None = None
     ai_review_api_style: str = "generic_json"
     ai_review_timeout_seconds: float = 30.0
+    ai_review_categories: tuple[str, ...] = DEFAULT_AI_REVIEW_CATEGORIES
+    ai_review_category_mode: str = "ai"
 
     @classmethod
     def from_env(cls, dotenv_path: str | Path = ".env") -> "Settings":
         load_dotenv(dotenv_path)
         rsshub_base_url = _env_value("RSSHUB_BASE_URL")
         ai_review_model = os.getenv("AI_REVIEW_MODEL") or None
+        categories = _parse_categories(os.getenv("AI_REVIEW_CATEGORIES"))
+        category_mode = (os.getenv("AI_REVIEW_CATEGORY_MODE") or "ai").strip().lower()
+        if category_mode not in {"ai", "source"}:
+            category_mode = "ai"
         return cls(
             database_url=os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL),
             rsshub_base_url=rsshub_base_url.rstrip("/") if rsshub_base_url else None,
@@ -62,9 +71,20 @@ class Settings:
             ai_review_model=ai_review_model,
             ai_review_api_style=os.getenv("AI_REVIEW_API_STYLE", "generic_json"),
             ai_review_timeout_seconds=float(os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "30")),
+            ai_review_categories=categories,
+            ai_review_category_mode=category_mode,
         )
 
 
 def _env_value(name: str) -> str | None:
     value = os.getenv(name)
     return value.strip() if value and value.strip() else None
+
+
+def _parse_categories(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return DEFAULT_AI_REVIEW_CATEGORIES
+    parts = [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
+    # Keep order stable for the UI and prompts while avoiding duplicate labels.
+    unique = tuple(dict.fromkeys(parts))
+    return unique or DEFAULT_AI_REVIEW_CATEGORIES

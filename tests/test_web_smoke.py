@@ -26,6 +26,7 @@ def test_web_home_and_all_pages_render_empty_state(tmp_path):
     all_response = client.get("/all")
     search_response = client.get("/search")
     github_response = client.get("/github")
+    sources_response = client.get("/sources")
 
     assert home_response.status_code == 200
     assert "暂无精选内容" in home_response.text
@@ -35,6 +36,8 @@ def test_web_home_and_all_pages_render_empty_state(tmp_path):
     assert "输入关键词开始搜索" in search_response.text
     assert github_response.status_code == 200
     assert "暂无 GitHub 项目" in github_response.text
+    assert sources_response.status_code == 200
+    assert "还没有来源" in sources_response.text
 
 
 def test_web_github_metadata_fixture_renders_home_github_and_search(tmp_path):

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.collectors.feed import FeedCollector, ProductHuntCollector, RSSHubCollector
 from app.collectors.github import GitHubCollector, GitHubTrendingCollector
 from app.collectors.router import CollectorRouter
+from app.config.limits import DEFAULT_FETCH_LIMIT_PER_SOURCE
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
 from app.domain.models import FetchBatch, SourceSpec
@@ -79,7 +80,7 @@ def run_intel_fetch_job(
     session_factory: sessionmaker[Session],
     sources: Iterable[SourceSpec],
     router: CollectorRouter,
-    limit_per_source: int | None = None,
+    limit_per_source: int | None = DEFAULT_FETCH_LIMIT_PER_SOURCE,
     source_filter: str | None = None,
     content_class: str | None = None,
     force: bool = False,
@@ -240,7 +241,7 @@ def run_intel_fetch_from_settings(
     *,
     settings: Settings,
     registry_path=DEFAULT_REGISTRY_PATH,
-    limit_per_source: int | None = None,
+    limit_per_source: int | None = DEFAULT_FETCH_LIMIT_PER_SOURCE,
     source_filter: str | None = None,
     content_class: str | None = None,
     force: bool = False,

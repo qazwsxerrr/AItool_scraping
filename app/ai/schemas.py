@@ -32,6 +32,7 @@ CONTENT_CLASSES: tuple[str, ...] = (
 ITEM_ANALYSIS_RESPONSE_SCHEMA: dict[str, str] = {
     "keep": "boolean",
     "content_class": "official_model_company|project_tool|community_social",
+    "topic_category": "string; one of the configured topic categories",
     "summary_cn": "string",
     "reason": "string",
     "risk_flags": "array<string>",
@@ -90,6 +91,7 @@ class ItemAnalysisResponse(BaseModel):
 
     keep: bool
     content_class: ContentClass
+    topic_category: str = "未分类"
     summary_cn: str
     reason: str
     risk_flags: list[str] = Field(default_factory=list)
@@ -110,6 +112,7 @@ class ItemAnalysisResponse(BaseModel):
             raise TypeError("raw_response must be a dict or None")
         data.update(
             content_class=content_class,
+            topic_category=clean_text(data.get("topic_category") or data.get("category")) or "未分类",
             keep=coerce_bool(data.get("keep"), default=False),
             summary_cn=clean_text(data.get("summary_cn")),
             reason=clean_text(data.get("reason")),
@@ -153,6 +156,7 @@ guard_item_analysis_response = apply_local_guard
 def parse_item_analysis_response(
     data: Any,
     source_content_class: str,
+    allowed_categories: list[str] | tuple[str, ...] | None = None,
 ) -> ItemAnalysisResponse:
     """Unwrap, strictly parse, normalize, and guard a provider response.
 
@@ -163,7 +167,10 @@ def parse_item_analysis_response(
 
     raw = _coerce_raw_mapping(data)
     result = _unwrap_response(raw)
-    required_fields = list(ITEM_ANALYSIS_RESPONSE_SCHEMA)
+    # ``topic_category`` was added after the original AI-only contract. Keep
+    # it optional at the parser boundary so old provider responses and audit
+    # rows remain readable; the job assigns a deterministic fallback.
+    required_fields = [key for key in ITEM_ANALYSIS_RESPONSE_SCHEMA if key != "topic_category"]
     missing = [key for key in required_fields if key not in result]
     if missing:
         raise ValueError("Item analysis response is missing required fields: " + ", ".join(missing))
@@ -174,6 +181,7 @@ def parse_item_analysis_response(
     response = ItemAnalysisResponse(
         keep=coerce_bool(result.get("keep"), default=False),
         content_class=fallback_class,
+        topic_category=normalize_topic_category(result.get("topic_category") or result.get("category"), allowed_categories),
         summary_cn=clean_text(result.get("summary_cn")),
         reason=clean_text(result.get("reason")),
         risk_flags=clean_string_list(result.get("risk_flags")),
@@ -181,6 +189,22 @@ def parse_item_analysis_response(
         raw_response=raw,
     )
     return apply_local_guard(response, fallback_class)
+
+
+def normalize_topic_category(value: Any, allowed_categories: list[str] | tuple[str, ...] | None = None) -> str:
+    """Normalize a model-provided editorial category without trusting free text."""
+
+    allowed = tuple(str(item).strip() for item in (allowed_categories or ()) if str(item).strip())
+    text = clean_text(value)
+    if allowed:
+        if text in allowed:
+            return text
+        lowered = text.casefold()
+        for candidate in allowed:
+            if candidate.casefold() == lowered:
+                return candidate
+        return "未分类"
+    return text or "未分类"
 
 
 def parse_project_summary_response(data: Any) -> ItemAnalysisResponse:

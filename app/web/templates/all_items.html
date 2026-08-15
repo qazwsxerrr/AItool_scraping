@@ -4,10 +4,11 @@
 {% block content %}
 <section class="page-head">
   <div>
-    <p class="eyebrow">全部动态</p>
-    <h1>AI 信息流</h1>
-    <p class="muted-text">展示统一情报条目、来源归属、AI 处理状态与摘要。</p>
+    <p class="eyebrow">ARCHIVE / ALL SIGNALS</p>
+    <h1>全部动态</h1>
+    <p class="muted-text">主题分类与来源归属分开呈现，方便从“发生了什么”追溯到“信息从哪里来”。</p>
   </div>
+  <a class="button button-quiet" href="/sources">来源目录 →</a>
 </section>
 
 <form class="filters" action="/all" method="get">
@@ -25,6 +26,12 @@
       <option value="{{ value }}" {{ 'selected' if filters.content_class == value else '' }}>{{ value | content_class_label }}</option>
     {% endfor %}
   </select>
+  <select name="topic_category">
+    <option value="">全部主题</option>
+    {% for value in filter_options.topic_categories %}
+      <option value="{{ value }}" {{ 'selected' if filters.topic_category == value else '' }}>{{ value }}</option>
+    {% endfor %}
+  </select>
   <select name="status">
     <option value="">全部状态</option>
     {% for value in filter_options.statuses %}
@@ -37,7 +44,7 @@
     <option value="drop" {{ 'selected' if filters.ai_keep is sameas false else '' }}>drop</option>
   </select>
   <button type="submit">应用筛选</button>
-  {% if filters.query or filters.source_group or filters.content_class or filters.status or filters.ai_keep is not none %}
+  {% if filters.query or filters.source_group or filters.content_class or filters.topic_category or filters.status or filters.ai_keep is not none %}
     <a class="button secondary" href="/all">清除</a>
   {% endif %}
 </form>

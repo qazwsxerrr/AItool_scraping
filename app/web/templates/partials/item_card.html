@@ -4,21 +4,24 @@
     <span>{{ item.published_at | datetime }}</span>
   </div>
   <div class="card-body">
-    <div class="card-meta">
-      <span>{{ item.source_name }}</span>
-      {% if item.content_class %}<span>{{ item.content_class | content_class_label }}</span>{% endif %}
-      {% if item.selection_score is not none %}<span>筛选分 {{ item.selection_score }}</span>{% endif %}
-      {% if item.ai_confidence is not none %}<span>AI 置信度 {{ item.ai_confidence }}</span>{% endif %}
+    <div class="source-line">
+      <span class="source-avatar">{{ (item.source_name or '来')[:1] }}</span>
+      <span class="source-name">{{ item.source_name }}</span>
+      {% if item.source_group %}<span class="source-group">{{ item.source_group | source_group_label }}</span>{% endif %}
+      {% if item.source_transport %}<span class="source-transport">{{ item.source_transport | transport_label }}</span>{% endif %}
+      {% if item.account_url or item.source_url %}<a class="source-origin" href="{{ item.account_url or item.source_url }}" target="_blank" rel="noopener noreferrer">来源页 ↗</a>{% endif %}
     </div>
     <h3>
       {% if item.url %}<a href="{{ item.url }}" target="_blank" rel="noopener noreferrer">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
     </h3>
-    {% if item.summary_cn %}<p><strong>AI 摘要：</strong>{{ item.summary_cn }}</p>{% endif %}
+    {% if item.summary_cn %}<p class="summary-clamp">{{ item.summary_cn }}</p>{% endif %}
     {% if item.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ item.selection_reason }}</p>{% endif %}
     <div class="badges">
-      {% if item.source_group %}<span class="badge">{{ item.source_group }}</span>{% endif %}
+      {% if item.topic_category %}<span class="badge topic-badge">{{ item.topic_category }}</span>{% endif %}
+      {% if item.content_class %}<span class="badge badge-source">{{ item.content_class | content_class_label }}</span>{% endif %}
+      {% if item.source_tier %}<span class="badge">{{ item.source_tier | tier_label }}</span>{% endif %}
       {% if item.source_subtype %}<span class="badge">{{ item.source_subtype }}</span>{% endif %}
-      {% if item.source_role %}<span class="badge">{{ item.source_role }}</span>{% endif %}
+      {% if item.source_role %}<span class="badge">{{ item.source_role | source_role_label }}</span>{% endif %}
       {% if item.spam_risk %}<span class="badge warning">risk {{ item.spam_risk }}</span>{% endif %}
       {% if item.status %}<span class="badge primary">{{ item.status | status_label }}</span>{% endif %}
       {% if item.ai_status %}<span class="badge">AI {{ item.ai_status }}</span>{% endif %}

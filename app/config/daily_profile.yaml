@@ -1,11 +1,11 @@
 version: wave3-v1
 snapshot_key: latest
 
-# Hard editorial pool size.  There is intentionally no minimum: an empty or
+# Default editorial pool size.  There is intentionally no minimum: an empty or
 # fully gated day produces an empty snapshot rather than padded content.
-total_max: 60
+total_max: 30
 
-# Seven-topic hard caps (sum = 60).
+# Topic caps remain independent from the 30-item default pool size.
 topic_caps:
   model: 16
   product: 12

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.web.routes import all_items, github, home, search
+from app.web.routes import all_items, github, home, search, sources
 
 
 def create_app(
@@ -21,8 +21,10 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(title="AI 热点内容台")
 
+    if settings is None:
+        settings = Settings.from_env()
+
     if session_factory is None:
-        settings = settings or Settings.from_env()
         engine = create_engine_from_url(settings.database_url)
         if init_database:
             init_db(engine)
@@ -31,6 +33,7 @@ def create_app(
     app.state.session_factory = session_factory
     app.state.github_data_path = github_data_path
     app.state.intel_output_root = intel_output_root
+    app.state.topic_categories = settings.ai_review_categories
 
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -38,6 +41,7 @@ def create_app(
     app.include_router(all_items.router)
     app.include_router(github.router)
     app.include_router(search.router)
+    app.include_router(sources.router)
     return app
 
 

@@ -1,24 +1,33 @@
 <article class="card recommendation-card {{ 'top' if is_top | default(false) else '' }}">
-  <div class="score-pill score-{{ 'high' if card.selection_score >= 80 else 'mid' if card.selection_score >= 60 else 'low' }}">
-    {{ card.selection_score }}
+  <div class="score-block">
+    <div class="score-pill score-{{ 'high' if card.selection_score >= 80 else 'mid' if card.selection_score >= 60 else 'low' }}">
+      {{ card.selection_score }}
+    </div>
+    <small>筛选分</small>
   </div>
   <div class="card-body">
-    <div class="card-meta">
-      <span>{{ card.source_name or '未知来源' }}</span>
-      {% if card.published_at %}<span>{{ card.published_at | relative_time }}</span>{% endif %}
-      {% if card.content_class %}<span>{{ card.content_class | content_class_label }}</span>{% endif %}
-      {% if card.ai_keep and card.ai_status == 'success' %}<span>AI 已选</span>{% endif %}
+    <div class="source-line">
+      <span class="source-avatar">{{ (card.source_name or '来')[:1] }}</span>
+      <span class="source-name">{{ card.source_name or '未知来源' }}</span>
+      {% if card.source_group %}<span class="source-group">{{ card.source_group | source_group_label }}</span>{% endif %}
+      {% if card.source_transport %}<span class="source-transport">{{ card.source_transport | transport_label }}</span>{% endif %}
+      {% if card.account_url or card.source_url %}<a class="source-origin" href="{{ card.account_url or card.source_url }}" target="_blank" rel="noopener noreferrer">来源页 ↗</a>{% endif %}
+      {% if card.published_at %}<time datetime="{{ card.published_at }}">{{ card.published_at | relative_time }}</time>{% endif %}
     </div>
     <h3>
       {% if card.url %}<a href="{{ card.url }}" target="_blank" rel="noopener noreferrer">{{ card.title }}</a>{% else %}{{ card.title }}{% endif %}
     </h3>
-    {% if card.summary %}<p class="summary-clamp" title="{{ card.summary }}"><strong>AI 摘要：</strong>{{ card.summary }}</p>{% endif %}
+    {% if card.summary %}<p class="summary-clamp" title="{{ card.summary }}">{{ card.summary }}</p>{% endif %}
     {% if card.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ card.selection_reason }}</p>{% endif %}
-    {% if card.url %}<p class="note"><a class="inline-link" href="{{ card.url }}" target="_blank" rel="noopener noreferrer">打开来源</a></p>{% endif %}
+    <div class="card-footline">
+      <div class="topic-label"><span class="topic-dot"></span>{{ card.topic_category or card.content_class or '未分类' }}</div>
+      {% if card.url %}<a class="inline-link" href="{{ card.url }}" target="_blank" rel="noopener noreferrer">阅读原文 <span>↗</span></a>{% endif %}
+    </div>
     <div class="badges">
       <span class="badge primary">{{ card.status | status_label }}</span>
-      {% if card.content_class %}<span class="badge">{{ card.content_class | content_class_label }}</span>{% endif %}
-      {% if card.source_group %}<span class="badge">{{ card.source_group }}</span>{% endif %}
+      {% if card.content_class %}<span class="badge badge-source">{{ card.content_class | content_class_label }}</span>{% endif %}
+      {% if card.source_tier %}<span class="badge">{{ card.source_tier | tier_label }}</span>{% endif %}
+      {% if card.ai_confidence is not none %}<span class="badge">AI 把握 {{ card.ai_confidence }}%</span>{% endif %}
       {% if card.risk_flags %}
         <details class="risk-details">
           <summary class="badge warning">风险提示 {{ card.risk_flags | length }}</summary>

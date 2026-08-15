@@ -9,12 +9,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 from sqlalchemy import false, func, or_, select
 from sqlalchemy.orm import Session
 
+from app.config.settings import DEFAULT_AI_REVIEW_CATEGORIES
+from app.domain.categories import fallback_topic_category
 from app.storage.models import (
     AIItemReview,
     IntelEvent,
@@ -43,6 +45,14 @@ class DashboardStats:
     last_run_type: str | None
     last_run_status: str | None
     last_run_started_at: datetime | None
+    category_counts: tuple["FacetCount", ...] = ()
+    source_counts: tuple["FacetCount", ...] = ()
+
+
+@dataclass(frozen=True)
+class FacetCount:
+    value: str
+    count: int
 
 @dataclass(frozen=True)
 class FeaturedItemRow:
@@ -64,6 +74,13 @@ class FeaturedItemRow:
     created_at: datetime | None
     ai_keep: bool | None = None
     ai_status: str | None = None
+    topic_category: str | None = None
+    source_id: str | None = None
+    source_transport: str | None = None
+    source_tier: str | None = None
+    source_role: str | None = None
+    source_url: str | None = None
+    account_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +129,12 @@ class AllItemRow:
     content_class: str | None = None
     selection_reason: str | None = None
     ai_status: str | None = None
+    topic_category: str | None = None
+    source_id: str | None = None
+    source_transport: str | None = None
+    source_tier: str | None = None
+    source_url: str | None = None
+    account_url: str | None = None
 
 @dataclass(frozen=True)
 class AllItemFilters:
@@ -120,6 +143,7 @@ class AllItemFilters:
     status: str | None = None
     ai_keep: bool | None = None
     content_class: str | None = None
+    topic_category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +163,10 @@ class SearchResultRow:
     status: str | None = None
     ai_status: str | None = None
     selection_reason: str | None = None
+    topic_category: str | None = None
+    source_group: str | None = None
+    source_transport: str | None = None
+    source_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,13 +191,33 @@ class UIFilterOptions:
     source_groups: tuple[str, ...]
     content_classes: tuple[str, ...]
     statuses: tuple[str, ...]
+    topic_categories: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SourceRow:
+    source_id: str
+    name: str
+    transport: str
+    source_group: str | None
+    source_subtype: str | None
+    source_role: str | None
+    tier: str | None
+    content_class: str | None
+    url: str | None
+    account_url: str | None
+    health_status: str | None
+    consecutive_failures: int
+    item_count: int
 
 
 class UIReadRepository:
     """Stable read boundary backed only by the v2 tables."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, topic_categories: Sequence[str] | None = None) -> None:
         self.session = session
+        configured = tuple(str(value).strip() for value in (topic_categories or DEFAULT_AI_REVIEW_CATEGORIES) if str(value).strip())
+        self.topic_categories = configured or DEFAULT_AI_REVIEW_CATEGORIES
 
     def get_dashboard_stats(self) -> DashboardStats:
         last_run = self.session.scalars(
@@ -213,6 +261,39 @@ class UIReadRepository:
                 filters = {}
             if isinstance(filters, dict):
                 run_type = str(filters.get("stage") or filters.get("command") or run_type)
+        category_counts_map: dict[str, int] = {}
+        selected_rows = self.session.execute(
+            select(IntelItem, Source, AIItemReview)
+            .join(Source, IntelItem.source_id == Source.id)
+            .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
+            .where(
+                IntelItem.status == "selected",
+                AIItemReview.status == "success",
+                AIItemReview.keep.is_(True),
+            )
+        ).all()
+        for item, source, review in selected_rows:
+            category = _display_topic_category(review.topic_category if review else None, item, source, self.topic_categories)
+            category_counts_map[category] = category_counts_map.get(category, 0) + 1
+        category_counts = tuple(
+            FacetCount(value=value, count=count)
+            for value, count in sorted(category_counts_map.items(), key=lambda entry: (-entry[1], entry[0]))
+        )
+        source_counts = tuple(
+            FacetCount(value=str(value or "general"), count=int(count))
+            for value, count in self.session.execute(
+                select(Source.source_group, func.count(IntelItem.id))
+                .join(IntelItem, IntelItem.source_id == Source.id)
+                .join(AIItemReview, AIItemReview.item_id == IntelItem.id)
+                .where(
+                    IntelItem.status == "selected",
+                    AIItemReview.status == "success",
+                    AIItemReview.keep.is_(True),
+                )
+                .group_by(Source.source_group)
+                .order_by(func.count(IntelItem.id).desc())
+            ).all()
+        )
         return DashboardStats(
             raw_items=self._count(IntelItem),
             selected_items=selected_items,
@@ -223,6 +304,8 @@ class UIReadRepository:
             last_run_type=run_type,
             last_run_status=last_run.status if last_run else None,
             last_run_started_at=last_run.started_at if last_run else None,
+            category_counts=category_counts,
+            source_counts=source_counts,
         )
 
     def list_filter_options(self) -> UIFilterOptions:
@@ -265,16 +348,29 @@ class UIReadRepository:
             if value
         )
         statuses = tuple(sorted(set(ITEM_STATUSES).union(set(persisted_statuses) - {"hotspot"})))
+        persisted_topic_categories = tuple(
+            value
+            for (value,) in self.session.execute(
+                select(AIItemReview.topic_category)
+                .where(AIItemReview.topic_category.is_not(None), AIItemReview.topic_category != "")
+                .distinct()
+                .order_by(AIItemReview.topic_category.asc())
+            ).all()
+            if value
+        )
+        topic_categories = tuple(dict.fromkeys((*self.topic_categories, *persisted_topic_categories)))
         return UIFilterOptions(
             source_groups=source_groups,
             content_classes=content_classes,
             statuses=statuses,
+            topic_categories=topic_categories,
         )
 
     def list_featured_cards(
         self,
         *,
         category: str | None = None,
+        source_group: str | None = None,
         limit: int = 30,
     ) -> list[FeaturedItemRow]:
         if limit <= 0:
@@ -302,12 +398,19 @@ class UIReadRepository:
                 AIItemReview.keep.is_(True),
             )
             .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
-            .limit(max(safe_limit * 3, safe_limit))
+            # Legacy rows may not have a persisted topic yet; fetch a wider
+            # window before applying the deterministic display fallback below.
+            .limit(max(safe_limit * 10, safe_limit))
         )
         if category:
-            stmt = stmt.where(IntelItem.content_class == category)
+            stmt = stmt.where(or_(AIItemReview.topic_category == category, AIItemReview.topic_category.is_(None)))
+        if source_group:
+            stmt = stmt.where(Source.source_group == source_group)
         rows: list[FeaturedItemRow] = []
         for item, source, review in self.session.execute(stmt).all():
+            display_category = _display_topic_category(review.topic_category if review else None, item, source, self.topic_categories)
+            if category and display_category != category:
+                continue
             risk_flags = _json_list(review.risk_flags_json if review else None)
             risk_flags = list(dict.fromkeys(risk_flags))
             rows.append(
@@ -330,6 +433,13 @@ class UIReadRepository:
                     created_at=item.created_at,
                     ai_keep=review.keep if review else None,
                     ai_status=review.status if review else None,
+                    topic_category=display_category,
+                    source_id=source.id,
+                    source_transport=source.transport,
+                    source_tier=source.tier,
+                    source_role=source.source_role,
+                    source_url=_safe_url(source.url),
+                    account_url=_safe_url(source.account_url),
                 )
             )
             if len(rows) >= safe_limit:
@@ -490,6 +600,8 @@ class UIReadRepository:
             stmt = stmt.where(Source.source_group == filters.source_group.strip())
         if filters.content_class:
             stmt = stmt.where(IntelItem.content_class == filters.content_class.strip())
+        if filters.topic_category:
+            stmt = stmt.where(or_(AIItemReview.topic_category == filters.topic_category.strip(), AIItemReview.topic_category.is_(None)))
         if filters.status:
             if filters.status.strip() == "hotspot":
                 stmt = stmt.where(false())
@@ -500,6 +612,9 @@ class UIReadRepository:
 
         items: list[AllItemRow] = []
         for item, source, review in self.session.execute(stmt).all():
+            display_category = _display_topic_category(review.topic_category if review else None, item, source, self.topic_categories)
+            if filters.topic_category and display_category != filters.topic_category.strip():
+                continue
             items.append(
                 AllItemRow(
                     item_id=item.id,
@@ -520,6 +635,12 @@ class UIReadRepository:
                     content_class=item.content_class,
                     selection_reason=item.selection_reason,
                     ai_status=review.status if review else None,
+                    topic_category=display_category,
+                    source_id=source.id,
+                    source_transport=source.transport,
+                    source_tier=source.tier,
+                    source_url=_safe_url(source.url),
+                    account_url=_safe_url(source.account_url),
                 )
             )
         return items
@@ -548,6 +669,10 @@ class UIReadRepository:
                 status=row.status,
                 ai_status=row.ai_status,
                 selection_reason=row.selection_reason,
+                topic_category=row.topic_category,
+                source_group=row.source_group,
+                source_transport=row.source_transport,
+                source_tier=row.source_tier,
             )
             for row in self.list_all_items(filters=AllItemFilters(query=normalized_query), page_size=safe_limit)
         ]
@@ -581,6 +706,7 @@ class UIReadRepository:
         )
         rows: list[SearchResultRow] = []
         for item, source, review in self.session.execute(stmt).all():
+            display_category = _display_topic_category(review.topic_category if review else None, item, source, self.topic_categories)
             rows.append(
                 SearchResultRow(
                     result_type="selected",
@@ -598,6 +724,10 @@ class UIReadRepository:
                     status=item.status,
                     ai_status=review.status if review else None,
                     selection_reason=item.selection_reason or (review.reason if review else None),
+                    topic_category=display_category,
+                    source_group=source.source_group,
+                    source_transport=source.transport,
+                    source_tier=source.tier,
                 )
             )
         return rows
@@ -607,6 +737,35 @@ class UIReadRepository:
         if conditions:
             stmt = stmt.where(*conditions)
         return int(self.session.execute(stmt).scalar_one())
+
+    def list_sources(self) -> list[SourceRow]:
+        """Return a compact source catalog for the provenance page."""
+
+        counts = {
+            source_id: int(count)
+            for source_id, count in self.session.execute(
+                select(IntelItem.source_id, func.count(IntelItem.id)).group_by(IntelItem.source_id)
+            ).all()
+        }
+        rows = self.session.scalars(select(Source).order_by(Source.priority.asc(), Source.name.asc())).all()
+        return [
+            SourceRow(
+                source_id=source.id,
+                name=source.name,
+                transport=source.transport,
+                source_group=source.source_group,
+                source_subtype=source.source_subtype,
+                source_role=source.source_role,
+                tier=source.tier,
+                content_class=source.content_class,
+                url=_safe_url(source.url),
+                account_url=_safe_url(source.account_url),
+                health_status=source.health_status,
+                consecutive_failures=int(source.consecutive_failures or 0),
+                item_count=counts.get(source.id, 0),
+            )
+            for source in rows
+        ]
 
 
 def _json_list(raw: str | None) -> list[str]:
@@ -637,3 +796,25 @@ def _safe_url(value: str | None) -> str | None:
 
 def _credibility(review: AIItemReview | None) -> int:
     return max(0, min(int(review.confidence if review else 0), 100))
+
+
+def _display_topic_category(
+    value: str | None,
+    item: IntelItem,
+    source: Source,
+    categories: tuple[str, ...] = DEFAULT_AI_REVIEW_CATEGORIES,
+) -> str:
+    """Give legacy rows the same readable topic labels as newly reviewed rows."""
+
+    if value and value != "未分类":
+        return value
+    return fallback_topic_category(
+        title=item.title,
+        summary=item.summary,
+        content=item.content_text,
+        source_group=source.source_group,
+        source_subtype=source.source_subtype,
+        transport=source.transport,
+        content_class=source.content_class,
+        categories=categories,
+    )

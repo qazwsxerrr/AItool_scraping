@@ -509,6 +509,7 @@ class IntelRepository:
         *,
         model: str | None,
         content_class: str | None = None,
+        topic_category: str | None = None,
         status: str = "success",
         error_message: str | None = None,
     ) -> AIItemReview:
@@ -527,6 +528,9 @@ class IntelRepository:
         raw = _response_value(response, "raw_response") if response is not None else None
         if raw is None and isinstance(response, Mapping):
             raw = dict(response)
+        legacy_category = _text(topic_category or _response_value(response, "topic_category"))
+        triage_category = _text(getattr(response, "topic_label", None)) if is_triage else None
+        review.topic_category = legacy_category or triage_category or review.topic_category or "未分类"
         review.raw_response_json = _dump_json(raw if raw is not None else {})
         if is_triage:
             # Persist every Wave 1 field explicitly.  The raw response remains
