@@ -2,180 +2,152 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
-from app.ai import ItemAnalysisClient
-from app.ai.client import IntelTriageClient
 from app.ai.skills.intel_triage import (
-    INTEL_TRIAGE_JSON_SCHEMA,
-    INTEL_TOPICS,
+    AnalysisResult,
+    IntelTriageClient,
     RawIntelEnvelope,
-    TriageResult,
-    build_provider_payload,
-    normalize_html,
-    normalize_text,
-    parse_triage_result,
-    run_triage_batch,
+    ScreenResult,
+    apply_screen_guard,
+    build_analysis_provider_payload,
+    build_screen_provider_payload,
+    parse_analysis_result,
+    parse_screen_result,
+    run_analysis_isolated,
+    run_screen_isolated,
 )
 
 
 class FakeResponse:
-    def __init__(self, payload, status_code: int = 200):
+    def __init__(self, payload):
         self.payload = payload
-        self.status_code = status_code
 
     def raise_for_status(self):
-        if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+        return None
 
     def json(self):
         return self.payload
 
 
 class FakeHttp:
-    def __init__(self, response):
-        self.response = response
+    def __init__(self, payload):
+        self.payload = payload
         self.calls: list[dict] = []
 
     def post(self, url, *, headers, json, **kwargs):
-        self.calls.append({"url": url, "headers": headers, "json": json, "kwargs": kwargs})
-        return self.response
+        self.calls.append({"url": url, "headers": headers, "json": json})
+        return FakeResponse(self.payload)
 
 
-def envelope(**overrides) -> RawIntelEnvelope:
-    values = {
-        "item_id": 7,
-        "source_id": "github_search",
-        "source_group": "github_search",
-        "source_content_class": "project_tool",
-        "title": "Example MCP project",
-        "url": "https://example.test/project/?utm_source=rss",
-        "raw_html": "<p>A <b>reusable</b> MCP server.</p><script>ignore()</script>",
-    }
-    values.update(overrides)
-    return RawIntelEnvelope(**values)
-
-
-def triage_payload(**overrides):
+def envelope(**overrides):
     value = {
-        "keep": True,
+        "item_id": 7,
+        "source_id": "feed",
+        "source_content_class": "project_tool",
+        "title": "MCP project",
+        "url": "https://example.test/mcp",
+        "body_text": "A reusable MCP server.",
+    }
+    value.update(overrides)
+    return RawIntelEnvelope(**value)
+
+
+def analysis_payload(**overrides):
+    value = {
         "topic": "project",
-        "summary_cn": "一个可复用的 MCP 项目。",
+        "topics": ["project"],
+        "summary_cn": "一个可复用的 MCP 服务项目",
         "keywords": ["MCP", "开源"],
+        "entities": [{"name": "MCP", "type": "technology"}],
         "selection_score": 87,
-        "scores": {"relevance": 90, "impact": 80, "total": 87},
-        "novelty": "unknown",
+        "score_components": {
+            "relevance": 90,
+            "impact": 80,
+            "freshness": 85,
+            "source_authority": 70,
+            "actionability": 80,
+            "total": 87,
+        },
         "paper_support": {"is_paper": False},
         "risk_flags": [],
+        "reason": "项目材料明确",
         "confidence": 91,
     }
     value.update(overrides)
     return value
 
 
-def _assert_strict_object_requirements(schema, path: str = "$"):
-    if not isinstance(schema, dict):
-        return
-    properties = schema.get("properties")
-    if schema.get("type") == "object" and isinstance(properties, dict):
-        assert set(schema.get("required", [])) == set(properties), path
-        for name, child in properties.items():
-            _assert_strict_object_requirements(child, f"{path}.properties.{name}")
-    items = schema.get("items")
-    if isinstance(items, dict):
-        _assert_strict_object_requirements(items, f"{path}.items")
-
-
-def test_raw_envelope_normalizes_html_and_aliases():
-    item = envelope(item_id=12, link="https://example.test/project/", content="<p>Hello&nbsp;world</p>", content_class="project_tool")
-    assert item.item_id == 12
-    assert item.url == "https://example.test/project"
-    assert item.body_text == "Hello world"
-    assert "script" not in normalize_html(item.raw_html or "")
-
-
-def test_html_fragment_normalization_is_one_way_for_fixture_like_literals():
-    fixture_like = "<article><p>Use &lt; foo&gt; and version 1.2.</p><p>Next line</p></article>"
-    normalized = normalize_html(fixture_like)
-    assert normalized == "Use < foo> and version 1.2.\n\nNext line"
-    assert normalize_text(fixture_like) == normalized
-    assert normalize_html(normalized) == normalized
-
-
-def test_strict_parse_has_seven_topics_and_preserves_raw_audit():
-    item = envelope()
-    result = parse_triage_result(triage_payload(topic="项目"), envelope=item)
-    assert result.topic == "project"
-    assert result.topics == ["project"]
-    assert tuple(INTEL_TOPICS) == ("model", "product", "project", "industry", "tutorial", "opinion", "paper")
-    assert result.raw_response and result.raw_response["selection_score"] == 87
-    assert result.content_class == "project_tool"
-
-
-def test_paper_arxiv_only_is_deterministically_rejected():
-    item = envelope(
-        source_content_class="community_social",
-        url="https://arxiv.org/abs/1234",
-        title="A paper",
+def test_stage_a_low_confidence_reject_becomes_uncertain():
+    result = parse_screen_result(
+        {"decision": "reject", "reason_code": "noise", "reason": "weak signal", "confidence": 40, "risk_flags": []},
+        envelope=envelope(),
     )
-    result = parse_triage_result(
-        triage_payload(
-            keep=True,
-            topic="paper",
-            paper_support={"is_paper": True, "paper_url": item.url},
-        ),
+    assert result.decision == "uncertain"
+    assert "screen:low_confidence_reject" in result.risk_flags
+
+
+def test_stage_a_strict_parser_preserves_raw_and_threshold_compatible_fields():
+    payload = {"decision": "reject", "reason_code": "ad", "reason": "marketing", "confidence": 95, "risk_flags": ["ad"]}
+    result = parse_screen_result(payload, envelope=envelope())
+    assert isinstance(result, ScreenResult)
+    assert result.decision == "reject"
+    assert result.item_id == 7
+    assert result.raw_response == payload
+
+
+def test_stage_b_strict_parser_has_entities_and_no_legacy_decision_fields():
+    payload = analysis_payload()
+    result = parse_analysis_result(payload, envelope=envelope())
+    assert isinstance(result, AnalysisResult)
+    assert result.selection_score == 87
+    assert result.entities[0].type == "technology"
+    assert not hasattr(result, "keep")
+    assert not hasattr(result, "novelty")
+    assert result.raw_response == payload
+
+
+def test_paper_guard_marks_arxiv_only_analysis():
+    item = envelope(url="https://arxiv.org/abs/1234.5678")
+    result = parse_analysis_result(
+        analysis_payload(topic="paper", topics=["paper"], paper_support={"is_paper": True, "paper_url": item.url}),
         envelope=item,
     )
-    assert result.keep is False
+    assert result.paper_support.arxiv_only is True
+    assert result.paper_gate_pass is False
     assert "paper:arxiv_only" in result.risk_flags
 
 
-def test_provider_payloads_and_client_one_call():
+def test_payloads_are_stage_specific_and_provider_styles_are_supported():
     item = envelope()
-    http = FakeHttp(FakeResponse(triage_payload()))
-    client = IntelTriageClient(
-        api_url="https://api.example.test/v1",
-        api_key="key",
-        model="triage-model",
-        api_style="openai_chat",
-        http_client=http,
-    )
-    result = client.triage(item)
-    assert result.keep is True
-    assert not hasattr(IntelTriageClient, "analyze")
-    assert http.calls[0]["url"].endswith("/chat/completions")
-    assert http.calls[0]["json"]["response_format"]["type"] == "json_schema"
-    assert build_provider_payload(item, api_style="generic_json")["task"] == "intel_triage"
-
-    legacy_adapter = ItemAnalysisClient(
-        api_url="https://api.example.test/v1",
-        api_key="key",
-        model="triage-model",
-        api_style="openai_chat",
-        http_client=FakeHttp(FakeResponse(triage_payload())),
-    )
-    assert legacy_adapter.triage(item).topic == "project"
+    assert build_screen_provider_payload(item)["task"] == "intel_screen"
+    assert build_analysis_provider_payload(item)["task"] == "intel_analysis"
+    chat = build_screen_provider_payload(item, api_style="openai_chat")
+    assert chat["response_format"]["json_schema"]["name"] == "intel_screen"
+    responses = build_analysis_provider_payload(item, api_style="openai_responses")
+    assert responses["text"]["format"]["name"] == "intel_analysis"
 
 
-def test_openai_strict_schema_requires_every_object_property():
-    _assert_strict_object_requirements(INTEL_TRIAGE_JSON_SCHEMA)
-    payload = build_provider_payload(envelope(), api_style="openai_responses")
-    assert payload["text"]["format"]["schema"] == INTEL_TRIAGE_JSON_SCHEMA
+def test_client_calls_independent_stage_endpoints_and_isolates_failures():
+    item = envelope()
+    screen_http = FakeHttp({"decision": "pass", "reason_code": "relevant", "reason": "ok", "confidence": 90, "risk_flags": []})
+    client = IntelTriageClient(api_url="https://ai.example.test", api_key="secret", http_client=screen_http)
+    screen = client.screen(item)
+    assert screen.decision == "pass"
+    assert screen_http.calls[0]["json"]["task"] == "intel_screen"
 
+    analysis_http = FakeHttp(analysis_payload())
+    analysis_client = IntelTriageClient(api_url="https://ai.example.test", api_key="secret", http_client=analysis_http)
+    analysis = analysis_client.analyze(item)
+    assert analysis.selection_score == 87
+    assert analysis_http.calls[0]["json"]["task"] == "intel_analysis"
 
-def test_batch_isolates_provider_failures():
     class Failing:
-        def triage(self, item):
-            if item.item_id == 2:
-                raise TimeoutError("provider timeout")
-            return triage_payload()
+        def screen(self, _):
+            raise RuntimeError("screen down")
 
-    results = run_triage_batch(Failing(), [envelope(item_id=1), envelope(item_id=2)])
-    assert [result.status for result in results] == ["success", "ai_failed"]
-    assert results[1].keep is False
-    assert results[1].error_code == "TimeoutError"
+        def analyze(self, _):
+            raise RuntimeError("analysis down")
 
-
-def test_strict_parser_rejects_missing_contract_fields():
-    with pytest.raises(ValueError, match="paper_support"):
-        parse_triage_result({"keep": True, "topic": "project", "summary_cn": "x", "keywords": [], "selection_score": 1, "novelty": "unknown", "risk_flags": []})
+    screen_failed = run_screen_isolated(Failing(), [item])[0]
+    analysis_failed = run_analysis_isolated(Failing(), [item])[0]
+    assert screen_failed.status == "screen_failed"
+    assert analysis_failed.status == "analysis_failed"

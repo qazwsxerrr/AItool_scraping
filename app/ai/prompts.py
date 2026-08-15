@@ -1,4 +1,9 @@
-"""Prompt and provider payload builders for one-pass item analysis."""
+"""Prompt and provider payload builders for project summaries.
+
+Stage A/B payloads live in ``app.ai.skills.intel_triage.prompts`` so each
+stage has an independent schema and prompt.  This module retains only the
+unrelated GitHub/project summary transport helpers.
+"""
 
 from __future__ import annotations
 
@@ -139,33 +144,28 @@ __all__ = [
     "build_openai_chat_payload",
     "build_openai_responses_payload",
     "PROJECT_SUMMARY_TASK",
-    "INTEL_TRIAGE_JSON_SCHEMA",
-    "INTEL_TRIAGE_RESPONSE_SCHEMA",
-    "INTEL_TRIAGE_SYSTEM_PROMPT",
-    "INTEL_TRIAGE_TASK",
-    "build_generic_triage_payload",
-    "build_openai_chat_triage_payload",
-    "build_openai_responses_triage_payload",
-    "build_provider_payload",
-    "build_triage_payload",
 ]
 
 
-_TRIAGE_PROMPT_EXPORTS = {
-    "INTEL_TRIAGE_JSON_SCHEMA",
-    "INTEL_TRIAGE_RESPONSE_SCHEMA",
-    "INTEL_TRIAGE_SYSTEM_PROMPT",
-    "INTEL_TRIAGE_TASK",
-    "build_generic_triage_payload",
-    "build_openai_chat_triage_payload",
-    "build_openai_responses_triage_payload",
-    "build_provider_payload",
-    "build_triage_payload",
+_INTEL_STAGE_PROMPT_EXPORTS = {
+    "INTEL_ANALYSIS_JSON_SCHEMA",
+    "INTEL_ANALYSIS_RESPONSE_SCHEMA",
+    "INTEL_ANALYSIS_SYSTEM_PROMPT",
+    "INTEL_ANALYSIS_TASK",
+    "INTEL_SCREEN_JSON_SCHEMA",
+    "INTEL_SCREEN_RESPONSE_SCHEMA",
+    "INTEL_SCREEN_SYSTEM_PROMPT",
+    "INTEL_SCREEN_TASK",
+    "PAPER_SUPPORT_JSON_SCHEMA",
+    "build_analysis_payload",
+    "build_analysis_provider_payload",
+    "build_screen_payload",
+    "build_screen_provider_payload",
 }
 
 
 def __getattr__(name: str):
-    if name in _TRIAGE_PROMPT_EXPORTS:
+    if name in _INTEL_STAGE_PROMPT_EXPORTS:
         from app.ai.skills import intel_triage
 
         return getattr(intel_triage, name)
