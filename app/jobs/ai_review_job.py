@@ -128,7 +128,7 @@ def run_ai_review_job(
     A supplied limit is an explicit safety cap. The default None processes the
     whole selected scope; capped runs remain auditable as partial.
     """
-    del http_client, now, concurrency
+    del http_client, now
     explicit_cap = ai_limit is not None or limit is not None
     if ai_limit is not None:
         limit = ai_limit
@@ -169,6 +169,7 @@ def run_ai_review_job(
         content_class=content_class,
         force=force,
         screen_reject_threshold=screen_reject_threshold,
+        concurrency=concurrency,
     )
     effective_run_id = stage_a.run_id
     stage_b = run_stage_b_analysis_job(
@@ -182,6 +183,7 @@ def run_ai_review_job(
         force=force,
         item_ids=stage_a.item_ids,
         analysis_min_score=analysis_min_score,
+        concurrency=concurrency,
     )
     result.run_id = effective_run_id
     result.processed = stage_a.processed

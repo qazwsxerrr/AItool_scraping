@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -110,7 +111,7 @@ def run_stage_b_analysis_job(
 ) -> StageBAnalysisResult:
     """Run only persisted Stage-A eligible work for ``run_id``."""
 
-    del concurrency
+    max_workers = _bounded_concurrency(concurrency)
     if retry is not None:
         retry_failed = bool(retry)
     selected_limit = _normalise_limit(ai_limit if ai_limit is not None else limit)
@@ -218,6 +219,7 @@ def run_stage_b_analysis_job(
     result.item_ids = [context.item_id for context in contexts]
     result.processed = len(contexts)
 
+    claimed_contexts: list[tuple[_AnalysisContext, int]] = []
     for context in contexts:
         task_id = task_ids_by_item.get(context.item_id)
         if task_id is None:
@@ -231,14 +233,15 @@ def run_stage_b_analysis_job(
         ):
             result.skipped += 1
             continue
+        claimed_contexts.append((context, task_id))
 
-        analysis: AnalysisResult
-        failure: BaseException | None = None
-        try:
-            analysis = _call_analysis(ai_client, context.envelope)
-        except BaseException as exc:  # isolate each provider call
-            failure = exc
-            analysis = _analysis_failure(context.item_id, context.envelope, exc)
+    def persist_outcome(
+        context: _AnalysisContext,
+        task_id: int,
+        analysis: AnalysisResult,
+        failure: BaseException | None,
+    ) -> None:
+        """Persist one completed outcome on the coordinator thread."""
 
         if failure is not None or analysis.status == "analysis_failed":
             retryable, category, code, message = _classify_provider_failure(
@@ -264,7 +267,7 @@ def run_stage_b_analysis_job(
                 result.errors.append(f"intel_item_id={context.item_id}: {message}")
             else:
                 result.errors.append(f"intel_item_id={context.item_id}: analysis persistence failed")
-            continue
+            return
 
         try:
             guard_reason = analysis_guard_failure(analysis)
@@ -326,6 +329,17 @@ def run_stage_b_analysis_job(
             _mark_persistence_failure(session_factory, task_id, owner=owner, message=str(exc))
             LOGGER.exception("Stage B persistence failed for intel item %s", context.item_id)
 
+    if claimed_contexts:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="intel-stage-b") as executor:
+            futures = {
+                executor.submit(_analysis_provider_outcome, ai_client, context): (context, task_id)
+                for context, task_id in claimed_contexts
+            }
+            for future in as_completed(futures):
+                context, task_id = futures[future]
+                analysis, failure = future.result()
+                persist_outcome(context, task_id, analysis, failure)
+
     with session_factory() as session:
         repo = IntelRepository(session)
         stage = repo.get_stage(run_id, "analyze")
@@ -365,6 +379,18 @@ def _call_analysis(client: Any, envelope: RawIntelEnvelope) -> AnalysisResult:
     else:
         parsed = strict_parse_analysis(value, envelope=envelope)
     return apply_analysis_guards(parsed.with_item(envelope), envelope)
+
+
+def _analysis_provider_outcome(
+    client: Any,
+    context: _AnalysisContext,
+) -> tuple[AnalysisResult, BaseException | None]:
+    """Execute one provider call without touching SQLAlchemy state."""
+
+    try:
+        return _call_analysis(client, context.envelope), None
+    except BaseException as exc:  # isolate one provider failure from its batch
+        return _analysis_failure(context.item_id, context.envelope, exc), exc
 
 
 def _analysis_failure(item_id: int, envelope: RawIntelEnvelope, exc: BaseException) -> AnalysisResult:
@@ -491,6 +517,13 @@ def _bounded_score(value: Any, default: int) -> int:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError):
         return default
+
+
+def _bounded_concurrency(value: Any) -> int:
+    try:
+        return max(1, min(4, int(value)))
+    except (TypeError, ValueError):
+        return 4
 
 
 __all__ = [

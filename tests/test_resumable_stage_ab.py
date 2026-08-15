@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 from sqlalchemy import select
 
 from app.ai.skills.intel_triage import AnalysisResult, ScreenResult, preflight_intel_triage_schemas
@@ -7,6 +10,7 @@ from app.ai.skills.intel_triage.prompts import INTEL_ANALYSIS_JSON_SCHEMA
 from app.domain.models import FetchItem, SourceSpec
 from app.jobs.stage_a_screen_job import run_stage_a_screen_job
 from app.jobs.stage_b_analysis_job import run_stage_b_analysis_job
+from app.jobs.ai_review_job import run_ai_review_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import IntelItem, IntelRun, IntelRunStageTask
 from app.storage.repository import IntelRepository
@@ -223,6 +227,55 @@ def test_provider_retryable_and_blocked_failures_are_distinguished(tmp_path):
         stage = IntelRepository(session).get_stage(run_id, "screen")
         tasks = IntelRepository(session).list_stage_tasks(stage, subject_type="item")
         assert [task.status for task in tasks] == ["retry_waiting", "blocked"]
+
+
+def test_provider_concurrency_is_bounded_and_facade_forwards_limit(tmp_path):
+    class Concurrent(_Provider):
+        def __init__(self):
+            super().__init__()
+            self._lock = threading.Lock()
+            self._active = 0
+            self.max_active = 0
+
+        def _enter(self):
+            with self._lock:
+                self._active += 1
+                self.max_active = max(self.max_active, self._active)
+
+        def _exit(self):
+            with self._lock:
+                self._active -= 1
+
+        def screen(self, envelope):
+            self._enter()
+            try:
+                time.sleep(0.03)
+                return super().screen(envelope)
+            finally:
+                self._exit()
+
+        def analyze(self, envelope):
+            self._enter()
+            try:
+                time.sleep(0.03)
+                return super().analyze(envelope)
+            finally:
+                self._exit()
+
+    sf = _factory(tmp_path)
+    source, run_id = _run_with_items(sf, [f"item-{index}" for index in range(8)])
+    provider = Concurrent()
+    result = run_ai_review_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=run_id,
+        concurrency=2,
+    )
+
+    assert result.candidate == 8
+    assert provider.max_active > 1
+    assert provider.max_active <= 2
 
 
 def test_strict_schema_preflight_rejects_missing_aliases():

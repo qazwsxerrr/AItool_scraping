@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -101,7 +102,8 @@ def run_stage_a_screen_job(
     never creates or invokes a Stage B task/provider call.
     """
 
-    del concurrency, now  # kept in the public job contract for compatibility
+    del now  # kept in the public job contract for compatibility
+    max_workers = _bounded_concurrency(concurrency)
     if retry is not None:
         retry_failed = bool(retry)
     selected_limit = _normalise_limit(ai_limit if ai_limit is not None else limit)
@@ -176,9 +178,10 @@ def run_stage_a_screen_job(
             task_ids_by_item[context.item_id] = int(task.id)
         session.commit()
 
-    # Provider calls are intentionally outside SQLAlchemy sessions.  A task is
-    # claimed and committed first, then the provider is called, then the
-    # completed item is committed independently.
+    # Provider calls are intentionally outside SQLAlchemy sessions.  Claim all
+    # work first, run only the provider calls in bounded worker threads, and
+    # keep every projection/task commit on this coordinator thread.
+    claimed_contexts: list[tuple[_ItemContext, int]] = []
     for context in contexts:
         task_id = task_ids_by_item.get(context.item_id)
         if task_id is None:
@@ -197,17 +200,15 @@ def run_stage_a_screen_job(
             if _task_is_eligible(session_factory, task_id):
                 result.eligible_item_ids.append(context.item_id)
             continue
+        claimed_contexts.append((context, task_id))
 
-        screen: ScreenResult
-        failure: BaseException | None = None
-        if context.structural_error is not None:
-            screen = _structural_screen(context.item_id, context.structural_error)
-        else:
-            try:
-                screen = _call_screen(ai_client, context.envelope, reject_threshold=reject_threshold)
-            except BaseException as exc:  # provider failures are isolated per item
-                failure = exc
-                screen = _screen_failure(context.item_id, exc)
+    def persist_outcome(
+        context: _ItemContext,
+        task_id: int,
+        screen: ScreenResult,
+        failure: BaseException | None,
+    ) -> None:
+        """Persist one completed outcome on the coordinator thread."""
 
         if failure is not None or screen.status == "screen_failed":
             retryable, category, code, message = _classify_provider_failure(
@@ -232,7 +233,7 @@ def run_stage_a_screen_job(
                 result.errors.append(f"intel_item_id={context.item_id}: {message}")
             else:
                 result.errors.append(f"intel_item_id={context.item_id}: screen persistence failed")
-            continue
+            return
 
         try:
             with session_factory() as session:
@@ -270,6 +271,36 @@ def run_stage_a_screen_job(
             result.errors.append(f"intel_item_id={context.item_id}: screen persistence failed: {exc}")
             _mark_persistence_failure(session_factory, task_id, owner=owner, message=str(exc))
             LOGGER.exception("Stage A persistence failed for intel item %s", context.item_id)
+
+    for context, task_id in claimed_contexts:
+        if context.structural_error is not None:
+            persist_outcome(
+                context,
+                task_id,
+                _structural_screen(context.item_id, context.structural_error),
+                None,
+            )
+
+    provider_contexts = [
+        (context, task_id)
+        for context, task_id in claimed_contexts
+        if context.structural_error is None
+    ]
+    if provider_contexts:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="intel-stage-a") as executor:
+            futures = {
+                executor.submit(
+                    _screen_provider_outcome,
+                    ai_client,
+                    context,
+                    reject_threshold,
+                ): (context, task_id)
+                for context, task_id in provider_contexts
+            }
+            for future in as_completed(futures):
+                context, task_id = futures[future]
+                screen, failure = future.result()
+                persist_outcome(context, task_id, screen, failure)
 
     with session_factory() as session:
         repo = IntelRepository(session)
@@ -388,6 +419,19 @@ def _call_screen(client: Any, envelope: RawIntelEnvelope | None, *, reject_thres
     else:
         parsed = strict_parse_screen(value, envelope=envelope, reject_threshold=reject_threshold)
     return apply_screen_guard(parsed.with_item(envelope), envelope, reject_threshold=reject_threshold)
+
+
+def _screen_provider_outcome(
+    client: Any,
+    context: _ItemContext,
+    reject_threshold: int,
+) -> tuple[ScreenResult, BaseException | None]:
+    """Execute one provider call without touching SQLAlchemy state."""
+
+    try:
+        return _call_screen(client, context.envelope, reject_threshold=reject_threshold), None
+    except BaseException as exc:  # isolate one provider failure from its batch
+        return _screen_failure(context.item_id, exc), exc
 
 
 def _screen_failure(item_id: int, exc: BaseException) -> ScreenResult:
@@ -646,6 +690,13 @@ def _bounded_score(value: Any, default: int) -> int:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError):
         return default
+
+
+def _bounded_concurrency(value: Any) -> int:
+    try:
+        return max(1, min(4, int(value)))
+    except (TypeError, ValueError):
+        return 4
 
 
 def _normalise_limit(value: Any) -> int | None:
