@@ -5,12 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from uuid import uuid4
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.domain.models import SourceSpec
@@ -23,6 +24,9 @@ from app.storage.models import (
     IntelItem,
     IntelRun,
     IntelRunItem,
+    IntelRunStage,
+    IntelRunStageAttempt,
+    IntelRunStageTask,
     Source,
     FetchAttempt,
     utcnow,
@@ -70,6 +74,29 @@ class EventItemUpsertResult:
 class EventRankingSnapshotUpsertResult:
     snapshot: IntelEventRankingSnapshot
     created: bool
+
+
+@dataclass(frozen=True)
+class StageStateSummary:
+    """Small serializable summary used by status/CLI callers."""
+
+    stage_id: int
+    run_id: int
+    stage_name: str
+    status: str
+    total: int = 0
+    pending: int = 0
+    running: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    retry_waiting: int = 0
+    blocked: int = 0
+
+
+STAGE_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "blocked", "cancelled", "skipped"})
+STAGE_RETRYABLE_STATUSES = frozenset({"pending", "retry_waiting", "failed"})
+STAGE_RUNNING_STATUSES = frozenset({"running", "in_progress"})
+TASK_REUSABLE_STATUS = "succeeded"
 
 
 class IntelRepository:
@@ -196,20 +223,81 @@ class IntelRepository:
         scope: Mapping[str, Any] | None = None,
         run_type: str = "run_once",
         source_ids: Iterable[str] | None = None,
+        reference_time: datetime | None = None,
     ) -> IntelRun:
         """Create a durable run and its explicit processing scope."""
 
         source_values = _unique_strings(source_ids or ())
+        scope_values = dict(scope or {})
+        # ``reference_time`` is run-frozen metadata.  An explicit argument
+        # wins over a caller-supplied scope value; otherwise preserve a valid
+        # value already present in the initial scope, then fall back to now.
+        reference = _as_utc(reference_time) or _as_utc(scope_values.get("reference_time")) or utcnow()
+        scope_values["reference_time"] = reference.isoformat()
         run = IntelRun(
             status="running",
             run_type=_text(run_type) or "run_once",
             filters_json=_dump_json(dict(filters or {})),
-            scope_json=_dump_json(dict(scope or {})),
+            scope_json=_dump_json(scope_values),
             source_ids_json=_dump_json(source_values),
         )
         self.session.add(run)
         self.session.flush()
         return run
+
+    def freeze_run_scope(
+        self,
+        run_id: int,
+        *,
+        source_ids: Iterable[str] | None = None,
+        item_ids: Iterable[int] | None = None,
+        scope: Mapping[str, Any] | None = None,
+        frozen_at: datetime | None = None,
+    ) -> IntelRun | None:
+        """Freeze fetch membership before any resumable processing stage.
+
+        The marker lives in the legacy JSON scope so this operation remains
+        additive: no ALTER/backfill is needed for existing databases.  A
+        frozen run may still update ``IntelRunItem.status`` projections, but
+        cannot gain new source/item membership.
+        """
+
+        run = self.session.get(IntelRun, int(run_id))
+        if run is None:
+            return None
+        if run.scope_frozen:
+            # Idempotent re-entry is safe only when no caller asks to mutate
+            # the already-frozen membership or reserved metadata.
+            if source_ids is not None or item_ids is not None or scope:
+                raise RuntimeError(f"intel run {run_id} scope is already frozen")
+            return run
+        if source_ids is not None:
+            run.source_ids_json = _dump_json(_unique_strings(source_ids))
+        elif not run.source_ids:
+            scoped_sources = self.session.scalars(
+                select(IntelRunItem.source_id).where(
+                    IntelRunItem.run_id == run.id,
+                    IntelRunItem.source_id.is_not(None),
+                )
+            ).all()
+            run.source_ids_json = _dump_json(_unique_strings(scoped_sources))
+        if item_ids is not None:
+            run.item_ids_json = _dump_json(_unique_ints(item_ids))
+        elif not run.item_ids:
+            run.item_ids_json = _dump_json(self.list_run_item_ids(run.id))
+        values = run.scope
+        if scope:
+            values.update(dict(scope))
+        current = _as_utc(frozen_at) or utcnow()
+        values["_frozen"] = True
+        values["_frozen_at"] = current.isoformat()
+        # Preserve the run reference even if an old row did not have it.
+        values.setdefault("reference_time", (_as_utc(run.started_at) or current).isoformat())
+        run.scope_json = _dump_json(values)
+        self.session.flush()
+        return run
+
+    freeze_scope = freeze_run_scope
 
     def set_run_scope(
         self,
@@ -222,6 +310,8 @@ class IntelRepository:
         run = self.session.get(IntelRun, int(run_id))
         if run is None:
             return None
+        if run.scope_frozen and (source_ids is not None or item_ids is not None or scope):
+            raise RuntimeError(f"intel run {run_id} scope is already frozen")
         if source_ids is not None:
             run.source_ids_json = _dump_json(_unique_strings(source_ids))
         if item_ids is not None:
@@ -261,6 +351,8 @@ class IntelRepository:
             )
         )
         if relation is None:
+            if run.scope_frozen:
+                raise RuntimeError(f"intel run {run_id} scope is already frozen")
             relation = IntelRunItem(run_id=int(run_id), item_id=int(item_id))
             self.session.add(relation)
         relation.source_id = source_id or relation.source_id or item.source_id
@@ -1289,6 +1381,1211 @@ class IntelRepository:
         self.session.flush()
         return len(rows)
 
+    # ------------------------------------------------------------------
+    # Durable resumable run/stage/task/attempt state
+    # ------------------------------------------------------------------
+
+    def ensure_stage(
+        self,
+        run_id: int,
+        stage_name: str | None = None,
+        *,
+        stage: str | None = None,
+        status: str = "pending",
+        input_fingerprint: str | None = None,
+        config_fingerprint: str | None = None,
+        reference_time: datetime | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        force: bool = False,
+    ) -> IntelRunStage:
+        """Create or idempotently refresh one run-stage row.
+
+        Fingerprint changes invalidate previously successful work but retain
+        all immutable attempts for audit.  ``force`` is deliberately scoped to
+        this stage and never cascades to another stage.
+        """
+
+        run = self.session.get(IntelRun, int(run_id))
+        if run is None:
+            raise ValueError(f"intel run {run_id} does not exist")
+        name = _text(stage_name or stage)
+        if not name:
+            raise ValueError("stage_name is required")
+        row = self.session.scalar(
+            select(IntelRunStage).where(
+                IntelRunStage.run_id == int(run_id), IntelRunStage.stage_name == name
+            )
+        )
+        created = row is None
+        if row is None:
+            row = IntelRunStage(run_id=int(run_id), stage_name=name, status=status or "pending")
+            self.session.add(row)
+        old_input = row.input_fingerprint
+        old_config = row.config_fingerprint
+        if input_fingerprint is not None:
+            row.input_fingerprint = _text(input_fingerprint)
+        if config_fingerprint is not None:
+            row.config_fingerprint = _text(config_fingerprint)
+        run_reference = run.reference_time or _as_utc(run.started_at)
+        requested_reference = _as_utc(reference_time)
+        if run.reference_time is not None and requested_reference is not None and requested_reference != run_reference:
+            raise ValueError(
+                f"intel run {run_id} reference_time is frozen at {run_reference.isoformat()}"
+            )
+        if run.reference_time is None and requested_reference is not None:
+            run.reference_time = requested_reference
+            run_reference = requested_reference
+        if row.reference_time is None:
+            row.reference_time = run_reference
+        if metadata is not None:
+            existing = _load_json(row.metadata_json, {})
+            row.metadata_json = _dump_json(
+                {**(dict(existing) if isinstance(existing, Mapping) else {}), **dict(metadata)}
+            )
+        fingerprint_changed = (
+            not created
+            and ((input_fingerprint is not None and old_input != row.input_fingerprint)
+                 or (config_fingerprint is not None and old_config != row.config_fingerprint))
+        )
+        if fingerprint_changed or force:
+            self._reset_stage_tasks(row.id, include_succeeded=force or fingerprint_changed)
+            row.status = status or "pending"
+            row.finished_at = None
+            row.next_retry_at = None
+            row.error_category = None
+            row.error_code = None
+            row.error_message = None
+        row.updated_at = utcnow()
+        self.session.flush()
+        return row
+
+    create_stage = ensure_stage
+    upsert_stage = ensure_stage
+    get_or_create_stage = ensure_stage
+
+    def get_stage(self, run_id: int, stage_name: str) -> IntelRunStage | None:
+        return self.session.scalar(
+            select(IntelRunStage).where(
+                IntelRunStage.run_id == int(run_id), IntelRunStage.stage_name == str(stage_name)
+            )
+        )
+
+    get_run_stage = get_stage
+
+    def get_stage_by_id(self, stage_id: int) -> IntelRunStage | None:
+        return self.session.get(IntelRunStage, int(stage_id))
+
+    def list_stages(self, run_id: int, *, statuses: Iterable[str] | None = None) -> list[IntelRunStage]:
+        stmt = select(IntelRunStage).where(IntelRunStage.run_id == int(run_id)).order_by(IntelRunStage.id.asc())
+        if statuses:
+            stmt = stmt.where(IntelRunStage.status.in_(list(statuses)))
+        return list(self.session.scalars(stmt).all())
+
+    list_run_stages = list_stages
+
+    def start_stage(
+        self,
+        run_id: int,
+        stage_name: str | None = None,
+        *,
+        stage: str | None = None,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+        **kwargs: Any,
+    ) -> IntelRunStage | None:
+        """Start a stage and acquire its single-stage execution lease."""
+
+        stage_row = self.ensure_stage(run_id, stage_name, stage=stage, **kwargs)
+        return self.acquire_stage_lease(
+            stage_row,
+            owner=owner or lease_owner,
+            lease_seconds=lease_seconds,
+            now=now,
+        )
+
+    def acquire_stage_lease(
+        self,
+        stage: IntelRunStage | int,
+        *,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+        worker_id: str | None = None,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> IntelRunStage | None:
+        """Acquire/renew a stage lease; return ``None`` on ownership conflict."""
+
+        row = self._coerce_stage(stage)
+        if row is None:
+            return None
+        current = _as_utc(now) or utcnow()
+        owner_value = _text(owner or lease_owner or worker_id) or f"worker-{uuid4().hex}"
+        active = bool(row.lease_owner and row.lease_expires_at and _as_utc(row.lease_expires_at) > current)
+        if active and row.lease_owner != owner_value:
+            return None
+        prior_status = row.status
+        lease_was_expired = bool(
+            row.lease_expires_at is not None and _as_utc(row.lease_expires_at) <= current
+        )
+        row.lease_owner = owner_value
+        row.lease_expires_at = current + timedelta(seconds=max(1, int(lease_seconds)))
+        row.heartbeat_at = current
+        if row.status not in STAGE_RUNNING_STATUSES or lease_was_expired:
+            row.status = "running"
+            row.started_at = row.started_at or current
+            row.attempt_count = int(row.attempt_count or 0) + 1
+            if prior_status in {"succeeded", "failed", "blocked", "cancelled", "skipped"}:
+                row.finished_at = None
+        row.updated_at = current
+        self.session.flush()
+        return row
+
+    claim_stage_lease = acquire_stage_lease
+
+    def heartbeat_stage(
+        self,
+        stage: IntelRunStage | int,
+        *,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> IntelRunStage | None:
+        row = self._coerce_stage(stage)
+        if row is None:
+            return None
+        current = _as_utc(now) or utcnow()
+        expected_owner = _text(owner or lease_owner)
+        if expected_owner and row.lease_owner != expected_owner:
+            return None
+        if row.lease_expires_at is not None and _as_utc(row.lease_expires_at) <= current:
+            return None
+        row.heartbeat_at = current
+        row.lease_expires_at = current + timedelta(seconds=max(1, int(lease_seconds)))
+        row.updated_at = current
+        self.session.flush()
+        return row
+
+    def release_stage_lease(
+        self,
+        stage: IntelRunStage | int,
+        *,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+        status: str | None = None,
+    ) -> IntelRunStage | None:
+        row = self._coerce_stage(stage)
+        if row is None:
+            return None
+        expected_owner = _text(owner or lease_owner)
+        if expected_owner and row.lease_owner not in {None, expected_owner}:
+            return None
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.heartbeat_at = None
+        if status:
+            row.status = _text(status) or row.status
+        row.updated_at = utcnow()
+        self.session.flush()
+        return row
+
+    def finish_stage(
+        self,
+        stage: IntelRunStage | int,
+        *,
+        status: str = "succeeded",
+        result_ref: Any | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        error_category: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+    ) -> IntelRunStage | None:
+        row = self._coerce_stage(stage)
+        if row is None:
+            return None
+        expected_owner = _text(owner or lease_owner)
+        if expected_owner and row.lease_owner not in {None, expected_owner}:
+            return None
+        row.status = _text(status) or "succeeded"
+        row.finished_at = utcnow()
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.heartbeat_at = None
+        if result_ref is not None:
+            row.result_ref_json = _dump_json(_structured_json(result_ref))
+        if metadata is not None:
+            row.metadata_json = _dump_json(dict(metadata))
+        row.error_category = _text(error_category)
+        row.error_code = _text(error_code)
+        row.error_message = _text(error_message)
+        row.updated_at = utcnow()
+        self.session.flush()
+        return row
+
+    complete_stage = finish_stage
+
+    def ensure_stage_task(
+        self,
+        stage: IntelRunStage | int | None = None,
+        *,
+        stage_id: int | None = None,
+        subject_type: str = "item",
+        subject_id: Any | None = None,
+        subject: Any | None = None,
+        subject_key: Any | None = None,
+        input_fingerprint: str | None = None,
+        config_fingerprint: str | None = None,
+        item_id: int | None = None,
+        event_id: int | None = None,
+        target_run_id: int | None = None,
+        status: str = "pending",
+        result_ref: Any | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        force: bool = False,
+    ) -> IntelRunStageTask:
+        stage_row = self._coerce_stage(stage if stage is not None else stage_id)
+        if stage_row is None:
+            raise ValueError(f"intel run stage {stage!r} does not exist")
+        kind = _normalize_subject_type(subject_type)
+        subject_value = _text(subject_id if subject_id is not None else (subject if subject is not None else subject_key))
+        if not subject_value:
+            if kind == "item" and item_id is not None:
+                subject_value = str(int(item_id))
+            elif kind == "event" and event_id is not None:
+                subject_value = str(int(event_id))
+            elif kind == "run" and target_run_id is not None:
+                subject_value = str(int(target_run_id))
+        if not subject_value:
+            raise ValueError("subject_id is required")
+        resolved_item_id = item_id
+        if kind == "item" and resolved_item_id is None and subject_value.isdigit():
+            resolved_item_id = int(subject_value)
+        if kind == "item" and resolved_item_id is not None:
+            item = self.session.get(IntelItem, int(resolved_item_id))
+            if item is not None:
+                in_scope = self.session.scalar(
+                    select(IntelRunItem.id).where(
+                        IntelRunItem.run_id == stage_row.run_id,
+                        IntelRunItem.item_id == int(resolved_item_id),
+                    )
+                )
+                if in_scope is None:
+                    raise ValueError(
+                        f"item {resolved_item_id} is not attached to intel run {stage_row.run_id}"
+                    )
+        task = self.session.scalar(
+            select(IntelRunStageTask).where(
+                IntelRunStageTask.stage_id == stage_row.id,
+                IntelRunStageTask.subject_type == kind,
+                IntelRunStageTask.subject_id == subject_value,
+            )
+        )
+        created = task is None
+        if task is None:
+            task = IntelRunStageTask(
+                stage_id=stage_row.id,
+                subject_type=kind,
+                subject_id=subject_value,
+                status=status or "pending",
+            )
+            self.session.add(task)
+        changed = (
+            (input_fingerprint is not None and task.input_fingerprint not in {None, input_fingerprint})
+            or (config_fingerprint is not None and task.config_fingerprint not in {None, config_fingerprint})
+        )
+        if input_fingerprint is not None:
+            task.input_fingerprint = _text(input_fingerprint)
+        if config_fingerprint is not None:
+            task.config_fingerprint = _text(config_fingerprint)
+        task.item_id = resolved_item_id if resolved_item_id is not None else task.item_id
+        task.event_id = event_id if event_id is not None else task.event_id
+        task.target_run_id = target_run_id if target_run_id is not None else task.target_run_id
+        if kind == "item" and task.item_id is None and subject_value.isdigit():
+            task.item_id = int(subject_value)
+        elif kind == "event" and task.event_id is None and subject_value.isdigit():
+            task.event_id = int(subject_value)
+        elif kind == "run" and task.target_run_id is None and subject_value.isdigit():
+            task.target_run_id = int(subject_value)
+        if changed or force:
+            self._reset_task(task, include_succeeded=True)
+            task.status = status or "pending"
+        if result_ref is not None:
+            task.result_ref_json = _dump_json(_structured_json(result_ref))
+        if metadata is not None:
+            # Task metadata is represented by result JSON for the compact
+            # schema; callers still get a stable JSON reference.
+            current = _load_json(task.result_json, {})
+            task.result_json = _dump_json(
+                {**(dict(current) if isinstance(current, Mapping) else {}), "metadata": dict(metadata)}
+            )
+        if created:
+            task.updated_at = utcnow()
+        self.session.flush()
+        return task
+
+    create_stage_task = ensure_stage_task
+    upsert_stage_task = ensure_stage_task
+    create_task = ensure_stage_task
+    upsert_task = ensure_stage_task
+    get_or_create_stage_task = ensure_stage_task
+
+    def get_stage_task(self, task_id: int | IntelRunStageTask) -> IntelRunStageTask | None:
+        if isinstance(task_id, IntelRunStageTask):
+            return task_id
+        try:
+            return self.session.get(IntelRunStageTask, int(task_id))
+        except (TypeError, ValueError):
+            return None
+
+    def get_task(
+        self,
+        stage: IntelRunStage | int,
+        *,
+        subject_type: str = "item",
+        subject_id: Any,
+    ) -> IntelRunStageTask | None:
+        stage_row = self._coerce_stage(stage)
+        if stage_row is None:
+            return None
+        return self.session.scalar(
+            select(IntelRunStageTask).where(
+                IntelRunStageTask.stage_id == stage_row.id,
+                IntelRunStageTask.subject_type == _normalize_subject_type(subject_type),
+                IntelRunStageTask.subject_id == str(subject_id),
+            )
+        )
+
+    def list_stage_tasks(
+        self,
+        stage: IntelRunStage | int | None = None,
+        *,
+        stage_id: int | None = None,
+        statuses: Iterable[str] | None = None,
+        subject_type: str | None = None,
+        input_fingerprint: str | None = None,
+        config_fingerprint: str | None = None,
+        reusable_only: bool = False,
+        include_expired: bool = False,
+        limit: int | None = None,
+    ) -> list[IntelRunStageTask]:
+        stage_row = self._coerce_stage(stage if stage is not None else stage_id)
+        if stage_row is None:
+            return []
+        stmt = select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage_row.id).order_by(IntelRunStageTask.id.asc())
+        if statuses:
+            stmt = stmt.where(IntelRunStageTask.status.in_(list(statuses)))
+        if subject_type:
+            stmt = stmt.where(IntelRunStageTask.subject_type == _normalize_subject_type(subject_type))
+        if input_fingerprint is not None:
+            stmt = stmt.where(IntelRunStageTask.input_fingerprint == str(input_fingerprint))
+        if config_fingerprint is not None:
+            stmt = stmt.where(IntelRunStageTask.config_fingerprint == str(config_fingerprint))
+        if reusable_only:
+            stmt = stmt.where(IntelRunStageTask.status == TASK_REUSABLE_STATUS)
+        if not include_expired:
+            # Expired running tasks are intentionally hidden from normal query
+            # callers; ``recover_expired_stage_tasks`` exposes them explicitly.
+            stmt = stmt.where(
+                or_(
+                    IntelRunStageTask.status != "running",
+                    IntelRunStageTask.lease_expires_at.is_(None),
+                    IntelRunStageTask.lease_expires_at > utcnow(),
+                )
+            )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    list_pending_tasks = list_stage_tasks
+    list_tasks = list_stage_tasks
+    list_recoverable_tasks = list_stage_tasks
+
+    def task_is_reusable(
+        self,
+        task: IntelRunStageTask | int,
+        *,
+        input_fingerprint: str | None = None,
+        config_fingerprint: str | None = None,
+    ) -> bool:
+        row = self.get_stage_task(task) if isinstance(task, (int, str)) else task
+        if row is None or row.status != TASK_REUSABLE_STATUS:
+            return False
+        if input_fingerprint is not None and row.input_fingerprint != str(input_fingerprint):
+            return False
+        if config_fingerprint is not None and row.config_fingerprint != str(config_fingerprint):
+            return False
+        return True
+
+    is_task_reusable = task_is_reusable
+
+    def claim_stage_task(
+        self,
+        stage: IntelRunStage | int | None = None,
+        *,
+        stage_id: int | None = None,
+        task_id: int | None = None,
+        subject_type: str = "item",
+        subject_id: Any | None = None,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+        worker_id: str | None = None,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+        input_fingerprint: str | None = None,
+        config_fingerprint: str | None = None,
+        force: bool = False,
+        acquire_stage: bool = True,
+    ) -> IntelRunStageTask | None:
+        """Atomically claim one pending/retryable task and create an attempt."""
+
+        stage_row = self._coerce_stage(stage if stage is not None else stage_id)
+        if stage_row is None:
+            return None
+        current = _as_utc(now) or utcnow()
+        owner_value = _text(owner or lease_owner or worker_id) or f"worker-{uuid4().hex}"
+        if task_id is not None:
+            task = self.session.get(IntelRunStageTask, int(task_id))
+            if task is None or task.stage_id != stage_row.id:
+                return None
+        else:
+            if subject_id is None:
+                return None
+            task = self.get_task(stage_row, subject_type=subject_type, subject_id=subject_id)
+            if task is None:
+                return None
+
+        # A successful projection is reusable only under the same input and
+        # stage-contract fingerprints.  A changed fingerprint (or explicit
+        # stage-scoped force) resets this task while retaining prior attempts.
+        reusable = self.task_is_reusable(
+            task, input_fingerprint=input_fingerprint, config_fingerprint=config_fingerprint
+        )
+        if task.status == "succeeded" and not force and reusable:
+            return None
+        if force and task.status in {"succeeded", "blocked", "cancelled", "skipped"}:
+            self._reset_task(task, include_succeeded=True)
+        elif task.status == "succeeded" and not reusable:
+            self._reset_task(task, include_succeeded=True)
+        expired = task.status == "running" and (
+            task.lease_expires_at is None or _as_utc(task.lease_expires_at) <= current
+        )
+        if task.status == "running" and not expired:
+            return None
+        if expired:
+            previous_attempt = self._current_attempt(task)
+            if previous_attempt is not None and previous_attempt.status == "running":
+                self._finish_attempt_row(
+                    previous_attempt,
+                    status="retry_waiting",
+                    finished_at=current,
+                    retryable=True,
+                    next_retry_at=current,
+                    error_category="lease_expired",
+                    error_code="lease_expired",
+                    error_message="task lease expired before completion",
+                )
+        due = task.next_retry_at is None or _as_utc(task.next_retry_at) <= current
+        eligible = task.status in {"pending", "retry_waiting", "failed"} and due
+        if not eligible and not expired:
+            return None
+        if acquire_stage and self.acquire_stage_lease(
+            stage_row, owner=owner_value, lease_seconds=lease_seconds, now=current
+        ) is None:
+            return None
+        task.status = "running"
+        task.lease_owner = owner_value
+        task.lease_expires_at = current + timedelta(seconds=max(1, int(lease_seconds)))
+        task.heartbeat_at = current
+        task.next_retry_at = None
+        task.attempt_count = int(task.attempt_count or 0) + 1
+        if input_fingerprint is not None:
+            task.input_fingerprint = str(input_fingerprint)
+        if config_fingerprint is not None:
+            task.config_fingerprint = str(config_fingerprint)
+        task.error_category = None
+        task.error_code = None
+        task.error_message = None
+        task.updated_at = current
+        self.session.flush()
+        attempt = IntelRunStageAttempt(
+            task_id=task.id,
+            attempt_no=task.attempt_count,
+            status="running",
+            started_at=current,
+            lease_owner=owner_value,
+            lease_expires_at=task.lease_expires_at,
+            heartbeat_at=current,
+            input_fingerprint=task.input_fingerprint,
+            config_fingerprint=task.config_fingerprint,
+        )
+        self.session.add(attempt)
+        self.session.flush()
+        task.last_attempt_id = attempt.id
+        self.session.flush()
+        return task
+
+    claim_task = claim_stage_task
+    claim_recoverable_task = claim_stage_task
+
+    def claim_stage_tasks(
+        self,
+        stage: IntelRunStage | int | None = None,
+        *,
+        stage_id: int | None = None,
+        limit: int = 1,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+        worker_id: str | None = None,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+        statuses: Iterable[str] | None = None,
+        force: bool = False,
+        input_fingerprint: str | None = None,
+        config_fingerprint: str | None = None,
+    ) -> list[IntelRunStageTask]:
+        stage_row = self._coerce_stage(stage if stage is not None else stage_id)
+        if stage_row is None or int(limit) <= 0:
+            return []
+        current = _as_utc(now) or utcnow()
+        owner_value = _text(owner or lease_owner or worker_id) or f"worker-{uuid4().hex}"
+        if self.acquire_stage_lease(stage_row, owner=owner_value, lease_seconds=lease_seconds, now=current) is None:
+            return []
+        allowed = list(statuses) if statuses else ["pending", "retry_waiting", "failed", "running"]
+        stmt = select(IntelRunStageTask).where(
+            IntelRunStageTask.stage_id == stage_row.id,
+            IntelRunStageTask.status.in_(allowed),
+        ).order_by(IntelRunStageTask.id.asc())
+        candidates = list(self.session.scalars(stmt).all())
+        claimed: list[IntelRunStageTask] = []
+        for task in candidates:
+            if len(claimed) >= int(limit):
+                break
+            row = self.claim_stage_task(
+                stage_row,
+                task_id=task.id,
+                owner=owner_value,
+                lease_seconds=lease_seconds,
+                now=current,
+                force=force,
+                input_fingerprint=input_fingerprint,
+                config_fingerprint=config_fingerprint,
+                acquire_stage=False,
+            )
+            if row is not None:
+                claimed.append(row)
+        return claimed
+
+    claim_tasks = claim_stage_tasks
+    claim_recoverable_tasks = claim_stage_tasks
+
+    def heartbeat_stage_task(
+        self,
+        task: IntelRunStageTask | int,
+        *,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> IntelRunStageTask | None:
+        row = self.get_stage_task(task) if isinstance(task, (int, str)) else task
+        if row is None:
+            return None
+        current = _as_utc(now) or utcnow()
+        expected_owner = _text(owner or lease_owner)
+        if row.status != "running" or (expected_owner and row.lease_owner != expected_owner):
+            return None
+        if row.lease_expires_at is not None and _as_utc(row.lease_expires_at) <= current:
+            return None
+        row.heartbeat_at = current
+        row.lease_expires_at = current + timedelta(seconds=max(1, int(lease_seconds)))
+        attempt = self._current_attempt(row)
+        if attempt is not None:
+            attempt.heartbeat_at = current
+            attempt.lease_expires_at = row.lease_expires_at
+        row.updated_at = current
+        self.session.flush()
+        return row
+
+    heartbeat_task = heartbeat_stage_task
+    touch_task_lease = heartbeat_stage_task
+
+    def complete_stage_task(
+        self,
+        task: IntelRunStageTask | int,
+        *,
+        result_ref: Any | None = None,
+        result: Any | None = None,
+        raw_response: Any | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+        status: str = "succeeded",
+        now: datetime | None = None,
+    ) -> IntelRunStageTask | None:
+        row = self.get_stage_task(task) if isinstance(task, (int, str)) else task
+        if row is None:
+            return None
+        expected_owner = _text(owner or lease_owner)
+        if expected_owner and row.lease_owner not in {None, expected_owner}:
+            return None
+        current = _as_utc(now) or utcnow()
+        if (
+            row.status == "running"
+            and row.lease_expires_at is not None
+            and _as_utc(row.lease_expires_at) <= current
+        ):
+            return None
+        attempt = self._current_attempt(row)
+        if attempt is not None:
+            self._finish_attempt_row(
+                attempt,
+                status=_text(status) or "succeeded",
+                finished_at=current,
+                result_ref=result_ref,
+                raw_response=raw_response,
+                metadata=metadata,
+            )
+        row.status = _text(status) or "succeeded"
+        if result_ref is not None:
+            row.result_ref_json = _dump_json(_structured_json(result_ref))
+        if result is not None:
+            row.result_json = _dump_json(_structured_json(result))
+        elif metadata is not None:
+            current_result = _load_json(row.result_json, {})
+            row.result_json = _dump_json(
+                {**(dict(current_result) if isinstance(current_result, Mapping) else {}), "metadata": dict(metadata)}
+            )
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.heartbeat_at = None
+        row.next_retry_at = None
+        row.error_category = None
+        row.error_code = None
+        row.error_message = None
+        row.updated_at = current
+        self.session.flush()
+        self.refresh_stage_status(row.stage_id, now=current)
+        return row
+
+    finish_stage_task = complete_stage_task
+    complete_task = complete_stage_task
+    record_task_success = complete_stage_task
+
+    def fail_stage_task(
+        self,
+        task: IntelRunStageTask | int,
+        *,
+        error_category: str | None = None,
+        category: str | None = None,
+        error_code: str | None = None,
+        code: str | None = None,
+        error_message: str | None = None,
+        message: str | None = None,
+        retryable: bool | None = None,
+        retry_after_seconds: int | float | None = None,
+        next_retry_at: datetime | None = None,
+        raw_response: Any | None = None,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+        now: datetime | None = None,
+    ) -> IntelRunStageTask | None:
+        row = self.get_stage_task(task) if isinstance(task, (int, str)) else task
+        if row is None:
+            return None
+        expected_owner = _text(owner or lease_owner)
+        if expected_owner and row.lease_owner not in {None, expected_owner}:
+            return None
+        current = _as_utc(now) or utcnow()
+        if (
+            row.status == "running"
+            and row.lease_expires_at is not None
+            and _as_utc(row.lease_expires_at) <= current
+        ):
+            return None
+        category_value = _text(error_category or category) or "provider"
+        code_value = _text(error_code or code)
+        message_value = _text(error_message or message)
+        if retryable is None:
+            retryable = _retryable_stage_error(category_value, code_value, message_value)
+        due = _as_utc(next_retry_at)
+        if due is None and retryable:
+            delay = max(0.0, float(retry_after_seconds or 0.0))
+            due = current + timedelta(seconds=delay) if delay else current
+        attempt = self._current_attempt(row)
+        if attempt is not None and attempt.status == "running":
+            self._finish_attempt_row(
+                attempt,
+                status="retry_waiting" if retryable else "blocked",
+                finished_at=current,
+                retryable=bool(retryable),
+                next_retry_at=due,
+                error_category=category_value,
+                error_code=code_value,
+                error_message=message_value,
+                raw_response=raw_response,
+            )
+        row.status = "retry_waiting" if retryable else "blocked"
+        row.next_retry_at = due
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.heartbeat_at = None
+        row.error_category = category_value
+        row.error_code = code_value
+        row.error_message = message_value[:4000] if message_value else None
+        row.updated_at = current
+        self.session.flush()
+        self.refresh_stage_status(row.stage_id, now=current)
+        return row
+
+    mark_task_failed = fail_stage_task
+    fail_task = fail_stage_task
+    record_task_failure = fail_stage_task
+
+    def start_stage_attempt(
+        self,
+        task: IntelRunStageTask | int,
+        *,
+        owner: str | None = None,
+        lease_owner: str | None = None,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> IntelRunStageAttempt | None:
+        row = self.get_stage_task(task) if isinstance(task, (int, str)) else task
+        if row is None:
+            return None
+        current = _as_utc(now) or utcnow()
+        row.attempt_count = int(row.attempt_count or 0) + 1
+        row.status = "running"
+        row.lease_owner = _text(owner or lease_owner)
+        row.lease_expires_at = current + timedelta(seconds=max(1, int(lease_seconds)))
+        row.heartbeat_at = current
+        attempt = IntelRunStageAttempt(
+            task_id=row.id,
+            attempt_no=row.attempt_count,
+            status="running",
+            started_at=current,
+            lease_owner=row.lease_owner,
+            lease_expires_at=row.lease_expires_at,
+            heartbeat_at=current,
+            input_fingerprint=row.input_fingerprint,
+            config_fingerprint=row.config_fingerprint,
+        )
+        self.session.add(attempt)
+        self.session.flush()
+        row.last_attempt_id = attempt.id
+        self.session.flush()
+        return attempt
+
+    create_stage_attempt = start_stage_attempt
+
+    def finish_stage_attempt(
+        self,
+        attempt: IntelRunStageAttempt | int,
+        *,
+        status: str = "succeeded",
+        result_ref: Any | None = None,
+        raw_response: Any | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        error_category: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        retryable: bool = False,
+        next_retry_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> IntelRunStageAttempt | None:
+        row = self.session.get(IntelRunStageAttempt, int(attempt)) if isinstance(attempt, (int, str)) else attempt
+        if row is None:
+            return None
+        self._finish_attempt_row(
+            row,
+            status=_text(status) or "succeeded",
+            finished_at=_as_utc(now) or utcnow(),
+            result_ref=result_ref,
+            raw_response=raw_response,
+            metadata=metadata,
+            error_category=error_category,
+            error_code=error_code,
+            error_message=error_message,
+            retryable=retryable,
+            next_retry_at=_as_utc(next_retry_at),
+        )
+        self.session.flush()
+        return row
+
+    complete_stage_attempt = finish_stage_attempt
+
+    def list_stage_attempts(self, task: IntelRunStageTask | int, *, limit: int | None = None) -> list[IntelRunStageAttempt]:
+        task_id = int(task.id if isinstance(task, IntelRunStageTask) else task)
+        stmt = select(IntelRunStageAttempt).where(IntelRunStageAttempt.task_id == task_id).order_by(IntelRunStageAttempt.attempt_no.asc())
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def recover_expired_stage_tasks(
+        self,
+        stage: IntelRunStage | int | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> list[IntelRunStageTask]:
+        """Make expired leases retryable without deleting their audit rows."""
+
+        current = _as_utc(now) or utcnow()
+        stage_id = self._stage_id(stage) if stage is not None else None
+        stmt = select(IntelRunStageTask).where(
+            IntelRunStageTask.status == "running",
+            IntelRunStageTask.lease_expires_at.is_not(None),
+            IntelRunStageTask.lease_expires_at <= current,
+        )
+        if stage_id is not None:
+            stmt = stmt.where(IntelRunStageTask.stage_id == stage_id)
+        rows = list(self.session.scalars(stmt).all())
+        for row in rows:
+            attempt = self._current_attempt(row)
+            if attempt is not None and attempt.status == "running":
+                self._finish_attempt_row(
+                    attempt,
+                    status="retry_waiting",
+                    finished_at=current,
+                    retryable=True,
+                    next_retry_at=current,
+                    error_category="lease_expired",
+                    error_code="lease_expired",
+                    error_message="task lease expired before completion",
+                )
+            row.status = "retry_waiting"
+            row.next_retry_at = current
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.heartbeat_at = None
+            row.error_category = "lease_expired"
+            row.error_code = "lease_expired"
+            row.error_message = "task lease expired before completion"
+            row.updated_at = current
+        if rows:
+            self.session.flush()
+            touched_stage_ids = {row.stage_id for row in rows}
+            for touched_stage_id in touched_stage_ids:
+                self.refresh_stage_status(touched_stage_id, now=current)
+        return rows
+
+    recover_expired_tasks = recover_expired_stage_tasks
+
+    def retry_failed(
+        self,
+        stage: IntelRunStage | int,
+        *,
+        include_blocked: bool = False,
+        task_ids: Iterable[int] | None = None,
+        now: datetime | None = None,
+        reset_attempt_count: bool = False,
+    ) -> list[IntelRunStageTask]:
+        stage_row = self._coerce_stage(stage)
+        if stage_row is None:
+            return []
+        statuses = {"failed", "retry_waiting"}
+        if include_blocked:
+            statuses.add("blocked")
+        requested = {int(value) for value in task_ids} if task_ids is not None else None
+        rows = list(
+            self.session.scalars(
+                select(IntelRunStageTask).where(
+                    IntelRunStageTask.stage_id == stage_row.id,
+                    IntelRunStageTask.status.in_(statuses),
+                ).order_by(IntelRunStageTask.id.asc())
+            ).all()
+        )
+        current = _as_utc(now) or utcnow()
+        selected: list[IntelRunStageTask] = []
+        for row in rows:
+            if requested is not None and row.id not in requested:
+                continue
+            row.status = "pending"
+            row.next_retry_at = None
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.heartbeat_at = None
+            row.error_category = None
+            row.error_code = None
+            row.error_message = None
+            if reset_attempt_count:
+                row.attempt_count = 0
+            row.updated_at = current
+            selected.append(row)
+        if selected:
+            stage_row.status = "pending"
+            stage_row.finished_at = None
+            stage_row.next_retry_at = None
+            stage_row.error_category = None
+            stage_row.error_code = None
+            stage_row.error_message = None
+            stage_row.lease_owner = None
+            stage_row.lease_expires_at = None
+            stage_row.heartbeat_at = None
+            stage_row.updated_at = current
+            self.session.flush()
+            self.refresh_stage_status(stage_row, now=current)
+        return selected
+
+    retry_stage = retry_failed
+    reset_failed = retry_failed
+    retry_stage_tasks = retry_failed
+
+    def reset_stage(
+        self,
+        stage: IntelRunStage | int,
+        *,
+        include_succeeded: bool = False,
+        reset_attempt_count: bool = False,
+    ) -> IntelRunStage | None:
+        row = self._coerce_stage(stage)
+        if row is None:
+            return None
+        self._reset_stage_tasks(row.id, include_succeeded=include_succeeded, reset_attempt_count=reset_attempt_count)
+        row.status = "pending"
+        row.finished_at = None
+        row.next_retry_at = None
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.heartbeat_at = None
+        row.error_category = None
+        row.error_code = None
+        row.error_message = None
+        row.updated_at = utcnow()
+        self.session.flush()
+        return row
+
+    def stage_summary(self, stage: IntelRunStage | int) -> StageStateSummary | None:
+        row = self._coerce_stage(stage)
+        if row is None:
+            return None
+        tasks = list(self.session.scalars(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == row.id)).all())
+        counts = {status: 0 for status in ("pending", "running", "succeeded", "failed", "retry_waiting", "blocked")}
+        for task in tasks:
+            counts[task.status] = counts.get(task.status, 0) + 1
+        return StageStateSummary(
+            stage_id=row.id,
+            run_id=row.run_id,
+            stage_name=row.stage_name,
+            status=row.status,
+            total=len(tasks),
+            pending=counts.get("pending", 0),
+            running=counts.get("running", 0),
+            succeeded=counts.get("succeeded", 0),
+            failed=counts.get("failed", 0),
+            retry_waiting=counts.get("retry_waiting", 0),
+            blocked=counts.get("blocked", 0),
+        )
+
+    def refresh_stage_status(
+        self,
+        stage: IntelRunStage | int,
+        *,
+        now: datetime | None = None,
+    ) -> IntelRunStage | None:
+        """Derive stage status from durable task state without touching projections."""
+
+        row = self._coerce_stage(stage)
+        if row is None:
+            return None
+        tasks = list(
+            self.session.scalars(
+                select(IntelRunStageTask).where(IntelRunStageTask.stage_id == row.id)
+            ).all()
+        )
+        if not tasks:
+            return row
+        current = _as_utc(now) or utcnow()
+        statuses = {task.status for task in tasks}
+        representative_error = next(
+            (task for task in tasks if task.error_code or task.error_message), None
+        )
+        if statuses <= {"succeeded", "skipped", "cancelled"}:
+            row.status = "succeeded"
+            row.finished_at = row.finished_at or current
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.heartbeat_at = None
+        elif "running" in statuses:
+            row.status = "running"
+            row.finished_at = None
+        elif "blocked" in statuses and not (statuses & {"pending", "retry_waiting", "failed"}):
+            row.status = "blocked"
+            row.finished_at = row.finished_at or current
+        elif "failed" in statuses and not (statuses & {"pending", "retry_waiting"}):
+            row.status = "failed"
+            row.finished_at = row.finished_at or current
+        else:
+            row.status = "pending"
+            row.finished_at = None
+        if "running" not in statuses:
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.heartbeat_at = None
+        if representative_error is not None:
+            row.error_category = representative_error.error_category
+            row.error_code = representative_error.error_code
+            row.error_message = representative_error.error_message
+        elif row.status in {"succeeded", "pending", "running"}:
+            row.error_category = None
+            row.error_code = None
+            row.error_message = None
+        row.updated_at = current
+        self.session.flush()
+        return row
+
+    update_stage_status = refresh_stage_status
+
+    get_stage_summary = stage_summary
+
+    def run_stage_summary(self, run_id: int) -> list[StageStateSummary]:
+        return [summary for stage in self.list_stages(run_id) if (summary := self.stage_summary(stage)) is not None]
+
+    def status_summary(self, run_id: int) -> dict[str, Any]:
+        summaries = self.run_stage_summary(run_id)
+        return {
+            "run_id": int(run_id),
+            "stages": [asdict(summary) for summary in summaries],
+            "total_tasks": sum(summary.total for summary in summaries),
+            "succeeded_tasks": sum(summary.succeeded for summary in summaries),
+            "failed_tasks": sum(summary.failed for summary in summaries),
+            "retry_waiting_tasks": sum(summary.retry_waiting for summary in summaries),
+            "blocked_tasks": sum(summary.blocked for summary in summaries),
+        }
+
+    def adopt_existing_stage_tasks(
+        self,
+        run_id: int,
+        stage_name: str,
+        *,
+        config_fingerprint: str | None = None,
+    ) -> list[IntelRunStageTask]:
+        """Reconstruct only trustworthy projection-backed tasks, without AI calls."""
+
+        stage = self.ensure_stage(run_id, stage_name, config_fingerprint=config_fingerprint)
+        name = stage.stage_name.casefold()
+        rows = list(
+            self.session.scalars(
+                select(IntelRunItem)
+                .where(IntelRunItem.run_id == int(run_id))
+                .order_by(IntelRunItem.id.asc())
+            ).all()
+        )
+        adopted: list[IntelRunStageTask] = []
+        for relation in rows:
+            item = self.session.get(IntelItem, relation.item_id)
+            if item is None:
+                continue
+            projection: AIItemScreen | AIItemReview | None
+            if name in {"screen", "stage_a", "a", "stage-a"}:
+                projection = self.session.scalar(select(AIItemScreen).where(AIItemScreen.item_id == item.id))
+            elif name in {"analyze", "analysis", "stage_b", "b", "stage-b"}:
+                projection = self.session.scalar(select(AIItemReview).where(AIItemReview.item_id == item.id))
+            else:
+                projection = None
+            if projection is None or projection.run_id != int(run_id):
+                continue
+            projection_status = _text(getattr(projection, "status", None)) or "success"
+            if name in {"screen", "stage_a", "a", "stage-a"}:
+                decision = _text(getattr(projection, "decision", None)) or "uncertain"
+                task_status = "succeeded" if projection_status == "success" else "blocked"
+                if decision == "pass":
+                    task_status = "succeeded"
+            else:
+                task_status = "succeeded" if projection_status == "success" else "retry_waiting"
+            task = self.ensure_stage_task(
+                stage,
+                subject_type="item",
+                subject_id=item.id,
+                item_id=item.id,
+                input_fingerprint=item.content_hash,
+                config_fingerprint=config_fingerprint or _projection_fingerprint(projection),
+                status=task_status,
+            )
+            task.status = task_status
+            task.result_ref_json = _dump_json({"projection": projection.__class__.__name__, "id": projection.id})
+            task.next_retry_at = None if task_status == "succeeded" else utcnow()
+            task.updated_at = utcnow()
+            self.session.flush()
+            adopted.append(task)
+        return adopted
+
+    adopt_existing = adopt_existing_stage_tasks
+
+    def _coerce_stage(self, stage: IntelRunStage | int) -> IntelRunStage | None:
+        if isinstance(stage, IntelRunStage):
+            return stage
+        try:
+            return self.session.get(IntelRunStage, int(stage))
+        except (TypeError, ValueError):
+            return None
+
+    def _stage_id(self, stage: IntelRunStage | int) -> int | None:
+        row = self._coerce_stage(stage)
+        return row.id if row is not None else None
+
+    def _current_attempt(self, task: IntelRunStageTask) -> IntelRunStageAttempt | None:
+        if task.last_attempt_id:
+            attempt = self.session.get(IntelRunStageAttempt, task.last_attempt_id)
+            if attempt is not None:
+                return attempt
+        return self.session.scalar(
+            select(IntelRunStageAttempt)
+            .where(IntelRunStageAttempt.task_id == task.id)
+            .order_by(IntelRunStageAttempt.attempt_no.desc())
+        )
+
+    def _finish_attempt_row(self, attempt: IntelRunStageAttempt, *, status: str, finished_at: datetime, **kwargs: Any) -> None:
+        attempt.status = status
+        attempt.finished_at = finished_at
+        if "retryable" in kwargs and kwargs["retryable"] is not None:
+            attempt.retryable = bool(kwargs["retryable"])
+        if "next_retry_at" in kwargs:
+            attempt.next_retry_at = kwargs["next_retry_at"]
+        for name in ("error_category", "error_code", "error_message"):
+            if name in kwargs and kwargs[name] is not None:
+                setattr(attempt, name, _text(kwargs[name]))
+        if kwargs.get("result_ref") is not None:
+            attempt.result_ref_json = _dump_json(_structured_json(kwargs["result_ref"]))
+        metadata = kwargs.get("metadata")
+        if metadata is not None:
+            attempt.metadata_json = _dump_json(dict(metadata) if isinstance(metadata, Mapping) else _structured_json(metadata))
+        raw_response = kwargs.get("raw_response")
+        # Immutable raw audit: the first completed payload wins and can never
+        # be overwritten by a later retry or cleanup call.
+        if raw_response is not None and not attempt.raw_response_json:
+            payload = _structured_json(raw_response)
+            attempt.raw_response_json = _dump_json(payload)
+            attempt.raw_response_hash = hashlib.sha256(attempt.raw_response_json.encode("utf-8")).hexdigest()
+        attempt.lease_owner = None
+        attempt.lease_expires_at = None
+        attempt.heartbeat_at = None
+
+    def _reset_task(self, task: IntelRunStageTask, *, include_succeeded: bool = False, reset_attempt_count: bool = False) -> None:
+        if task.status == "succeeded" and not include_succeeded:
+            return
+        task.status = "pending"
+        task.next_retry_at = None
+        task.lease_owner = None
+        task.lease_expires_at = None
+        task.heartbeat_at = None
+        task.result_ref_json = "{}"
+        task.result_json = "{}"
+        task.error_category = None
+        task.error_code = None
+        task.error_message = None
+        if reset_attempt_count:
+            task.attempt_count = 0
+        task.updated_at = utcnow()
+
+    def _reset_stage_tasks(self, stage_id: int, *, include_succeeded: bool = False, reset_attempt_count: bool = False) -> None:
+        rows = list(self.session.scalars(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == int(stage_id))).all())
+        for task in rows:
+            self._reset_task(task, include_succeeded=include_succeeded, reset_attempt_count=reset_attempt_count)
+
     def count_by_status(self) -> dict[str, int]:
         rows = self.session.execute(
             select(IntelItem.status).order_by(IntelItem.status)
@@ -1405,6 +2702,36 @@ def _counts_dict(counts: IntelCounts | Mapping[str, Any] | None) -> dict[str, An
 
 def _dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+
+
+def _normalize_subject_type(value: Any) -> str:
+    text = (_text(value) or "item").casefold().replace("-", "_")
+    aliases = {
+        "items": "item",
+        "event_item": "event",
+        "events": "event",
+        "runs": "run",
+        "run_stage": "run",
+    }
+    return aliases.get(text, text)
+
+
+def _retryable_stage_error(category: str | None, code: str | None, message: str | None) -> bool:
+    """Apply the frozen provider retry policy conservatively."""
+
+    values = " ".join(value.casefold() for value in (category, code, message) if value)
+    if any(token in values for token in ("auth", "unauthorized", "forbidden", "schema", "validation", "4xx", "400", "401", "403", "404")):
+        return False
+    return any(token in values for token in ("429", "rate_limit", "ratelimit", "timeout", "timed out", "5xx", "500", "502", "503", "504", "temporarily", "unavailable", "retry"))
+
+
+def _projection_fingerprint(projection: Any) -> str:
+    model = getattr(projection, "model", None)
+    prompt_version = getattr(projection, "prompt_version", None)
+    status = getattr(projection, "status", None)
+    return hashlib.sha256(
+        _dump_json({"model": model, "prompt_version": prompt_version, "status": status}).encode("utf-8")
+    ).hexdigest()
 
 
 def _response_value(value: Any, name: str, default: Any = None) -> Any:
@@ -1745,6 +3072,11 @@ def _text(value: Any) -> str | None:
 def _as_utc(value: Any) -> datetime | None:
     if value is None:
         return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
     if not isinstance(value, datetime):
         return None
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)

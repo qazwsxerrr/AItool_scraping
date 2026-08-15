@@ -9,6 +9,18 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.storage.models import Base
 
 
+# These tables are additive durable coordinator state.  ``init_db`` may create
+# them in an otherwise complete Stage A/B database, but it must never attempt
+# to alter existing tables or silently backfill legacy data.
+STATE_TABLE_NAMES = frozenset(
+    {
+        "intel_run_stages",
+        "intel_run_stage_tasks",
+        "intel_run_stage_attempts",
+    }
+)
+
+
 def create_engine_from_url(database_url: str, *, echo: bool = False) -> Engine:
     url = make_url(database_url)
     connect_args = {}
@@ -48,7 +60,10 @@ def _assert_fresh_or_compatible_schema(engine: Engine) -> None:
     # missing Stage A/B columns and partial databases that would otherwise
     # fail later on the first query.
     user_tables = {name for name in existing if not name.startswith("sqlite_")}
-    missing_tables = expected - user_tables
+    # Existing databases from before resumable stages are accepted when their
+    # complete legacy contract is present.  Missing coordinator tables are
+    # additive and will be created by ``create_all`` below.
+    missing_tables = (expected - STATE_TABLE_NAMES) - user_tables
     extra_tables = user_tables - expected
     incompatible_columns: dict[str, set[str]] = {}
     for table_name in expected & user_tables:

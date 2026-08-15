@@ -30,6 +30,9 @@ def test_fresh_database_contains_only_ai_core_tables(tmp_path):
         "intel_events",
         "intel_items",
         "intel_run_items",
+        "intel_run_stage_attempts",
+        "intel_run_stage_tasks",
+        "intel_run_stages",
         "intel_runs",
         "sources",
     ]

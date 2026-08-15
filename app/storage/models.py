@@ -8,6 +8,7 @@ recreated from this metadata.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 
@@ -17,6 +18,15 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _dump_json(value: object) -> str:
+    """Serialize state metadata consistently with the existing projections."""
+
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return json.dumps(str(value), ensure_ascii=False)
 
 
 def _decode_json(value: str | None, default):
@@ -179,11 +189,33 @@ class IntelRun(Base):
     run_items: Mapped[list["IntelRunItem"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
+    run_stages: Mapped[list["IntelRunStage"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="IntelRunStage.id"
+    )
 
     @property
     def scope(self) -> dict[str, object]:
         value = _decode_json(self.scope_json, {})
         return dict(value) if isinstance(value, dict) else {}
+
+    @property
+    def scope_frozen(self) -> bool:
+        """Whether fetch membership has been frozen for downstream stages."""
+
+        return bool(self.scope.get("_frozen"))
+
+    @property
+    def scope_frozen_at(self) -> datetime | None:
+        value = self.scope.get("_frozen_at")
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
     @property
     def source_ids(self) -> list[str]:
@@ -217,6 +249,341 @@ class IntelRun(Base):
     @property
     def failure_count(self) -> int:
         return int((self.screen_failed or 0) + (self.analysis_failed or 0) + (self.failed or 0))
+
+    @property
+    def reference_time(self) -> datetime | None:
+        """Fixed run reference time used by resumable downstream stages.
+
+        The legacy ``intel_runs`` table is deliberately not altered by the
+        resumable-state migration.  Persisting the value in ``scope_json``
+        keeps existing databases migration-safe while exposing the natural
+        attribute expected by stage orchestration code.
+        """
+
+        value = self.scope.get("reference_time")
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+    @reference_time.setter
+    def reference_time(self, value: datetime | None) -> None:
+        scope = self.scope
+        if value is None:
+            scope.pop("reference_time", None)
+        else:
+            current = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+            scope["reference_time"] = current.isoformat()
+        self.scope_json = _dump_json(scope)
+
+
+class IntelRunStage(Base):
+    """Durable state for one named stage within an :class:`IntelRun`.
+
+    Stage rows are intentionally additive.  They are the coordinator's
+    source of truth; the historical ``IntelRunItem.status`` and latest AI
+    projections remain compatibility/UI views only.
+    """
+
+    __tablename__ = "intel_run_stages"
+    __table_args__ = (
+        UniqueConstraint("run_id", "stage_name", name="uq_intel_run_stages_run_stage"),
+        Index("ix_intel_run_stages_run_status", "run_id", "status"),
+        Index("ix_intel_run_stages_status", "status"),
+        Index("ix_intel_run_stages_lease", "lease_expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id"), nullable=False)
+    stage_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    input_fingerprint: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    config_fingerprint: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    reference_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result_ref_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    run: Mapped[IntelRun] = relationship(back_populates="run_stages")
+    tasks: Mapped[list["IntelRunStageTask"]] = relationship(
+        back_populates="stage", cascade="all, delete-orphan", order_by="IntelRunStageTask.id"
+    )
+
+    @property
+    def stage(self) -> str:
+        """Compatibility alias for code that calls the name simply ``stage``."""
+
+        return self.stage_name
+
+    @stage.setter
+    def stage(self, value: str) -> None:
+        self.stage_name = str(value)
+
+    @property
+    def result_ref(self) -> object:
+        return _decode_json(self.result_ref_json, {})
+
+    @result_ref.setter
+    def result_ref(self, value: object) -> None:
+        self.result_ref_json = _dump_json(value if value is not None else {})
+
+    @property
+    def result_reference(self) -> object:
+        """Alias used by stage callers that spell the reference in full."""
+
+        return self.result_ref
+
+    @result_reference.setter
+    def result_reference(self, value: object) -> None:
+        self.result_ref = value
+
+    @property
+    def metadata_dict(self) -> dict[str, object]:
+        value = _decode_json(self.metadata_json, {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    @metadata_dict.setter
+    def metadata_dict(self, value: object) -> None:
+        self.metadata_json = _dump_json(value if value is not None else {})
+
+    @property
+    def lease_active(self) -> bool:
+        current = utcnow()
+        return bool(self.lease_owner and self.lease_expires_at and self.lease_expires_at > current)
+
+    @property
+    def retry_at(self) -> datetime | None:
+        return self.next_retry_at
+
+    @retry_at.setter
+    def retry_at(self, value: datetime | None) -> None:
+        self.next_retry_at = value
+
+    @property
+    def input_hash(self) -> str | None:
+        return self.input_fingerprint
+
+    @input_hash.setter
+    def input_hash(self, value: str | None) -> None:
+        self.input_fingerprint = value
+
+    @property
+    def config_hash(self) -> str | None:
+        return self.config_fingerprint
+
+    @config_hash.setter
+    def config_hash(self, value: str | None) -> None:
+        self.config_fingerprint = value
+
+
+class IntelRunStageTask(Base):
+    """One independently resumable stage unit.
+
+    ``subject_type``/``subject_id`` support item, event, and run subjects.
+    Optional typed foreign keys make common queries explicit without forcing
+    callers to encode IDs in JSON.
+    """
+
+    __tablename__ = "intel_run_stage_tasks"
+    __table_args__ = (
+        UniqueConstraint(
+            "stage_id", "subject_type", "subject_id", name="uq_intel_run_stage_tasks_subject"
+        ),
+        Index("ix_intel_run_stage_tasks_stage_status", "stage_id", "status"),
+        Index("ix_intel_run_stage_tasks_retry", "stage_id", "status", "next_retry_at"),
+        Index("ix_intel_run_stage_tasks_lease", "lease_expires_at"),
+        Index("ix_intel_run_stage_tasks_subject", "subject_type", "subject_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stage_id: Mapped[int] = mapped_column(ForeignKey("intel_run_stages.id"), nullable=False)
+    subject_type: Mapped[str] = mapped_column(String(16), nullable=False, default="item")
+    subject_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Explicit references are optional and are kept in sync by the repository
+    # when the subject is an item/event/run.  They are useful for joins and
+    # leave generic subjects available for future stages.
+    item_id: Mapped[int | None] = mapped_column(ForeignKey("intel_items.id"), nullable=True)
+    event_id: Mapped[int | None] = mapped_column(ForeignKey("intel_events.id"), nullable=True)
+    target_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    input_fingerprint: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    config_fingerprint: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_id: Mapped[int | None] = mapped_column(ForeignKey("intel_run_stage_attempts.id"), nullable=True)
+    result_ref_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    result_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    stage: Mapped[IntelRunStage] = relationship(back_populates="tasks", foreign_keys=[stage_id])
+    attempts: Mapped[list["IntelRunStageAttempt"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="IntelRunStageAttempt.attempt_no",
+        foreign_keys="IntelRunStageAttempt.task_id",
+    )
+
+    @property
+    def subject(self) -> str:
+        return self.subject_id
+
+    @subject.setter
+    def subject(self, value: object) -> None:
+        self.subject_id = str(value)
+
+    @property
+    def result_ref(self) -> object:
+        return _decode_json(self.result_ref_json, {})
+
+    @result_ref.setter
+    def result_ref(self, value: object) -> None:
+        self.result_ref_json = _dump_json(value if value is not None else {})
+
+    @property
+    def result_reference(self) -> object:
+        return self.result_ref
+
+    @result_reference.setter
+    def result_reference(self, value: object) -> None:
+        self.result_ref = value
+
+    @property
+    def result(self) -> object:
+        return _decode_json(self.result_json, {})
+
+    @result.setter
+    def result(self, value: object) -> None:
+        self.result_json = _dump_json(value if value is not None else {})
+
+    @property
+    def lease_active(self) -> bool:
+        current = utcnow()
+        return bool(self.lease_owner and self.lease_expires_at and self.lease_expires_at > current)
+
+    @property
+    def reusable(self) -> bool:
+        return self.status == "succeeded"
+
+    @property
+    def retry_at(self) -> datetime | None:
+        return self.next_retry_at
+
+    @retry_at.setter
+    def retry_at(self, value: datetime | None) -> None:
+        self.next_retry_at = value
+
+    @property
+    def input_hash(self) -> str | None:
+        return self.input_fingerprint
+
+    @input_hash.setter
+    def input_hash(self, value: str | None) -> None:
+        self.input_fingerprint = value
+
+    @property
+    def config_hash(self) -> str | None:
+        return self.config_fingerprint
+
+    @config_hash.setter
+    def config_hash(self, value: str | None) -> None:
+        self.config_fingerprint = value
+
+
+class IntelRunStageAttempt(Base):
+    """Immutable-attempt audit row for one provider/local execution."""
+
+    __tablename__ = "intel_run_stage_attempts"
+    __table_args__ = (
+        UniqueConstraint("task_id", "attempt_no", name="uq_intel_run_stage_attempts_task_no"),
+        Index("ix_intel_run_stage_attempts_task", "task_id", "attempt_no"),
+        Index("ix_intel_run_stage_attempts_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("intel_run_stage_tasks.id"), nullable=False)
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    input_fingerprint: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    config_fingerprint: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    result_ref_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # This payload is append-only audit data.  Repository finish methods never
+    # replace a non-empty value, preserving the first provider response.
+    raw_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_response_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    task: Mapped[IntelRunStageTask] = relationship(
+        back_populates="attempts", foreign_keys=[task_id]
+    )
+
+    @property
+    def result_ref(self) -> object:
+        return _decode_json(self.result_ref_json, {})
+
+    @result_ref.setter
+    def result_ref(self, value: object) -> None:
+        self.result_ref_json = _dump_json(value if value is not None else {})
+
+    @property
+    def result_reference(self) -> object:
+        return self.result_ref
+
+    @result_reference.setter
+    def result_reference(self, value: object) -> None:
+        self.result_ref = value
+
+    @property
+    def raw_response(self) -> object:
+        return _decode_json(self.raw_response_json, {})
+
+    @raw_response.setter
+    def raw_response(self, value: object) -> None:
+        payload = _dump_json(value if value is not None else {})
+        self.raw_response_json = payload
+        self.raw_response_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @property
+    def metadata_dict(self) -> dict[str, object]:
+        value = _decode_json(self.metadata_json, {})
+        return dict(value) if isinstance(value, dict) else {}
 
 
 class IntelRunItem(Base):
