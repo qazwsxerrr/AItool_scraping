@@ -638,7 +638,9 @@ class IntelRepository:
             # Stage A pass/uncertain items remain ``new`` until Stage B
             # produces a projection; high-confidence rejects are excluded.
             stmt = stmt.where(
-                IntelItem.status == "new",
+                IntelItem.status.in_(["new", "analysis_filtered", "analysis_failed", "candidate"])
+                if force
+                else IntelItem.status == "new",
                 IntelItem.ai_screen.has(
                     and_(
                         AIItemScreen.decision.in_(["pass", "uncertain"]),
@@ -652,7 +654,13 @@ class IntelRepository:
                     | (IntelItem.ai_review.has(AIItemReview.status == "analysis_failed"))
                 )
         else:
-            stmt = stmt.where(IntelItem.status == "new")
+            stmt = stmt.where(
+                IntelItem.status.in_(
+                    ["new", "screened_out", "screen_failed", "analysis_filtered", "analysis_failed", "candidate"]
+                )
+                if force
+                else IntelItem.status == "new"
+            )
             if not force:
                 stmt = stmt.where(
                     (~IntelItem.ai_screen.has())
