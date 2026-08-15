@@ -25,8 +25,10 @@
       {% if item.spam_risk %}<span class="badge warning">risk {{ item.spam_risk }}</span>{% endif %}
       {% if item.status %}<span class="badge primary">{{ item.status | status_label }}</span>{% endif %}
       {% if item.ai_status %}<span class="badge">AI {{ item.ai_status }}</span>{% endif %}
-      {% if item.ai_keep is sameas true %}<span class="badge success">AI 保留</span>{% endif %}
-      {% if item.ai_keep is sameas false %}<span class="badge danger">AI 未保留</span>{% endif %}
+      {% if item.screen_decision %}<span class="badge">Stage A {{ item.screen_decision }}</span>{% endif %}
+      {% if item.screen_confidence is not none %}<span class="badge">screen {{ item.screen_confidence }}%</span>{% endif %}
+      {% if item.screen_reason_code %}<span class="badge">{{ item.screen_reason_code }}</span>{% endif %}
+      {% if item.screen_risk_flags %}<span class="badge warning">screen risk {{ item.screen_risk_flags | join(', ') }}</span>{% endif %}
     </div>
   </div>
 </article>

@@ -75,10 +75,11 @@ _ROLE_LABELS = {
 }
 _STATUS_LABELS = {
     "new": "待处理",
-    "selected": "AI 已选",
-    "ai_failed": "AI 处理失败",
-    "filtered": "未入选",
-    "rejected": "已排除",
+    "candidate": "候选事件",
+    "screen_failed": "Stage A 失败",
+    "analysis_failed": "Stage B 失败",
+    "screened_out": "Stage A 排除",
+    "analysis_filtered": "Stage B 过滤",
 }
 
 

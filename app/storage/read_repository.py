@@ -7,7 +7,7 @@ unified items, their structured AI review, and source attribution.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 from urllib.parse import urlsplit
@@ -19,7 +19,9 @@ from app.config.settings import DEFAULT_AI_REVIEW_CATEGORIES
 from app.domain.categories import fallback_topic_category
 from app.storage.models import (
     AIItemReview,
+    AIItemScreen,
     IntelEvent,
+    IntelEventItem,
     IntelEventRankingSnapshot,
     IntelItem,
     IntelRun,
@@ -27,10 +29,10 @@ from app.storage.models import (
 )
 
 
-FINAL_ITEM_STATUSES = ("selected",)
-PENDING_ITEM_STATUSES = ("new", "selected", "ai_failed")
-DASHBOARD_PENDING_ITEM_STATUSES = ("new", "ai_failed")
-ITEM_STATUSES = FINAL_ITEM_STATUSES + PENDING_ITEM_STATUSES + ("filtered", "rejected")
+FINAL_ITEM_STATUSES = ("candidate",)
+PENDING_ITEM_STATUSES = ("new", "screen_failed", "analysis_failed")
+DASHBOARD_PENDING_ITEM_STATUSES = ("new", "screen_failed", "analysis_failed")
+ITEM_STATUSES = FINAL_ITEM_STATUSES + PENDING_ITEM_STATUSES + ("screened_out", "analysis_filtered")
 CONTENT_CLASSES = ("official_model_company", "project_tool", "community_social")
 
 
@@ -72,7 +74,11 @@ class FeaturedItemRow:
     risk_flags: list[str]
     published_at: datetime | None
     created_at: datetime | None
-    ai_keep: bool | None = None
+    screen_decision: str | None = None
+    screen_confidence: int | None = None
+    screen_reason_code: str | None = None
+    screen_reason: str | None = None
+    screen_risk_flags: list[str] = field(default_factory=list)
     ai_status: str | None = None
     topic_category: str | None = None
     source_id: str | None = None
@@ -101,6 +107,10 @@ class FeaturedEventRow:
     source_ids: tuple[str, ...]
     risk_flags: list[str]
     published_at: datetime | None
+    keywords: tuple[str, ...] = ()
+    entities: tuple[dict[str, object], ...] = ()
+    provenance: str = "new"
+    source_refs: tuple[dict[str, object], ...] = ()
 
     @property
     def id(self) -> int:
@@ -122,13 +132,17 @@ class AllItemRow:
     selection_score: int | None
     status: str | None
     ai_confidence: int | None
-    ai_keep: bool | None
+    screen_decision: str | None
+    screen_confidence: int | None
     summary_cn: str | None
     published_at: datetime | None
     fetched_at: datetime | None
     content_class: str | None = None
     selection_reason: str | None = None
     ai_status: str | None = None
+    screen_reason_code: str | None = None
+    screen_reason: str | None = None
+    screen_risk_flags: list[str] = field(default_factory=list)
     topic_category: str | None = None
     source_id: str | None = None
     source_transport: str | None = None
@@ -141,7 +155,8 @@ class AllItemFilters:
     query: str | None = None
     source_group: str | None = None
     status: str | None = None
-    ai_keep: bool | None = None
+    screen_decision: str | None = None
+    screen_confidence: int | None = None
     content_class: str | None = None
     topic_category: str | None = None
 
@@ -232,27 +247,14 @@ class UIReadRepository:
         selected_items = int(
             self.session.execute(
                 select(func.count())
-                .select_from(IntelItem)
-                .join(AIItemReview, AIItemReview.item_id == IntelItem.id)
+                .select_from(IntelEventRankingSnapshot)
                 .where(
-                    IntelItem.status == "selected",
-                    AIItemReview.status == "success",
-                    AIItemReview.keep.is_(True),
+                    IntelEventRankingSnapshot.snapshot_key == "latest",
+                    IntelEventRankingSnapshot.selected.is_(True),
                 )
             ).scalar_one()
         )
         pending_items = sum(status_counts.get(status, 0) for status in DASHBOARD_PENDING_ITEM_STATUSES)
-        pending_items += int(
-            self.session.execute(
-                select(func.count())
-                .select_from(IntelItem)
-                .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
-                .where(
-                    IntelItem.status == "selected",
-                    or_(AIItemReview.id.is_(None), AIItemReview.status != "success"),
-                )
-            ).scalar_one()
-        )
         run_type = "run-once" if last_run else None
         if last_run and last_run.filters_json:
             try:
@@ -263,44 +265,42 @@ class UIReadRepository:
                 run_type = str(filters.get("stage") or filters.get("command") or run_type)
         category_counts_map: dict[str, int] = {}
         selected_rows = self.session.execute(
-            select(IntelItem, Source, AIItemReview)
-            .join(Source, IntelItem.source_id == Source.id)
-            .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
+            select(IntelEventRankingSnapshot, IntelEvent)
+            .join(IntelEvent, IntelEvent.id == IntelEventRankingSnapshot.event_id)
             .where(
-                IntelItem.status == "selected",
-                AIItemReview.status == "success",
-                AIItemReview.keep.is_(True),
+                IntelEventRankingSnapshot.snapshot_key == "latest",
+                IntelEventRankingSnapshot.selected.is_(True),
             )
         ).all()
-        for item, source, review in selected_rows:
-            category = _display_topic_category(review.topic_category if review else None, item, source, self.topic_categories)
+        for snapshot, event in selected_rows:
+            category = str(snapshot.topic or event.topic or "未分类")
             category_counts_map[category] = category_counts_map.get(category, 0) + 1
-        category_counts = tuple(
-            FacetCount(value=value, count=count)
-            for value, count in sorted(category_counts_map.items(), key=lambda entry: (-entry[1], entry[0]))
-        )
         source_counts = tuple(
             FacetCount(value=str(value or "general"), count=int(count))
             for value, count in self.session.execute(
-                select(Source.source_group, func.count(IntelItem.id))
-                .join(IntelItem, IntelItem.source_id == Source.id)
-                .join(AIItemReview, AIItemReview.item_id == IntelItem.id)
+                select(Source.source_group, func.count(IntelEventItem.id))
+                .join(IntelEventItem, IntelEventItem.source_id == Source.id)
+                .join(IntelEvent, IntelEvent.id == IntelEventItem.event_id)
+                .join(IntelEventRankingSnapshot, IntelEventRankingSnapshot.event_id == IntelEvent.id)
                 .where(
-                    IntelItem.status == "selected",
-                    AIItemReview.status == "success",
-                    AIItemReview.keep.is_(True),
+                    IntelEventRankingSnapshot.snapshot_key == "latest",
+                    IntelEventRankingSnapshot.selected.is_(True),
                 )
                 .group_by(Source.source_group)
-                .order_by(func.count(IntelItem.id).desc())
+                .order_by(func.count(IntelEventItem.id).desc())
             ).all()
+        )
+        category_counts = tuple(
+            FacetCount(value=value, count=count)
+            for value, count in sorted(category_counts_map.items(), key=lambda entry: (-entry[1], entry[0]))
         )
         return DashboardStats(
             raw_items=self._count(IntelItem),
             selected_items=selected_items,
             pending_items=pending_items,
-            ai_failed_items=status_counts.get("ai_failed", 0),
-            filtered_items=status_counts.get("filtered", 0),
-            rejected_items=status_counts.get("rejected", 0),
+            ai_failed_items=status_counts.get("screen_failed", 0) + status_counts.get("analysis_failed", 0),
+            filtered_items=status_counts.get("analysis_filtered", 0),
+            rejected_items=status_counts.get("screened_out", 0),
             last_run_type=run_type,
             last_run_status=last_run.status if last_run else None,
             last_run_started_at=last_run.started_at if last_run else None,
@@ -312,7 +312,7 @@ class UIReadRepository:
         """Return distinct filter values from persisted v2 rows.
 
         Source registry values are intentionally not hardcoded in the route;
-        this keeps the UI correct when a deployment adds a source group or
+        this leaves the UI correct when a deployment adds a source group or
         content class without requiring a template change.
         """
 
@@ -347,14 +347,14 @@ class UIReadRepository:
             ).all()
             if value
         )
-        statuses = tuple(sorted(set(ITEM_STATUSES).union(set(persisted_statuses) - {"hotspot"})))
+        statuses = tuple(sorted(set(ITEM_STATUSES).union(set(persisted_statuses))))
         persisted_topic_categories = tuple(
             value
             for (value,) in self.session.execute(
-                select(AIItemReview.topic_category)
-                .where(AIItemReview.topic_category.is_not(None), AIItemReview.topic_category != "")
+                select(AIItemReview.topic)
+                .where(AIItemReview.topic.is_not(None), AIItemReview.topic != "")
                 .distinct()
-                .order_by(AIItemReview.topic_category.asc())
+                .order_by(AIItemReview.topic.asc())
             ).all()
             if value
         )
@@ -375,76 +375,10 @@ class UIReadRepository:
     ) -> list[FeaturedItemRow]:
         if limit <= 0:
             return []
-        safe_limit = min(limit, 100)
-        # Wave 3 makes the editorial snapshot the homepage source of truth.
-        # Keep the item query as a compatibility fallback for databases created
-        # before the event/ranking tables existed or before the first ranking
-        # run.  Once any ``latest`` snapshot row exists, an intentionally empty
-        # selected set remains empty (no padding from raw item scores).
-        snapshot_exists = self.session.execute(
-            select(func.count())
-            .select_from(IntelEventRankingSnapshot)
-            .where(IntelEventRankingSnapshot.snapshot_key == "latest")
-        ).scalar_one()
-        if int(snapshot_exists or 0) > 0:
-            return self._list_featured_event_cards(category=category, limit=safe_limit)
-        stmt = (
-            select(IntelItem, Source, AIItemReview)
-            .join(Source, IntelItem.source_id == Source.id)
-            .join(AIItemReview, AIItemReview.item_id == IntelItem.id)
-            .where(
-                IntelItem.status == "selected",
-                AIItemReview.status == "success",
-                AIItemReview.keep.is_(True),
-            )
-            .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
-            # Legacy rows may not have a persisted topic yet; fetch a wider
-            # window before applying the deterministic display fallback below.
-            .limit(max(safe_limit * 10, safe_limit))
-        )
-        if category:
-            stmt = stmt.where(or_(AIItemReview.topic_category == category, AIItemReview.topic_category.is_(None)))
+        cards = self._list_featured_event_cards(category=category, limit=min(limit, 100))
         if source_group:
-            stmt = stmt.where(Source.source_group == source_group)
-        rows: list[FeaturedItemRow] = []
-        for item, source, review in self.session.execute(stmt).all():
-            display_category = _display_topic_category(review.topic_category if review else None, item, source, self.topic_categories)
-            if category and display_category != category:
-                continue
-            risk_flags = _json_list(review.risk_flags_json if review else None)
-            risk_flags = list(dict.fromkeys(risk_flags))
-            rows.append(
-                FeaturedItemRow(
-                    id=item.id,
-                    title=item.title,
-                    summary=(review.summary_cn if review else None) or item.summary,
-                    selection_reason=item.selection_reason or (review.reason if review else None),
-                    url=_safe_url(item.canonical_url),
-                    risk_note=("；".join(risk_flags) if risk_flags else None),
-                    status=item.status,
-                    selection_score=int(item.selection_score or 0),
-                    ai_confidence=_credibility(review),
-                    content_class=item.content_class,
-                    source_name=source.name,
-                    source_group=source.source_group,
-                    source_subtype=source.source_subtype,
-                    risk_flags=risk_flags,
-                    published_at=item.published_at,
-                    created_at=item.created_at,
-                    ai_keep=review.keep if review else None,
-                    ai_status=review.status if review else None,
-                    topic_category=display_category,
-                    source_id=source.id,
-                    source_transport=source.transport,
-                    source_tier=source.tier,
-                    source_role=source.source_role,
-                    source_url=_safe_url(source.url),
-                    account_url=_safe_url(source.account_url),
-                )
-            )
-            if len(rows) >= safe_limit:
-                break
-        return rows
+            cards = [card for card in cards if card.source_group == source_group]
+        return cards
 
     def list_featured_events(
         self,
@@ -498,7 +432,12 @@ class UIReadRepository:
             .limit(min(max(limit * 3, limit), 100))
         )
         if category:
-            stmt = stmt.where(IntelEventRankingSnapshot.content_class == category)
+            stmt = stmt.where(
+                or_(
+                    IntelEventRankingSnapshot.topic == category,
+                    IntelEventRankingSnapshot.content_class == category,
+                )
+            )
         cards: list[FeaturedItemRow] = []
         for snapshot, event in self.session.execute(stmt).all():
             row = self._event_row(snapshot, event)
@@ -520,7 +459,8 @@ class UIReadRepository:
                     risk_flags=row.risk_flags,
                     published_at=row.published_at,
                     created_at=event.created_at,
-                    ai_keep=True,
+                    screen_decision="pass",
+                    screen_confidence=100,
                     ai_status="editorial_snapshot",
                 )
             )
@@ -549,6 +489,22 @@ class UIReadRepository:
                 source_ids.append(relation.source_id)
         source_name = "、".join(source_names) or (source_ids[0] if source_ids else None)
         published_at = event.last_seen_at or event.first_seen_at or event.created_at
+        source_refs = tuple(
+            {
+                "item_id": relation.item_id,
+                "source_id": relation.source_id,
+                "source_name": (relation.source.name if relation.source is not None else None),
+                "source_url": relation.source_url,
+                "match_type": relation.match_type,
+                "match_confidence": relation.match_confidence,
+                "is_primary": bool(relation.is_primary),
+            }
+            for relation in event.event_items
+        )
+        try:
+            event_entities = json.loads(event.entities_json or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            event_entities = []
         return FeaturedEventRow(
             event_id=int(event.id),
             rank=int(snapshot.rank or 0),
@@ -564,6 +520,10 @@ class UIReadRepository:
             source_ids=tuple(source_ids),
             risk_flags=_json_list(event.risk_flags_json),
             published_at=published_at,
+            keywords=tuple(_json_list(event.keywords_json)),
+            entities=tuple(value for value in event_entities if isinstance(value, dict)),
+            provenance="new" if event.new_in_run_id == snapshot.run_id else "repeat",
+            source_refs=source_refs,
         )
 
     def list_all_items(
@@ -580,7 +540,7 @@ class UIReadRepository:
             select(IntelItem, Source, AIItemReview)
             .join(Source, IntelItem.source_id == Source.id)
             .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
-            .where(IntelItem.status != "hotspot")
+            .where(IntelItem.status.is_not(None))
             .order_by(IntelItem.published_at.desc(), IntelItem.captured_at.desc(), IntelItem.id.desc())
             .offset((safe_page - 1) * safe_page_size)
             .limit(safe_page_size)
@@ -601,20 +561,20 @@ class UIReadRepository:
         if filters.content_class:
             stmt = stmt.where(IntelItem.content_class == filters.content_class.strip())
         if filters.topic_category:
-            stmt = stmt.where(or_(AIItemReview.topic_category == filters.topic_category.strip(), AIItemReview.topic_category.is_(None)))
+            stmt = stmt.where(or_(AIItemReview.topic == filters.topic_category.strip(), AIItemReview.topic.is_(None)))
         if filters.status:
-            if filters.status.strip() == "hotspot":
-                stmt = stmt.where(false())
-            else:
-                stmt = stmt.where(IntelItem.status == filters.status.strip())
-        if filters.ai_keep is not None:
-            stmt = stmt.where(AIItemReview.keep.is_(filters.ai_keep))
+            stmt = stmt.where(IntelItem.status == filters.status.strip())
+        if filters.screen_decision:
+            stmt = stmt.join(AIItemScreen, AIItemScreen.item_id == IntelItem.id).where(
+                AIItemScreen.decision == filters.screen_decision.strip()
+            )
 
         items: list[AllItemRow] = []
         for item, source, review in self.session.execute(stmt).all():
-            display_category = _display_topic_category(review.topic_category if review else None, item, source, self.topic_categories)
+            display_category = _display_topic_category(review.topic if review else None, item, source, self.topic_categories)
             if filters.topic_category and display_category != filters.topic_category.strip():
                 continue
+            screen = self.session.get(AIItemScreen, item.id)
             items.append(
                 AllItemRow(
                     item_id=item.id,
@@ -628,7 +588,11 @@ class UIReadRepository:
                     selection_score=item.selection_score,
                     status=item.status,
                     ai_confidence=review.confidence if review else None,
-                    ai_keep=review.keep if review else None,
+                    screen_decision=screen.decision if screen else None,
+                    screen_confidence=screen.confidence if screen else None,
+                    screen_reason_code=screen.reason_code if screen else None,
+                    screen_reason=screen.reason if screen else None,
+                    screen_risk_flags=screen.risk_flags if screen else [],
                     summary_cn=(review.summary_cn if review else None) or item.summary,
                     published_at=item.published_at,
                     fetched_at=item.captured_at,
@@ -687,11 +651,7 @@ class UIReadRepository:
             select(IntelItem, Source, AIItemReview)
             .join(Source, IntelItem.source_id == Source.id)
             .join(AIItemReview, AIItemReview.item_id == IntelItem.id)
-            .where(
-                IntelItem.status == "selected",
-                AIItemReview.status == "success",
-                AIItemReview.keep.is_(True),
-            )
+            .where(IntelItem.status == "candidate", AIItemReview.status == "success")
             .where(
                 or_(
                     IntelItem.title.ilike(like),
@@ -706,10 +666,10 @@ class UIReadRepository:
         )
         rows: list[SearchResultRow] = []
         for item, source, review in self.session.execute(stmt).all():
-            display_category = _display_topic_category(review.topic_category if review else None, item, source, self.topic_categories)
+            display_category = _display_topic_category(review.topic if review else None, item, source, self.topic_categories)
             rows.append(
                 SearchResultRow(
-                    result_type="selected",
+                    result_type="candidate",
                     id=item.id,
                     title=item.title,
                     summary=(review.summary_cn if review else None) or item.summary,
@@ -717,7 +677,7 @@ class UIReadRepository:
                     source_name=source.name,
                     item_id=item.id,
                     score=item.selection_score,
-                    badges=[badge for badge in ["selected", item.content_class, item.status] if badge],
+                    badges=[badge for badge in ["candidate", item.content_class, item.status] if badge],
                     published_at=item.published_at,
                     created_at=item.created_at,
                     content_class=item.content_class,

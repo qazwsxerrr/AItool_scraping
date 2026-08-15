@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
+
+import pytest
+
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, init_db
 
@@ -39,16 +43,11 @@ def test_settings_read_category_taxonomy(monkeypatch):
     assert settings.ai_review_category_mode == "source"
 
 
-def test_init_db_adds_topic_category_to_existing_schema(tmp_path):
-    import sqlite3
-
+def test_init_db_rejects_incompatible_legacy_schema_without_backfill(tmp_path):
     path = tmp_path / "legacy.db"
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE ai_item_reviews (id INTEGER PRIMARY KEY)")
     connection.commit()
     connection.close()
-    init_db(create_engine_from_url(f"sqlite:///{path}"))
-    connection = sqlite3.connect(path)
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(ai_item_reviews)")}
-    connection.close()
-    assert "topic_category" in columns
+    with pytest.raises(RuntimeError, match="incompatible.*no migrations/backfill"):
+        init_db(create_engine_from_url(f"sqlite:///{path}"))

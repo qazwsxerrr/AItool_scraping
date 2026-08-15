@@ -17,13 +17,13 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelEvent, IntelEventItem, IntelItem
+from app.storage.models import IntelEvent, IntelEventItem, IntelItem, IntelRun
 from app.storage.repository import IntelRepository
 
 
@@ -169,7 +169,7 @@ def run_editorial_rank_job(
     result = EditorialRankResult(run_id=run_id, snapshot_key=key)
     with session_factory() as session:
         try:
-            events = _load_events(session, limit=limit, force=force, event_ids=event_ids)
+            events = _load_events(session, limit=limit, run_id=run_id, event_ids=event_ids)
             result.processed = len(events)
             candidates = [_candidate(event) for event in events]
             ai_order: dict[int, tuple[int, float | None]] = {}
@@ -274,7 +274,7 @@ def _load_events(
     session: Session,
     *,
     limit: int | None,
-    force: bool,
+    run_id: int | None,
     event_ids: Iterable[int] | None,
 ) -> list[IntelEvent]:
     stmt = (
@@ -294,11 +294,13 @@ def _load_events(
     ids = [int(value) for value in event_ids] if event_ids is not None else []
     if event_ids is not None:
         stmt = stmt.where(IntelEvent.id.in_(ids or [-1]))
-    if not force:
-        # Ranking is snapshot-based and rerunnable.  We intentionally do not
-        # exclude already-ranked events; clearing and rebuilding the same key
-        # is what makes changed quotas visible on rerun.
-        pass
+    elif run_id is not None:
+        # Stage C marks only genuinely new events with this run id.  Repeats
+        # remain visible in history but cannot enter the current snapshot.
+        stmt = stmt.where(IntelEvent.new_in_run_id == int(run_id))
+    else:
+        latest_run = session.scalar(select(func.max(IntelRun.id)))
+        stmt = stmt.where(IntelEvent.new_in_run_id == latest_run if latest_run else IntelEvent.new_in_run_id.is_(None))
     if limit is not None:
         stmt = stmt.limit(max(0, int(limit)))
     return list(session.scalars(stmt).unique().all())
@@ -314,8 +316,8 @@ def _candidate(event: IntelEvent) -> dict[str, Any]:
     content_class = str(event.content_class or "").strip() or None
     topic = str(event.topic or "opinion").strip().casefold() or "opinion"
     gate_pass, gate_reason = _paper_gate(event)
-    has_retained_member = not event.event_items or any(
-        relation.item is not None and relation.item.status in {"selected", "hotspot"}
+    has_retained_member = any(
+        relation.item is not None and relation.item.status == "candidate"
         for relation in event.event_items
     )
     return {

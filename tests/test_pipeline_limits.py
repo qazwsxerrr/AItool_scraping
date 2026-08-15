@@ -4,7 +4,7 @@ from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
 from app.jobs.editorial_rank_job import EditorialProfile, load_daily_profile
 from app.jobs.export_job import run_intel_export_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelItem, Source
+from app.storage.models import IntelEvent, IntelEventRankingSnapshot
 
 
 def test_daily_profile_defaults_to_thirty_and_allows_explicit_overrides():
@@ -22,30 +22,27 @@ def test_export_defaults_to_thirty_but_allows_explicit_overrides(tmp_path):
     session_factory = create_session_factory(engine)
 
     with session_factory() as session:
-        source = Source(
-            id="cap-source",
-            name="Cap source",
-            transport="feed",
-            url="https://example.test/feed",
-            content_class="official_model_company",
-        )
-        session.add(source)
         for index in range(35):
-            item = IntelItem(
-                source=source,
-                external_id=f"item-{index}",
+            event = IntelEvent(
+                event_key=f"event-{index}",
                 title=f"Item {index}",
-                content_class="official_model_company",
-                content_hash=f"{index:064x}",
-                selection_score=index,
-                status="selected",
+                topic="model",
+                summary_cn=f"Summary {index}",
+                display_score=index,
             )
-            item.ai_review = AIItemReview(
-                content_class="official_model_company",
-                keep=True,
-                status="success",
+            session.add(event)
+            session.flush()
+            session.add(
+                IntelEventRankingSnapshot(
+                    snapshot_key="latest",
+                    event_id=event.id,
+                    rank=index + 1,
+                    display_score=index,
+                    selected=True,
+                    topic="model",
+                    content_class="official_model_company",
+                )
             )
-            session.add(item)
         session.commit()
 
     default_result = run_intel_export_job(

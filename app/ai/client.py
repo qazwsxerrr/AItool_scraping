@@ -1,4 +1,4 @@
-"""Unified one-call AI client for normalized intelligence item analysis."""
+"""Unified provider client for project summaries and the two intelligence stages."""
 
 from __future__ import annotations
 
@@ -10,38 +10,24 @@ from app.ai.prompts import (
     ITEM_ANALYSIS_RESPONSE_SCHEMA,
     ITEM_ANALYSIS_SYSTEM_PROMPT,
     ITEM_ANALYSIS_TASK,
+    PROJECT_SUMMARY_RESPONSE_SCHEMA,
     PROJECT_SUMMARY_SYSTEM_PROMPT,
     PROJECT_SUMMARY_TASK,
     build_generic_json_payload,
     build_openai_chat_payload,
     build_openai_responses_payload,
 )
-from app.ai.schemas import (
-    COMMUNITY_SOCIAL,
-    CONTENT_CLASSES,
-    ContentClass,
-    ItemAnalysisRequest,
-    ItemAnalysisResponse,
-    OFFICIAL_MODEL_COMPANY,
-    PROJECT_SUMMARY_RESPONSE_SCHEMA,
-    PROJECT_TOOL,
-    parse_item_analysis_response,
-    parse_project_summary_response,
-)
+from app.ai.schemas import ItemAnalysisRequest, ItemAnalysisResponse, parse_item_analysis_response, parse_project_summary_response
+from app.ai.skills.intel_triage import AnalysisResult, IntelTriageClient, RawIntelEnvelope, ScreenResult
 from app.config.settings import Settings
 
 
 class SupportsPost(Protocol):
-    def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any]): ...
+    def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any], **kwargs: Any): ...
 
 
 class ItemAnalysisClient:
-    """Compatibility adapter for triage and GitHub summary provider calls.
-
-    Pass-1 callers should use :meth:`triage`; the historical item-analysis
-    interface was intentionally removed so a run cannot silently take the old
-    contract path.
-    """
+    """Shared provider configuration with Stage A ``screen`` and Stage B ``analyze`` APIs."""
 
     def __init__(
         self,
@@ -53,22 +39,15 @@ class ItemAnalysisClient:
         timeout_seconds: float = 30.0,
         http_client: SupportsPost | None = None,
     ) -> None:
-        style = _normalize_api_style(api_style)
         self.api_url = api_url.rstrip("/") if api_url else None
         self.api_key = api_key
         self.model = model
-        self.api_style = style
+        self.api_style = _normalize_api_style(api_style)
         self.timeout_seconds = timeout_seconds
         self._http_client = http_client
 
     @classmethod
-    def from_settings(
-        cls,
-        settings: Settings,
-        http_client: SupportsPost | None = None,
-    ) -> "ItemAnalysisClient":
-        """Build a client from the configured single-pass AI provider."""
-
+    def from_settings(cls, settings: Settings, http_client: SupportsPost | None = None) -> "ItemAnalysisClient":
         return cls(
             api_url=settings.ai_review_api_url,
             api_key=settings.ai_review_api_key,
@@ -82,28 +61,14 @@ class ItemAnalysisClient:
     def is_configured(self) -> bool:
         return bool(self.api_url and self.api_key)
 
-    def triage(self, envelope: Any):
-        """Run the Wave 1 Intel Triage contract through the adapter."""
+    def screen(self, envelope: RawIntelEnvelope | dict[str, Any]) -> ScreenResult:
+        return self._intel_client().screen(envelope)
 
-        from app.ai.skills.intel_triage.client import IntelTriageClient
-
-        adapter = IntelTriageClient(
-            api_url=self.api_url,
-            api_key=self.api_key,
-            model=self.model,
-            api_style=self.api_style,
-            timeout_seconds=self.timeout_seconds,
-            http_client=self._http_client,
-        )
-        return adapter.triage(envelope)
-
-    def triage_batch(self, envelopes: Any):
-        from app.ai.skills.intel_triage.client import run_triage_batch
-
-        return run_triage_batch(self, envelopes)
+    def analyze(self, envelope: RawIntelEnvelope | dict[str, Any]) -> AnalysisResult:
+        return self._intel_client().analyze(envelope)
 
     def summarize_project(self, request: ItemAnalysisRequest) -> ItemAnalysisResponse:
-        """Run one GitHub project-summary request using the same schema/audit path."""
+        """Run the existing narrow GitHub summary contract."""
 
         if not self.is_configured:
             raise RuntimeError("Item analysis API is not configured")
@@ -123,39 +88,30 @@ class ItemAnalysisClient:
         try:
             return parse_item_analysis_response(data, request.source_content_class)
         except ValueError as analysis_error:
-            # The narrow contract may arrive directly, inside a generic
-            # envelope, or inside an OpenAI-compatible choices message.  The
-            # project parser already knows how to unwrap all of those shapes.
             try:
                 return parse_project_summary_response(data)
             except ValueError:
                 raise analysis_error
 
+    def _intel_client(self) -> IntelTriageClient:
+        return IntelTriageClient(
+            api_url=self.api_url,
+            api_key=self.api_key,
+            model=self.model,
+            api_style=self.api_style,
+            timeout_seconds=self.timeout_seconds,
+            http_client=self._http_client,
+        )
+
     def _post_once(self, url: str, payload: dict[str, Any]):
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", "Accept": "application/json"}
         if self._http_client is not None:
             try:
-                response = self._http_client.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout_seconds,
-                )
+                response = self._http_client.post(url, headers=headers, json=payload, timeout=self.timeout_seconds)
             except TypeError:
-                # Small test/fake clients often expose only the minimal
-                # ``post(url, headers, json)`` signature.
                 response = self._http_client.post(url, headers=headers, json=payload)
         else:
-            with httpx.Client(
-                timeout=self.timeout_seconds,
-                follow_redirects=True,
-                http2=True,
-                trust_env=True,
-            ) as client:
+            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True, http2=True, trust_env=True) as client:
                 response = client.post(url, headers=headers, json=payload)
         response.raise_for_status()
         return response
@@ -163,9 +119,9 @@ class ItemAnalysisClient:
     def _endpoint_url(self) -> str:
         if self.api_url is None:  # pragma: no cover - guarded by is_configured
             raise RuntimeError("Item analysis API is not configured")
-        if self.api_style == "openai_chat" and not self.api_url.lower().endswith("/chat/completions"):
+        if self.api_style == "openai_chat" and not self.api_url.casefold().endswith("/chat/completions"):
             return f"{self.api_url}/chat/completions"
-        if self.api_style == "openai_responses" and not self.api_url.lower().endswith("/responses"):
+        if self.api_style == "openai_responses" and not self.api_url.casefold().endswith("/responses"):
             return f"{self.api_url}/responses"
         return self.api_url
 
@@ -178,92 +134,18 @@ class ItemAnalysisClient:
         response_schema: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if self.api_style == "openai_chat":
-            return build_openai_chat_payload(
-                request,
-                model=self.model,
-                task=task,
-                system_prompt=system_prompt,
-                response_schema=response_schema,
-            )
+            return build_openai_chat_payload(request, model=self.model, task=task, system_prompt=system_prompt, response_schema=response_schema)
         if self.api_style == "openai_responses":
-            return build_openai_responses_payload(
-                request,
-                model=self.model,
-                task=task,
-                system_prompt=system_prompt,
-                response_schema=response_schema,
-            )
-        return build_generic_json_payload(
-            request,
-            model=self.model,
-            task=task,
-            system_prompt=system_prompt,
-            response_schema=response_schema,
-        )
-
-__all__ = [
-    "COMMUNITY_SOCIAL",
-    "CONTENT_CLASSES",
-    "ContentClass",
-    "ITEM_ANALYSIS_RESPONSE_SCHEMA",
-    "ITEM_ANALYSIS_SYSTEM_PROMPT",
-    "ITEM_ANALYSIS_TASK",
-    "PROJECT_SUMMARY_SYSTEM_PROMPT",
-    "PROJECT_SUMMARY_TASK",
-    "PROJECT_SUMMARY_RESPONSE_SCHEMA",
-    "ItemAnalysisClient",
-    "ItemAnalysisRequest",
-    "ItemAnalysisResponse",
-    "OFFICIAL_MODEL_COMPANY",
-    "PROJECT_TOOL",
-    "SupportsPost",
-    "parse_item_analysis_response",
-    "parse_project_summary_response",
-    "IntelTriageClient",
-    "TriageClient",
-    "run_triage_batch",
-    "triage_item",
-    "triage_items",
-    "safe_triage",
-    "isolate_ai_failures",
-    "isolate_ai_failure",
-    "run_triage_isolated",
-]
+            return build_openai_responses_payload(request, model=self.model, task=task, system_prompt=system_prompt, response_schema=response_schema)
+        return build_generic_json_payload(request, model=self.model, task=task, system_prompt=system_prompt, response_schema=response_schema)
 
 
 def _normalize_api_style(value: Any) -> str:
-    """Normalize provider style aliases while keeping one internal spelling."""
-
-    style = str(value or "generic_json").strip().lower().replace("-", "_")
-    aliases = {
-        "responses": "openai_responses",
-        "openai_response": "openai_responses",
-        "openai_responses_api": "openai_responses",
-        "chat": "openai_chat",
-        "chat_completions": "openai_chat",
-    }
-    style = aliases.get(style, style)
+    style = str(value or "generic_json").strip().casefold().replace("-", "_")
+    style = {"responses": "openai_responses", "openai_response": "openai_responses", "chat": "openai_chat", "chat_completions": "openai_chat"}.get(style, style)
     if style not in {"generic_json", "openai_chat", "openai_responses"}:
         raise ValueError("api_style must be generic_json, openai_chat, or openai_responses")
     return style
 
 
-_TRIAGE_CLIENT_EXPORTS = {
-    "IntelTriageClient",
-    "TriageClient",
-    "run_triage_batch",
-    "triage_item",
-    "triage_items",
-    "safe_triage",
-    "isolate_ai_failures",
-    "isolate_ai_failure",
-    "run_triage_isolated",
-}
-
-
-def __getattr__(name: str):
-    if name in _TRIAGE_CLIENT_EXPORTS:
-        from app.ai.skills import intel_triage
-
-        return getattr(intel_triage, name)
-    raise AttributeError(name)
+__all__ = ["ItemAnalysisClient", "SupportsPost"]

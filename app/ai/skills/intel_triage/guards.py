@@ -1,157 +1,146 @@
-"""Deterministic safety rules applied after provider parsing."""
+"""Deterministic Stage A/Stage B guards.
+
+Provider output is never allowed to upgrade a result.  The screen guard only
+normalizes low-confidence rejects to ``uncertain``; the analysis guard records
+paper and empty-summary risks while leaving threshold decisions to the job.
+"""
 
 from __future__ import annotations
 
 from typing import Any, Mapping
 
 from .models import (
+    AnalysisResult,
     COMMUNITY_SOCIAL,
-    CONTENT_CLASS_TO_DEFAULT_TOPIC,
-    OFFICIAL_MODEL_COMPANY,
-    PROJECT_TOOL,
-    TOPIC_INDUSTRY,
-    TOPIC_MODEL,
-    TOPIC_OPINION,
-    TOPIC_PAPER,
-    TOPIC_PRODUCT,
-    TOPIC_PROJECT,
-    TOPIC_TUTORIAL,
     RawIntelEnvelope,
-    TriageResult,
-    normalize_topic,
+    ScreenResult,
+    TOPIC_PAPER,
 )
 
 
-def infer_topic(envelope: RawIntelEnvelope | Mapping[str, Any] | Any) -> str:
-    """Infer a safe fallback topic from source class and visible text only."""
-
-    item = envelope if isinstance(envelope, RawIntelEnvelope) else RawIntelEnvelope.model_validate(envelope)
-    text = f"{item.title} {item.summary or ''} {item.body_text or ''}".casefold()
-    if any(token in text for token in ("arxiv", "paper", "论文", "研究", "preprint", "benchmark")):
-        return TOPIC_PAPER
-    if any(token in text for token in ("教程", "tutorial", "guide", "how to", "how-to", "入门")):
-        return TOPIC_TUTORIAL
-    if any(token in text for token in ("观点", "评论", "opinion", "analysis", "评论文章")):
-        return TOPIC_OPINION
-    if any(token in text for token in ("行业", "industry", "market", "融资", "regulation", "政策")):
-        return TOPIC_INDUSTRY
-    if any(token in text for token in ("model", "模型", "llm", "checkpoint", "weights", "权重")):
-        return TOPIC_MODEL
-    if any(token in text for token in ("github", "repo", "repository", "开源", "项目", "agent", "mcp")):
-        return TOPIC_PROJECT
-    if item.source_content_class == PROJECT_TOOL:
-        return TOPIC_PROJECT
-    if item.source_content_class == OFFICIAL_MODEL_COMPANY:
-        return TOPIC_PRODUCT
-    if item.source_content_class == COMMUNITY_SOCIAL:
-        return TOPIC_OPINION
-    return TOPIC_PRODUCT
+def _as_envelope(value: RawIntelEnvelope | Mapping[str, Any] | Any) -> RawIntelEnvelope:
+    return value if isinstance(value, RawIntelEnvelope) else RawIntelEnvelope.model_validate(value)
 
 
-def guard_paper_support(result: TriageResult) -> TriageResult:
-    """Apply the paper hard gate without ever upgrading a result.
-
-    arXiv-only papers are always rejected.  Other papers require an explicit
-    supported/strong paper support record and at least one link/code/official
-    source field.  The guard only lowers ``keep`` and appends audit flags.
-    """
-
-    if result.topic != TOPIC_PAPER:
-        return result
-    support = result.paper_support
-    flags = list(result.risk_flags)
-    updates: dict[str, Any] = {}
-    if not support.is_paper:
-        if "paper:not_declared" not in flags:
-            flags.append("paper:not_declared")
-        updates["keep"] = False
-    elif support.arxiv_only:
-        if "paper:arxiv_only" not in flags:
-            flags.append("paper:arxiv_only")
-        updates["keep"] = False
-    elif not support.hard_gate_pass:
-        if "paper:unsupported" not in flags:
-            flags.append("paper:unsupported")
-        updates["keep"] = False
-    if flags != result.risk_flags:
-        updates["risk_flags"] = flags
-    return result.model_copy(update=updates) if updates else result
-
-
-def apply_deterministic_guards(
-    result: TriageResult,
+def apply_screen_guard(
+    result: ScreenResult | Mapping[str, Any],
     envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
-) -> TriageResult:
-    """Apply all local guards while preserving raw provider data.
+    *,
+    reject_threshold: int = 85,
+) -> ScreenResult:
+    """Normalize Stage A output without allowing an unsafe rejection.
 
-    Source metadata is authoritative for ``content_class``.  The function is
-    monotonic: it can reject or lower confidence/score, but never upgrades a
-    provider result.
+    A reject is actionable only at or above ``reject_threshold``.  Lower
+    confidence rejects become ``uncertain`` and therefore continue to Stage B.
+    ``screen_failed`` records are never converted into a successful decision.
     """
 
-    if not isinstance(result, TriageResult):
-        result = TriageResult.model_validate(result)
-    item = None
-    if envelope is not None:
-        item = envelope if isinstance(envelope, RawIntelEnvelope) else RawIntelEnvelope.model_validate(envelope)
-
+    parsed = result if isinstance(result, ScreenResult) else ScreenResult.model_validate(result)
+    threshold = max(0, min(int(reject_threshold), 100))
     updates: dict[str, Any] = {}
-    flags = list(result.risk_flags)
-    if item is not None:
-        if result.item_id is None and item.item_id is not None:
+    if parsed.status == "success" and parsed.decision == "reject" and parsed.confidence < threshold:
+        updates["decision"] = "uncertain"
+        flags = list(parsed.risk_flags)
+        if "screen:low_confidence_reject" not in flags:
+            flags.append("screen:low_confidence_reject")
+        updates["risk_flags"] = flags
+    if envelope is not None:
+        item = _as_envelope(envelope)
+        if parsed.item_id is None and item.item_id is not None:
             updates["item_id"] = item.item_id
-        if result.content_class != item.source_content_class:
-            # A provider cannot turn a community discovery source into an
-            # official source (or vice versa).
-            updates["content_class"] = item.source_content_class
-        if result.source_group is None and item.source_group:
+    return parsed.model_copy(update=updates) if updates else parsed
+
+
+def guard_screen_result(
+    result: ScreenResult | Mapping[str, Any],
+    envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
+    *,
+    reject_threshold: int = 85,
+) -> ScreenResult:
+    """Descriptive alias used by pipeline callers."""
+
+    return apply_screen_guard(result, envelope, reject_threshold=reject_threshold)
+
+
+def apply_analysis_guards(
+    result: AnalysisResult | Mapping[str, Any],
+    envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
+) -> AnalysisResult:
+    """Apply monotonic Stage B safety guards and preserve raw provider data."""
+
+    parsed = result if isinstance(result, AnalysisResult) else AnalysisResult.model_validate(result)
+    updates: dict[str, Any] = {}
+    flags = list(parsed.risk_flags)
+    item = _as_envelope(envelope) if envelope is not None else None
+
+    if item is not None:
+        if parsed.item_id is None and item.item_id is not None:
+            updates["item_id"] = item.item_id
+        if parsed.source_content_class is None:
+            updates["source_content_class"] = item.source_content_class
+        elif parsed.source_content_class != item.source_content_class:
+            # Source metadata is authoritative for provenance; provider output
+            # cannot relabel a community signal as an official source.
+            updates["source_content_class"] = item.source_content_class
+            if "source:class_mismatch" not in flags:
+                flags.append("source:class_mismatch")
+        if parsed.source_group is None and item.source_group:
             updates["source_group"] = item.source_group
 
-        # An arXiv URL in the source envelope is enough to mark an otherwise
-        # incomplete paper record as arXiv-only; it still cannot pass the gate.
-        if result.topic == TOPIC_PAPER and item.url and "arxiv.org" in item.url.casefold():
-            support = result.paper_support
-            if not support.paper_url or support.paper_url != item.url:
+        if parsed.topic == TOPIC_PAPER and item.url and "arxiv.org" in item.url.casefold():
+            support = parsed.paper_support
+            if support.paper_url != item.url or not support.is_paper:
                 support = support.model_copy(update={"paper_url": item.url, "is_paper": True, "arxiv_only": True})
                 updates["paper_support"] = support
 
-    if result.keep and not result.summary_cn.strip():
-        updates["keep"] = False
+    if parsed.status == "success" and not parsed.summary_cn.strip():
         if "summary:empty" not in flags:
             flags.append("summary:empty")
 
-    if result.topic not in {
-        TOPIC_MODEL,
-        TOPIC_PRODUCT,
-        TOPIC_PROJECT,
-        TOPIC_INDUSTRY,
-        TOPIC_TUTORIAL,
-        TOPIC_OPINION,
-        TOPIC_PAPER,
-    }:
-        updates["topic"] = TOPIC_OPINION
-        updates["topics"] = [TOPIC_OPINION]
-        if "topic:invalid" not in flags:
-            flags.append("topic:invalid")
+    if parsed.topic == TOPIC_PAPER and not parsed.paper_support.hard_gate_pass:
+        if parsed.paper_support.arxiv_only and "paper:arxiv_only" not in flags:
+            flags.append("paper:arxiv_only")
+        elif "paper:unsupported" not in flags:
+            flags.append("paper:unsupported")
 
-    # Community/social items remain discovery signals.  Keep the model's
-    # decision but make the weaker provenance explicit for downstream ranking.
-    final_class = updates.get("content_class", result.content_class)
-    if final_class == COMMUNITY_SOCIAL and "source:social_only" not in flags:
+    if parsed.source_content_class == COMMUNITY_SOCIAL and "source:social_only" not in flags:
         flags.append("source:social_only")
-
-    if flags != result.risk_flags:
+    if flags != parsed.risk_flags:
         updates["risk_flags"] = flags
-    guarded = result.model_copy(update=updates) if updates else result
-    return guard_paper_support(guarded)
+    return parsed.model_copy(update=updates) if updates else parsed
 
 
-guard_triage_result = apply_deterministic_guards
+def guard_analysis_result(
+    result: AnalysisResult | Mapping[str, Any],
+    envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
+) -> AnalysisResult:
+    return apply_analysis_guards(result, envelope)
+
+
+def guard_paper_support(result: AnalysisResult | Mapping[str, Any]) -> AnalysisResult:
+    """Apply the paper-only guard without requiring the raw envelope."""
+
+    return apply_analysis_guards(result)
+
+
+def analysis_guard_failure(result: AnalysisResult | Mapping[str, Any]) -> str | None:
+    """Return a deterministic Stage B filter reason, if one applies."""
+
+    parsed = result if isinstance(result, AnalysisResult) else AnalysisResult.model_validate(result)
+    if parsed.status != "success":
+        return "analysis_failed"
+    if not parsed.summary_cn.strip():
+        return "summary_empty"
+    if parsed.topic == TOPIC_PAPER and not parsed.paper_support.hard_gate_pass:
+        return "paper_support_failed"
+    return None
 
 
 __all__ = [
-    "apply_deterministic_guards",
+    "analysis_guard_failure",
+    "apply_analysis_guards",
+    "apply_screen_guard",
+    "guard_analysis_result",
     "guard_paper_support",
-    "guard_triage_result",
-    "infer_topic",
+    "guard_screen_result",
 ]

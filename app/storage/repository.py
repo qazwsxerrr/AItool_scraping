@@ -10,17 +10,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.domain.models import SourceSpec
 from app.storage.models import (
+    AIItemScreen,
     AIItemReview,
     IntelEvent,
     IntelEventItem,
     IntelEventRankingSnapshot,
     IntelItem,
     IntelRun,
+    IntelRunItem,
     Source,
     FetchAttempt,
     utcnow,
@@ -40,6 +42,13 @@ class IntelCounts:
     fetched: int = 0
     inserted: int = 0
     skipped: int = 0
+    screened: int = 0
+    screened_out: int = 0
+    screen_failed: int = 0
+    analysis_filtered: int = 0
+    analysis_failed: int = 0
+    candidate: int = 0
+    partial: int = 0
     selected: int = 0
     analyzed: int = 0
     failed: int = 0
@@ -180,11 +189,117 @@ class IntelRepository:
             stmt = stmt.where(Source.id == source_id)
         return list(self.session.scalars(stmt).all())
 
-    def start_run(self, *, filters: Mapping[str, Any] | None = None) -> IntelRun:
-        run = IntelRun(status="running", filters_json=_dump_json(dict(filters or {})))
+    def start_run(
+        self,
+        *,
+        filters: Mapping[str, Any] | None = None,
+        scope: Mapping[str, Any] | None = None,
+        run_type: str = "run_once",
+        source_ids: Iterable[str] | None = None,
+    ) -> IntelRun:
+        """Create a durable run and its explicit processing scope."""
+
+        source_values = _unique_strings(source_ids or ())
+        run = IntelRun(
+            status="running",
+            run_type=_text(run_type) or "run_once",
+            filters_json=_dump_json(dict(filters or {})),
+            scope_json=_dump_json(dict(scope or {})),
+            source_ids_json=_dump_json(source_values),
+        )
         self.session.add(run)
         self.session.flush()
         return run
+
+    def set_run_scope(
+        self,
+        run_id: int,
+        *,
+        source_ids: Iterable[str] | None = None,
+        item_ids: Iterable[int] | None = None,
+        scope: Mapping[str, Any] | None = None,
+    ) -> IntelRun | None:
+        run = self.session.get(IntelRun, int(run_id))
+        if run is None:
+            return None
+        if source_ids is not None:
+            run.source_ids_json = _dump_json(_unique_strings(source_ids))
+        if item_ids is not None:
+            run.item_ids_json = _dump_json(_unique_ints(item_ids))
+        if scope is not None:
+            existing = _load_json(run.scope_json, {})
+            existing = dict(existing) if isinstance(existing, Mapping) else {}
+            existing.update(dict(scope))
+            run.scope_json = _dump_json(existing)
+        self.session.flush()
+        return run
+
+    def record_run_item(
+        self,
+        run_id: int,
+        item_id: int,
+        *,
+        source_id: str | None = None,
+        role: str = "fetched",
+        status: str = "fetched",
+    ) -> IntelRunItem:
+        """Attach an item to a run scope idempotently.
+
+        This method performs only serial SQLAlchemy work; provider threads must
+        return their result before the job invokes it.
+        """
+
+        run = self.session.get(IntelRun, int(run_id))
+        if run is None:
+            raise ValueError(f"intel run {run_id} does not exist")
+        item = self.session.get(IntelItem, int(item_id))
+        if item is None:
+            raise ValueError(f"intel item {item_id} does not exist")
+        relation = self.session.scalar(
+            select(IntelRunItem).where(
+                IntelRunItem.run_id == int(run_id), IntelRunItem.item_id == int(item_id)
+            )
+        )
+        if relation is None:
+            relation = IntelRunItem(run_id=int(run_id), item_id=int(item_id))
+            self.session.add(relation)
+        relation.source_id = source_id or relation.source_id or item.source_id
+        relation.role = _text(role) or "fetched"
+        relation.status = _text(status) or "fetched"
+        item.latest_run_id = int(run_id)
+        item_ids = _unique_ints([*(_string_values(_load_json(run.item_ids_json, []))), int(item_id)])
+        run.item_ids_json = _dump_json(item_ids)
+        relation.updated_at = utcnow()
+        self.session.flush()
+        return relation
+
+    def update_run_item_status(self, run_id: int, item_id: int, *, status: str) -> IntelRunItem | None:
+        relation = self.session.scalar(
+            select(IntelRunItem).where(
+                IntelRunItem.run_id == int(run_id), IntelRunItem.item_id == int(item_id)
+            )
+        )
+        if relation is None:
+            return None
+        relation.status = _text(status) or relation.status
+        relation.updated_at = utcnow()
+        self.session.flush()
+        return relation
+
+    def list_run_item_ids(
+        self,
+        run_id: int,
+        *,
+        role: str | None = None,
+        status: str | Iterable[str] | None = None,
+    ) -> list[int]:
+        stmt = select(IntelRunItem.item_id).where(IntelRunItem.run_id == int(run_id)).order_by(IntelRunItem.id.asc())
+        if role:
+            stmt = stmt.where(IntelRunItem.role == role)
+        if status:
+            statuses = [status] if isinstance(status, str) else list(status)
+            stmt = stmt.where(IntelRunItem.status.in_(statuses))
+        return [int(value) for value in self.session.scalars(stmt).all()]
 
     def finish_run(
         self,
@@ -193,6 +308,8 @@ class IntelRepository:
         status: str,
         counts: IntelCounts | Mapping[str, int] | None = None,
         error: str | None = None,
+        partial: bool | None = None,
+        partial_reason: str | None = None,
     ) -> None:
         run = self.session.get(IntelRun, run_id)
         if run is None:
@@ -200,10 +317,26 @@ class IntelRepository:
         values = _counts_dict(counts)
         run.status = status
         run.finished_at = utcnow()
-        for name in ("fetched", "inserted", "selected", "analyzed", "failed"):
+        for name in (
+            "fetched", "inserted", "screened", "screened_out", "screen_failed",
+            "analyzed", "analysis_filtered", "analysis_failed", "candidate", "failed",
+        ):
             if name in values:
                 setattr(run, name, int(values[name]))
+        if "selected" in values:
+            run.selected = int(values["selected"])
+        elif "candidate" in values:
+            run.selected = int(values["candidate"])
+        if partial is not None:
+            run.partial = bool(partial)
+        elif "partial" in values:
+            run.partial = bool(values["partial"])
+        if partial_reason is not None:
+            run.partial_reason = _text(partial_reason)
+        elif values.get("partial_reason") is not None:
+            run.partial_reason = _text(values.get("partial_reason"))
         run.error = error[:4000] if error else None
+        self.session.flush()
 
     def create_attempt(
         self,
@@ -267,7 +400,7 @@ class IntelRepository:
                 attempt.error_code = getattr(error, "error_code", None) or attempt.error_code or type(error).__name__.lower()
             attempt.error_message = message[:4000]
 
-    def insert_item(self, item: Any) -> IntelInsertResult:
+    def insert_item(self, item: Any, *, run_id: int | None = None, run_role: str = "fetched") -> IntelInsertResult:
         """Insert or refresh one normalized item idempotently.
 
         GitHub repository identifiers are stable across search sources, so they
@@ -331,6 +464,11 @@ class IntelRepository:
                 "rejected",
                 "filtered",
                 "ai_failed",
+                "screened_out",
+                "screen_failed",
+                "analysis_filtered",
+                "analysis_failed",
+                "candidate",
             }:
                 # A refreshed item must pass deterministic selection again. Its
                 # previous AI result remains available for audit until the
@@ -339,6 +477,14 @@ class IntelRepository:
                 existing.selection_score = 0
                 existing.selection_reason = None
             existing.updated_at = utcnow()
+            if run_id is not None:
+                self.record_run_item(
+                    run_id,
+                    existing.id,
+                    source_id=existing.source_id,
+                    role=run_role,
+                    status="fetched",
+                )
             return IntelInsertResult(inserted=False, item_id=existing.id, reason="duplicate", updated=True)
 
         row_metrics = (
@@ -367,6 +513,14 @@ class IntelRepository:
         )
         self.session.add(row)
         self.session.flush()
+        if run_id is not None:
+            self.record_run_item(
+                run_id,
+                row.id,
+                source_id=row.source_id,
+                role=run_role,
+                status="fetched",
+            )
         return IntelInsertResult(inserted=True, item_id=row.id)
 
     def save_github_enrichment(self, item_id: int, enrichment: Mapping[str, Any]) -> IntelItem | None:
@@ -464,24 +618,87 @@ class IntelRepository:
         content_class: str | None = None,
         source_id: str | None = None,
         force: bool = False,
+        run_id: int | None = None,
+        stage: str = "screen",
     ) -> list[IntelItem]:
         stmt = (
             select(IntelItem)
-            .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
+            .options(
+                joinedload(IntelItem.source),
+                joinedload(IntelItem.ai_screen),
+                joinedload(IntelItem.ai_review),
+            )
             .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
         )
-        if not force:
-            stmt = stmt.where(
-                IntelItem.status.in_(["new", "selected", "ai_failed"])
-                | (
-                    (IntelItem.status == "hotspot")
-                    & (IntelItem.ai_review.has(AIItemReview.status == "ai_failed"))
-                )
+        if run_id is not None:
+            stmt = stmt.join(IntelRunItem, IntelRunItem.item_id == IntelItem.id).where(
+                IntelRunItem.run_id == int(run_id)
             )
+        if stage.casefold() in {"analysis", "analyze", "stage_b", "b"}:
+            # Stage A pass/uncertain items remain ``new`` until Stage B
+            # produces a projection; high-confidence rejects are excluded.
+            stmt = stmt.where(
+                IntelItem.status.in_(["new", "analysis_filtered", "analysis_failed", "candidate"])
+                if force
+                else IntelItem.status == "new",
+                IntelItem.ai_screen.has(
+                    and_(
+                        AIItemScreen.decision.in_(["pass", "uncertain"]),
+                        AIItemScreen.status == "success",
+                    )
+                ),
+            )
+            if not force:
+                stmt = stmt.where(
+                    (~IntelItem.ai_review.has())
+                    | (IntelItem.ai_review.has(AIItemReview.status == "analysis_failed"))
+                )
+        else:
+            stmt = stmt.where(
+                IntelItem.status.in_(
+                    ["new", "screened_out", "screen_failed", "analysis_filtered", "analysis_failed", "candidate"]
+                )
+                if force
+                else IntelItem.status == "new"
+            )
+            if not force:
+                stmt = stmt.where(
+                    (~IntelItem.ai_screen.has())
+                    | (IntelItem.ai_screen.has(AIItemScreen.status == "screen_failed"))
+                )
         if content_class:
             stmt = stmt.where(IntelItem.content_class == content_class)
         if source_id:
             stmt = stmt.where(IntelItem.source_id == source_id)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).unique().all())
+
+    def list_run_items(
+        self,
+        run_id: int,
+        *,
+        statuses: Iterable[str] | None = None,
+        role: str | None = None,
+        limit: int | None = None,
+    ) -> list[IntelItem]:
+        """Read only the items attached to one run scope."""
+
+        stmt = (
+            select(IntelItem)
+            .join(IntelRunItem, IntelRunItem.item_id == IntelItem.id)
+            .options(
+                joinedload(IntelItem.source),
+                joinedload(IntelItem.ai_screen),
+                joinedload(IntelItem.ai_review),
+            )
+            .where(IntelRunItem.run_id == int(run_id))
+            .order_by(IntelItem.id.asc())
+        )
+        if statuses:
+            stmt = stmt.where(IntelItem.status.in_(list(statuses)))
+        if role:
+            stmt = stmt.where(IntelRunItem.role == role)
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).unique().all())
@@ -502,79 +719,128 @@ class IntelRepository:
             item.discovered_links_json = _dump_json(links)
             item.updated_at = utcnow()
 
-    def upsert_ai_review(
+    def upsert_ai_screen(
         self,
         item_id: int,
         response: Any,
         *,
-        model: str | None,
-        content_class: str | None = None,
-        topic_category: str | None = None,
-        status: str = "success",
+        run_id: int | None = None,
+        model: str | None = None,
+        status: str | None = None,
         error_message: str | None = None,
-    ) -> AIItemReview:
-        review = self.session.scalar(select(AIItemReview).where(AIItemReview.item_id == item_id))
-        if review is None:
-            review = AIItemReview(item_id=item_id, content_class=content_class or "community_social")
-            self.session.add(review)
-        is_triage = _is_triage_response(response)
-        review.model = model
-        review.keep = bool(_response_value(response, "keep", False)) if response is not None else False
-        review.content_class = str(_response_value(response, "content_class") or content_class or "community_social")
-        review.summary_cn = _text(_response_value(response, "summary_cn"))
-        review.reason = _text(_response_value(response, "reason"))
-        review.risk_flags_json = _dump_json(_structured_json(_response_value(response, "risk_flags", [])))
-        review.confidence = max(0, min(int(_response_value(response, "confidence", 0) or 0), 100))
+    ) -> AIItemScreen:
+        """Persist one Stage A result, including the untouched raw payload."""
+
+        item = self.session.get(IntelItem, int(item_id))
+        if item is None:
+            raise ValueError(f"intel item {item_id} does not exist")
+        screen = self.session.scalar(select(AIItemScreen).where(AIItemScreen.item_id == int(item_id)))
+        if screen is None:
+            screen = AIItemScreen(item_id=int(item_id))
+            self.session.add(screen)
+        screen.run_id = run_id
+        screen.model = model
+        screen.decision = _normalize_screen_decision(_response_value(response, "decision", "uncertain"))
+        screen.reason_code = _text(_response_value(response, "reason_code") or _response_value(response, "code")) or ""
+        screen.reason = _text(_response_value(response, "reason") or _response_value(response, "explanation")) or ""
+        screen.confidence = _bounded_int(_response_value(response, "confidence", 0))
+        screen.risk_flags_json = _dump_json(_structured_json(_response_value(response, "risk_flags", [])))
         raw = _response_value(response, "raw_response") if response is not None else None
         if raw is None and isinstance(response, Mapping):
             raw = dict(response)
-        legacy_category = _text(topic_category or _response_value(response, "topic_category"))
-        triage_category = _text(getattr(response, "topic_label", None)) if is_triage else None
-        review.topic_category = legacy_category or triage_category or review.topic_category or "未分类"
-        review.raw_response_json = _dump_json(raw if raw is not None else {})
-        if is_triage:
-            # Persist every Wave 1 field explicitly.  The raw response remains
-            # intact for forensic replay; these columns give event clustering
-            # an auditable/queryable projection without JSON1 requirements.
-            review.prompt_version = "intel_triage_v1"
-            review.topic = _text(_response_value(response, "topic"))
-            review.topics_json = _dump_json(_structured_json(_response_value(response, "topics", [])))
-            review.keywords_json = _dump_json(_structured_json(_response_value(response, "keywords", [])))
-            score = _response_value(response, "selection_score")
-            review.selection_score = _bounded_int(score) if score is not None else None
-            review.scores_json = _dump_json(_structured_json(_response_value(response, "scores", {})))
-            review.novelty = _text(_response_value(response, "novelty"))
-            review.novelty_score = _bounded_int(_response_value(response, "novelty_score", 0))
-            review.paper_support_json = _dump_json(_structured_json(_response_value(response, "paper_support", {})))
-            response_status = _text(_response_value(response, "status"))
-            review.status = response_status or status
-            response_error = _text(_response_value(response, "error_message"))
-            review.error_message = (response_error or error_message or "")[:4000] or None
-        else:
-            # Legacy ItemAnalysis rows remain readable.  Do not manufacture a
-            # topic/novelty when no triage result was produced.
-            if response is None and status in {"ai_failed", "invalid"}:
-                # A retry failure must not leave a previous successful triage
-                # projection looking current to the event stage.
-                review.topic = None
-                review.topics_json = "[]"
-                review.keywords_json = "[]"
-                review.selection_score = None
-                review.scores_json = "{}"
-                review.novelty = None
-                review.novelty_score = 0
-                review.paper_support_json = "{}"
-            review.status = status
-            review.error_message = error_message[:4000] if error_message else None
+        screen.raw_response_json = _dump_json(_structured_json(raw if raw is not None else {}))
+        response_status = _text(_response_value(response, "status"))
+        screen.status = response_status or _text(status) or "success"
+        screen.error_code = _text(_response_value(response, "error_code"))
+        response_error = _text(_response_value(response, "error_message"))
+        screen.error_message = (response_error or error_message or "")[:4000] or None
+        screen.updated_at = utcnow()
+        self.session.flush()
+        if run_id is not None:
+            self.update_run_item_status(run_id, item_id, status=screen.status)
+        return screen
+
+    save_ai_screen = upsert_ai_screen
+    save_screen_result = upsert_ai_screen
+    save_screen = upsert_ai_screen
+
+    def upsert_ai_analysis(
+        self,
+        item_id: int,
+        response: Any,
+        *,
+        run_id: int | None = None,
+        model: str | None = None,
+        content_class: str | None = None,
+        status: str | None = None,
+        error_message: str | None = None,
+    ) -> AIItemReview:
+        """Persist one Stage B projection and its raw provider payload."""
+
+        item = self.session.get(IntelItem, int(item_id))
+        if item is None:
+            raise ValueError(f"intel item {item_id} does not exist")
+        review = self.session.scalar(select(AIItemReview).where(AIItemReview.item_id == int(item_id)))
+        if review is None:
+            review = AIItemReview(
+                item_id=int(item_id),
+                content_class=content_class or item.content_class or "community_social",
+            )
+            self.session.add(review)
+        review.run_id = run_id
+        review.model = model
+        review.content_class = _text(
+            _response_value(response, "source_content_class")
+            or _response_value(response, "content_class")
+            or content_class
+            or item.content_class
+            or "community_social"
+        ) or "community_social"
+        review.topic = _text(_response_value(response, "topic"))
+        review.topics_json = _dump_json(_structured_json(_response_value(response, "topics", [])))
+        review.keywords_json = _dump_json(_structured_json(_response_value(response, "keywords", [])))
+        review.entities_json = _dump_json(
+            _structured_json(_response_value(response, "entities") or _response_value(response, "typed_entities", []))
+        )
+        score = _response_value(response, "selection_score")
+        review.selection_score = _bounded_int(score) if score is not None else None
+        score_components = _response_value(response, "score_components")
+        if score_components is None:
+            score_components = _response_value(response, "scores", {})
+        review.score_components_json = _dump_json(_structured_json(score_components or {}))
+        review.paper_support_json = _dump_json(
+            _structured_json(_response_value(response, "paper_support", {}))
+        )
+        review.summary_cn = _text(_response_value(response, "summary_cn") or _response_value(response, "summary"))
+        review.reason = _text(_response_value(response, "reason"))
+        review.risk_flags_json = _dump_json(_structured_json(_response_value(response, "risk_flags", [])))
+        review.confidence = _bounded_int(_response_value(response, "confidence", 0))
+        raw = _response_value(response, "raw_response") if response is not None else None
+        if raw is None and isinstance(response, Mapping):
+            raw = dict(response)
+        review.raw_response_json = _dump_json(_structured_json(raw if raw is not None else {}))
+        response_status = _text(_response_value(response, "status"))
+        review.status = response_status or _text(status) or "success"
+        review.error_code = _text(_response_value(response, "error_code"))
+        response_error = _text(_response_value(response, "error_message"))
+        review.error_message = (response_error or error_message or "")[:4000] or None
         review.updated_at = utcnow()
         self.session.flush()
+        if run_id is not None:
+            self.update_run_item_status(run_id, item_id, status=review.status)
         return review
 
-    def set_item_status(self, item_id: int, status: str) -> None:
+    save_ai_analysis = upsert_ai_analysis
+    save_analysis_result = upsert_ai_analysis
+    save_analysis = upsert_ai_analysis
+
+    def set_item_status(self, item_id: int, status: str, *, run_id: int | None = None) -> None:
         item = self.session.get(IntelItem, item_id)
         if item is not None:
             item.status = status
             item.updated_at = utcnow()
+            if run_id is not None:
+                self.update_run_item_status(run_id, item_id, status=status)
 
     def list_export_items(
         self,
@@ -585,12 +851,11 @@ class IntelRepository:
     ) -> list[IntelItem]:
         stmt = (
             select(IntelItem)
-            .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
+            .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_screen), joinedload(IntelItem.ai_review))
             .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
             .where(
-                IntelItem.status == "selected",
+                IntelItem.status == "candidate",
                 AIItemReview.status == "success",
-                AIItemReview.keep.is_(True),
             )
             .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
         )
@@ -619,6 +884,8 @@ class IntelRepository:
         summary_cn: str | None = None,
         topic: str | None = None,
         topics: Iterable[str] | None = None,
+        keywords: Iterable[str] | None = None,
+        entities: Iterable[Mapping[str, Any]] | None = None,
         content_class: str | None = None,
         source_group: str | None = None,
         source_ids: Iterable[str] | None = None,
@@ -632,6 +899,8 @@ class IntelRepository:
         resolution_raw: Any | None = None,
         risk_flags: Iterable[str] | None = None,
         primary_item_id: int | None = None,
+        run_id: int | None = None,
+        new_in_run_id: int | None = None,
         first_seen_at: datetime | None = None,
         last_seen_at: datetime | None = None,
         metadata: Mapping[str, Any] | None = None,
@@ -705,10 +974,28 @@ class IntelRepository:
             [*(source_groups or ()), *(_string_values(values.get("source_groups"))), source_group, values.get("source_group")]
         )
         previous_topics = _load_json(row.topics_json, [])
+        previous_keywords = _load_json(row.keywords_json, [])
+        previous_entities = _load_json(row.entities_json, [])
         previous_sources = _load_json(row.source_ids_json, [])
         previous_source_groups = _load_json(row.source_groups_json, [])
         previous_aliases = _load_json(row.identity_keys_json, [])
         merged_topics = _unique_strings([*(_string_values(previous_topics)), *values_topics])
+        values_keywords = _unique_strings(
+            [*(keywords or ()), *(_string_values(values.get("keywords"))), values.get("keyword")]
+        )
+        merged_keywords = _unique_strings([*(_string_values(previous_keywords)), *values_keywords])
+        values_entities = [
+            _structured_json(entity)
+            for entity in (entities or ())
+            if isinstance(_structured_json(entity), Mapping)
+        ]
+        if isinstance(values.get("entities"), (list, tuple, set)):
+            values_entities.extend(
+                _structured_json(entity)
+                for entity in values.get("entities", ())
+                if isinstance(_structured_json(entity), Mapping)
+            )
+        merged_entities = _unique_json_objects([*(_load_json(row.entities_json, [])), *values_entities])
         merged_sources = _unique_strings([*(_string_values(previous_sources)), *values_sources])
         merged_source_groups = _unique_strings([*(_string_values(previous_source_groups)), *values_source_groups])
         merged_aliases = _unique_strings([*(_string_values(previous_aliases)), *aliases])
@@ -729,6 +1016,10 @@ class IntelRepository:
             row.topics_json = _dump_json(merged_topics)
             if not row.topic or row.topic == "opinion":
                 row.topic = merged_topics[0]
+        if merged_keywords:
+            row.keywords_json = _dump_json(merged_keywords)
+        if merged_entities:
+            row.entities_json = _dump_json(merged_entities)
         if merged_sources:
             row.source_ids_json = _dump_json(merged_sources)
         if merged_source_groups:
@@ -765,6 +1056,13 @@ class IntelRepository:
             candidate_primary = int(primary_item_id if primary_item_id is not None else values.get("primary_item_id"))
             if row.primary_item_id is None:
                 row.primary_item_id = candidate_primary
+        if run_id is not None or values.get("run_id") is not None:
+            current_run_id = int(run_id if run_id is not None else values.get("run_id"))
+            if row.first_run_id is None:
+                row.first_run_id = current_run_id
+            row.last_run_id = current_run_id
+        if new_in_run_id is not None or values.get("new_in_run_id") is not None:
+            row.new_in_run_id = int(new_in_run_id if new_in_run_id is not None else values.get("new_in_run_id"))
         first_seen = _as_utc(first_seen_at or values.get("first_seen_at"))
         last_seen = _as_utc(last_seen_at or values.get("last_seen_at"))
         existing_first_seen = _as_utc(row.first_seen_at)
@@ -848,6 +1146,8 @@ class IntelRepository:
             relation.event_id = int(event_id)
             relation.source_id = source_id or relation.source_id or item.source_id
         relation.source_group = source_group or relation.source_group or (item.source.source_group if item.source else None)
+        relation.source_url = relation.source_url or item.canonical_url or item.source_url
+        relation.source_title = relation.source_title or item.title
         relation.identity_key = identity_key or relation.identity_key
         relation.match_type = _text(match_type) or "deterministic"
         try:
@@ -1085,27 +1385,26 @@ def _policy_dict(policy: Any, kind: str) -> dict[str, Any]:
     return {}
 
 
-def _counts_dict(counts: IntelCounts | Mapping[str, int] | None) -> dict[str, int]:
+def _counts_dict(counts: IntelCounts | Mapping[str, Any] | None) -> dict[str, Any]:
     if counts is None:
         return {}
     if isinstance(counts, Mapping):
-        return {str(k): int(v) for k, v in counts.items()}
+        result: dict[str, Any] = {}
+        for key, value in counts.items():
+            name = str(key)
+            if name == "partial_reason":
+                result[name] = value
+                continue
+            try:
+                result[name] = int(value)
+            except (TypeError, ValueError, OverflowError):
+                result[name] = 0
+        return result
     return {key: int(value) for key, value in asdict(counts).items()}
 
 
 def _dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
-
-
-def _is_triage_response(value: Any) -> bool:
-    """Return whether ``value`` exposes the Wave 1 triage projection."""
-
-    if isinstance(value, Mapping):
-        return any(name in value for name in ("topic", "topics", "keywords", "paper_support", "novelty"))
-    return value is not None and any(
-        hasattr(value, name)
-        for name in ("topic", "topics", "keywords", "paper_support", "novelty")
-    )
 
 
 def _response_value(value: Any, name: str, default: Any = None) -> Any:
@@ -1134,6 +1433,41 @@ def _bounded_int(value: Any, default: int = 0) -> int:
         return max(0, min(100, int(float(value))))
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _normalize_screen_decision(value: Any) -> str:
+    text = (_text(value) or "").casefold()
+    return text if text in {"pass", "reject", "uncertain"} else "uncertain"
+
+
+def _unique_ints(values: Iterable[Any]) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if number in seen:
+            continue
+        seen.add(number)
+        result.append(number)
+    return result
+
+
+def _unique_json_objects(values: Iterable[Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        normalized = dict(_structured_json(value))
+        marker = _dump_json(normalized)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(normalized)
+    return result
 
 
 def _normalize_event_title(value: Any) -> str:

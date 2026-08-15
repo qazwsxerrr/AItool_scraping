@@ -1,4 +1,4 @@
-"""Single-module compatibility surface for the Intel Triage contract."""
+"""Convenience surface for the Stage A/B intelligence contract."""
 
 from .guards import *
 from .models import *
