@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+import threading
+import time
 
 from sqlalchemy import select
 
-from app.ai.schemas import TriageResult
+from app.ai.skills.intel_triage import AnalysisResult, ScreenResult
 from app.domain.models import FetchItem, SourceSpec
-from app.domain.policies import source_spec_from_config
 from app.jobs.ai_review_job import run_ai_review_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelItem
+from app.storage.models import IntelItem, IntelRun, IntelRunItem
 from app.storage.repository import IntelRepository
-
-
-NOW = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
 
 
 def _db(tmp_path):
@@ -25,8 +22,8 @@ def _db(tmp_path):
 
 def _source() -> SourceSpec:
     return SourceSpec(
-        id="official_review_test",
-        name="Official review test",
+        id="stage_ab_test",
+        name="Stage A/B test",
         transport="feed",
         url="https://official.example/feed.xml",
         feed={"format": "rss", "adapter": "generic"},
@@ -41,277 +38,332 @@ def _source() -> SourceSpec:
 class _AI:
     model = "test-model"
 
-    def __init__(self, fail_ids=()):
-        self.fail_ids = set(fail_ids)
-        self.calls: list[int] = []
+    def __init__(
+        self,
+        *,
+        reject_titles: dict[str, int] | None = None,
+        fail_screen_titles: set[str] | None = None,
+        score_by_title: dict[str, int] | None = None,
+        paper_titles: set[str] | None = None,
+        fail_analysis_titles: set[str] | None = None,
+        track_concurrency: bool = False,
+    ):
+        self.reject_titles = reject_titles or {}
+        self.fail_screen_titles = fail_screen_titles or set()
+        self.score_by_title = score_by_title or {}
+        self.paper_titles = paper_titles or set()
+        self.fail_analysis_titles = fail_analysis_titles or set()
+        self.screen_calls: list[int] = []
+        self.analysis_calls: list[int] = []
+        self.track_concurrency = track_concurrency
+        self._lock = threading.Lock()
+        self._active = 0
+        self.max_active = 0
 
-    def triage(self, envelope):
-        self.calls.append(envelope.item_id)
-        if envelope.item_id in self.fail_ids:
-            raise RuntimeError("provider timeout")
-        return TriageResult(
-            item_id=envelope.item_id,
-            keep=True,
-            topic="product",
-            topics=["product"],
-            summary_cn="中文简要总结",
-            keywords=["model", "release"],
-            selection_score=91,
-            scores={"relevance": 90, "total": 91},
-            novelty="new",
-            paper_support={"is_paper": False},
-            risk_flags=[],
-            reason="保留",
-            confidence=91,
-            raw_response={"fixture": True},
-        )
+    def _enter(self) -> None:
+        if not self.track_concurrency:
+            return
+        with self._lock:
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+        time.sleep(0.01)
+
+    def _exit(self) -> None:
+        if not self.track_concurrency:
+            return
+        with self._lock:
+            self._active -= 1
+
+    def screen(self, envelope):
+        self._enter()
+        try:
+            self.screen_calls.append(envelope.item_id)
+            if envelope.title in self.fail_screen_titles:
+                raise RuntimeError("screen timeout")
+            if envelope.title in self.reject_titles:
+                return ScreenResult(
+                    item_id=envelope.item_id,
+                    decision="reject",
+                    reason_code="not_relevant",
+                    reason="screen decision",
+                    confidence=self.reject_titles[envelope.title],
+                    risk_flags=["screen_fixture"],
+                    raw_response={"fixture": "screen"},
+                )
+            return ScreenResult(
+                item_id=envelope.item_id,
+                decision="pass",
+                reason_code="relevant",
+                reason="screen pass",
+                confidence=90,
+                risk_flags=[],
+                raw_response={"fixture": "screen"},
+            )
+        finally:
+            self._exit()
+
+    def analyze(self, envelope):
+        self._enter()
+        try:
+            self.analysis_calls.append(envelope.item_id)
+            if envelope.title in self.fail_analysis_titles:
+                raise RuntimeError("analysis timeout")
+            score = self.score_by_title.get(envelope.title, 80)
+            if envelope.title in self.paper_titles:
+                return AnalysisResult(
+                    item_id=envelope.item_id,
+                    topic="paper",
+                    topics=["paper"],
+                    summary_cn="论文摘要",
+                    keywords=["paper"],
+                    entities=[],
+                    selection_score=score,
+                    score_components={"total": score},
+                    paper_support={
+                        "is_paper": True,
+                        "paper_url": envelope.url,
+                        "arxiv_only": True,
+                    },
+                    risk_flags=[],
+                    reason="paper fixture",
+                    confidence=90,
+                    raw_response={"fixture": "analysis"},
+                )
+            return AnalysisResult(
+                item_id=envelope.item_id,
+                topic="product",
+                topics=["product"],
+                summary_cn="中文阶段 B 摘要",
+                keywords=["model", "release"],
+                entities=[],
+                selection_score=score,
+                score_components={"relevance": score, "total": score},
+                paper_support={"is_paper": False},
+                risk_flags=[],
+                reason="analysis fixture",
+                confidence=90,
+                raw_response={"fixture": "analysis"},
+            )
+        finally:
+            self._exit()
 
 
-class _RejectingAI(_AI):
-    def triage(self, envelope):
-        self.calls.append(envelope.item_id)
-        return TriageResult(
-            item_id=envelope.item_id,
-            keep=False,
-            topic="product",
-            topics=["product"],
-            summary_cn="与 AI 日报主题无关",
-            keywords=["noise"],
-            selection_score=4,
-            scores={"relevance": 2, "total": 4},
-            novelty="repeat",
-            paper_support={"is_paper": False},
-            reason="内容与 AI 工具情报无关",
-            risk_flags=["irrelevant"],
-            confidence=94,
-            raw_response={"fixture": True, "keep": False},
-        )
-
-
-def _insert_items(sf, source, spec):
-    with sf() as session:
+def _insert_items(session_factory, source: SourceSpec, titles: list[str], *, run_id: int | None = None):
+    with session_factory() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(source, policy=spec)
-        for external_id, title in (
-            ("keep:1", "Announcing a new model release"),
-            ("filtered:1", "Unrelated noise"),
-            ("failed:1", "API version update"),
-        ):
+        repo.upsert_source(source, policy=source)
+        for index, title in enumerate(titles, 1):
             repo.insert_item(
                 FetchItem(
                     source_id=source.id,
-                    external_id=external_id,
+                    external_id=f"item:{index}:{title}",
                     title=title,
-                    url=f"https://official.example/{external_id}",
-                    published_at=NOW - timedelta(hours=2),
+                    url=f"https://official.example/{index}/{title.replace(' ', '-')}",
                     summary=title,
-                )
+                ),
+                run_id=run_id,
             )
         session.commit()
 
 
-def test_ai_review_never_calls_verification_and_exports_not_run(tmp_path, monkeypatch):
+def test_stage_a_stage_b_guards_and_exports(tmp_path):
     sf = _db(tmp_path)
     source = _source()
-    spec = source_spec_from_config(source)
-    _insert_items(sf, source, spec)
-    ai = _AI()
+    titles = ["high reject", "low reject", "low score", "paper", "candidate"]
+    _insert_items(sf, source, titles)
+    ai = _AI(
+        reject_titles={"high reject": 90, "low reject": 20},
+        score_by_title={"low score": 59, "paper": 99, "candidate": 60},
+        paper_titles={"paper"},
+    )
 
     result = run_ai_review_job(
         session_factory=sf,
-        source_specs={source.id: spec},
+        source_specs={source.id: source},
         ai_client=ai,
         output_dir=tmp_path / "out",
-        limit=10,
-        now=NOW,
     )
 
-    assert result.analyzed == 2
-    assert result.filtered == 1
+    assert result.processed == 5
+    assert result.screened == 5
+    assert result.screened_out == 1
+    assert result.analyzed == 4
+    assert result.analysis_filtered == 2
+    assert result.candidate == 2
+    assert len(result.candidate_ids) == 2
     assert result.exported == 2
-    records = [
+    assert result.audit_exported == 5
+    assert len(ai.screen_calls) == 5
+    assert len(ai.analysis_calls) == 4
+
+    with sf() as session:
+        rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
+        assert [row.status for row in rows] == [
+            "screened_out",
+            "candidate",
+            "analysis_filtered",
+            "analysis_filtered",
+            "candidate",
+        ]
+        assert rows[0].ai_review is None
+        assert rows[1].ai_review.selection_score == 80
+        assert rows[2].ai_review.selection_score == 59
+        assert rows[3].ai_review.paper_support["arxiv_only"] is True
+        assert rows[4].ai_review.selection_score == 60
+
+    candidate_records = [
         json.loads(line)
         for line in (tmp_path / "out" / "ai_review_candidates.jsonl").read_text().splitlines()
     ]
-    records_by_title = {row["title"]: row for row in records}
-    record = records[0]
-    assert record["stage"] == "ai_review"
-    assert record["source_id"] == source.id
-    assert record["source_group"] == "official_blog"
-    assert record["source_subtype"] == "fixed_news"
-    assert "evidence_status" not in record
-    assert "verification_status" not in record
-    assert "verification" not in record
-    assert record["summary_cn"] == "中文简要总结"
-    assert record["content_class"] == "official_model_company"
-    assert record["topic_category"] == "产品"
-
-    with sf() as session:
-        rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
-        assert rows[0].status == "selected"
-        assert rows[0].ai_review.status == "success"
-        assert rows[0].ai_review.summary_cn == "中文简要总结"
-        assert rows[0].ai_review.topic == "product"
-        assert json.loads(rows[0].ai_review.topics_json) == ["product"]
-        assert json.loads(rows[0].ai_review.keywords_json) == ["model", "release"]
-        assert rows[0].ai_review.selection_score == 91
-        assert rows[0].ai_review.novelty == "new"
-        assert json.loads(rows[0].ai_review.paper_support_json)["is_paper"] is False
-        assert rows[0].ai_review.topic_category == "产品"
-        assert rows[1].status == "filtered"
-        assert rows[2].status == "selected"
+    assert {record["status"] for record in candidate_records} == {"candidate"}
+    assert all("keep" not in record and "novelty" not in record for record in candidate_records)
+    assert {record["screen"]["decision"] for record in candidate_records} == {"pass", "uncertain"}
+    assert candidate_records[0]["analysis"]["summary_cn"] == "中文阶段 B 摘要"
 
 
-def test_ai_review_failure_isolated_and_auditable(tmp_path):
+def test_low_confidence_reject_is_uncertain_and_reaches_stage_b(tmp_path):
     sf = _db(tmp_path)
     source = _source()
-    spec = source_spec_from_config(source)
-    _insert_items(sf, source, spec)
-    with sf() as session:
-        failed_item = session.scalar(select(IntelItem).where(IntelItem.external_id == "failed:1"))
-        assert failed_item is not None
-        failed_id = failed_item.id
+    _insert_items(sf, source, ["low reject"])
+    ai = _AI(reject_titles={"low reject": 84})
 
     result = run_ai_review_job(
         session_factory=sf,
-        source_specs={source.id: spec},
-        ai_client=_AI(fail_ids={failed_id}),
-        output_dir=tmp_path / "out",
-        limit=10,
-        now=NOW,
-    )
-    assert result.ai_failed == 1
-    assert result.analyzed == 1
-
-    with sf() as session:
-        rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
-        assert rows[0].status == "selected"
-        assert rows[1].status == "filtered"
-        assert rows[2].status == "ai_failed"
-        failed_review = session.scalar(select(AIItemReview).where(AIItemReview.item_id == failed_id))
-        assert failed_review is not None
-        assert failed_review.status == "ai_failed"
-        assert failed_review.error_message == "provider timeout"
-
-    audit = [json.loads(line) for line in (tmp_path / "out" / "ai_review_audit.jsonl").read_text().splitlines()]
-    assert {row["status"] for row in audit} == {"selected", "filtered", "ai_failed"}
-    failed = next(row for row in audit if row["status"] == "ai_failed")
-    assert failed["ai"]["status"] == "ai_failed"
-    assert "evidence_status" not in failed
-
-
-def test_ai_review_ai_keep_false_rejects_item_and_excludes_candidate(tmp_path):
-    sf = _db(tmp_path)
-    source = _source()
-    spec = source_spec_from_config(source)
-    with sf() as session:
-        repo = IntelRepository(session)
-        repo.upsert_source(source, policy=spec)
-        repo.insert_item(
-            FetchItem(
-                source_id=source.id,
-                external_id="irrelevant:1",
-                title="Announcing a new model release",
-                url="https://official.example/irrelevant",
-                published_at=NOW - timedelta(hours=2),
-                summary="A deliberately irrelevant entertainment item unrelated to the claimed release.",
-            )
-        )
-        session.commit()
-
-    ai = _RejectingAI()
-    result = run_ai_review_job(
-        session_factory=sf,
-        source_specs={source.id: spec},
+        source_specs={source.id: source},
         ai_client=ai,
         output_dir=tmp_path / "out",
-        limit=10,
-        now=NOW,
     )
 
-    assert result.selected == 1
+    assert result.screened_out == 0
     assert result.analyzed == 1
-    assert result.exported == 0
-    assert ai.calls == [1]
-
+    assert ai.analysis_calls == [1]
     with sf() as session:
         item = session.scalar(select(IntelItem))
-        assert item is not None
-        assert item.status == "rejected"
-        assert item.ai_review is not None
-        assert item.ai_review.status == "success"
-        assert item.ai_review.keep is False
-
-    audit = [json.loads(line) for line in (tmp_path / "out" / "ai_review_audit.jsonl").read_text().splitlines()]
-    assert len(audit) == 1
-    assert audit[0]["status"] == "rejected"
-    assert audit[0]["keep_decision"] is False
-    assert audit[0]["ai"]["risk_flags"] == ["irrelevant"]
+        assert item.status == "candidate"
+        assert item.ai_screen.decision == "uncertain"
+        assert "screen:low_confidence_reject" in item.ai_screen.risk_flags
 
 
-def test_ai_review_p1_official_without_keyword_reaches_ai_and_exports_summary(tmp_path):
+def test_screen_failure_isolated_and_stage_b_not_called(tmp_path):
     sf = _db(tmp_path)
-    source = SourceSpec(
-        id="official_p1_review_test",
-        name="Official P1 review test",
-        transport="feed",
-        url="https://official.example/feed.xml",
-        feed={"format": "rss", "adapter": "generic"},
-        source_group="official_blog",
-        source_subtype="fixed_news",
-        source_role="official",
-        content_class="official_model_company",
-        tier="p1",
-        fetch_interval=1,
+    source = _source()
+    _insert_items(sf, source, ["screen fail", "good"])
+    ai = _AI(fail_screen_titles={"screen fail"})
+
+    result = run_ai_review_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=ai,
+        output_dir=tmp_path / "out",
     )
-    spec = source_spec_from_config(source)
+
+    assert result.screen_failed == 1
+    assert result.analyzed == 1
+    assert ai.analysis_calls == [2]
+    with sf() as session:
+        rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
+        assert rows[0].status == "screen_failed"
+        assert rows[0].ai_screen.status == "screen_failed"
+        assert rows[0].ai_review is None
+        assert rows[1].status == "candidate"
+
+
+def test_analysis_failure_isolated_and_auditable(tmp_path):
+    sf = _db(tmp_path)
+    source = _source()
+    _insert_items(sf, source, ["analysis fail", "good"])
+    ai = _AI(fail_analysis_titles={"analysis fail"})
+
+    result = run_ai_review_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=ai,
+        output_dir=tmp_path / "out",
+    )
+
+    assert result.analysis_failed == 1
+    assert result.candidate == 1
+    with sf() as session:
+        rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
+        assert rows[0].status == "analysis_failed"
+        assert rows[0].ai_review.status == "analysis_failed"
+        assert rows[0].ai_review.error_message == "analysis timeout"
+        assert rows[1].status == "candidate"
+
+
+def test_run_scope_and_force_are_run_local(tmp_path):
+    sf = _db(tmp_path)
+    source = _source()
     with sf() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(source, policy=spec)
-        repo.insert_item(
-            FetchItem(
-                source_id=source.id,
-                external_id="openai:assistance-to-execution",
-                title="From assistance to execution: building agents",
-                url="https://official.example/assistance-to-execution",
-                published_at=NOW - timedelta(hours=2),
-                summary="A first-party article about building agents.",
-            )
-        )
+        repo.upsert_source(source, policy=source)
+        run = repo.start_run(run_type="run_once")
         session.commit()
+        run_id = run.id
+    _insert_items(sf, source, ["scoped"], run_id=run_id)
+    _insert_items(sf, source, ["historical"])
 
     ai = _AI()
     result = run_ai_review_job(
         session_factory=sf,
-        source_specs={source.id: spec},
+        source_specs={source.id: source},
         ai_client=ai,
+        run_id=run_id,
         output_dir=tmp_path / "out",
-        limit=10,
-        now=NOW,
     )
 
-    assert result.analyzed == 1
-    assert ai.calls == [1]
-    record = json.loads((tmp_path / "out" / "ai_review_candidates.jsonl").read_text().splitlines()[0])
-    assert record["summary_cn"] == "中文简要总结"
-    assert record["selection_reason"] == "selected:official_recent_no_keyword; risks=official_keyword_missing"
+    assert result.candidate_ids == [1]
+    assert ai.screen_calls == [1]
+    with sf() as session:
+        rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
+        assert rows[0].status == "candidate"
+        assert rows[1].status == "new"
+        assert session.scalar(select(IntelRunItem).where(IntelRunItem.run_id == run_id)).item_id == 1
 
 
-def test_ai_review_export_keeps_source_attribution(tmp_path):
+def test_explicit_ai_limit_marks_run_and_output_partial(tmp_path):
     sf = _db(tmp_path)
     source = _source()
-    spec = source_spec_from_config(source)
-    _insert_items(sf, source, spec)
+    with sf() as session:
+        repo = IntelRepository(session)
+        repo.upsert_source(source, policy=source)
+        run = repo.start_run(run_type="run_once")
+        session.commit()
+        run_id = run.id
+    _insert_items(sf, source, ["first", "second"], run_id=run_id)
+    ai = _AI()
     result = run_ai_review_job(
         session_factory=sf,
-        source_specs={source.id: spec},
-        ai_client=_AI(),
+        source_specs={source.id: source},
+        ai_client=ai,
+        run_id=run_id,
+        limit=100,
         output_dir=tmp_path / "out",
-        limit=10,
-        now=NOW,
     )
+
+    assert result.partial is True
+    assert result.partial_reason == "ai_limit:100"
+    with sf() as session:
+        run = session.get(IntelRun, run_id)
+        assert run.partial is True
+        assert run.partial_reason == "ai_limit:100"
     record = json.loads((tmp_path / "out" / "ai_review_candidates.jsonl").read_text().splitlines()[0])
-    assert result.exported == 2
-    assert record["source_name"] == source.name
-    assert record["source_group"] == "official_blog"
-    assert record["x_official"] is False
+    assert record["run_partial"] is True
+    assert record["run_counts"]["candidate"] == 2
+
+
+def test_provider_concurrency_is_bounded_to_four(tmp_path):
+    sf = _db(tmp_path)
+    source = _source()
+    _insert_items(sf, source, [f"item-{index}" for index in range(8)])
+    ai = _AI(track_concurrency=True)
+
+    run_ai_review_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=ai,
+        output_dir=tmp_path / "out",
+        concurrency=20,
+    )
+
+    assert ai.max_active <= 4
