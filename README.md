@@ -1,12 +1,15 @@
 # AI 情报抓取与处理
 
-本项目支持一条可重复执行的 AI-only 文字情报链路：
+本项目支持一条可重复执行、可恢复的 AI-only 文字情报链路：
 
 ```text
 source registry
 → fetch（抓取、解析、标准化、去重、来源健康记录）
-→ ai-review（确定性初筛 → AI 分类/剔除无关内容/中文摘要）
-→ export（仅导出 AI keep=true 的 selected 条目）
+→ Stage A screen（确定性初筛与轻量 AI 筛选）
+→ Stage B analyze（结构化分析、实体与评分）
+→ Stage C cluster（固定 reference time 的事件聚类）
+→ rank（编辑排序）
+→ export（仅导出当前 run 的结果）
 → UI（首页、搜索、全部动态只读展示）
 ```
 
@@ -87,7 +90,7 @@ AI_REVIEW_CATEGORY_MODE=ai
 
 ## CLI
 
-保留的命令：
+保留的旧命令与新的 run-scoped 命令：
 
 ```bash
 python -m app.main fetch [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
@@ -96,6 +99,15 @@ python -m app.main ai-review [--source SOURCE_ID] [--class CONTENT_CLASS] [--lim
 python -m app.main export [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N]
 python -m app.main run-once [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--ai-limit N] [--force]
 python -m app.main source-health [--source SOURCE_ID]
+
+# 正式的可恢复链路
+python -m app.main pipeline start [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N]
+python -m app.main pipeline stage-a --run-id RUN_ID
+python -m app.main pipeline stage-b --run-id RUN_ID
+python -m app.main pipeline stage-c --run-id RUN_ID
+python -m app.main pipeline rank --run-id RUN_ID
+python -m app.main pipeline export --run-id RUN_ID
+python -m app.main pipeline status --run-id RUN_ID
 ```
 
 ## 完整执行指令
@@ -115,24 +127,33 @@ bash scripts/start_rsshub.sh
 # 查看来源健康状态和最近一次抓取结果
 $PYTHON -m app.main source-health
 
-# 推荐：一次完成 fetch -> ai-review -> export
+# 推荐：一次完成完整兼容链路（需要逐阶段恢复时使用 pipeline 命令）
 $PYTHON -m app.main run-once \
   --limit 20 \
   --ai-limit 1000 \
   --force \
   --output-dir output/intel
 
-# 需要观察每个阶段时，分开执行同一条链路
-$PYTHON -m app.main fetch --limit 20 --force
-$PYTHON -m app.main ai-review --limit 1000 --force --output-dir output/ai-review
-$PYTHON -m app.main export --limit 30 --output-dir output/intel
+# 正式逐阶段链路：start 只抓取并冻结 membership，后续阶段不会重复抓取
+$PYTHON -m app.main pipeline start --limit 20
+# 使用上一步输出的 run_id
+$PYTHON -m app.main pipeline stage-a --run-id RUN_ID
+$PYTHON -m app.main pipeline stage-b --run-id RUN_ID
+$PYTHON -m app.main pipeline stage-c --run-id RUN_ID
+$PYTHON -m app.main pipeline rank --run-id RUN_ID
+$PYTHON -m app.main pipeline export --run-id RUN_ID
 
-# 只抓取并检查原始/标准化结果，不调用 AI
+# 只抓取并检查原始/标准化结果，不调用 AI；这是诊断命令，不会创建正式 pipeline run
 $PYTHON -m app.main fetch-only \
   --source x_account_openai \
   --limit 5 \
   --force \
   --output-dir output/fetch
+
+# Stage B 失败后的安全恢复：只重试 Stage B，不会重新调用 Stage A
+$PYTHON -m app.main pipeline retry --run-id RUN_ID --stage stage-b
+# 或按依赖顺序恢复所有当前可执行的下游阶段（默认不 fetch）
+$PYTHON -m app.main pipeline resume --run-id RUN_ID
 ```
 
 单个来源或来源类别可以用同样的参数缩小范围：
@@ -171,7 +192,7 @@ $PYTHON -m app.main source-health --source x_account_openai
 $PYTHON -m uvicorn app.web.app:app --host 127.0.0.1 --port 8000
 ```
 
-`run-once` 固定执行 `fetch -> ai-review -> export`。`fetch-only` 只抓取并输出标准化条目及来源归因，不调用 AI。`ai-review` 输出：
+`run-once` 是完整链路的兼容 facade。正式 pipeline 会把 fetch membership、reference time 和各阶段 task 状态写入 run；重试只作用于命名阶段。`fetch-only` 只抓取并输出标准化条目及来源归因，不调用 AI，也不代表一个可恢复的正式 run。`ai-review` 输出：
 
 默认数量策略为：每个来源抓取 20 条，AI review 最多处理 1000 条已有条目，日报默认导出 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；`--ai-limit` 独立控制 AI review、事件聚合和编辑排序的处理量；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
 
