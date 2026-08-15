@@ -201,6 +201,23 @@ class IntelRun(Base):
                     continue
         return result
 
+    # Descriptive aliases used by stage orchestration/reporting code.
+    @property
+    def screen_count(self) -> int:
+        return int(self.screened or 0)
+
+    @property
+    def analyze_count(self) -> int:
+        return int(self.analyzed or 0)
+
+    @property
+    def filtered_count(self) -> int:
+        return int((self.screened_out or 0) + (self.analysis_filtered or 0))
+
+    @property
+    def failure_count(self) -> int:
+        return int((self.screen_failed or 0) + (self.analysis_failed or 0) + (self.failed or 0))
+
 
 class IntelRunItem(Base):
     """Run-local scope relation retaining every fetched item lineage."""
