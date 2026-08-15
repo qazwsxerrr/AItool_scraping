@@ -165,4 +165,3 @@ def test_changed_fingerprint_and_force_reclaim_successful_task(tmp_path):
         repo.complete_stage_task(task, owner="worker-a", result={"version": 2})
         assert repo.claim_stage_task(stage, task_id=task.id, owner="worker-a") is None
         assert repo.claim_stage_task(stage, task_id=task.id, owner="worker-a", force=True) is not None
-
