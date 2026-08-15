@@ -87,6 +87,7 @@ class EventResolutionClient:
             "Do not generate title, summary, topic, or any editorial copy."
         )
         user = json.dumps(values, ensure_ascii=False, default=str)
+        serialized_values = json.loads(user)
         if self.api_style == "openai_chat":
             return {
                 "model": self.model,
@@ -104,7 +105,7 @@ class EventResolutionClient:
             "model": self.model,
             "task": "event_resolution",
             "instructions": instruction,
-            "input": values,
+            "input": serialized_values,
             "response_schema": {"type": "object", "required": ["decision", "confidence"], "additionalProperties": True},
         }
 
