@@ -17,3 +17,8 @@ data/*.db
 data/*.sqlite*
 output/
 output/BACKUP/
+
+# Local user workspace artifacts
+/ - 副本.env
+/.cursor/
+/reference/AI资讯项目流程与改进概要.md
