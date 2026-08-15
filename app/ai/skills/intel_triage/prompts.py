@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .models import ENTITY_TYPES, INTEL_TOPICS, RawIntelEnvelope
 
@@ -130,6 +130,79 @@ INTEL_ANALYSIS_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
+def preflight_strict_schema(schema: Mapping[str, Any], *, path: str = "$") -> bool:
+    """Validate the local subset required by strict JSON-schema providers.
+
+    OpenAI-compatible strict schemas reject an object when it declares
+    ``additionalProperties=false`` but omits one of its properties from
+    ``required``.  Providers report that failure only after a request; this
+    recursive check keeps the contract local and deterministic.
+    """
+
+    if not isinstance(schema, Mapping):
+        raise TypeError(f"{path}: schema must be an object")
+    properties = schema.get("properties")
+    if schema.get("additionalProperties") is False:
+        if not isinstance(properties, Mapping):
+            raise ValueError(f"{path}: additionalProperties=false requires properties")
+        required = schema.get("required")
+        if not isinstance(required, (list, tuple, set)):
+            raise ValueError(f"{path}: additionalProperties=false requires required")
+        missing = [str(name) for name in properties if name not in required]
+        if missing:
+            raise ValueError(f"{path}: strict object properties missing from required: {', '.join(missing)}")
+
+    if isinstance(properties, Mapping):
+        for name, child in properties.items():
+            preflight_strict_schema(child, path=f"{path}.properties.{name}")
+    for key in (
+        "items", "additionalProperties", "contains", "propertyNames", "not", "if", "then", "else",
+        "$defs", "definitions", "dependentSchemas", "patternProperties",
+    ):
+        child = schema.get(key)
+        if isinstance(child, Mapping):
+            if key in {"$defs", "definitions", "dependentSchemas", "patternProperties"}:
+                for name, nested in child.items():
+                    if isinstance(nested, Mapping):
+                        preflight_strict_schema(nested, path=f"{path}.{key}.{name}")
+            else:
+                preflight_strict_schema(child, path=f"{path}.{key}")
+    for key in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        children = schema.get(key)
+        if isinstance(children, (list, tuple)):
+            for index, child in enumerate(children):
+                if isinstance(child, Mapping):
+                    preflight_strict_schema(child, path=f"{path}.{key}[{index}]")
+    return True
+
+
+def validate_strict_schema(schema: Mapping[str, Any], *, path: str = "$") -> bool:
+    """Descriptive alias for :func:`preflight_strict_schema`."""
+
+    return preflight_strict_schema(schema, path=path)
+
+
+# Compatibility spellings used by callers that distinguish assertion from
+# validation or include the JSON-schema qualifier in the helper name.
+assert_strict_schema = preflight_strict_schema
+validate_strict_json_schema = preflight_strict_schema
+preflight_json_schema = preflight_strict_schema
+
+
+def preflight_intel_triage_schemas() -> bool:
+    """Validate both shipped strict provider schemas before any request."""
+
+    preflight_strict_schema(INTEL_SCREEN_JSON_SCHEMA, path="screen")
+    preflight_strict_schema(INTEL_ANALYSIS_JSON_SCHEMA, path="analysis")
+    return True
+
+
+# Keep import-time validation as a safety net while jobs call the function
+# explicitly before their first provider request (which also supports tests
+# that monkeypatch a nested schema).
+preflight_intel_triage_schemas()
+
+
 def _coerce_envelope(envelope: RawIntelEnvelope | dict[str, Any]) -> RawIntelEnvelope:
     return envelope if isinstance(envelope, RawIntelEnvelope) else RawIntelEnvelope.model_validate(envelope)
 
@@ -229,4 +302,6 @@ __all__ = [
     "build_analysis_payload", "build_analysis_provider_payload", "build_generic_analysis_payload", "build_generic_screen_payload",
     "build_openai_chat_analysis_payload", "build_openai_chat_screen_payload", "build_openai_responses_analysis_payload",
     "build_openai_responses_screen_payload", "build_screen_payload", "build_screen_provider_payload", "PAPER_SUPPORT_JSON_SCHEMA",
+    "assert_strict_schema", "preflight_intel_triage_schemas", "preflight_json_schema", "preflight_strict_schema",
+    "validate_strict_json_schema", "validate_strict_schema",
 ]

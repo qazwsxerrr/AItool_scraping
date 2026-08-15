@@ -39,6 +39,8 @@ from app.domain.models import SourceSpec
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import IntelItem, IntelRun
 from app.storage.repository import IntelRepository
+from app.jobs.stage_a_screen_job import run_stage_a_screen_job
+from app.jobs.stage_b_analysis_job import run_stage_b_analysis_job
 
 LOGGER = logging.getLogger(__name__)
 
@@ -126,15 +128,11 @@ def run_ai_review_job(
     A supplied limit is an explicit safety cap. The default None processes the
     whole selected scope; capped runs remain auditable as partial.
     """
-    del http_client, now
+    del http_client, now, concurrency
     explicit_cap = ai_limit is not None or limit is not None
     if ai_limit is not None:
         limit = ai_limit
     limit = _normalise_limit(limit)
-    reject_threshold = _bounded_score(screen_reject_threshold, DEFAULT_AI_SCREEN_REJECT_THRESHOLD)
-    min_score = _bounded_score(analysis_min_score, DEFAULT_AI_ANALYSIS_MIN_SCORE)
-    max_workers = min(4, max(1, int(concurrency or DEFAULT_AI_REVIEW_CONCURRENCY)))
-
     result = AIReviewResult(run_id=run_id, dry_run=dry_run, ai_limit=limit)
     output_path = Path(output_dir)
     result.candidate_path = str(output_path / "ai_review_candidates.jsonl")
@@ -142,162 +140,70 @@ def run_ai_review_job(
     result.markdown_path = str(output_path / "ai_review_digest.md")
     specs = dict(source_specs or {})
 
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        items = repo.list_pending_items(
-            limit=None,
-            source_id=source_filter,
-            content_class=content_class,
-            force=force,
-            run_id=run_id,
-            stage="screen",
-        )
-        if explicit_cap and limit is not None:
-            result.partial = True
-            result.partial_reason = f"ai_limit:{limit}"
-            if len(items) > limit:
-                items = items[:limit]
-        result.processed = len(items)
-        if dry_run:
-            # Dry-run is intentionally side-effect free: do not invoke a
-            # provider, create screen/analysis rows, or write audit files.
-            return result
-        envelopes: list[tuple[IntelItem, SourceSpec, RawIntelEnvelope]] = []
-        structural: list[tuple[IntelItem, ScreenResult]] = []
-        for item in items:
-            spec = specs.get(item.source_id) or _spec_from_row(item.source)
-            if not _structurally_valid(item):
-                structural.append((item, _structural_screen(item)))
-                continue
-            try:
-                envelopes.append((item, spec, _item_to_envelope(item, spec)))
-            except Exception as exc:
-                structural.append((item, _structural_screen(item, error=str(exc))))
-
-    screen_results = _parallel_map(
-        envelopes,
-        lambda entry: _screen_one(ai_client, entry[2], reject_threshold),
-        max_workers=max_workers,
-    )
-
-    stage_b: list[tuple[IntelItem, SourceSpec, RawIntelEnvelope]] = []
-    envelope_by_id = {entry[0].id: entry for entry in envelopes}
-    all_screen_results = [
-        *structural,
-        *[(entry[0], value) for entry, value in zip(envelopes, screen_results)],
-    ]
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        for item, screen in all_screen_results:
-            try:
-                with session.begin_nested():
-                    repo.save_screen(
-                        item.id,
-                        screen,
-                        run_id=run_id,
-                        model=getattr(ai_client, "model", None),
-                        status=screen.status,
-                        error_message=screen.error_message,
-                    )
-                    if screen.status == "screen_failed":
-                        repo.set_item_status(item.id, "screen_failed", run_id=run_id)
-                        result.screen_failed += 1
-                    elif screen.decision == "reject" and screen.confidence >= reject_threshold:
-                        repo.set_item_status(item.id, "screened_out", run_id=run_id)
-                        result.screened_out += 1
-                        result.screened += 1
-                    else:
-                        result.screened += 1
-                        match = envelope_by_id.get(item.id)
-                        if match is not None:
-                            stage_b.append(match)
-            except Exception as exc:
-                result.screen_failed += 1
-                result.errors.append(f"intel_item_id={item.id}: screen persistence failed: {exc}")
-                LOGGER.exception("Stage A persistence failed for intel item %s", item.id)
-        session.commit()
-
-    analysis_results = _parallel_map(
-        stage_b,
-        lambda entry: _analysis_one(ai_client, entry[2]),
-        max_workers=max_workers,
-    )
-
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        for (item, spec, _envelope), analysis in zip(stage_b, analysis_results):
-            try:
-                if analysis.status == "analysis_failed":
-                    repo.save_analysis(
-                        item.id,
-                        analysis,
-                        run_id=run_id,
-                        model=getattr(ai_client, "model", None),
-                        content_class=spec.content_class,
-                        status="analysis_failed",
-                        error_message=analysis.error_message,
-                    )
-                    repo.set_item_status(item.id, "analysis_failed", run_id=run_id)
-                    result.analysis_failed += 1
-                    result.errors.append(
-                        f"intel_item_id={item.id}: {analysis.error_message or 'analysis_failed'}"
-                    )
-                    continue
-
-                result.analyzed += 1
-                guard_reason = analysis_guard_failure(analysis)
-                score = int(analysis.selection_score or 0)
-                if guard_reason or score < min_score:
-                    reason = guard_reason or "score_below_threshold"
-                    response = analysis.model_copy(update={"reason": f"analysis_filtered:{reason}"})
-                    repo.save_analysis(
-                        item.id,
-                        response,
-                        run_id=run_id,
-                        model=getattr(ai_client, "model", None),
-                        content_class=spec.content_class,
-                        status="success",
-                    )
-                    managed_item = session.get(IntelItem, item.id)
-                    if managed_item is not None:
-                        managed_item.selection_score = score
-                        managed_item.selection_reason = f"analysis_filtered:{reason}"
-                    repo.set_item_status(item.id, "analysis_filtered", run_id=run_id)
-                    result.analysis_filtered += 1
-                    continue
-
-                repo.save_analysis(
-                    item.id,
-                    analysis,
-                    run_id=run_id,
-                    model=getattr(ai_client, "model", None),
-                    content_class=spec.content_class,
-                    status="success",
-                )
-                managed_item = session.get(IntelItem, item.id)
-                if managed_item is not None:
-                    managed_item.selection_score = score
-                    managed_item.selection_reason = analysis.reason[:4000] if analysis.reason else "analysis_candidate"
-                repo.set_item_status(item.id, "candidate", run_id=run_id)
-                result.candidate += 1
-                result.candidate_ids.append(int(item.id))
-            except Exception as exc:
-                result.analysis_failed += 1
-                result.errors.append(f"intel_item_id={item.id}: analysis persistence failed: {exc}")
-                LOGGER.exception("Stage B persistence failed for intel item %s", item.id)
-                session.rollback()
-        session.commit()
-
-    if run_id is not None and not dry_run:
-        _persist_run_counts(session_factory, run_id, result)
-
+    # Keep dry-run side-effect free: no run, stage rows, projection rows, or
+    # provider calls are created.
     if dry_run:
+        with session_factory() as session:
+            items = IntelRepository(session).list_pending_items(
+                limit=None,
+                source_id=source_filter,
+                content_class=content_class,
+                force=force,
+                run_id=run_id,
+                stage="screen",
+            )
+            if limit is not None:
+                items = items[:limit]
+            result.processed = len(items)
+            result.partial = explicit_cap
+            result.partial_reason = f"ai_limit:{limit}" if explicit_cap else None
         return result
+
+    stage_a = run_stage_a_screen_job(
+        session_factory=session_factory,
+        source_specs=specs,
+        ai_client=ai_client,
+        run_id=run_id,
+        limit=limit,
+        source_filter=source_filter,
+        content_class=content_class,
+        force=force,
+        screen_reject_threshold=screen_reject_threshold,
+    )
+    effective_run_id = stage_a.run_id
+    stage_b = run_stage_b_analysis_job(
+        session_factory=session_factory,
+        source_specs=specs,
+        ai_client=ai_client,
+        run_id=effective_run_id,
+        limit=limit,
+        source_filter=source_filter,
+        content_class=content_class,
+        force=force,
+        item_ids=stage_a.item_ids,
+        analysis_min_score=analysis_min_score,
+    )
+    result.run_id = effective_run_id
+    result.processed = stage_a.processed
+    result.screened = stage_a.screened
+    result.screened_out = stage_a.screened_out
+    result.screen_failed = stage_a.screen_failed
+    result.analyzed = stage_b.analyzed
+    result.analysis_filtered = stage_b.analysis_filtered
+    result.analysis_failed = stage_b.analysis_failed
+    result.candidate = stage_b.candidate
+    result.candidate_ids = list(stage_b.candidate_ids)
+    result.partial = bool(stage_a.partial or stage_b.partial)
+    result.partial_reason = stage_a.partial_reason or stage_b.partial_reason
+    result.errors = [*stage_a.errors, *stage_b.errors]
+
+    if effective_run_id is not None:
+        _persist_run_counts(session_factory, effective_run_id, result)
 
     with session_factory() as session:
         candidates, audit = _load_stage_exports(
             session,
-            run_id=run_id,
+            run_id=effective_run_id,
             source_filter=source_filter,
             content_class=content_class,
         )

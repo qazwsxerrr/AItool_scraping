@@ -12,7 +12,7 @@ from app.config.settings import Settings
 from .guards import apply_analysis_guards, apply_screen_guard
 from .models import AnalysisResult, RawIntelEnvelope, ScreenResult
 from .parser import strict_parse_analysis, strict_parse_screen
-from .prompts import build_analysis_provider_payload, build_screen_provider_payload
+from .prompts import build_analysis_provider_payload, build_screen_provider_payload, preflight_intel_triage_schemas
 
 
 LOGGER = logging.getLogger(__name__)
@@ -63,6 +63,7 @@ class IntelTriageClient:
         item = _as_envelope(envelope)
         if not self.is_configured:
             raise RuntimeError("Intel screen API is not configured")
+        preflight_intel_triage_schemas()
         response = self._post_once(self._endpoint_url(), build_screen_provider_payload(item, model=self.model, api_style=self.api_style))
         data = _response_json(response, stage="screen")
         return strict_parse_screen(data, envelope=item)
@@ -71,6 +72,7 @@ class IntelTriageClient:
         item = _as_envelope(envelope)
         if not self.is_configured:
             raise RuntimeError("Intel analysis API is not configured")
+        preflight_intel_triage_schemas()
         response = self._post_once(self._endpoint_url(), build_analysis_provider_payload(item, model=self.model, api_style=self.api_style))
         data = _response_json(response, stage="analysis")
         return strict_parse_analysis(data, envelope=item)

@@ -92,6 +92,12 @@ from .prompts import (
     build_openai_responses_screen_payload,
     build_screen_payload,
     build_screen_provider_payload,
+    preflight_intel_triage_schemas,
+    preflight_json_schema,
+    preflight_strict_schema,
+    assert_strict_schema,
+    validate_strict_json_schema,
+    validate_strict_schema,
 )
 
 __all__ = [
@@ -111,6 +117,8 @@ __all__ = [
     "build_generic_screen_payload", "build_openai_chat_analysis_payload", "build_openai_chat_screen_payload",
     "build_openai_responses_analysis_payload", "build_openai_responses_screen_payload",
     "build_screen_payload", "build_screen_provider_payload", "guard_analysis_result", "guard_paper_support", "guard_screen_result",
+    "assert_strict_schema", "preflight_intel_triage_schemas", "preflight_json_schema", "preflight_strict_schema",
+    "validate_strict_json_schema", "validate_strict_schema",
     "html_to_text", "isolate_analysis_failure", "isolate_analysis_failures", "isolate_screen_failure",
     "isolate_screen_failures", "normalize_content_class", "normalize_entity_type", "normalize_html",
     "normalize_text", "normalize_topic", "normalize_url", "parse_analysis_response", "parse_analysis_result", "parse_screen_response", "parse_screen_result",
