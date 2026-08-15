@@ -754,6 +754,7 @@ class IntelRepository:
 
     save_ai_screen = upsert_ai_screen
     save_screen_result = upsert_ai_screen
+    save_screen = upsert_ai_screen
 
     def upsert_ai_analysis(
         self,
@@ -823,6 +824,7 @@ class IntelRepository:
 
     save_ai_analysis = upsert_ai_analysis
     save_analysis_result = upsert_ai_analysis
+    save_analysis = upsert_ai_analysis
 
     def set_item_status(self, item_id: int, status: str, *, run_id: int | None = None) -> None:
         item = self.session.get(IntelItem, item_id)
