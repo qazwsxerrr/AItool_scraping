@@ -71,4 +71,3 @@ def test_retry_stage_b_targets_only_stage_b_tasks(tmp_path, monkeypatch):
     assert value is not None
     assert seen["run_id"] == run_id
     assert seen["task_ids"] == [task_id]
-
