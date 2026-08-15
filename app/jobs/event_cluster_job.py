@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import unicodedata
@@ -19,7 +20,7 @@ from app.ai.skills.intel_triage import normalize_url
 from app.config.limits import DEFAULT_AI_REVIEW_LIMIT
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem, IntelRunItem
+from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem, IntelRun, IntelRunItem
 from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
@@ -43,6 +44,8 @@ class EventClusterResult:
     errors: list[str] = field(default_factory=list)
     event_ids: list[int] = field(default_factory=list)
     snapshot_key: str = "latest"
+    run_id: int | None = None
+    reference_time: datetime | None = None
 
     @property
     def new_event_ids(self) -> list[int]:
@@ -277,53 +280,173 @@ def _compatible_candidate(left: Mapping[str, Any], right: Mapping[str, Any]) -> 
     return not (left_class and right_class and left_class != right_class)
 
 
-def run_event_cluster_job(*, session_factory: sessionmaker[Session], ai_client: Any | None = None, limit: int | None = DEFAULT_AI_REVIEW_LIMIT, force: bool = False, now: datetime | None = None, history_hook: Callable[..., Any] | None = None, history_provider: Callable[..., Any] | None = None, item_ids: Iterable[int] | None = None, snapshot_key: str = "latest", run_id: int | None = None, **_: Any) -> EventClusterResult:
-    """Aggregate current Stage B candidates into new or historical events."""
-    del force
-    result = EventClusterResult(snapshot_key=snapshot_key)
-    current = _as_utc(now) or datetime.now(timezone.utc)
+def run_event_cluster_job(
+    *,
+    session_factory: sessionmaker[Session],
+    ai_client: Any | None = None,
+    limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
+    force: bool = False,
+    now: datetime | None = None,
+    reference_time: datetime | None = None,
+    history_hook: Callable[..., Any] | None = None,
+    history_provider: Callable[..., Any] | None = None,
+    item_ids: Iterable[int] | None = None,
+    snapshot_key: str | None = None,
+    run_id: int | None = None,
+    **_: Any,
+) -> EventClusterResult:
+    """Aggregate current Stage-B candidates into new or historical events.
+
+    When a run id is supplied, its reference time and candidate membership are
+    durable inputs.  A retry therefore never needs to invoke Stage A/B or
+    consult the mutable ``IntelItem.status`` projection as orchestration state.
+    """
+
+    key = _effective_snapshot_key(snapshot_key, run_id)
+    result = EventClusterResult(snapshot_key=key, run_id=run_id)
     del history_hook, history_provider
+    stage = None
+    stage_task = None
+    owner = "event-cluster"
     with session_factory() as session:
         try:
-            items = _load_cluster_items(session, run_id=run_id, item_ids=item_ids, limit=limit)
+            repo = IntelRepository(session)
+            run = session.get(IntelRun, int(run_id)) if run_id is not None else None
+            frozen_reference = _as_utc(reference_time) or _as_utc(run.reference_time if run else None)
+            frozen_reference = frozen_reference or _as_utc(now) or datetime.now(timezone.utc)
+            if run_id is not None and run is not None:
+                stage = repo.ensure_stage(
+                    int(run_id),
+                    "cluster",
+                    reference_time=frozen_reference,
+                    metadata={"snapshot_key": key, "history_window_hours": 72},
+                )
+            current = _as_utc(stage.reference_time if stage is not None else frozen_reference) or frozen_reference
+            result.reference_time = current
+            items = _load_cluster_items(
+                session,
+                run_id=run_id,
+                item_ids=item_ids,
+                limit=limit,
+                stage=stage,
+            )
             candidates = [_item_candidate(item) for item in items]
             result.processed = len(candidates)
-            history_events = _load_history_events(session, current=current, snapshot_key=snapshot_key)
+            if stage is not None:
+                input_fingerprint = _cluster_input_fingerprint(candidates)
+                stage_task = repo.ensure_stage_task(
+                    stage,
+                    subject_type="run",
+                    subject_id=int(run_id),
+                    target_run_id=int(run_id),
+                    input_fingerprint=input_fingerprint,
+                    config_fingerprint="cluster-v1",
+                )
+                claimed = repo.claim_stage_task(
+                    stage,
+                    task_id=stage_task.id,
+                    owner=owner,
+                    force=force,
+                    input_fingerprint=input_fingerprint,
+                    config_fingerprint="cluster-v1",
+                )
+                if claimed is None:
+                    if repo.task_is_reusable(
+                        stage_task,
+                        input_fingerprint=input_fingerprint,
+                        config_fingerprint="cluster-v1",
+                    ):
+                        result.processed = 0
+                        return result
+                    result.failed = 1
+                    result.errors.append("cluster stage is already running")
+                    return result
+                stage_task = claimed
+                # Keep the lease/task claim durable independently from event
+                # writes.  A failed group must not roll it back.
+                session.commit()
+            history_events = _load_history_events(session, current=current, snapshot_key=key)
             in_run_events: dict[int, IntelEvent] = {}
             for values, fuzzy_group in _cluster_rows(candidates):
                 try:
-                    if fuzzy_group:
-                        result.ambiguous += 1
-                    resolution = _resolve_ambiguous_group(values, ai_client=ai_client, ambiguous=fuzzy_group)
-                    if resolution.method.startswith("ai"):
-                        result.ai_resolved += 1
-                    if "resolver_failed" in resolution.risk_flags:
-                        result.ai_failed += 1
-                    for subgroup in resolution.groups:
-                        event, is_new, _ = _persist_group(session, subgroup, current=current, run_id=run_id, history_events=history_events, in_run_events=in_run_events, resolver=resolution, ai_client=ai_client)
-                        if is_new:
-                            result.events += 1
-                            if run_id is None or event.new_in_run_id == run_id:
-                                if event.id not in result.event_ids:
-                                    result.event_ids.append(event.id)
-                        else:
-                            result.repeats += 1
-                        result.merged += max(0, len(subgroup) - 1)
-                        if event.id not in {row.id for row in history_events}:
-                            history_events.append(event)
-                        if run_id is not None and event.new_in_run_id == run_id:
-                            in_run_events[event.id] = event
+                    with session.begin_nested():
+                        if fuzzy_group:
+                            result.ambiguous += 1
+                        resolution = _resolve_ambiguous_group(values, ai_client=ai_client, ambiguous=fuzzy_group)
+                        if resolution.method.startswith("ai"):
+                            result.ai_resolved += 1
+                        if "resolver_failed" in resolution.risk_flags:
+                            result.ai_failed += 1
+                        for subgroup in resolution.groups:
+                            event, is_new, _ = _persist_group(
+                                session,
+                                subgroup,
+                                current=current,
+                                run_id=run_id,
+                                history_events=history_events,
+                                in_run_events=in_run_events,
+                                resolver=resolution,
+                                ai_client=ai_client,
+                            )
+                            if is_new:
+                                result.events += 1
+                                if run_id is None or event.new_in_run_id == run_id:
+                                    if event.id not in result.event_ids:
+                                        result.event_ids.append(event.id)
+                            else:
+                                result.repeats += 1
+                            result.merged += max(0, len(subgroup) - 1)
+                            if event.id not in {row.id for row in history_events}:
+                                history_events.append(event)
+                            if run_id is not None and event.new_in_run_id == run_id:
+                                in_run_events[event.id] = event
                 except Exception as exc:
                     result.failed += 1
                     result.errors.append(f"event_group={values[0].get('id')}: {exc}")
                     LOGGER.exception("Event aggregation failed for group %s", values[0].get("id"))
-                    session.rollback()
+                    # The nested transaction above isolates one bad group;
+                    # already persisted events and the stage lease survive.
             session.commit()
+            if stage_task is not None:
+                if result.failed:
+                    repo.fail_stage_task(
+                        stage_task,
+                        error_category="stage",
+                        error_code="cluster_group_failed",
+                        error_message="; ".join(result.errors)[-4000:],
+                        retryable=True,
+                        owner=owner,
+                    )
+                else:
+                    repo.complete_stage_task(
+                        stage_task,
+                        owner=owner,
+                        result={"event_ids": result.event_ids, "processed": result.processed},
+                    )
+                session.commit()
         except Exception as exc:
             session.rollback()
             result.failed += 1
             result.errors.append(str(exc))
             LOGGER.exception("Event cluster job failed")
+            if run_id is not None:
+                try:
+                    with session_factory() as state_session:
+                        state_repo = IntelRepository(state_session)
+                        state_stage = state_repo.get_stage(int(run_id), "cluster")
+                        state_task = state_repo.get_task(state_stage, subject_type="run", subject_id=int(run_id)) if state_stage else None
+                        if state_task is not None and state_task.status == "running":
+                            state_repo.fail_stage_task(
+                                state_task,
+                                error_category="stage",
+                                error_code="cluster_failed",
+                                error_message=str(exc),
+                                retryable=True,
+                                owner=owner,
+                            )
+                        state_session.commit()
+                except Exception:
+                    LOGGER.exception("Unable to persist cluster stage failure")
     return result
 
 
@@ -340,16 +463,95 @@ def run_event_cluster_from_settings(*, settings: Settings, ai_client: Any | None
     return run_event_cluster_job(session_factory=create_session_factory(engine), ai_client=resolver, **kwargs)
 
 
-def _load_cluster_items(session: Session, *, run_id: int | None, item_ids: Iterable[int] | None, limit: int | None) -> list[IntelItem]:
-    stmt = select(IntelItem).options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review), joinedload(IntelItem.ai_screen)).where(IntelItem.status == "candidate").order_by(IntelItem.published_at.desc(), IntelItem.selection_score.desc(), IntelItem.id.asc())
+def _effective_snapshot_key(snapshot_key: str | None, run_id: int | None) -> str:
+    if snapshot_key:
+        return str(snapshot_key)
+    return f"run-{int(run_id)}" if run_id is not None else "latest"
+
+
+def _cluster_input_fingerprint(candidates: Sequence[Mapping[str, Any]]) -> str:
+    payload = [
+        {
+            "id": int(value.get("id")),
+            "title": value.get("title"),
+            "url": value.get("canonical_url"),
+            "external_id": value.get("external_id"),
+            "score": value.get("selection_score"),
+        }
+        for value in candidates
+    ]
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _load_cluster_items(
+    session: Session,
+    *,
+    run_id: int | None,
+    item_ids: Iterable[int] | None,
+    limit: int | None,
+    stage: Any | None = None,
+) -> list[IntelItem]:
+    stmt = select(IntelItem).options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review), joinedload(IntelItem.ai_screen)).order_by(IntelItem.published_at.desc(), IntelItem.selection_score.desc(), IntelItem.id.asc())
     if item_ids is not None:
         ids = [int(item_id) for item_id in item_ids]
         stmt = stmt.where(IntelItem.id.in_(ids or [-1]))
     elif run_id is not None:
         stmt = stmt.join(IntelRunItem, IntelRunItem.item_id == IntelItem.id).where(IntelRunItem.run_id == int(run_id))
+        # Prefer durable Stage-B task state.  The mutable item status remains
+        # only a compatibility fallback for old runs with no task table row.
+        task_ids = _successful_analysis_item_ids(session, int(run_id)) if stage is not None else []
+        if task_ids:
+            stmt = stmt.where(IntelItem.id.in_(task_ids))
+        else:
+            # Older runs may not have durable Stage-B tasks yet.  A successful
+            # review tied to this run is still trustworthy and avoids falling
+            # back to the mutable global item status.
+            review_ids = [
+                int(value)
+                for value in session.scalars(
+                    select(IntelItem.id)
+                    .join(AIItemReview, AIItemReview.item_id == IntelItem.id)
+                    .where(
+                        AIItemReview.run_id == int(run_id),
+                        AIItemReview.status == "success",
+                    )
+                ).all()
+            ]
+            stmt = stmt.where(IntelItem.id.in_(review_ids or [-1]))
+    else:
+        stmt = stmt.where(IntelItem.status == "candidate")
     if limit is not None:
         stmt = stmt.limit(max(0, int(limit)))
     return list(session.scalars(stmt).unique().all())
+
+
+def _successful_analysis_item_ids(session: Session, run_id: int) -> list[int]:
+    """Read successful Stage-B tasks without consulting ``IntelItem.status``."""
+
+    from app.storage.models import IntelRunStage, IntelRunStageTask
+
+    stage = session.scalar(
+        select(IntelRunStage).where(
+            IntelRunStage.run_id == int(run_id),
+            IntelRunStage.stage_name.in_(("analyze", "analysis", "stage_b", "stage-b")),
+        )
+    )
+    if stage is None:
+        return []
+    values: list[int] = []
+    for task in session.scalars(
+        select(IntelRunStageTask).where(
+            IntelRunStageTask.stage_id == stage.id,
+            IntelRunStageTask.subject_type == "item",
+            IntelRunStageTask.status == "succeeded",
+        )
+    ).all():
+        if task.item_id is not None:
+            values.append(int(task.item_id))
+        elif str(task.subject_id).isdigit():
+            values.append(int(task.subject_id))
+    return values
 
 
 def _load_history_events(session: Session, *, current: datetime, snapshot_key: str) -> list[IntelEvent]:
@@ -637,6 +839,11 @@ def _number(value: Any) -> float:
 
 
 def _as_utc(value: Any) -> datetime | None:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
     if value is None or not isinstance(value, datetime):
         return None
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)

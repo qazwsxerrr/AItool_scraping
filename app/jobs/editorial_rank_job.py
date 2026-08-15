@@ -11,6 +11,7 @@ the deterministic display-score ordering.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -165,13 +166,53 @@ def run_editorial_rank_job(
     """Rank candidate events and write one idempotent ranking snapshot."""
 
     policy = _coerce_profile(profile if profile is not None else profile_path)
-    key = str(snapshot_key or policy.snapshot_key or "latest")
+    key = str(snapshot_key or (f"run-{int(run_id)}" if run_id is not None else policy.snapshot_key) or "latest")
     result = EditorialRankResult(run_id=run_id, snapshot_key=key)
+    stage = None
+    stage_task = None
+    owner = "editorial-rank"
     with session_factory() as session:
         try:
+            repo = IntelRepository(session)
+            run = session.get(IntelRun, int(run_id)) if run_id is not None else None
+            if run is not None:
+                stage = repo.ensure_stage(
+                    int(run_id),
+                    "rank",
+                    metadata={"snapshot_key": key, "profile_version": policy.version},
+                )
             events = _load_events(session, limit=limit, run_id=run_id, event_ids=event_ids)
             result.processed = len(events)
-            candidates = [_candidate(event) for event in events]
+            if stage is not None:
+                input_fingerprint = _rank_input_fingerprint(events, policy, key)
+                stage_task = repo.ensure_stage_task(
+                    stage,
+                    subject_type="run",
+                    subject_id=int(run_id),
+                    target_run_id=int(run_id),
+                    input_fingerprint=input_fingerprint,
+                    config_fingerprint=f"rank-v1:{policy.version}",
+                )
+                claimed = repo.claim_stage_task(
+                    stage,
+                    task_id=stage_task.id,
+                    owner=owner,
+                    # Ranking is a cheap deterministic projection.  Rebuild
+                    # the run snapshot on each explicit invocation while
+                    # retaining the durable attempt history.
+                    force=True if force or stage_task.status == "succeeded" else False,
+                    input_fingerprint=input_fingerprint,
+                    config_fingerprint=f"rank-v1:{policy.version}",
+                )
+                if claimed is None:
+                    result.errors.append("editorial rank stage is already running")
+                    result.ai_failed = 1
+                    return result
+                stage_task = claimed
+                # Persist the lease before any optional provider call so a
+                # concurrent rank command cannot start the same run.
+                session.commit()
+            candidates = [_candidate(event, run_id=run_id) for event in events]
             ai_order: dict[int, tuple[int, float | None]] = {}
             rank_source = "deterministic"
             if ai_client is not None and candidates:
@@ -189,7 +230,6 @@ def run_editorial_rank_job(
             ordered = _ordered_candidates(candidates, ai_order, policy)
             selected_ids, reasons, metadata = _select_with_quotas(ordered, policy)
 
-            repo = IntelRepository(session)
             repo.clear_event_ranking_snapshot(snapshot_key=key)
             for rank, candidate in enumerate(ordered, start=1):
                 event = candidate["event"]
@@ -222,10 +262,34 @@ def run_editorial_rank_job(
                 )
                 result.snapshots += int(snapshot.created)
             session.commit()
+            if stage_task is not None:
+                repo.complete_stage_task(
+                    stage_task,
+                    owner=owner,
+                    result={"selected": result.selected, "snapshot_key": key},
+                )
+                session.commit()
         except Exception as exc:
             session.rollback()
             result.errors.append(str(exc))
             LOGGER.exception("Editorial ranking failed")
+            if stage is not None:
+                try:
+                    with session.begin():
+                        state_repo = IntelRepository(session)
+                        state_stage = state_repo.get_stage(int(run_id), "rank")
+                        state_task = state_repo.get_task(state_stage, subject_type="run", subject_id=int(run_id)) if state_stage else None
+                        if state_task is not None and state_task.status == "running":
+                            state_repo.fail_stage_task(
+                                state_task,
+                                error_category="stage",
+                                error_code="rank_failed",
+                                error_message=str(exc),
+                                retryable=True,
+                                owner=owner,
+                            )
+                except Exception:
+                    LOGGER.exception("Unable to persist editorial rank failure")
     return result
 
 
@@ -306,7 +370,29 @@ def _load_events(
     return list(session.scalars(stmt).unique().all())
 
 
-def _candidate(event: IntelEvent) -> dict[str, Any]:
+def _rank_input_fingerprint(
+    events: Sequence[IntelEvent],
+    policy: EditorialProfile,
+    snapshot_key: str,
+) -> str:
+    payload = {
+        "snapshot_key": snapshot_key,
+        "profile_version": policy.version,
+        "total_max": policy.total_max,
+        "events": [
+            {
+                "id": int(event.id),
+                "score": float(event.display_score or 0.0),
+                "state": event.state,
+            }
+            for event in events
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _candidate(event: IntelEvent, *, run_id: int | None = None) -> dict[str, Any]:
     source_groups = _json_strings(event.source_groups_json)
     source_ids = _json_strings(event.source_ids_json)
     if not source_groups and event.source_group:
@@ -316,10 +402,29 @@ def _candidate(event: IntelEvent) -> dict[str, Any]:
     content_class = str(event.content_class or "").strip() or None
     topic = str(event.topic or "opinion").strip().casefold() or "opinion"
     gate_pass, gate_reason = _paper_gate(event)
-    has_retained_member = any(
-        relation.item is not None and relation.item.status == "candidate"
-        for relation in event.event_items
-    )
+    if run_id is None:
+        has_retained_member = any(
+            relation.item is not None and relation.item.status == "candidate"
+            for relation in event.event_items
+        )
+    else:
+        # Run-scoped ranking uses event provenance, not the mutable global item
+        # status projection.  A repeat event is retained when Stage C attached
+        # a member with this run's lineage or the event itself was new in it.
+        has_retained_member = (
+            event.new_in_run_id == int(run_id)
+            or event.last_run_id == int(run_id)
+            or event.first_run_id == int(run_id)
+        )
+        if not has_retained_member:
+            for relation in event.event_items:
+                try:
+                    lineage = json.loads(relation.lineage_json or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    lineage = {}
+                if isinstance(lineage, Mapping) and lineage.get("run_id") == int(run_id):
+                    has_retained_member = True
+                    break
     return {
         "event": event,
         "topic": topic,

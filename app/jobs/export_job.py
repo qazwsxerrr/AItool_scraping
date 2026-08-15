@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -18,7 +21,7 @@ from app.domain.categories import fallback_topic_category
 from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
-from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem
+from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem, IntelRun, IntelRunItem
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,8 @@ class IntelExportResult:
     failure_counts: dict[str, int] = field(default_factory=dict)
     partial: bool = False
     partial_reason: str | None = None
+    run_id: int | None = None
+    snapshot_key: str = "latest"
 
 
 def run_intel_export_job(
@@ -45,33 +50,79 @@ def run_intel_export_job(
     content_class: str | None = None,
     dry_run: bool = False,
     github_report_dir: str | Path | None = None,
-    snapshot_key: str = "latest",
+    snapshot_key: str | None = None,
+    run_id: int | None = None,
     partial: bool = False,
     partial_reason: str | None = None,
 ) -> IntelExportResult:
-    output = Path(output_dir)
+    final_output = Path(output_dir)
+    key = str(snapshot_key or (f"run-{int(run_id)}" if run_id is not None else "latest"))
+    run_output = _run_output_dir(final_output, run_id)
+    artifact_output = run_output if run_id is not None else final_output
     effective_limit = _normalise_export_limit(limit)
-    jsonl_path = output / "intel_items.jsonl"
-    markdown_path = output / "intel_digest.md"
-    pending_path = output / "intel_pending.jsonl"
-    report_root = Path(github_report_dir) if github_report_dir else output.parent / "github-trending"
+    jsonl_path = artifact_output / "intel_items.jsonl"
+    markdown_path = artifact_output / "intel_digest.md"
+    pending_path = artifact_output / "intel_pending.jsonl"
+    report_root = Path(github_report_dir) if github_report_dir else artifact_output / "github-trending"
+    stage = None
+    stage_task = None
+    owner = "intel-export"
     with session_factory() as session:
-        repo = IntelRepository(session)
-        snapshot_rows = _list_export_events(
-            session,
-            snapshot_key=snapshot_key,
-            limit=effective_limit,
-            source_filter=source_filter,
-            content_class=content_class,
-        )
-        pending_items = _list_pending(
-            session,
-            limit=effective_limit,
-            source_filter=source_filter,
-            content_class=content_class,
-        )
-        records = snapshot_rows
-        pending_records = [_serialize(item) for item in pending_items]
+        try:
+            repo = IntelRepository(session)
+            run = session.get(IntelRun, int(run_id)) if run_id is not None else None
+            if run is not None and not dry_run:
+                stage = repo.ensure_stage(
+                    int(run_id),
+                    "export",
+                    metadata={"snapshot_key": key, "artifact_dir": str(artifact_output)},
+                )
+            snapshot_rows = _list_export_events(
+                session,
+                snapshot_key=key,
+                limit=effective_limit,
+                source_filter=source_filter,
+                content_class=content_class,
+                run_id=run_id,
+            )
+            pending_items = _list_pending(
+                session,
+                limit=effective_limit,
+                source_filter=source_filter,
+                content_class=content_class,
+                run_id=run_id,
+            )
+            records = snapshot_rows
+            pending_records = [_serialize(item) for item in pending_items]
+            if run is not None and (run.partial or str(run.status).casefold() in {"failed", "partial"}):
+                partial = True
+                partial_reason = partial_reason or run.partial_reason or f"run_status:{run.status}"
+            if stage is not None:
+                input_fingerprint = _export_input_fingerprint(records, pending_records, key)
+                stage_task = repo.ensure_stage_task(
+                    stage,
+                    subject_type="run",
+                    subject_id=int(run_id),
+                    target_run_id=int(run_id),
+                    input_fingerprint=input_fingerprint,
+                    config_fingerprint="export-v1",
+                )
+                claimed = repo.claim_stage_task(
+                    stage,
+                    task_id=stage_task.id,
+                    owner=owner,
+                    force=True,
+                    input_fingerprint=input_fingerprint,
+                    config_fingerprint="export-v1",
+                )
+                if claimed is None:
+                    raise RuntimeError("export stage is already running")
+                stage_task = claimed
+                # Make the export lease visible before filesystem work starts.
+                session.commit()
+        except Exception:
+            session.rollback()
+            raise
 
     status_counts = dict(Counter(str(record.get("status") or "unknown") for record in [*records, *pending_records]))
     failure_counts = {
@@ -81,28 +132,73 @@ def run_intel_export_job(
     }
 
     github_report_path: Path | None = None
-    if not dry_run:
-        output.mkdir(parents=True, exist_ok=True)
-        jsonl_path.write_text(
-            "".join(json.dumps(record, ensure_ascii=False, default=str) + "\n" for record in records),
-            encoding="utf-8",
-        )
-        pending_path.write_text(
-            "".join(json.dumps(record, ensure_ascii=False, default=str) + "\n" for record in pending_records),
-            encoding="utf-8",
-        )
-        markdown_path.write_text(
-            _markdown(
-                records,
-                pending_records,
-                status_counts=status_counts,
-                failure_counts=failure_counts,
-                partial=partial,
-                partial_reason=partial_reason,
-            ),
-            encoding="utf-8",
-        )
-        github_report_path = write_github_trending_report(records, output_root=report_root)
+    try:
+        if not dry_run and (run_id is not None or not partial):
+            payloads = {
+                jsonl_path: "".join(json.dumps(record, ensure_ascii=False, default=str) + "\n" for record in records),
+                pending_path: "".join(json.dumps(record, ensure_ascii=False, default=str) + "\n" for record in pending_records),
+                markdown_path: _markdown(
+                    records,
+                    pending_records,
+                    status_counts=status_counts,
+                    failure_counts=failure_counts,
+                    partial=partial,
+                    partial_reason=partial_reason,
+                ),
+            }
+            _atomic_write_bundle(payloads)
+            github_report_path = write_github_trending_report(records, output_root=report_root)
+            # A partial/failed upstream run is auditable in its per-run
+            # directory but must never replace the last successful digest.
+            if run_id is not None and not partial:
+                final_payloads = {
+                    final_output / "intel_items.jsonl": payloads[jsonl_path],
+                    final_output / "intel_pending.jsonl": payloads[pending_path],
+                    final_output / "intel_digest.md": payloads[markdown_path],
+                }
+                _atomic_write_bundle(final_payloads)
+        if stage_task is not None:
+            with session_factory() as session:
+                repo = IntelRepository(session)
+                state_stage = repo.get_stage(int(run_id), "export") if run_id is not None else None
+                state_task = repo.get_task(state_stage, subject_type="run", subject_id=int(run_id)) if state_stage else None
+                if state_task is not None:
+                    if partial:
+                        repo.fail_stage_task(
+                            state_task,
+                            error_category="upstream",
+                            error_code="partial_upstream",
+                            error_message=partial_reason or "upstream stage is partial",
+                            retryable=True,
+                            owner=owner,
+                        )
+                    else:
+                        repo.complete_stage_task(
+                            state_task,
+                            owner=owner,
+                            result={"exported": len(records), "artifact_dir": str(artifact_output)},
+                        )
+                session.commit()
+    except Exception as exc:
+        if stage_task is not None:
+            try:
+                with session_factory() as session:
+                    repo = IntelRepository(session)
+                    state_stage = repo.get_stage(int(run_id), "export") if run_id is not None else None
+                    state_task = repo.get_task(state_stage, subject_type="run", subject_id=int(run_id)) if state_stage else None
+                    if state_task is not None and state_task.status == "running":
+                        repo.fail_stage_task(
+                            state_task,
+                            error_category="io",
+                            error_code="export_failed",
+                            error_message=str(exc),
+                            retryable=True,
+                            owner=owner,
+                        )
+                    session.commit()
+            except Exception:
+                pass
+        raise
 
     return IntelExportResult(
         exported=len(records),
@@ -116,6 +212,8 @@ def run_intel_export_job(
         failure_counts=failure_counts,
         partial=bool(partial),
         partial_reason=partial_reason,
+        run_id=run_id,
+        snapshot_key=key,
     )
 
 
@@ -128,7 +226,8 @@ def run_intel_export_from_settings(
     content_class: str | None = None,
     dry_run: bool = False,
     github_report_dir: str | Path | None = None,
-    snapshot_key: str = "latest",
+    snapshot_key: str | None = None,
+    run_id: int | None = None,
     partial: bool = False,
     partial_reason: str | None = None,
 ) -> IntelExportResult:
@@ -145,9 +244,54 @@ def run_intel_export_from_settings(
         dry_run=dry_run,
         github_report_dir=github_report_dir,
         snapshot_key=snapshot_key,
+        run_id=run_id,
         partial=partial,
         partial_reason=partial_reason,
     )
+
+
+def _run_output_dir(final_output: Path, run_id: int | None) -> Path:
+    if run_id is None:
+        return final_output
+    base = final_output.parent if final_output.name.casefold() == "intel" else final_output
+    return base / "runs" / f"run-{int(run_id)}"
+
+
+def _export_input_fingerprint(
+    records: list[dict[str, Any]],
+    pending_records: list[dict[str, Any]],
+    snapshot_key: str,
+) -> str:
+    payload = {
+        "snapshot_key": snapshot_key,
+        "events": [int(record.get("event_id")) for record in records if record.get("event_id") is not None],
+        "pending": [int(record.get("id")) for record in pending_records if record.get("id") is not None],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _atomic_write_bundle(payloads: dict[Path, str]) -> None:
+    """Write a group of text artifacts without truncating existing outputs."""
+
+    temporary: list[tuple[str, Path]] = []
+    try:
+        for path, value in payloads.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(value)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.append((name, path))
+        for name, path in temporary:
+            os.replace(name, path)
+    finally:
+        for name, _ in temporary:
+            try:
+                os.unlink(name)
+            except FileNotFoundError:
+                pass
 
 
 def _list_export_events(
@@ -157,6 +301,7 @@ def _list_export_events(
     limit: int | None,
     source_filter: str | None,
     content_class: str | None,
+    run_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """Return selected event records from the requested snapshot only."""
     stmt = (
@@ -174,6 +319,13 @@ def _list_export_events(
         )
         .order_by(IntelEventRankingSnapshot.rank.asc(), IntelEvent.id.asc())
     )
+    if run_id is not None:
+        stmt = stmt.where(
+            or_(
+                IntelEventRankingSnapshot.run_id == int(run_id),
+                IntelEventRankingSnapshot.run_id.is_(None),
+            )
+        )
     rows = list(session.execute(stmt).unique().all())
     records: list[dict[str, Any]] = []
     for snapshot, event in rows:
@@ -280,6 +432,7 @@ def _list_pending(
     limit: int | None,
     source_filter: str | None,
     content_class: str | None,
+    run_id: int | None = None,
 ) -> list[IntelItem]:
     # Pending is an audit projection for items that did not reach a candidate.
     stmt = (
@@ -291,6 +444,8 @@ def _list_pending(
         )
         .order_by(IntelItem.selection_score.desc(), IntelItem.id.asc())
     )
+    if run_id is not None:
+        stmt = stmt.join(IntelRunItem, IntelRunItem.item_id == IntelItem.id).where(IntelRunItem.run_id == int(run_id))
     if source_filter:
         stmt = stmt.where(IntelItem.source_id == source_filter)
     if content_class:
