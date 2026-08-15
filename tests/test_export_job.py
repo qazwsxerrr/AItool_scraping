@@ -20,4 +20,3 @@ def test_export_reads_selected_snapshot_only(tmp_path):
     result = run_intel_export_job(session_factory=session_factory, output_dir=tmp_path)
     assert result.exported == 1
     assert '"record_type": "intel_event"' in (tmp_path / "intel_items.jsonl").read_text()
-

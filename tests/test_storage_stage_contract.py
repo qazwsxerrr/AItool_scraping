@@ -108,4 +108,3 @@ def test_stage_a_b_raw_payloads_and_run_scope_are_serially_persisted(tmp_path):
         assert persisted.raw_response == {"provider": "analysis"}
         assert session.get(IntelItem, inserted.item_id).status == "candidate"
         assert session.get(IntelRun, run.id).item_ids_json == "[1]"
-
