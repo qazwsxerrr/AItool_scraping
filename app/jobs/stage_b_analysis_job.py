@@ -28,6 +28,7 @@ from app.ai.skills.intel_triage import (
 )
 from app.config.limits import DEFAULT_AI_ANALYSIS_MIN_SCORE, DEFAULT_AI_REVIEW_CONCURRENCY, DEFAULT_AI_REVIEW_LIMIT
 from app.domain.models import SourceSpec
+from app.jobs.provider_retry import ProviderResponseFailure, call_with_provider_retries
 from app.storage.models import IntelItem, IntelRunStageTask
 from app.storage.repository import IntelRepository
 
@@ -418,16 +419,46 @@ def _analysis_provider_outcome(
     client: Any,
     context: _AnalysisContext,
 ) -> tuple[AnalysisResult, BaseException | None]:
-    """Execute one provider call without touching SQLAlchemy state."""
+    """Execute one provider task with bounded transient-error retries."""
 
-    try:
-        return _call_analysis(client, context.envelope), None
-    except BaseException as exc:  # isolate one provider failure from its batch
-        return _analysis_failure(context.item_id, context.envelope, exc), exc
+    def operation() -> AnalysisResult:
+        value = _call_analysis(client, context.envelope)
+        if value.status == "analysis_failed":
+            retryable, _, _, _ = _classify_provider_failure(
+                None,
+                code=value.error_code,
+                message=value.error_message,
+            )
+            if retryable:
+                raise ProviderResponseFailure(value)
+        return value
+
+    value, failure, attempts = call_with_provider_retries(
+        operation,
+        is_retryable=lambda exc: _classify_provider_failure(
+            exc,
+            code=getattr(exc, "error_code", None),
+            message=str(exc),
+        )[0],
+        stage="stage-b",
+    )
+    if failure is not None:
+        return _analysis_failure(context.item_id, context.envelope, failure, attempts=attempts), failure
+    return value, None
 
 
-def _analysis_failure(item_id: int, envelope: RawIntelEnvelope, exc: BaseException) -> AnalysisResult:
+def _analysis_failure(
+    item_id: int,
+    envelope: RawIntelEnvelope,
+    exc: BaseException,
+    *,
+    attempts: int = 1,
+) -> AnalysisResult:
     message = str(exc).strip() or exc.__class__.__name__
+    raw_response = getattr(exc, "raw_response", None)
+    if not isinstance(raw_response, dict):
+        raw_response = {}
+    raw_response = {**raw_response, "provider_attempts": int(attempts)}
     return AnalysisResult(
         item_id=item_id,
         topic="opinion",
@@ -446,6 +477,7 @@ def _analysis_failure(item_id: int, envelope: RawIntelEnvelope, exc: BaseExcepti
         status="analysis_failed",
         error_code=getattr(exc, "error_code", None) or exc.__class__.__name__,
         error_message=message[:4000],
+        raw_response=raw_response,
     )
 
 

@@ -287,7 +287,8 @@ def test_analysis_failure_isolated_and_auditable(tmp_path):
         rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
         assert rows[0].status == "analysis_failed"
         assert rows[0].ai_review.status == "analysis_failed"
-        assert rows[0].ai_review.error_message == "analysis timeout"
+        assert "analysis timeout" in (rows[0].ai_review.error_message or "")
+        assert "after 6 attempts" in (rows[0].ai_review.error_message or "")
         assert rows[1].status == "candidate"
 
 

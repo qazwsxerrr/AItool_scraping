@@ -144,8 +144,9 @@ def test_stage_b_retry_does_not_call_stage_a(tmp_path):
         retry_failed=True,
     )
 
-    assert first_b.analysis_failed == 1
-    assert second_b.candidate == 1
+    assert first_b.analysis_failed == 0
+    assert first_b.candidate == 1
+    assert second_b.candidate == 0
     assert provider.screen_calls == [1]
     assert provider.analysis_calls == [1, 1]
 
@@ -208,7 +209,7 @@ def test_item_failure_isolated_from_other_items(tmp_path):
     assert provider.analysis_calls == [2]
 
 
-def test_provider_retryable_and_blocked_failures_are_distinguished(tmp_path):
+def test_provider_retryable_failure_is_terminal_after_automatic_retries(tmp_path):
     class ProviderError(RuntimeError):
         def __init__(self, status_code):
             super().__init__(f"HTTP {status_code}")
@@ -226,7 +227,10 @@ def test_provider_retryable_and_blocked_failures_are_distinguished(tmp_path):
     with sf() as session:
         stage = IntelRepository(session).get_stage(run_id, "screen")
         tasks = IntelRepository(session).list_stage_tasks(stage, subject_type="item")
-        assert [task.status for task in tasks] == ["retry_waiting", "blocked"]
+        assert [task.status for task in tasks] == ["blocked", "blocked"]
+        assert tasks[0].error_category == "provider_retry_exhausted"
+        assert "after 6 attempts" in (tasks[0].error_message or "")
+        assert len(provider.screen_calls) == 7
 
 
 def test_provider_concurrency_is_bounded_and_facade_forwards_limit(tmp_path):

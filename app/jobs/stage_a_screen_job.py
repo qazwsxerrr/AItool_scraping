@@ -28,6 +28,7 @@ from app.ai.skills.intel_triage import (
 )
 from app.config.limits import DEFAULT_AI_REVIEW_LIMIT, DEFAULT_AI_REVIEW_CONCURRENCY, DEFAULT_AI_SCREEN_REJECT_THRESHOLD
 from app.domain.models import SourceSpec
+from app.jobs.provider_retry import ProviderResponseFailure, ProviderRetryExhausted, call_with_provider_retries
 from app.storage.models import IntelItem, IntelRunStageTask
 from app.storage.repository import IntelRepository
 
@@ -471,16 +472,40 @@ def _screen_provider_outcome(
     context: _ItemContext,
     reject_threshold: int,
 ) -> tuple[ScreenResult, BaseException | None]:
-    """Execute one provider call without touching SQLAlchemy state."""
+    """Execute one provider task with bounded transient-error retries."""
 
-    try:
-        return _call_screen(client, context.envelope, reject_threshold=reject_threshold), None
-    except BaseException as exc:  # isolate one provider failure from its batch
-        return _screen_failure(context.item_id, exc), exc
+    def operation() -> ScreenResult:
+        value = _call_screen(client, context.envelope, reject_threshold=reject_threshold)
+        if value.status == "screen_failed":
+            retryable, _, _, _ = _classify_provider_failure(
+                None,
+                code=value.error_code,
+                message=value.error_message,
+            )
+            if retryable:
+                raise ProviderResponseFailure(value)
+        return value
+
+    value, failure, attempts = call_with_provider_retries(
+        operation,
+        is_retryable=lambda exc: _classify_provider_failure(
+            exc,
+            code=getattr(exc, "error_code", None),
+            message=str(exc),
+        )[0],
+        stage="stage-a",
+    )
+    if failure is not None:
+        return _screen_failure(context.item_id, failure, attempts=attempts), failure
+    return value, None
 
 
-def _screen_failure(item_id: int, exc: BaseException) -> ScreenResult:
+def _screen_failure(item_id: int, exc: BaseException, *, attempts: int = 1) -> ScreenResult:
     message = str(exc).strip() or exc.__class__.__name__
+    raw_response = getattr(exc, "raw_response", None)
+    if not isinstance(raw_response, dict):
+        raw_response = {}
+    raw_response = {**raw_response, "provider_attempts": int(attempts)}
     return ScreenResult(
         item_id=item_id,
         decision="uncertain",
@@ -491,6 +516,7 @@ def _screen_failure(item_id: int, exc: BaseException) -> ScreenResult:
         status="screen_failed",
         error_code=getattr(exc, "error_code", None) or exc.__class__.__name__,
         error_message=message[:4000],
+        raw_response=raw_response,
     )
 
 
@@ -625,6 +651,14 @@ def _classify_provider_failure(
     message: str | None,
 ) -> tuple[bool, str, str, str]:
     """Apply the frozen 429/timeout/5xx retry policy conservatively."""
+
+    if isinstance(exc, ProviderRetryExhausted) or getattr(exc, "retry_exhausted", False):
+        return (
+            False,
+            "provider_retry_exhausted",
+            str(getattr(exc, "error_code", None) or code or "retry_exhausted")[:128],
+            str(message or exc or "provider retries exhausted")[:4000],
+        )
 
     response = getattr(exc, "response", None) if exc is not None else None
     status = getattr(response, "status_code", None) if response is not None else None

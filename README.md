@@ -207,6 +207,8 @@ $PYTHON -m uvicorn app.web.app:app --host 127.0.0.1 --port 8000
 
 `run-once` 是完整链路的兼容 facade。正式 pipeline 会把 fetch membership、reference time 和各阶段 task 状态写入 run；重试只作用于命名阶段。`fetch-only` 只抓取并输出标准化条目及来源归因，不调用 AI，也不代表一个可恢复的正式 run。`ai-review` 输出：
 
+Stage A/B 对每条 AI provider 任务执行瞬态错误自动重试：首次调用失败后最多再重试 5 次（最多 6 次 provider 调用）。429、5xx、timeout 和 rate-limit 属于可重试错误；永久性 4xx、鉴权失败和 schema 错误不会重复请求。达到上限后任务记录 `provider_retry_exhausted` 并转为终结失败，成功任务仍会继续进入下游阶段，整次 run 以 `partial` 保留审计状态。
+
 默认数量策略为：每个来源抓取 20 条，AI review 最多处理 1000 条已有条目，日报默认导出 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；`--ai-limit` 独立控制 AI review、事件聚合和编辑排序的处理量；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
 
 - `ai_review_candidates.jsonl`：AI 选择且分析成功的候选。
