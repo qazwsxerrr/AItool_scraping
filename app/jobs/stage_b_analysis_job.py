@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from uuid import uuid4
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -88,6 +89,10 @@ class _AnalysisContext:
     content_class: str
 
 
+class _TaskLeaseLost(RuntimeError):
+    """Raised when a provider result can no longer be committed by its owner."""
+
+
 def run_stage_b_analysis_job(
     *,
     session_factory: sessionmaker[Session],
@@ -106,7 +111,7 @@ def run_stage_b_analysis_job(
     task_ids: Iterable[int] | None = None,
     analysis_min_score: int = DEFAULT_AI_ANALYSIS_MIN_SCORE,
     concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY,
-    owner: str = "stage-b",
+    owner: str | None = None,
     **_: Any,
 ) -> StageBAnalysisResult:
     """Run only persisted Stage-A eligible work for ``run_id``."""
@@ -117,6 +122,7 @@ def run_stage_b_analysis_job(
     selected_limit = _normalise_limit(ai_limit if ai_limit is not None else limit)
     min_score = _bounded_score(analysis_min_score, DEFAULT_AI_ANALYSIS_MIN_SCORE)
     result = StageBAnalysisResult(run_id=run_id)
+    owner = owner or f"stage-b-{uuid4().hex}"
     specs = dict(source_specs or {})
     requested_ids = {int(value) for value in item_ids} if item_ids is not None else None
     requested_task_ids = {int(value) for value in task_ids} if task_ids is not None else None
@@ -219,22 +225,6 @@ def run_stage_b_analysis_job(
     result.item_ids = [context.item_id for context in contexts]
     result.processed = len(contexts)
 
-    claimed_contexts: list[tuple[_AnalysisContext, int]] = []
-    for context in contexts:
-        task_id = task_ids_by_item.get(context.item_id)
-        if task_id is None:
-            continue
-        if not _claim_task(
-            session_factory,
-            task_id,
-            owner=owner,
-            input_fingerprint=context.input_fingerprint,
-            config_fingerprint=config_fingerprint,
-        ):
-            result.skipped += 1
-            continue
-        claimed_contexts.append((context, task_id))
-
     def persist_outcome(
         context: _AnalysisContext,
         task_id: int,
@@ -249,20 +239,26 @@ def run_stage_b_analysis_job(
                 code=analysis.error_code,
                 message=analysis.error_message,
             )
-            if _persist_analysis_failure(
-                session_factory,
-                task_id,
-                item_id=context.item_id,
-                run_id=run_id,
-                analysis=analysis,
-                content_class=context.content_class,
-                model=getattr(ai_client, "model", None),
-                owner=owner,
-                retryable=retryable,
-                error_category=category,
-                error_code=code,
-                error_message=message,
-            ):
+            try:
+                persisted = _persist_analysis_failure(
+                    session_factory,
+                    task_id,
+                    item_id=context.item_id,
+                    run_id=run_id,
+                    analysis=analysis,
+                    content_class=context.content_class,
+                    model=getattr(ai_client, "model", None),
+                    owner=owner,
+                    retryable=retryable,
+                    error_category=category,
+                    error_code=code,
+                    error_message=message,
+                )
+            except _TaskLeaseLost as exc:
+                result.skipped += 1
+                result.errors.append(f"intel_item_id={context.item_id}: {exc}")
+                return
+            if persisted:
                 result.analysis_failed += 1
                 result.errors.append(f"intel_item_id={context.item_id}: {message}")
             else:
@@ -274,9 +270,29 @@ def run_stage_b_analysis_job(
             score = int(analysis.selection_score or 0)
             with session_factory() as session:
                 repo = IntelRepository(session)
-                if guard_reason or score < min_score:
-                    reason = guard_reason or "score_below_threshold"
-                    persisted = analysis.model_copy(update={"reason": f"analysis_filtered:{reason}"})
+                task = session.get(IntelRunStageTask, task_id)
+                if task is None:
+                    raise RuntimeError(f"stage B task {task_id} disappeared")
+                heartbeated = repo.heartbeat_stage_task(task, owner=owner)
+                if heartbeated is None:
+                    raise _TaskLeaseLost(f"stage B task {task_id} lease/owner lost before persistence")
+                filtered = bool(guard_reason or score < min_score)
+                persisted = analysis.model_copy(update={"reason": f"analysis_filtered:{guard_reason or 'score_below_threshold'}"}) if filtered else analysis
+                completed = repo.complete_stage_task(
+                    task,
+                    owner=owner,
+                    result_ref={"projection": "AIItemReview", "item_id": context.item_id},
+                    result=persisted.model_dump(mode="json"),
+                    raw_response=persisted.raw_response,
+                    metadata={"selection_score": score, "filtered": filtered},
+                )
+                if completed is None:
+                    raise _TaskLeaseLost(f"stage B task {task_id} lease/owner lost before completion")
+                # Complete the task only after the lease check above.  Keep
+                # projection and task state in this same transaction so a
+                # stale worker cannot publish a result for a task it no
+                # longer owns.
+                if filtered:
                     repo.save_analysis(
                         context.item_id,
                         persisted,
@@ -288,11 +304,8 @@ def run_stage_b_analysis_job(
                     item = session.get(IntelItem, context.item_id)
                     if item is not None:
                         item.selection_score = score
-                        item.selection_reason = f"analysis_filtered:{reason}"
+                        item.selection_reason = f"analysis_filtered:{guard_reason or 'score_below_threshold'}"
                     repo.set_item_status(context.item_id, "analysis_filtered", run_id=run_id)
-                    result.analysis_filtered += 1
-                    result.analyzed += 1
-                    final = persisted
                 else:
                     repo.save_analysis(
                         context.item_id,
@@ -307,43 +320,63 @@ def run_stage_b_analysis_job(
                         item.selection_score = score
                         item.selection_reason = analysis.reason[:4000] if analysis.reason else "analysis_candidate"
                     repo.set_item_status(context.item_id, "candidate", run_id=run_id)
-                    result.candidate += 1
-                    result.candidate_ids.append(context.item_id)
-                    result.analyzed += 1
-                    final = analysis
-                task = session.get(IntelRunStageTask, task_id)
-                if task is None:
-                    raise RuntimeError(f"stage B task {task_id} disappeared")
-                repo.complete_stage_task(
-                    task,
-                    owner=owner,
-                    result_ref={"projection": "AIItemReview", "item_id": context.item_id},
-                    result=final.model_dump(mode="json"),
-                    raw_response=final.raw_response,
-                    metadata={"selection_score": score, "filtered": bool(guard_reason or score < min_score)},
-                )
                 session.commit()
+            result.analyzed += 1
+            if filtered:
+                result.analysis_filtered += 1
+            else:
+                result.candidate += 1
+                result.candidate_ids.append(context.item_id)
+        except _TaskLeaseLost as exc:
+            # Another worker may recover/retry this task.  Do not count a
+            # stale result as a success and, importantly, do not attempt to
+            # mark a task owned by someone else as failed.
+            result.skipped += 1
+            result.errors.append(f"intel_item_id={context.item_id}: {exc}")
         except Exception as exc:
             result.analysis_failed += 1
             result.errors.append(f"intel_item_id={context.item_id}: analysis persistence failed: {exc}")
             _mark_persistence_failure(session_factory, task_id, owner=owner, message=str(exc))
             LOGGER.exception("Stage B persistence failed for intel item %s", context.item_id)
 
-    if claimed_contexts:
+    # Keep at most ``max_workers`` provider calls in flight.  A task is
+    # claimed immediately before submission, so queued work cannot consume
+    # its lease while waiting behind earlier provider calls.
+    if contexts:
+        pending = iter((context, task_ids_by_item[context.item_id]) for context in contexts)
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="intel-stage-b") as executor:
-            futures = {
-                executor.submit(_analysis_provider_outcome, ai_client, context): (context, task_id)
-                for context, task_id in claimed_contexts
-            }
-            for future in as_completed(futures):
-                context, task_id = futures[future]
-                analysis, failure = future.result()
-                persist_outcome(context, task_id, analysis, failure)
+            futures: dict[Any, tuple[_AnalysisContext, int]] = {}
+
+            def submit_next() -> bool:
+                for context, task_id in pending:
+                    if not _claim_task(
+                        session_factory,
+                        task_id,
+                        owner=owner,
+                        input_fingerprint=context.input_fingerprint,
+                        config_fingerprint=config_fingerprint,
+                    ):
+                        result.skipped += 1
+                        continue
+                    futures[executor.submit(_analysis_provider_outcome, ai_client, context)] = (context, task_id)
+                    return True
+                return False
+
+            while len(futures) < max_workers and submit_next():
+                pass
+            while futures:
+                done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    context, task_id = futures.pop(future)
+                    analysis, failure = future.result()
+                    persist_outcome(context, task_id, analysis, failure)
+                    submit_next()
 
     with session_factory() as session:
         repo = IntelRepository(session)
         stage = repo.get_stage(run_id, "analyze")
         if stage is not None:
+            repo.recover_expired_stage_tasks(stage)
             repo.refresh_stage_status(stage)
             session.commit()
     return result
@@ -434,6 +467,25 @@ def _persist_analysis_failure(
     try:
         with session_factory() as session:
             repo = IntelRepository(session)
+            task = session.get(IntelRunStageTask, task_id)
+            if task is None:
+                raise RuntimeError(f"stage B task {task_id} disappeared")
+            heartbeated = repo.heartbeat_stage_task(task, owner=owner)
+            if heartbeated is None:
+                raise _TaskLeaseLost(f"stage B task {task_id} lease/owner lost before failure persistence")
+            failed = repo.fail_stage_task(
+                task,
+                owner=owner,
+                error_category=error_category,
+                error_code=error_code,
+                error_message=error_message,
+                retryable=retryable,
+                raw_response=analysis.raw_response,
+            )
+            if failed is None:
+                raise _TaskLeaseLost(f"stage B task {task_id} lease/owner lost before failure persistence")
+            # Persist the projection only after the owner/lease check above,
+            # in the same transaction as the task failure transition.
             repo.save_analysis(
                 item_id,
                 analysis,
@@ -444,20 +496,10 @@ def _persist_analysis_failure(
                 error_message=error_message,
             )
             repo.set_item_status(item_id, "analysis_failed", run_id=run_id)
-            task = session.get(IntelRunStageTask, task_id)
-            if task is None:
-                raise RuntimeError(f"stage B task {task_id} disappeared")
-            repo.fail_stage_task(
-                task,
-                owner=owner,
-                error_category=error_category,
-                error_code=error_code,
-                error_message=error_message,
-                retryable=retryable,
-                raw_response=analysis.raw_response,
-            )
             session.commit()
         return True
+    except _TaskLeaseLost:
+        raise
     except Exception:
         LOGGER.exception("Stage B failure persistence failed for intel item %s", item_id)
         return False

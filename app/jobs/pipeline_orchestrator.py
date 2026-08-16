@@ -68,7 +68,10 @@ DISPLAY_STAGE_NAMES = {
     "export": "export",
 }
 PIPELINE_STAGES = ("screen", "analyze", "cluster", "rank", "export")
+PIPELINE_STAGE_ORDER = ("fetch", *PIPELINE_STAGES)
 RETRYABLE_TASK_STATUSES = frozenset({"failed", "retry_waiting", "pending"})
+RUN_ACTIVE_STAGE_STATUSES = frozenset({"pending", "running", "retry_waiting"})
+RUN_FAILED_STAGE_STATUSES = frozenset({"failed", "blocked"})
 
 
 @dataclass(frozen=True)
@@ -141,6 +144,100 @@ def _registry(settings: Settings, registry_path=DEFAULT_REGISTRY_PATH) -> dict[s
         env={"RSSHUB_BASE_URL": settings.rsshub_base_url or ""},
     )
     return {source.id: source for source in loaded.sources}
+
+
+def _sync_pipeline_run_status(
+    session_factory: Any,
+    run_id: int,
+    *,
+    finalize: bool = False,
+    partial: bool | None = None,
+    partial_reason: str | None = None,
+) -> str | None:
+    """Reconcile the run summary from all durable stage rows.
+
+    Individual stage jobs own their task state, while this helper owns the
+    aggregate ``IntelRun.status`` used by the CLI and exporters.  A run is
+    only terminal after every fetch/pipeline stage is terminal; an active or
+    not-yet-started downstream stage keeps the run open.
+    """
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        run = session.get(IntelRun, int(run_id))
+        if run is None:
+            return None
+
+        stages = {stage.stage_name: stage for stage in repo.list_stages(int(run_id))}
+        statuses = {
+            name: str(stages[name].status) if name in stages else "pending"
+            for name in PIPELINE_STAGE_ORDER
+        }
+
+        if any(status in RUN_ACTIVE_STAGE_STATUSES for status in statuses.values()):
+            changed = False
+            if run.status != "running" or run.finished_at is not None:
+                run.status = "running"
+                run.finished_at = None
+                run.error = None
+                changed = True
+            if partial:
+                if not run.partial:
+                    run.partial = True
+                    changed = True
+                if partial_reason and run.partial_reason != partial_reason:
+                    run.partial_reason = partial_reason
+                    changed = True
+            if changed:
+                session.commit()
+            return "running"
+
+        failed = [name for name, status in statuses.items() if status in RUN_FAILED_STAGE_STATUSES]
+        if failed:
+            reason = partial_reason or "stage_failure:" + ",".join(failed)
+            repo.finish_run(
+                int(run_id),
+                status="partial",
+                error=reason,
+                partial=True,
+                partial_reason=reason,
+            )
+            session.commit()
+            return "partial"
+
+        if all(status == "succeeded" for status in statuses.values()):
+            if not finalize:
+                changed = False
+                if run.status != "running" or run.finished_at is not None:
+                    run.status = "running"
+                    run.finished_at = None
+                    run.error = None
+                    changed = True
+                if changed:
+                    session.commit()
+                return "running"
+            effective_partial = bool(run.partial or partial)
+            effective_reason = partial_reason or run.partial_reason
+            target_status = "partial" if effective_partial else "completed"
+            if (
+                run.status != target_status
+                or run.finished_at is None
+                or bool(run.partial) != effective_partial
+                or (run.partial_reason or None) != (effective_reason or None)
+            ):
+                repo.finish_run(
+                    int(run_id),
+                    status=target_status,
+                    error=effective_reason if effective_partial else None,
+                    partial=effective_partial,
+                    partial_reason=effective_reason if effective_partial else "",
+                )
+                session.commit()
+            return target_status
+
+        # Unknown/non-terminal stage state: leave the run open and let the
+        # next status/retry/resume operation reconcile it.
+        return "running"
 
 
 @contextmanager
@@ -313,7 +410,7 @@ def run_pipeline_stage_a_from_settings(
     _, session_factory = _engine_and_factory(settings)
     specs = _registry(settings, registry_path)
     with _stage_ai_client(settings, ai_client) as provider:
-        return run_stage_a_screen_job(
+        result = run_stage_a_screen_job(
             session_factory=session_factory,
             source_specs=specs,
             ai_client=provider,
@@ -329,6 +426,14 @@ def run_pipeline_stage_a_from_settings(
             screen_reject_threshold=settings.ai_screen_reject_threshold,
             concurrency=settings.ai_review_concurrency,
         )
+    _sync_pipeline_run_status(
+        session_factory,
+        int(run_id),
+        finalize=False,
+        partial=result.partial,
+        partial_reason=result.partial_reason,
+    )
+    return result
 
 
 def run_pipeline_stage_b_from_settings(
@@ -349,7 +454,7 @@ def run_pipeline_stage_b_from_settings(
     _, session_factory = _engine_and_factory(settings)
     specs = _registry(settings, registry_path)
     with _stage_ai_client(settings, ai_client) as provider:
-        return run_stage_b_analysis_job(
+        result = run_stage_b_analysis_job(
             session_factory=session_factory,
             source_specs=specs,
             ai_client=provider,
@@ -365,6 +470,14 @@ def run_pipeline_stage_b_from_settings(
             analysis_min_score=settings.ai_analysis_min_score,
             concurrency=settings.ai_review_concurrency,
         )
+    _sync_pipeline_run_status(
+        session_factory,
+        int(run_id),
+        finalize=False,
+        partial=result.partial,
+        partial_reason=result.partial_reason,
+    )
+    return result
 
 
 def run_pipeline_stage_c_from_settings(
@@ -377,7 +490,8 @@ def run_pipeline_stage_c_from_settings(
     ai_client: Any | None = None,
     item_ids: Iterable[int] | None = None,
 ) -> EventClusterResult:
-    return run_event_cluster_from_settings(
+    _, session_factory = _engine_and_factory(settings)
+    result = run_event_cluster_from_settings(
         settings=settings,
         run_id=int(run_id),
         limit=limit,
@@ -386,6 +500,8 @@ def run_pipeline_stage_c_from_settings(
         item_ids=item_ids,
         ai_client=ai_client,
     )
+    _sync_pipeline_run_status(session_factory, int(run_id), finalize=False)
+    return result
 
 
 def run_pipeline_rank_from_settings(
@@ -399,7 +515,8 @@ def run_pipeline_rank_from_settings(
     ai_client: Any | None = None,
     event_ids: Iterable[int] | None = None,
 ) -> EditorialRankResult:
-    return run_editorial_rank_from_settings(
+    _, session_factory = _engine_and_factory(settings)
+    result = run_editorial_rank_from_settings(
         settings=settings,
         run_id=int(run_id),
         limit=limit,
@@ -409,6 +526,8 @@ def run_pipeline_rank_from_settings(
         ai_client=ai_client,
         event_ids=event_ids,
     )
+    _sync_pipeline_run_status(session_factory, int(run_id), finalize=False)
+    return result
 
 
 def run_pipeline_export_from_settings(
@@ -424,7 +543,8 @@ def run_pipeline_export_from_settings(
     partial: bool = False,
     partial_reason: str | None = None,
 ) -> IntelExportResult:
-    return run_intel_export_from_settings(
+    _, session_factory = _engine_and_factory(settings)
+    result = run_intel_export_from_settings(
         settings=settings,
         run_id=int(run_id),
         limit=limit,
@@ -436,6 +556,14 @@ def run_pipeline_export_from_settings(
         partial=partial,
         partial_reason=partial_reason,
     )
+    _sync_pipeline_run_status(
+        session_factory,
+        int(run_id),
+        finalize=True,
+        partial=result.partial,
+        partial_reason=result.partial_reason,
+    )
+    return result
 
 
 def pipeline_status_from_settings(*, settings: Settings, run_id: int) -> PipelineStatus:
@@ -715,14 +843,16 @@ def resume_pipeline_from_settings(
             break
 
     # Keep the run summary useful to operators without changing the frozen
-    # item membership.  Downstream jobs own their stage/task projections.
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        run = session.get(IntelRun, int(run_id))
-        if run is not None:
-            status = "failed" if result.errors else ("completed" if result.ran_stages else run.status)
-            repo.finish_run(run_id, status=status, error="; ".join(result.errors) if result.errors else None)
-            session.commit()
+    # item membership.  Downstream jobs own their stage/task projections, but
+    # the orchestrator owns the aggregate terminal status.
+    if result.errors:
+        with session_factory() as session:
+            repo = IntelRepository(session)
+            if session.get(IntelRun, int(run_id)) is not None:
+                repo.finish_run(run_id, status="failed", error="; ".join(result.errors))
+                session.commit()
+    else:
+        _sync_pipeline_run_status(session_factory, int(run_id), finalize=True)
     return result
 
 

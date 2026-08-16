@@ -12,7 +12,7 @@ from app.jobs.stage_a_screen_job import run_stage_a_screen_job
 from app.jobs.stage_b_analysis_job import run_stage_b_analysis_job
 from app.jobs.ai_review_job import run_ai_review_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelItem, IntelRun, IntelRunStageTask
+from app.storage.models import AIItemScreen, IntelItem, IntelRun, IntelRunStageTask
 from app.storage.repository import IntelRepository
 
 
@@ -276,6 +276,121 @@ def test_provider_concurrency_is_bounded_and_facade_forwards_limit(tmp_path):
     assert result.candidate == 8
     assert provider.max_active > 1
     assert provider.max_active <= 2
+
+
+def test_stage_a_claims_only_inflight_tasks_before_short_lease_expires(tmp_path, monkeypatch):
+    """Queued work must not inherit a lease that expires before execution."""
+
+    sf = _factory(tmp_path)
+    titles = [f"queued-{index}" for index in range(30)]
+    source, run_id = _run_with_items(sf, titles)
+
+    original_claim = IntelRepository.claim_stage_task
+
+    def short_lease_claim(self, *args, **kwargs):
+        # Repository clamps leases to at least one second.  Thirty provider
+        # calls at 80ms with two workers take long enough to expose the old
+        # claim-all queue, while each bounded in-flight call remains live.
+        kwargs["lease_seconds"] = 1
+        return original_claim(self, *args, **kwargs)
+
+    monkeypatch.setattr(IntelRepository, "claim_stage_task", short_lease_claim)
+
+    class SlowProvider(_Provider):
+        def screen(self, envelope):
+            time.sleep(0.08)
+            return super().screen(envelope)
+
+    provider = SlowProvider()
+    result = run_stage_a_screen_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=run_id,
+        limit=None,
+        concurrency=2,
+    )
+
+    assert result.screened == len(titles)
+    assert result.screen_failed == 0
+    with sf() as session:
+        stage = IntelRepository(session).get_stage(run_id, "screen")
+        tasks = IntelRepository(session).list_stage_tasks(stage, subject_type="item", include_expired=True)
+        assert len(tasks) == len(titles)
+        assert all(task.status == "succeeded" for task in tasks)
+
+
+def test_stage_a_expired_lease_does_not_publish_stale_projection(tmp_path, monkeypatch):
+    sf = _factory(tmp_path)
+    source, run_id = _run_with_items(sf, ["expires"])
+
+    original_claim = IntelRepository.claim_stage_task
+
+    def one_second_lease_claim(self, *args, **kwargs):
+        kwargs["lease_seconds"] = 1
+        return original_claim(self, *args, **kwargs)
+
+    monkeypatch.setattr(IntelRepository, "claim_stage_task", one_second_lease_claim)
+
+    class ExpiringProvider(_Provider):
+        def screen(self, envelope):
+            time.sleep(1.1)
+            return super().screen(envelope)
+
+    result = run_stage_a_screen_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=ExpiringProvider(),
+        run_id=run_id,
+        limit=None,
+        concurrency=1,
+    )
+
+    assert result.screened == 0
+    assert result.screen_failed == 0
+    assert result.skipped == 1
+    with sf() as session:
+        stage = IntelRepository(session).get_stage(run_id, "screen")
+        task = session.scalar(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id))
+        assert task is not None
+        assert task.status == "retry_waiting"
+        assert session.scalar(select(AIItemScreen).where(AIItemScreen.item_id == 1)) is None
+
+
+def test_stage_a_expired_failure_lease_is_retryable_without_failure_projection(tmp_path, monkeypatch):
+    sf = _factory(tmp_path)
+    source, run_id = _run_with_items(sf, ["expires-failure"])
+
+    original_claim = IntelRepository.claim_stage_task
+
+    def one_second_lease_claim(self, *args, **kwargs):
+        kwargs["lease_seconds"] = 1
+        return original_claim(self, *args, **kwargs)
+
+    monkeypatch.setattr(IntelRepository, "claim_stage_task", one_second_lease_claim)
+
+    class ExpiringFailureProvider(_Provider):
+        def screen(self, envelope):
+            time.sleep(1.1)
+            raise RuntimeError("provider timeout")
+
+    result = run_stage_a_screen_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=ExpiringFailureProvider(),
+        run_id=run_id,
+        limit=None,
+        concurrency=1,
+    )
+
+    assert result.screen_failed == 0
+    assert result.skipped == 1
+    with sf() as session:
+        stage = IntelRepository(session).get_stage(run_id, "screen")
+        task = session.scalar(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id))
+        assert task is not None
+        assert task.status == "retry_waiting"
+        assert session.scalar(select(AIItemScreen).where(AIItemScreen.item_id == 1)) is None
 
 
 def test_strict_schema_preflight_rejects_missing_aliases():

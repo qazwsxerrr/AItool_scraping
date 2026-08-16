@@ -574,7 +574,7 @@ def _markdown(
                         f"display_score=`{record.get('display_score')}` | topic=`{record.get('topic')}`"
                     ),
                     (
-                        f"- 类别：`{record.get('content_class')}` | 来源组：`{record.get('source_group') or '-'}"
+                        f"- 类别：`{record.get('content_class')}` | 来源组：`{record.get('source_group') or '-'}`"
                         f" | 状态：`selected`"
                     ),
                     f"- 摘要：{record.get('summary_cn') or record.get('summary') or '暂无摘要'}",

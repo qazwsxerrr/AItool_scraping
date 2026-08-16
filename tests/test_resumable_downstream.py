@@ -134,6 +134,7 @@ def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_
             summary_cn="one",
             topic="model",
             display_score=90,
+            source_group="official_blog",
             new_in_run_id=run_one.id,
             first_run_id=run_one.id,
         )
@@ -157,6 +158,7 @@ def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_
                     rank=1,
                     display_score=90,
                     selected=True,
+                    source_group="official_blog",
                 ),
                 IntelEventRankingSnapshot(
                     snapshot_key=f"run-{run_two.id}",
@@ -199,4 +201,5 @@ def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_
     )
     assert successful.exported == 1
     assert (final_dir / "intel_digest.md").read_text(encoding="utf-8") != "previous-success"
+    assert "来源组：`official_blog` | 状态：`selected`" in (final_dir / "intel_digest.md").read_text(encoding="utf-8")
     assert run_two_id != run_one_id

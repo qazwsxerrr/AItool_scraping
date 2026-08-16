@@ -94,3 +94,35 @@ def test_stage_wrappers_forward_configured_ai_concurrency(tmp_path, monkeypatch)
     orchestrator.run_pipeline_stage_a_from_settings(settings=settings, run_id=1, ai_client=object())
     orchestrator.run_pipeline_stage_b_from_settings(settings=settings, run_id=1, ai_client=object())
     assert seen == {"screen": 7, "analysis": 7}
+
+
+def test_manual_pipeline_run_status_finalizes_only_after_export(tmp_path):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'pipeline.db'}")
+    engine = create_engine_from_url(settings.database_url)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        run = repo.start_run(reference_time=datetime.now(timezone.utc))
+        for stage_name in ("fetch", "screen", "analyze", "cluster", "rank"):
+            stage = repo.ensure_stage(run.id, stage_name)
+            repo.finish_stage(stage, status="succeeded")
+        session.commit()
+        run_id = int(run.id)
+
+    assert orchestrator._sync_pipeline_run_status(session_factory, run_id, finalize=False) == "running"
+    with session_factory() as session:
+        assert session.get(orchestrator.IntelRun, run_id).status == "running"
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        export_stage = repo.ensure_stage(run_id, "export")
+        repo.finish_stage(export_stage, status="succeeded")
+        session.commit()
+
+    assert orchestrator._sync_pipeline_run_status(session_factory, run_id, finalize=True) == "completed"
+    with session_factory() as session:
+        run = session.get(orchestrator.IntelRun, run_id)
+        assert run.status == "completed"
+        assert run.finished_at is not None

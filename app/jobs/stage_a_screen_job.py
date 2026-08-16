@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from uuid import uuid4
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -73,6 +74,10 @@ class _ItemContext:
     structural_error: str | None = None
 
 
+class _TaskLeaseLost(RuntimeError):
+    """Raised when a provider result can no longer be committed by its owner."""
+
+
 def run_stage_a_screen_job(
     *,
     session_factory: sessionmaker[Session],
@@ -93,7 +98,7 @@ def run_stage_a_screen_job(
     concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY,
     dry_run: bool = False,
     now: Any | None = None,
-    owner: str = "stage-a",
+    owner: str | None = None,
     **_: Any,
 ) -> StageAScreenResult:
     """Run Stage A with durable per-item state.
@@ -109,6 +114,7 @@ def run_stage_a_screen_job(
     selected_limit = _normalise_limit(ai_limit if ai_limit is not None else limit)
     reject_threshold = _bounded_score(screen_reject_threshold, DEFAULT_AI_SCREEN_REJECT_THRESHOLD)
     result = StageAScreenResult(run_id=run_id)
+    owner = owner or f"stage-a-{uuid4().hex}"
     specs = dict(source_specs or {})
 
     # Local strict-schema validation is intentionally before any provider
@@ -178,30 +184,6 @@ def run_stage_a_screen_job(
             task_ids_by_item[context.item_id] = int(task.id)
         session.commit()
 
-    # Provider calls are intentionally outside SQLAlchemy sessions.  Claim all
-    # work first, run only the provider calls in bounded worker threads, and
-    # keep every projection/task commit on this coordinator thread.
-    claimed_contexts: list[tuple[_ItemContext, int]] = []
-    for context in contexts:
-        task_id = task_ids_by_item.get(context.item_id)
-        if task_id is None:
-            continue
-        if not _claim_task(
-            session_factory,
-            task_id,
-            owner=owner,
-            input_fingerprint=context.input_fingerprint,
-            config_fingerprint=config_fingerprint,
-        ):
-            result.skipped += 1
-            # A reusable successful task is still eligible for Stage B.  Keep
-            # it in the scope passed to the facade without making a provider
-            # call again.
-            if _task_is_eligible(session_factory, task_id):
-                result.eligible_item_ids.append(context.item_id)
-            continue
-        claimed_contexts.append((context, task_id))
-
     def persist_outcome(
         context: _ItemContext,
         task_id: int,
@@ -216,19 +198,25 @@ def run_stage_a_screen_job(
                 code=screen.error_code,
                 message=screen.error_message,
             )
-            if _persist_screen_failure(
-                session_factory,
-                task_id,
-                item_id=context.item_id,
-                run_id=effective_run_id,
-                screen=screen,
-                owner=owner,
-                model=getattr(ai_client, "model", None),
-                retryable=retryable,
-                error_category=category,
-                error_code=code,
-                error_message=message,
-            ):
+            try:
+                persisted = _persist_screen_failure(
+                    session_factory,
+                    task_id,
+                    item_id=context.item_id,
+                    run_id=effective_run_id,
+                    screen=screen,
+                    owner=owner,
+                    model=getattr(ai_client, "model", None),
+                    retryable=retryable,
+                    error_category=category,
+                    error_code=code,
+                    error_message=message,
+                )
+            except _TaskLeaseLost as exc:
+                result.skipped += 1
+                result.errors.append(f"intel_item_id={context.item_id}: {exc}")
+                return
+            if persisted:
                 result.screen_failed += 1
                 result.errors.append(f"intel_item_id={context.item_id}: {message}")
             else:
@@ -238,24 +226,13 @@ def run_stage_a_screen_job(
         try:
             with session_factory() as session:
                 repo = IntelRepository(session)
-                repo.save_screen(
-                    context.item_id,
-                    screen,
-                    run_id=effective_run_id,
-                    model=getattr(ai_client, "model", None),
-                    status="success",
-                )
-                if screen.decision == "reject" and screen.confidence >= reject_threshold:
-                    repo.set_item_status(context.item_id, "screened_out", run_id=effective_run_id)
-                    result.screened_out += 1
-                else:
-                    # Keep the legacy projection in ``new`` until Stage B.
-                    repo.set_item_status(context.item_id, "new", run_id=effective_run_id)
-                    result.eligible_item_ids.append(context.item_id)
                 task = session.get(IntelRunStageTask, task_id)
                 if task is None:
                     raise RuntimeError(f"stage A task {task_id} disappeared")
-                repo.complete_stage_task(
+                heartbeated = repo.heartbeat_stage_task(task, owner=owner)
+                if heartbeated is None:
+                    raise _TaskLeaseLost(f"stage A task {task_id} lease/owner lost before persistence")
+                completed = repo.complete_stage_task(
                     task,
                     owner=owner,
                     result_ref={"projection": "AIItemScreen", "item_id": context.item_id},
@@ -263,8 +240,37 @@ def run_stage_a_screen_job(
                     raw_response=screen.raw_response,
                     metadata={"decision": screen.decision, "confidence": screen.confidence},
                 )
+                if completed is None:
+                    raise _TaskLeaseLost(f"stage A task {task_id} lease/owner lost before completion")
+                # Complete the task only after the lease check above.  Keep
+                # projection and task state in this same transaction so a
+                # stale worker cannot publish a result for a task it no
+                # longer owns.
+                repo.save_screen(
+                    context.item_id,
+                    screen,
+                    run_id=effective_run_id,
+                    model=getattr(ai_client, "model", None),
+                    status="success",
+                )
+                screened_out = screen.decision == "reject" and screen.confidence >= reject_threshold
+                if screened_out:
+                    repo.set_item_status(context.item_id, "screened_out", run_id=effective_run_id)
+                else:
+                    # Keep the legacy projection in ``new`` until Stage B.
+                    repo.set_item_status(context.item_id, "new", run_id=effective_run_id)
                 session.commit()
+            if screened_out:
+                result.screened_out += 1
+            else:
+                result.eligible_item_ids.append(context.item_id)
             result.screened += 1
+        except _TaskLeaseLost as exc:
+            # Another worker may recover/retry this task.  Do not count a
+            # stale result as a success and, importantly, do not attempt to
+            # mark a task owned by someone else as failed.
+            result.skipped += 1
+            result.errors.append(f"intel_item_id={context.item_id}: {exc}")
         except Exception as exc:
             # Persistence failures are item-local and must not abort the batch.
             result.screen_failed += 1
@@ -272,40 +278,79 @@ def run_stage_a_screen_job(
             _mark_persistence_failure(session_factory, task_id, owner=owner, message=str(exc))
             LOGGER.exception("Stage A persistence failed for intel item %s", context.item_id)
 
-    for context, task_id in claimed_contexts:
+    provider_contexts: list[tuple[_ItemContext, int]] = []
+    for context in contexts:
+        task_id = task_ids_by_item.get(context.item_id)
+        if task_id is None:
+            continue
         if context.structural_error is not None:
-            persist_outcome(
-                context,
+            # Structural failures are local and cheap; claim immediately
+            # before persisting rather than leasing the entire queue.
+            if _claim_task(
+                session_factory,
                 task_id,
-                _structural_screen(context.item_id, context.structural_error),
-                None,
-            )
-
-    provider_contexts = [
-        (context, task_id)
-        for context, task_id in claimed_contexts
-        if context.structural_error is None
-    ]
-    if provider_contexts:
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="intel-stage-a") as executor:
-            futures = {
-                executor.submit(
-                    _screen_provider_outcome,
-                    ai_client,
+                owner=owner,
+                input_fingerprint=context.input_fingerprint,
+                config_fingerprint=config_fingerprint,
+            ):
+                persist_outcome(
                     context,
-                    reject_threshold,
-                ): (context, task_id)
-                for context, task_id in provider_contexts
-            }
-            for future in as_completed(futures):
-                context, task_id = futures[future]
-                screen, failure = future.result()
-                persist_outcome(context, task_id, screen, failure)
+                    task_id,
+                    _structural_screen(context.item_id, context.structural_error),
+                    None,
+                )
+            else:
+                result.skipped += 1
+                if _task_is_eligible(session_factory, task_id):
+                    result.eligible_item_ids.append(context.item_id)
+            continue
+        provider_contexts.append((context, task_id))
+
+    # Keep at most ``max_workers`` provider calls in flight.  A task is
+    # claimed immediately before submission, so queued work cannot consume
+    # its lease while waiting behind earlier provider calls.
+    if provider_contexts:
+        pending = iter(provider_contexts)
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="intel-stage-a") as executor:
+            futures: dict[Any, tuple[_ItemContext, int]] = {}
+
+            def submit_next() -> bool:
+                for context, task_id in pending:
+                    if not _claim_task(
+                        session_factory,
+                        task_id,
+                        owner=owner,
+                        input_fingerprint=context.input_fingerprint,
+                        config_fingerprint=config_fingerprint,
+                    ):
+                        result.skipped += 1
+                        if _task_is_eligible(session_factory, task_id):
+                            result.eligible_item_ids.append(context.item_id)
+                        continue
+                    futures[executor.submit(
+                        _screen_provider_outcome,
+                        ai_client,
+                        context,
+                        reject_threshold,
+                    )] = (context, task_id)
+                    return True
+                return False
+
+            while len(futures) < max_workers and submit_next():
+                pass
+            while futures:
+                done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    context, task_id = futures.pop(future)
+                    screen, failure = future.result()
+                    persist_outcome(context, task_id, screen, failure)
+                    submit_next()
 
     with session_factory() as session:
         repo = IntelRepository(session)
         stage = repo.get_stage(effective_run_id, "screen")
         if stage is not None:
+            repo.recover_expired_stage_tasks(stage)
             repo.refresh_stage_status(stage)
             session.commit()
     return result
@@ -478,6 +523,25 @@ def _persist_screen_failure(
     try:
         with session_factory() as session:
             repo = IntelRepository(session)
+            task = session.get(IntelRunStageTask, task_id)
+            if task is None:
+                raise RuntimeError(f"stage A task {task_id} disappeared")
+            heartbeated = repo.heartbeat_stage_task(task, owner=owner)
+            if heartbeated is None:
+                raise _TaskLeaseLost(f"stage A task {task_id} lease/owner lost before failure persistence")
+            failed = repo.fail_stage_task(
+                task,
+                owner=owner,
+                error_category=error_category,
+                error_code=error_code,
+                error_message=error_message,
+                retryable=retryable,
+                raw_response=screen.raw_response,
+            )
+            if failed is None:
+                raise _TaskLeaseLost(f"stage A task {task_id} lease/owner lost before failure persistence")
+            # Persist the projection only after the owner/lease check above,
+            # in the same transaction as the task failure transition.
             repo.save_screen(
                 item_id,
                 screen,
@@ -487,20 +551,10 @@ def _persist_screen_failure(
                 error_message=error_message,
             )
             repo.set_item_status(item_id, "screen_failed", run_id=run_id)
-            task = session.get(IntelRunStageTask, task_id)
-            if task is None:
-                raise RuntimeError(f"stage A task {task_id} disappeared")
-            repo.fail_stage_task(
-                task,
-                owner=owner,
-                error_category=error_category,
-                error_code=error_code,
-                error_message=error_message,
-                retryable=retryable,
-                raw_response=screen.raw_response,
-            )
             session.commit()
         return True
+    except _TaskLeaseLost:
+        raise
     except Exception:
         LOGGER.exception("Stage A failure persistence failed for intel item %s", item_id)
         return False
