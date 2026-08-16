@@ -28,7 +28,7 @@ def test_run_once_threads_one_run_id_and_default_fetch_cap(tmp_path, monkeypatch
     monkeypatch.setattr(run_job, "run_ai_review_from_settings", fake_review)
     monkeypatch.setattr(run_job, "run_event_cluster_from_settings", lambda **kwargs: EventClusterResult())
     monkeypatch.setattr(run_job, "run_editorial_rank_from_settings", lambda **kwargs: EditorialRankResult())
-    monkeypatch.setattr(run_job, "run_intel_export_from_settings", lambda **kwargs: IntelExportResult(0, 0, "items", "digest", "pending"))
+    monkeypatch.setattr(run_job, "run_intel_export_from_settings", lambda **kwargs: IntelExportResult(0, "items", "digest"))
 
     result = run_job.run_intel_once_from_settings(settings=Settings(database_url=f"sqlite:///{tmp_path / 'run.db'}"), output_dir=str(tmp_path / "out"))
     assert result.status == "completed"
@@ -48,7 +48,7 @@ def test_explicit_ai_cap_is_forwarded_for_partial_accounting(tmp_path, monkeypat
     monkeypatch.setattr(run_job, "run_ai_review_from_settings", fake_review)
     monkeypatch.setattr(run_job, "run_event_cluster_from_settings", lambda **kwargs: EventClusterResult())
     monkeypatch.setattr(run_job, "run_editorial_rank_from_settings", lambda **kwargs: EditorialRankResult())
-    monkeypatch.setattr(run_job, "run_intel_export_from_settings", lambda **kwargs: IntelExportResult(0, 0, "items", "digest", "pending"))
+    monkeypatch.setattr(run_job, "run_intel_export_from_settings", lambda **kwargs: IntelExportResult(0, "items", "digest"))
     result = run_job.run_intel_once_from_settings(settings=Settings(database_url=f"sqlite:///{tmp_path / 'cap.db'}"), ai_limit=1)
     assert result.status == "completed"
     assert seen["ai_limit"] == 1

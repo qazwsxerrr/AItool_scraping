@@ -17,21 +17,18 @@ from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
 from app.config.settings import Settings
-from app.domain.categories import fallback_topic_category
 from app.domain.recency import RecentWindowDecision, recent_window_decision
 from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
-from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem, IntelRun, IntelRunItem
+from app.storage.models import IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem, IntelRun, IntelRunItem
 
 
 @dataclass(frozen=True)
 class IntelExportResult:
     exported: int
-    pending: int
     jsonl_path: str
     markdown_path: str
-    pending_path: str
     dry_run: bool = False
     github_report_path: str | None = None
     status_counts: dict[str, int] = field(default_factory=dict)
@@ -63,7 +60,7 @@ def run_intel_export_job(
     effective_limit = _normalise_export_limit(limit)
     jsonl_path = artifact_output / "intel_items.jsonl"
     markdown_path = artifact_output / "intel_digest.md"
-    pending_path = artifact_output / "intel_pending.jsonl"
+    legacy_pending_path = artifact_output / "intel_pending.jsonl"
     report_root = Path(github_report_dir) if github_report_dir else artifact_output / "github-trending"
     stage = None
     stage_task = None
@@ -87,20 +84,12 @@ def run_intel_export_job(
                 run_id=run_id,
                 reference_time=run.reference_time if run is not None else None,
             )
-            pending_items = _list_pending(
-                session,
-                limit=effective_limit,
-                source_filter=source_filter,
-                content_class=content_class,
-                run_id=run_id,
-            )
             records = snapshot_rows
-            pending_records = [_serialize(item) for item in pending_items]
             if run is not None and (run.partial or str(run.status).casefold() in {"failed", "partial"}):
                 partial = True
                 partial_reason = partial_reason or run.partial_reason or f"run_status:{run.status}"
             if stage is not None:
-                input_fingerprint = _export_input_fingerprint(records, pending_records, key)
+                input_fingerprint = _export_input_fingerprint(records, key)
                 stage_task = repo.ensure_stage_task(
                     stage,
                     subject_type="run",
@@ -126,7 +115,7 @@ def run_intel_export_job(
             session.rollback()
             raise
 
-    status_counts = dict(Counter(str(record.get("status") or "unknown") for record in [*records, *pending_records]))
+    status_counts = dict(Counter(str(record.get("status") or "unknown") for record in records))
     failure_counts = {
         status: count
         for status, count in status_counts.items()
@@ -138,10 +127,8 @@ def run_intel_export_job(
         if not dry_run and (run_id is not None or not partial):
             payloads = {
                 jsonl_path: "".join(json.dumps(record, ensure_ascii=False, default=str) + "\n" for record in records),
-                pending_path: "".join(json.dumps(record, ensure_ascii=False, default=str) + "\n" for record in pending_records),
                 markdown_path: _markdown(
                     records,
-                    pending_records,
                     status_counts=status_counts,
                     failure_counts=failure_counts,
                     partial=partial,
@@ -149,16 +136,17 @@ def run_intel_export_job(
                 ),
             }
             _atomic_write_bundle(payloads)
+            _remove_legacy_pending_artifacts(legacy_pending_path)
             github_report_path = write_github_trending_report(records, output_root=report_root)
             # A partial/failed upstream run is auditable in its per-run
             # directory but must never replace the last successful digest.
             if run_id is not None and not partial:
                 final_payloads = {
                     final_output / "intel_items.jsonl": payloads[jsonl_path],
-                    final_output / "intel_pending.jsonl": payloads[pending_path],
                     final_output / "intel_digest.md": payloads[markdown_path],
                 }
                 _atomic_write_bundle(final_payloads)
+                _remove_legacy_pending_artifacts(final_output / "intel_pending.jsonl")
         if stage_task is not None:
             with session_factory() as session:
                 repo = IntelRepository(session)
@@ -204,10 +192,8 @@ def run_intel_export_job(
 
     return IntelExportResult(
         exported=len(records),
-        pending=len(pending_records),
         jsonl_path=str(jsonl_path),
         markdown_path=str(markdown_path),
-        pending_path=str(pending_path),
         dry_run=dry_run,
         github_report_path=str(github_report_path) if github_report_path else None,
         status_counts=status_counts,
@@ -261,13 +247,11 @@ def _run_output_dir(final_output: Path, run_id: int | None) -> Path:
 
 def _export_input_fingerprint(
     records: list[dict[str, Any]],
-    pending_records: list[dict[str, Any]],
     snapshot_key: str,
 ) -> str:
     payload = {
         "snapshot_key": snapshot_key,
         "events": [int(record.get("event_id")) for record in records if record.get("event_id") is not None],
-        "pending": [int(record.get("id")) for record in pending_records if record.get("id") is not None],
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -294,6 +278,16 @@ def _atomic_write_bundle(payloads: dict[Path, str]) -> None:
                 os.unlink(name)
             except FileNotFoundError:
                 pass
+
+
+def _remove_legacy_pending_artifacts(*paths: Path) -> None:
+    """Remove the retired audit artifact only after a new export succeeds."""
+
+    for path in paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
 
 
 def _list_export_events(
@@ -470,124 +464,8 @@ def _event_freshness(
     )
 
 
-def _list_pending(
-    session: Session,
-    *,
-    limit: int | None,
-    source_filter: str | None,
-    content_class: str | None,
-    run_id: int | None = None,
-) -> list[IntelItem]:
-    # Pending is an audit projection for items that did not reach a candidate.
-    stmt = (
-        select(IntelItem)
-        .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review))
-        .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
-        .where(
-            IntelItem.status.in_(("screen_failed", "analysis_failed", "screened_out", "analysis_filtered"))
-        )
-        .order_by(IntelItem.selection_score.desc(), IntelItem.id.asc())
-    )
-    if run_id is not None:
-        stmt = stmt.join(IntelRunItem, IntelRunItem.item_id == IntelItem.id).where(IntelRunItem.run_id == int(run_id))
-    if source_filter:
-        stmt = stmt.where(IntelItem.source_id == source_filter)
-    if content_class:
-        stmt = stmt.where(IntelItem.content_class == content_class)
-    if limit is not None:
-        stmt = stmt.limit(limit)
-    return list(session.scalars(stmt).unique().all())
-
-
-def _serialize(item: IntelItem) -> dict[str, Any]:
-    review = item.ai_review
-    source = item.source
-    source_group = source.source_group if source else None
-    source_subtype = source.source_subtype if source else None
-    source_transport = source.transport if source else None
-    source_tier = source.tier if source else None
-    source_role = source.source_role if source else None
-    source_ref = {
-        "id": item.source_id,
-        "name": source.name if source else None,
-        "source_id": item.source_id,
-        "transport": source_transport,
-        "source_group": source_group,
-        "source_subtype": source_subtype,
-        "tier": source_tier,
-        "role": source_role,
-        "x_official": source_group == "x_official",
-        "account_url": source.account_url if source else None,
-    }
-    topic_category = (
-        review.topic
-        if review and review.topic and review.topic != "未分类"
-        else fallback_topic_category(
-            title=item.title,
-            summary=item.summary,
-            content=item.content_text,
-            source_group=source_group,
-            source_subtype=source_subtype,
-            transport=source_transport,
-            content_class=item.content_class,
-        )
-    )
-    return {
-        "id": item.id,
-        "source_id": item.source_id,
-        "name": source.name if source else None,
-        "source_name": source.name if source else None,
-        "source_transport": source_transport,
-        "transport": source_transport,
-        "source_group": source_group,
-        "source_subtype": source_subtype,
-        "tier": source_tier,
-        "source_tier": source_tier,
-        "source_role": source_role,
-        "role": source_role,
-        "x_official": source_group == "x_official",
-        "account_url": source.account_url if source else None,
-        "source": source_ref,
-        "source_priority": source.priority if source else None,
-        "external_id": item.external_id,
-        "content_hash": item.content_hash,
-        "content_class": item.content_class,
-        "topic_category": topic_category,
-        "status": item.status,
-        "title": item.title,
-        "url": item.canonical_url,
-        "summary": item.summary,
-        "content_text": item.content_text,
-        "published_at": _date(item.published_at),
-        "captured_at": _date(item.captured_at),
-        "selection_score": item.selection_score,
-        "selection_reason": item.selection_reason,
-        "metrics": _json(item.metrics_json, {}),
-        "raw_payload": _json(item.raw_payload_json, {}),
-        "discovered_links": _json(item.discovered_links_json, []),
-        "ai": {
-            "model": review.model,
-            "status": review.status,
-            "content_class": review.content_class,
-            "topic": review.topic,
-            "topics": review.topics,
-            "keywords": review.keywords,
-            "entities": review.entities,
-            "summary_cn": review.summary_cn,
-            "reason": review.reason,
-            "risk_flags": review.risk_flags,
-            "selection_score": review.selection_score,
-            "confidence": review.confidence,
-            "error_message": review.error_message,
-        }
-        if review
-        else None,
-    }
-
-
 def _markdown(
     records: list[dict[str, Any]],
-    pending: list[dict[str, Any]],
     *,
     status_counts: dict[str, int] | None = None,
     failure_counts: dict[str, int] | None = None,
@@ -598,7 +476,7 @@ def _markdown(
     for record in records:
         key = str(record.get("topic_category") or record.get("content_class") or "未分类")
         counts[key] = counts.get(key, 0) + 1
-    lines = ["# AI 情报导出", "", f"保留条目：{len(records)}", f"待处理：{len(pending)}", ""]
+    lines = ["# AI 情报导出", "", f"保留条目：{len(records)}", ""]
     if partial:
         lines.extend([f"运行状态：partial（{partial_reason or 'explicit_ai_limit'}）", ""])
     if counts:
@@ -629,47 +507,6 @@ def _markdown(
                 ]
             )
             continue
-        ai = record.get("ai") or {}
-        lines.extend(
-            [
-                f"## {index}. {record.get('title') or '(untitled)'}",
-                f"- 主题：`{record.get('topic_category') or '未分类'}` | 来源类型：`{record.get('content_class')}` | 状态：`{record.get('status')}` | 选择分：`{record.get('selection_score')}`",
-                f"- 来源：`{record.get('source_name') or record.get('source_id')}`",
-                (
-                    f"- 来源标识：`{record.get('source_id')}` | transport=`{record.get('source_transport')}` "
-                    f"group=`{record.get('source_group')}` subtype=`{record.get('source_subtype')}` "
-                    f"tier=`{record.get('tier')}` role=`{record.get('source_role')}` "
-                    f"x_official=`{str(bool(record.get('x_official'))).lower()}`"
-                ),
-                f"- AI 摘要：{ai.get('summary_cn') or record.get('summary') or '暂无摘要'}",
-                f"- Stage B：`{ai.get('status') if ai else '未执行'}` / confidence=`{ai.get('confidence') if ai else 'n/a'}`",
-                f"- 风险：{', '.join(ai.get('risk_flags') or []) or '无'}",
-                f"- 链接：{record.get('url') or '无'}",
-                "",
-            ]
-        )
-        if _is_github_repository(record):
-            metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
-            periods = _trending_periods(metrics)
-            weekly = periods.get("weekly", {})
-            daily = periods.get("daily", {})
-            topics = _string_list(metrics.get("topics")) + _string_list(metrics.get("search_topics"))
-            lines.extend(
-                [
-                    "### GitHub 项目指标",
-                    f"- 累计 Star：{_count(metrics.get('stars'))}",
-                    f"- 本周新增 Star：{_count(weekly.get('stars_since')) if weekly else '-'}",
-                    f"- 今日新增 Star：{_count(daily.get('stars_since')) if daily else '-'}",
-                    f"- Fork：{_count(metrics.get('forks'))}",
-                    f"- Topics：{', '.join(topics) or '暂无'}",
-                    f"- 项目介绍：{ai.get('summary_cn') or record.get('summary') or '暂无介绍'}",
-                    "",
-                ]
-            )
-    if pending:
-        lines.extend(["## 待处理", ""])
-        for record in pending:
-            lines.append(f"- `{record.get('status')}` {record.get('title')}：{record.get('url') or '无链接'}")
     return "\n".join(lines) + "\n"
 
 
@@ -729,54 +566,3 @@ def _readable_database_url(database_url: str, *, dry_run: bool) -> str:
     if not path.is_absolute():
         path = Path.cwd() / path
     return database_url if path.exists() else "sqlite:///:memory:"
-
-
-def _is_github_repository(record: dict[str, Any]) -> bool:
-    source_transport = str(record.get("source_transport") or "").casefold()
-    source_id = str(record.get("source_id") or "").casefold()
-    external_id = str(record.get("external_id") or "").casefold()
-    url = str(record.get("url") or "").casefold()
-    payload = record.get("raw_payload")
-    payload_type = payload.get("github_item_type") if isinstance(payload, dict) else None
-    return (
-        record.get("content_class") == "project_tool"
-        and payload_type not in {"release"}
-        and not external_id.startswith("github_release:")
-        and (
-            payload_type == "repository"
-            or source_transport == "github"
-            or source_id.startswith("github_")
-            or external_id.startswith("github_repo:")
-            or "github.com/" in url
-        )
-    )
-
-
-def _trending_periods(metrics: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    raw = metrics.get("trending")
-    periods = {key: dict(value) for key, value in raw.items() if isinstance(value, dict)} if isinstance(raw, dict) else {}
-    period = metrics.get("trending_period")
-    if period and period not in periods:
-        periods[str(period)] = {
-            "rank": metrics.get("trending_rank"),
-            "stars_since": metrics.get("stars_since"),
-            "stars": metrics.get("stars"),
-            "forks": metrics.get("forks"),
-        }
-    return periods
-
-
-def _string_list(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if not isinstance(value, (list, tuple, set)):
-        return []
-    return [str(entry) for entry in value if str(entry).strip()]
-
-
-def _count(value: Any) -> str:
-    try:
-        number = int(float(str(value).replace(",", ""))) if value is not None else 0
-    except (TypeError, ValueError):
-        number = 0
-    return f"{number:,}" if number else "-"

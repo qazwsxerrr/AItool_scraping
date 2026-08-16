@@ -195,8 +195,8 @@ $PYTHON -m app.main source-health --source x_account_openai
 各阶段的职责和门禁如下：
 
 1. `fetch` 从 registry 载入启用来源，按 `transport` 调用 Feed/RSSHub/GitHub collector；完成解析、标准化、内容 hash 去重、幂等写入，并记录 `fetch_attempts`、HTTP 状态、重试、ETag/Last-Modified、失败原因和来源健康状态。
-2. `ai-review` 先执行来源级确定性初筛，再对保留条目调用结构化 AI。AI 返回 `keep`、`content_class`、`topic_category`、`summary_cn`、理由、风险标记和置信度；无关内容 `keep=false`，AI 失败或尚未处理的内容进入 audit/pending，不进入公开结果。主题列表由 `AI_REVIEW_CATEGORIES` 配置，`AI_REVIEW_CATEGORY_MODE=source` 可在模型不可用时使用来源规则回退。
-3. `export` 只查询同时满足 `intel_items.status=selected`、`ai_item_reviews.status=success`、`ai_item_reviews.keep=true` 的条目；日报默认输出最多 30 条，不足 30 条时不补内容，显式 `--limit` 可覆盖默认值。默认生成 `output/intel/intel_items.jsonl`、`intel_pending.jsonl` 和 `intel_digest.md`。
+2. `ai-review` 先执行来源级确定性初筛，再对保留条目调用结构化 AI。AI 返回 `keep`、`content_class`、`topic_category`、`summary_cn`、理由、风险标记和置信度；无关内容 `keep=false`，AI 失败或尚未处理的内容保留在数据库的阶段审计中，但不进入最终导出。主题列表由 `AI_REVIEW_CATEGORIES` 配置，`AI_REVIEW_CATEGORY_MODE=source` 可在模型不可用时使用来源规则回退。
+3. `export` 只查询 Rank 快照中 `selected=true` 的事件；日报默认输出最多 30 条，不足 30 条时不补内容，显式 `--limit` 可覆盖默认值。默认生成 `output/intel/intel_items.jsonl` 和 `intel_digest.md`。
 4. UI（`/`、`/search`、`/all`、`/github`）只读数据库或已生成报告，不在请求中执行抓取或 AI；首页、搜索和全部动态均保留来源归因及 AI 分类/摘要。
 
 启动本地 UI：
@@ -218,7 +218,6 @@ Stage A/B 对每条 AI provider 任务执行瞬态错误自动重试：首次调
 `export` 默认写入 `output/intel/`：
 
 - `intel_items.jsonl`：AI 选择结果与来源归因。
-- `intel_pending.jsonl`：尚未分析或 AI 失败的条目。
 - `intel_digest.md`：分类、状态、指标、风险和链接摘要。
 
 GitHub 项目保留抓取到的 stars、forks、Trending 周期指标、topics 和 README 摘要；AI 不替代项目指标筛选，也不会生成未提供的增长数据。

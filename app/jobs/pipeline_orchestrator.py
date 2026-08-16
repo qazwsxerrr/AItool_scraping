@@ -1208,10 +1208,8 @@ def run_pipeline_once_from_settings(
             AIReviewResult(run_id=run_id),
             IntelExportResult(
                 0,
-                0,
                 f"{output_dir}/intel_items.jsonl",
                 f"{output_dir}/intel_digest.md",
-                f"{output_dir}/intel_pending.jsonl",
                 run_id=run_id,
             ),
             "failed",

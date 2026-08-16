@@ -188,10 +188,9 @@ def export(
         dry_run=dry_run,
         snapshot_key=snapshot_key,
     )
-    typer.echo(f"exported={result.exported} pending={result.pending} dry_run={result.dry_run}")
+    typer.echo(f"exported={result.exported} dry_run={result.dry_run}")
     typer.echo(f"jsonl={result.jsonl_path}")
     typer.echo(f"markdown={result.markdown_path}")
-    typer.echo(f"pending_jsonl={result.pending_path}")
     if result.github_report_path:
         typer.echo(f"github_report={result.github_report_path}")
 
@@ -269,8 +268,7 @@ def run_once(
         f"candidate={result.ai_review.candidate} failed={result.ai_review.failed} partial={result.ai_review.partial}"
     )
     typer.echo(
-        f"export: exported={result.export.exported} pending={result.export.pending} "
-        f"partial={result.export.partial}"
+        f"export: exported={result.export.exported} partial={result.export.partial}"
     )
     if result.event_cluster is not None:
         typer.echo(
@@ -494,7 +492,7 @@ def pipeline_export(
     dry_run: bool = typer.Option(False, "--dry-run"),
     snapshot_key: str | None = typer.Option(None, "--snapshot", help="Run-scoped snapshot key override."),
 ) -> None:
-    """Export one run's ranked events and pending audit records."""
+    """Export one run's selected ranked events."""
 
     configure_logging()
     _validate_content_class(content_class)
@@ -509,12 +507,11 @@ def pipeline_export(
         snapshot_key=snapshot_key,
     )
     typer.echo(
-        f"run_id={run_id} export: exported={result.exported} pending={result.pending} "
-        f"partial={result.partial} snapshot={result.snapshot_key}"
+        f"run_id={run_id} export: exported={result.exported} partial={result.partial} "
+        f"snapshot={result.snapshot_key}"
     )
     typer.echo(f"jsonl={result.jsonl_path}")
     typer.echo(f"markdown={result.markdown_path}")
-    typer.echo(f"pending_jsonl={result.pending_path}")
 
 
 @pipeline_app.command("status")
