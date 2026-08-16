@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 
@@ -41,7 +42,8 @@ def _run_with_items(session_factory, titles: list[str]) -> tuple[SourceSpec, int
     with session_factory() as session:
         repo = IntelRepository(session)
         repo.upsert_source(source, policy=source)
-        run = repo.start_run(run_type="resumable_test")
+        reference_time = datetime(2026, 8, 16, 12, tzinfo=timezone.utc)
+        run = repo.start_run(run_type="resumable_test", reference_time=reference_time)
         for index, title in enumerate(titles, 1):
             repo.insert_item(
                 FetchItem(
@@ -50,6 +52,8 @@ def _run_with_items(session_factory, titles: list[str]) -> tuple[SourceSpec, int
                     title=title,
                     url=f"https://example.test/{index}",
                     summary=title,
+                    published_at=reference_time,
+                    captured_at=reference_time,
                 ),
                 run_id=run.id,
             )
@@ -193,6 +197,155 @@ def test_force_can_be_scoped_to_one_item(tmp_path):
     )
     assert provider.screen_calls == [1, 2, 1]
     assert provider.analysis_calls == [1, 2, 1]
+
+
+def test_force_stage_b_replaces_terminal_stage_a_ineligible_projection(tmp_path):
+    sf = _factory(tmp_path)
+    source, run_id = _run_with_items(sf, ["old", "reject", "keep"])
+    provider = _Provider()
+
+    run_stage_a_screen_job(session_factory=sf, source_specs={source.id: source}, ai_client=provider, run_id=run_id)
+    run_stage_b_analysis_job(session_factory=sf, source_specs={source.id: source}, ai_client=provider, run_id=run_id)
+
+    # Reprocess the same run: one former candidate falls outside the frozen
+    # window and another becomes a Stage-A reject.  Their old Stage-B tasks
+    # must be terminally skipped, not reset to permanently pending.
+    with sf() as session:
+        old = session.get(IntelItem, 1)
+        assert old is not None
+        old.published_at = datetime(2026, 8, 13, 10, 59, 59, tzinfo=timezone.utc)
+        session.commit()
+    provider.reject.add("reject")
+
+    screened = run_stage_a_screen_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=run_id,
+        force=True,
+        limit=None,
+    )
+    analyzed = run_stage_b_analysis_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=run_id,
+        force=True,
+        limit=None,
+    )
+
+    assert screened.time_filter_counts == {"too_old": 1}
+    assert screened.screened_out == 1
+    assert analyzed.candidate == 1
+    assert analyzed.skipped == 2
+    with sf() as session:
+        repo = IntelRepository(session)
+        stage = repo.get_stage(run_id, "analyze")
+        assert stage is not None and stage.status == "succeeded"
+        tasks = {
+            int(task.item_id): task
+            for task in repo.list_stage_tasks(stage, subject_type="item", include_expired=True)
+        }
+        assert {item_id: task.status for item_id, task in tasks.items()} == {
+            1: "skipped",
+            2: "skipped",
+            3: "succeeded",
+        }
+        # Current projection changes, but immutable provider attempts remain
+        # available for audit.
+        assert all(repo.list_stage_attempts(task) for task in tasks.values())
+
+
+def test_limits_only_mark_partial_when_eligible_work_is_deferred(tmp_path):
+    sf = _factory(tmp_path)
+    source, high_cap_run = _run_with_items(sf, ["one", "two"])
+    provider = _Provider()
+
+    screened = run_stage_a_screen_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=high_cap_run,
+        limit=1000,
+    )
+    analyzed = run_stage_b_analysis_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=high_cap_run,
+        limit=1000,
+    )
+    assert screened.partial is False
+    assert screened.partial_reason is None
+    assert analyzed.partial is False
+    assert analyzed.partial_reason is None
+
+    _, capped_screen_run = _run_with_items(sf, ["screen-one", "screen-two"])
+    capped_screen = run_stage_a_screen_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=capped_screen_run,
+        limit=1,
+    )
+    assert capped_screen.partial is True
+    assert capped_screen.partial_reason == "ai_limit:1"
+    with sf() as session:
+        repo = IntelRepository(session)
+        stage = repo.get_stage(capped_screen_run, "screen")
+        assert stage is not None and stage.status == "pending"
+        assert sorted(task.status for task in repo.list_stage_tasks(stage, subject_type="item")) == ["pending", "succeeded"]
+    resumed_screen = run_stage_a_screen_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=capped_screen_run,
+        limit=1,
+    )
+    assert resumed_screen.processed == 1
+    assert resumed_screen.partial is False
+    with sf() as session:
+        repo = IntelRepository(session)
+        stage = repo.get_stage(capped_screen_run, "screen")
+        assert stage is not None and stage.status == "succeeded"
+        assert all(task.status == "succeeded" for task in repo.list_stage_tasks(stage, subject_type="item"))
+
+    _, capped_analysis_run = _run_with_items(sf, ["analysis-one", "analysis-two"])
+    run_stage_a_screen_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=capped_analysis_run,
+        limit=None,
+    )
+    capped_analysis = run_stage_b_analysis_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=capped_analysis_run,
+        limit=1,
+    )
+    assert capped_analysis.partial is True
+    assert capped_analysis.partial_reason == "ai_limit:1"
+    with sf() as session:
+        repo = IntelRepository(session)
+        stage = repo.get_stage(capped_analysis_run, "analyze")
+        assert stage is not None and stage.status == "pending"
+        assert sorted(task.status for task in repo.list_stage_tasks(stage, subject_type="item")) == ["pending", "succeeded"]
+    resumed_analysis = run_stage_b_analysis_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=capped_analysis_run,
+        limit=1,
+    )
+    assert resumed_analysis.processed == 1
+    assert resumed_analysis.partial is False
+    with sf() as session:
+        repo = IntelRepository(session)
+        stage = repo.get_stage(capped_analysis_run, "analyze")
+        assert stage is not None and stage.status == "succeeded"
+        assert all(task.status == "succeeded" for task in repo.list_stage_tasks(stage, subject_type="item"))
 
 
 def test_item_failure_isolated_from_other_items(tmp_path):

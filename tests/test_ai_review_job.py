@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 
@@ -152,6 +153,8 @@ def _insert_items(session_factory, source: SourceSpec, titles: list[str], *, run
     with session_factory() as session:
         repo = IntelRepository(session)
         repo.upsert_source(source, policy=source)
+        run = session.get(IntelRun, run_id) if run_id is not None else None
+        timestamp = run.reference_time if run is not None else datetime.now(timezone.utc)
         for index, title in enumerate(titles, 1):
             repo.insert_item(
                 FetchItem(
@@ -160,6 +163,8 @@ def _insert_items(session_factory, source: SourceSpec, titles: list[str], *, run
                     title=title,
                     url=f"https://official.example/{index}/{title.replace(' ', '-')}",
                     summary=title,
+                    published_at=timestamp,
+                    captured_at=timestamp,
                 ),
                 run_id=run_id,
             )
@@ -322,7 +327,7 @@ def test_run_scope_and_force_are_run_local(tmp_path):
         assert session.scalar(select(IntelRunItem).where(IntelRunItem.run_id == run_id)).item_id == 1
 
 
-def test_explicit_ai_limit_marks_run_and_output_partial(tmp_path):
+def test_truncating_ai_limit_marks_run_and_output_partial(tmp_path):
     sf = _db(tmp_path)
     source = _source()
     with sf() as session:
@@ -338,19 +343,19 @@ def test_explicit_ai_limit_marks_run_and_output_partial(tmp_path):
         source_specs={source.id: source},
         ai_client=ai,
         run_id=run_id,
-        limit=100,
+        limit=1,
         output_dir=tmp_path / "out",
     )
 
     assert result.partial is True
-    assert result.partial_reason == "ai_limit:100"
+    assert result.partial_reason == "ai_limit:1"
     with sf() as session:
         run = session.get(IntelRun, run_id)
         assert run.partial is True
-        assert run.partial_reason == "ai_limit:100"
+        assert run.partial_reason == "ai_limit:1"
     record = json.loads((tmp_path / "out" / "ai_review_candidates.jsonl").read_text().splitlines()[0])
     assert record["run_partial"] is True
-    assert record["run_counts"]["candidate"] == 2
+    assert record["run_counts"]["candidate"] == 1
 
 
 def test_provider_concurrency_is_bounded_to_four(tmp_path):

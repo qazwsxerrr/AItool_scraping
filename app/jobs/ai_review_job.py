@@ -126,10 +126,10 @@ def run_ai_review_job(
     """Run structural prefilter, Stage A screen, then Stage B analysis.
 
     A supplied limit is an explicit safety cap. The default None processes the
-    whole selected scope; capped runs remain auditable as partial.
+    whole selected scope; only a cap that actually defers eligible work is
+    recorded as partial.
     """
     del http_client, now
-    explicit_cap = ai_limit is not None or limit is not None
     if ai_limit is not None:
         limit = ai_limit
     limit = _normalise_limit(limit)
@@ -152,11 +152,11 @@ def run_ai_review_job(
                 run_id=run_id,
                 stage="screen",
             )
+            result.partial = limit is not None and len(items) > limit
+            result.partial_reason = f"ai_limit:{limit}" if result.partial else None
             if limit is not None:
                 items = items[:limit]
             result.processed = len(items)
-            result.partial = explicit_cap
-            result.partial_reason = f"ai_limit:{limit}" if explicit_cap else None
         return result
 
     stage_a = run_stage_a_screen_job(
@@ -172,6 +172,13 @@ def run_ai_review_job(
         concurrency=concurrency,
     )
     effective_run_id = stage_a.run_id
+    # A full legacy ``ai-review --force`` means the same thing as the formal
+    # Stage A/B commands: replace the run's active Stage-B projection.  Do
+    # not narrow it to only this invocation's Stage-A provider calls, or old
+    # time-filtered/rejected B tasks can survive as pending residues.
+    stage_b_item_ids = stage_a.item_ids
+    if force and source_filter is None and content_class is None:
+        stage_b_item_ids = None
     stage_b = run_stage_b_analysis_job(
         session_factory=session_factory,
         source_specs=specs,
@@ -181,7 +188,7 @@ def run_ai_review_job(
         source_filter=source_filter,
         content_class=content_class,
         force=force,
-        item_ids=stage_a.item_ids,
+        item_ids=stage_b_item_ids,
         analysis_min_score=analysis_min_score,
         concurrency=concurrency,
     )

@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, joinedload, sessionmaker
 from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
 from app.config.settings import Settings
 from app.domain.categories import fallback_topic_category
+from app.domain.recency import RecentWindowDecision, recent_window_decision
 from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
@@ -84,6 +85,7 @@ def run_intel_export_job(
                 source_filter=source_filter,
                 content_class=content_class,
                 run_id=run_id,
+                reference_time=run.reference_time if run is not None else None,
             )
             pending_items = _list_pending(
                 session,
@@ -302,6 +304,7 @@ def _list_export_events(
     source_filter: str | None,
     content_class: str | None,
     run_id: int | None = None,
+    reference_time: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Return selected event records from the requested snapshot only."""
     stmt = (
@@ -329,7 +332,13 @@ def _list_export_events(
     rows = list(session.execute(stmt).unique().all())
     records: list[dict[str, Any]] = []
     for snapshot, event in rows:
-        record = _serialize_event(snapshot, event)
+        freshness = _event_freshness(event, reference_time=reference_time)
+        # A well-formed run-scoped event must still pass the frozen item-level
+        # gate at export time.  Legacy events without a primary item retain
+        # their prior compatibility behavior rather than being invented anew.
+        if freshness is not None and not freshness.eligible:
+            continue
+        record = _serialize_event(snapshot, event, freshness=freshness)
         if content_class and record.get("content_class") != content_class:
             continue
         if source_filter:
@@ -342,18 +351,26 @@ def _list_export_events(
     return records
 
 
-def _serialize_event(snapshot: IntelEventRankingSnapshot, event: IntelEvent) -> dict[str, Any]:
+def _serialize_event(
+    snapshot: IntelEventRankingSnapshot,
+    event: IntelEvent,
+    *,
+    freshness: RecentWindowDecision | None = None,
+) -> dict[str, Any]:
     source_ids = _json_list(event.source_ids_json)
     source_groups = _json_list(event.source_groups_json)
     source_refs: list[dict[str, Any]] = []
     screen_audit: list[dict[str, Any]] = []
     member_statuses: list[str] = []
+    primary_item: IntelItem | None = None
     for relation in event.event_items:
         if relation.source_id and relation.source_id not in source_ids:
             source_ids.append(relation.source_id)
         if relation.source_group and relation.source_group not in source_groups:
             source_groups.append(relation.source_group)
         item = relation.item
+        if relation.is_primary and item is not None:
+            primary_item = item
         source = relation.source or (item.source if item is not None else None)
         if item is not None:
             member_statuses.append(item.status)
@@ -423,7 +440,34 @@ def _serialize_event(snapshot: IntelEventRankingSnapshot, event: IntelEvent) -> 
         "screen_audit": screen_audit,
         "first_seen_at": _date(event.first_seen_at),
         "last_seen_at": _date(event.last_seen_at),
+        "published_at": _date(primary_item.published_at) if primary_item is not None else None,
+        "captured_at": _date(primary_item.captured_at) if primary_item is not None else None,
+        "freshness": freshness.metadata() if freshness is not None else None,
     }
+
+
+def _event_freshness(
+    event: IntelEvent,
+    *,
+    reference_time: datetime | None,
+) -> RecentWindowDecision | None:
+    if reference_time is None:
+        return None
+    primary = next(
+        (
+            relation.item
+            for relation in event.event_items
+            if relation.is_primary and relation.item is not None
+        ),
+        None,
+    )
+    if primary is None:
+        return None
+    return recent_window_decision(
+        primary,
+        source=primary.source,
+        reference_time=reference_time,
+    )
 
 
 def _list_pending(
@@ -577,6 +621,7 @@ def _markdown(
                         f"- 类别：`{record.get('content_class')}` | 来源组：`{record.get('source_group') or '-'}`"
                         f" | 状态：`selected`"
                     ),
+                    _event_time_line(record),
                     f"- 摘要：{record.get('summary_cn') or record.get('summary') or '暂无摘要'}",
                     f"- 风险：{', '.join(record.get('risk_flags') or []) or '无'}",
                     f"- 链接：{record.get('url') or '无'}",
@@ -626,6 +671,19 @@ def _markdown(
         for record in pending:
             lines.append(f"- `{record.get('status')}` {record.get('title')}：{record.get('url') or '无链接'}")
     return "\n".join(lines) + "\n"
+
+
+def _event_time_line(record: dict[str, Any]) -> str:
+    freshness = record.get("freshness") if isinstance(record.get("freshness"), dict) else {}
+    age = freshness.get("age_hours")
+    try:
+        age_text = f"{float(age):.1f}h" if age is not None else "-"
+    except (TypeError, ValueError):
+        age_text = "-"
+    return (
+        f"- 时间：published_at=`{record.get('published_at') or '-'}` | "
+        f"basis=`{freshness.get('time_basis') or '-'}` | age=`{age_text}`"
+    )
 
 
 def _json(value: str | None, default: Any) -> Any:

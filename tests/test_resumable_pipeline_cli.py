@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typer.testing import CliRunner
 
 from app import main
+from app.config.limits import RECENT_WINDOW_HOURS
 from app.config.settings import Settings
 from app.jobs.fetch_job import IntelFetchResult
 from app.jobs import pipeline_orchestrator as orchestrator
@@ -42,6 +43,9 @@ def test_start_creates_and_freezes_scope(tmp_path):
         assert run is not None
         assert run.scope_frozen is True
         assert run.reference_time is not None
+        assert run.scope["freshness_window_hours"] == RECENT_WINDOW_HOURS
+        assert run.scope["freshness_undated_policy"] == "exclude"
+        assert run.scope["freshness_github_trending_policy"] == "exempt"
 
 
 def test_retry_stage_b_targets_only_stage_b_tasks(tmp_path, monkeypatch):
@@ -126,6 +130,40 @@ def test_manual_pipeline_run_status_finalizes_only_after_export(tmp_path):
         run = session.get(orchestrator.IntelRun, run_id)
         assert run.status == "completed"
         assert run.finished_at is not None
+
+
+def test_completed_force_rerun_clears_stale_ai_limit_partial_marker(tmp_path):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'pipeline.db'}")
+    engine = create_engine_from_url(settings.database_url)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        run = repo.start_run(reference_time=datetime.now(timezone.utc))
+        for stage_name in orchestrator.PIPELINE_STAGE_ORDER:
+            stage = repo.ensure_stage(run.id, stage_name)
+            repo.finish_stage(stage, status="succeeded")
+        repo.finish_run(
+            run.id,
+            status="partial",
+            partial=True,
+            partial_reason="ai_limit:1000",
+        )
+        session.commit()
+        run_id = int(run.id)
+
+    assert orchestrator._sync_pipeline_run_status(
+        session_factory,
+        run_id,
+        finalize=True,
+        partial=False,
+    ) == "completed"
+    with session_factory() as session:
+        run = session.get(orchestrator.IntelRun, run_id)
+        assert run.status == "completed"
+        assert run.partial is False
+        assert run.partial_reason in {None, ""}
 
 
 def test_pipeline_run_auto_creates_and_reuses_run_id(tmp_path, monkeypatch):

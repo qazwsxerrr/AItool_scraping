@@ -17,7 +17,8 @@ from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.ai.event_resolution import event_resolution_client_from_settings, resolve_event_group
 from app.ai.skills.intel_triage import normalize_url
-from app.config.limits import DEFAULT_AI_REVIEW_LIMIT
+from app.config.limits import DEFAULT_AI_REVIEW_LIMIT, RECENT_WINDOW_HOURS
+from app.domain.recency import recent_window_decision
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem, IntelRun, IntelRunItem
@@ -43,6 +44,10 @@ class EventClusterResult:
     failed: int = 0
     errors: list[str] = field(default_factory=list)
     event_ids: list[int] = field(default_factory=list)
+    # ``event_ids`` is kept as the historical new-event projection for API
+    # compatibility.  Ranking needs the complete current Stage-C projection,
+    # including candidates that were matched to an existing event row.
+    current_event_ids: list[int] = field(default_factory=list)
     snapshot_key: str = "latest"
     run_id: int | None = None
     reference_time: datetime | None = None
@@ -319,7 +324,11 @@ def run_event_cluster_job(
                     int(run_id),
                     "cluster",
                     reference_time=frozen_reference,
-                    metadata={"snapshot_key": key, "history_window_hours": 72},
+                    metadata={
+                        "snapshot_key": key,
+                        "history_window_hours": 72,
+                        "freshness_window_hours": RECENT_WINDOW_HOURS,
+                    },
                 )
             current = _as_utc(stage.reference_time if stage is not None else frozen_reference) or frozen_reference
             result.reference_time = current
@@ -329,6 +338,7 @@ def run_event_cluster_job(
                 item_ids=item_ids,
                 limit=limit,
                 stage=stage,
+                reference_time=current,
             )
             candidates = [_item_candidate(item) for item in items]
             result.processed = len(candidates)
@@ -356,6 +366,12 @@ def run_event_cluster_job(
                         input_fingerprint=input_fingerprint,
                         config_fingerprint="cluster-v1",
                     ):
+                        stored = _mapping(stage_task.result)
+                        result.event_ids = _event_id_list(stored.get("event_ids"))
+                        result.current_event_ids = _event_id_list(
+                            stored.get("current_event_ids"),
+                            fallback=result.event_ids,
+                        )
                         result.processed = 0
                         return result
                     result.failed = 1
@@ -395,6 +411,8 @@ def run_event_cluster_job(
                                         result.event_ids.append(event.id)
                             else:
                                 result.repeats += 1
+                            if event.id not in result.current_event_ids:
+                                result.current_event_ids.append(event.id)
                             result.merged += max(0, len(subgroup) - 1)
                             if event.id not in {row.id for row in history_events}:
                                 history_events.append(event)
@@ -421,7 +439,11 @@ def run_event_cluster_job(
                     repo.complete_stage_task(
                         stage_task,
                         owner=owner,
-                        result={"event_ids": result.event_ids, "processed": result.processed},
+                        result={
+                            "event_ids": result.event_ids,
+                            "current_event_ids": result.current_event_ids,
+                            "processed": result.processed,
+                        },
                     )
                 session.commit()
         except Exception as exc:
@@ -484,6 +506,21 @@ def _cluster_input_fingerprint(candidates: Sequence[Mapping[str, Any]]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _event_id_list(value: Any, *, fallback: Iterable[int] = ()) -> list[int]:
+    """Normalize persisted Stage-C event id projections without duplicates."""
+
+    values = value if isinstance(value, Iterable) and not isinstance(value, (str, bytes, Mapping)) else fallback
+    result: list[int] = []
+    for item in values:
+        try:
+            event_id = int(item)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if event_id > 0 and event_id not in result:
+            result.append(event_id)
+    return result
+
+
 def _load_cluster_items(
     session: Session,
     *,
@@ -491,6 +528,7 @@ def _load_cluster_items(
     item_ids: Iterable[int] | None,
     limit: int | None,
     stage: Any | None = None,
+    reference_time: datetime | None = None,
 ) -> list[IntelItem]:
     stmt = select(IntelItem).options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review), joinedload(IntelItem.ai_screen)).order_by(IntelItem.published_at.desc(), IntelItem.selection_score.desc(), IntelItem.id.asc())
     if item_ids is not None:
@@ -505,29 +543,52 @@ def _load_cluster_items(
             stmt = stmt.where(IntelItem.id.in_(task_ids))
         else:
             # Older runs may not have durable Stage-B tasks yet.  A successful
-            # review tied to this run is still trustworthy and avoids falling
-            # back to the mutable global item status.
-            review_ids = [
-                int(value)
-                for value in session.scalars(
-                    select(IntelItem.id)
-                    .join(AIItemReview, AIItemReview.item_id == IntelItem.id)
-                    .where(
-                        AIItemReview.run_id == int(run_id),
-                        AIItemReview.status == "success",
-                    )
-                ).all()
-            ]
+            # candidate review tied to this run is still trustworthy and
+            # avoids falling back to the mutable global item status.
+            review_ids: list[int] = []
+            for review in session.scalars(
+                select(AIItemReview)
+                .join(IntelItem, AIItemReview.item_id == IntelItem.id)
+                .where(
+                    AIItemReview.run_id == int(run_id),
+                    AIItemReview.status == "success",
+                )
+            ).all():
+                # ``status=success`` describes a completed provider call.  It
+                # does not mean that Stage B kept the item as a candidate:
+                # filtered analyses are intentionally persisted as successful
+                # projections for auditability.  Keep the compatibility path
+                # aligned with the durable-task path below.
+                if not _analysis_result_is_filtered({"reason": review.reason}):
+                    review_ids.append(int(review.item_id))
             stmt = stmt.where(IntelItem.id.in_(review_ids or [-1]))
     else:
         stmt = stmt.where(IntelItem.status == "candidate")
+    items = list(session.scalars(stmt).unique().all())
+    if run_id is not None and reference_time is not None:
+        items = [
+            item
+            for item in items
+            if recent_window_decision(
+                item,
+                source=item.source,
+                reference_time=reference_time,
+            ).eligible
+        ]
     if limit is not None:
-        stmt = stmt.limit(max(0, int(limit)))
-    return list(session.scalars(stmt).unique().all())
+        return items[: max(0, int(limit))]
+    return items
 
 
 def _successful_analysis_item_ids(session: Session, run_id: int) -> list[int]:
-    """Read successful Stage-B tasks without consulting ``IntelItem.status``."""
+    """Read successful Stage-B *candidate* tasks for ``run_id``.
+
+    Stage B records both retained candidates and ``analysis_filtered`` items
+    with task status ``succeeded`` because the provider call itself completed
+    successfully.  Stage C must therefore inspect the task result (and the
+    run-scoped review as a compatibility fallback), rather than treating task
+    success as candidate eligibility.
+    """
 
     from app.storage.models import IntelRunStage, IntelRunStageTask
 
@@ -539,6 +600,14 @@ def _successful_analysis_item_ids(session: Session, run_id: int) -> list[int]:
     )
     if stage is None:
         return []
+    review_reasons = {
+        int(item_id): reason
+        for item_id, reason in session.execute(
+            select(AIItemReview.item_id, AIItemReview.reason).where(
+                AIItemReview.run_id == int(run_id),
+            )
+        ).all()
+    }
     values: list[int] = []
     for task in session.scalars(
         select(IntelRunStageTask).where(
@@ -547,11 +616,37 @@ def _successful_analysis_item_ids(session: Session, run_id: int) -> list[int]:
             IntelRunStageTask.status == "succeeded",
         )
     ).all():
+        item_id: int | None = None
         if task.item_id is not None:
-            values.append(int(task.item_id))
+            item_id = int(task.item_id)
         elif str(task.subject_id).isdigit():
-            values.append(int(task.subject_id))
+            item_id = int(task.subject_id)
+        if item_id is None:
+            continue
+
+        # Current Stage B tasks persist the normalized AnalysisResult, whose
+        # reason is prefixed with ``analysis_filtered:`` for rejected output.
+        # Older rows may only have the run-scoped AIItemReview projection, so
+        # consult that projection when the task result has no marker.
+        if _analysis_result_is_filtered(task.result):
+            continue
+        if _analysis_result_is_filtered({"reason": review_reasons.get(item_id)}):
+            continue
+        values.append(item_id)
     return values
+
+
+def _analysis_result_is_filtered(value: Any) -> bool:
+    """Return whether a Stage-B result is an analysis-filtered projection."""
+
+    data = _mapping(value)
+    reason = _text(data.get("reason"))
+    if reason is not None and reason.casefold().startswith("analysis_filtered"):
+        return True
+    if data.get("filtered") is True:
+        return True
+    metadata = _mapping(data.get("metadata"))
+    return metadata.get("filtered") is True
 
 
 def _load_history_events(session: Session, *, current: datetime, snapshot_key: str) -> list[IntelEvent]:

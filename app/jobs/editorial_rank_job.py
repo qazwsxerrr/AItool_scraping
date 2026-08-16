@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session, joinedload, sessionmaker
 from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelEvent, IntelEventItem, IntelItem, IntelRun
+from app.storage.models import IntelEvent, IntelEventItem, IntelItem, IntelRun, IntelRunStage, IntelRunStageTask
 from app.storage.repository import IntelRepository
 
 
@@ -181,6 +181,13 @@ def run_editorial_rank_job(
                     "rank",
                     metadata={"snapshot_key": key, "profile_version": policy.version},
                 )
+            if run_id is not None and event_ids is None:
+                # A run-scoped rank is downstream of Stage C.  Read the
+                # latest successful cluster task projection instead of
+                # querying every event ever marked ``new_in_run_id``.  That
+                # column is historical provenance and is intentionally not a
+                # current-run membership index.
+                event_ids = _load_current_cluster_event_ids(session, int(run_id))
             events = _load_events(session, limit=limit, run_id=run_id, event_ids=event_ids)
             result.processed = len(events)
             if stage is not None:
@@ -359,15 +366,66 @@ def _load_events(
     if event_ids is not None:
         stmt = stmt.where(IntelEvent.id.in_(ids or [-1]))
     elif run_id is not None:
-        # Stage C marks only genuinely new events with this run id.  Repeats
-        # remain visible in history but cannot enter the current snapshot.
-        stmt = stmt.where(IntelEvent.new_in_run_id == int(run_id))
+        # A run-scoped rank must receive the Stage-C current projection
+        # explicitly.  ``new_in_run_id`` is historical provenance and can
+        # contain stale rows after a same-run force rerun, so never use it as
+        # an implicit current-membership query.
+        stmt = stmt.where(IntelEvent.id.in_([-1]))
     else:
         latest_run = session.scalar(select(func.max(IntelRun.id)))
         stmt = stmt.where(IntelEvent.new_in_run_id == latest_run if latest_run else IntelEvent.new_in_run_id.is_(None))
     if limit is not None:
         stmt = stmt.limit(max(0, int(limit)))
     return list(session.scalars(stmt).unique().all())
+
+
+def _load_current_cluster_event_ids(session: Session, run_id: int) -> list[int]:
+    """Return the latest persisted Stage-C current projection for a run.
+
+    ``current_event_ids`` was added to the task result without a schema
+    migration.  Older task payloads only contain ``event_ids`` (new-event
+    ids), which remains a safe compatibility fallback; a missing task or an
+    empty payload deliberately resolves to an empty projection.
+    """
+
+    stage = session.scalar(
+        select(IntelRunStage).where(
+            IntelRunStage.run_id == int(run_id),
+            IntelRunStage.stage_name == "cluster",
+        )
+    )
+    if stage is None:
+        return []
+    task = session.scalar(
+        select(IntelRunStageTask).where(
+            IntelRunStageTask.stage_id == stage.id,
+            IntelRunStageTask.subject_type == "run",
+            IntelRunStageTask.subject_id == str(int(run_id)),
+        )
+    )
+    if task is None or task.status != "succeeded":
+        return []
+    payload = task.result
+    if not isinstance(payload, Mapping):
+        return []
+    value = payload.get("current_event_ids")
+    if value is None:
+        value = payload.get("event_ids")
+    return _normalize_event_ids(value)
+
+
+def _normalize_event_ids(value: Any) -> list[int]:
+    if isinstance(value, (str, bytes, Mapping)) or not isinstance(value, Iterable):
+        return []
+    result: list[int] = []
+    for raw in value:
+        try:
+            event_id = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if event_id > 0 and event_id not in result:
+            result.append(event_id)
+    return result
 
 
 def _rank_input_fingerprint(

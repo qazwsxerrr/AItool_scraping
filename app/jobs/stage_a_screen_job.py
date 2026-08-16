@@ -13,6 +13,7 @@ import logging
 from uuid import uuid4
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 
 import httpx
@@ -26,10 +27,21 @@ from app.ai.skills.intel_triage import (
     preflight_intel_triage_schemas,
     strict_parse_screen,
 )
-from app.config.limits import DEFAULT_AI_REVIEW_LIMIT, DEFAULT_AI_REVIEW_CONCURRENCY, DEFAULT_AI_SCREEN_REJECT_THRESHOLD
+from app.config.limits import (
+    DEFAULT_AI_REVIEW_LIMIT,
+    DEFAULT_AI_REVIEW_CONCURRENCY,
+    DEFAULT_AI_SCREEN_REJECT_THRESHOLD,
+    RECENT_WINDOW_HOURS,
+)
 from app.domain.models import SourceSpec
+from app.domain.recency import (
+    FRESHNESS_POLICY_VERSION,
+    RecentWindowDecision,
+    recent_window_decision,
+    recent_window_scope,
+)
 from app.jobs.provider_retry import ProviderResponseFailure, ProviderRetryExhausted, call_with_provider_retries
-from app.storage.models import IntelItem, IntelRunStageTask
+from app.storage.models import IntelItem, IntelRun, IntelRunStageTask
 from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
@@ -41,12 +53,16 @@ class StageAScreenResult:
     processed: int = 0
     screened: int = 0
     screened_out: int = 0
+    time_filtered: int = 0
+    time_filter_counts: dict[str, int] = field(default_factory=dict)
     screen_failed: int = 0
     skipped: int = 0
     partial: bool = False
     partial_reason: str | None = None
     item_ids: list[int] = field(default_factory=list)
     eligible_item_ids: list[int] = field(default_factory=list)
+    reference_time: datetime | None = None
+    cutoff_at: datetime | None = None
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -60,6 +76,8 @@ class StageAScreenResult:
             "screened": self.screened,
             "screen_count": self.screened,
             "screened_out": self.screened_out,
+            "time_filtered": self.time_filtered,
+            "time_filter_counts": dict(self.time_filter_counts),
             "screen_failed": self.screen_failed,
             "partial": self.partial,
             "partial_reason": self.partial_reason,
@@ -73,6 +91,13 @@ class _ItemContext:
     envelope: RawIntelEnvelope | None
     source_spec: SourceSpec | None
     structural_error: str | None = None
+
+
+@dataclass(frozen=True)
+class _TimeFilteredItem:
+    item_id: int
+    input_fingerprint: str
+    decision: RecentWindowDecision
 
 
 class _TaskLeaseLost(RuntimeError):
@@ -108,7 +133,6 @@ def run_stage_a_screen_job(
     never creates or invokes a Stage B task/provider call.
     """
 
-    del now  # kept in the public job contract for compatibility
     max_workers = _bounded_concurrency(concurrency)
     if retry is not None:
         retry_failed = bool(retry)
@@ -122,7 +146,7 @@ def run_stage_a_screen_job(
     # request.  A malformed nested schema must fail fast for the whole stage.
     preflight_intel_triage_schemas()
 
-    effective_run_id, contexts, explicit_cap = _prepare_scope(
+    effective_run_id, all_contexts, time_filtered, eligible_exceeds_limit, reference_time = _prepare_scope(
         session_factory,
         run_id=run_id,
         source_specs=specs,
@@ -132,13 +156,22 @@ def run_stage_a_screen_job(
         force=force,
         item_ids=item_ids,
         dry_run=dry_run,
+        now=now,
     )
     result.run_id = effective_run_id
-    result.partial = explicit_cap
-    result.partial_reason = f"ai_limit:{selected_limit}" if explicit_cap else None
-    result.item_ids = [context.item_id for context in contexts]
-    result.processed = len(contexts)
+    result.reference_time = reference_time
+    result.cutoff_at = _as_utc(reference_time)
+    if result.cutoff_at is not None:
+        result.cutoff_at -= timedelta(hours=RECENT_WINDOW_HOURS)
+    result.time_filtered = len(time_filtered)
+    for entry in time_filtered:
+        result.time_filter_counts[entry.decision.reason] = result.time_filter_counts.get(entry.decision.reason, 0) + 1
     if dry_run:
+        contexts = all_contexts if selected_limit is None else all_contexts[:selected_limit]
+        result.partial = eligible_exceeds_limit
+        result.partial_reason = f"ai_limit:{selected_limit}" if result.partial else None
+        result.item_ids = [context.item_id for context in contexts]
+        result.processed = len(contexts)
         return result
 
     if effective_run_id is None:
@@ -148,13 +181,33 @@ def run_stage_a_screen_job(
         stage="screen",
         model=getattr(ai_client, "model", None),
         reject_threshold=reject_threshold,
+        freshness_window_hours=RECENT_WINDOW_HOURS,
+        freshness_policy=FRESHNESS_POLICY_VERSION,
     )
     task_ids_by_item: dict[int, int] = {}
     requested_task_ids = {int(value) for value in task_ids} if task_ids is not None else None
     with session_factory() as session:
         repo = IntelRepository(session)
         existing_stage = repo.get_stage(effective_run_id, "screen")
-        stage_force = force and item_ids is None
+        # A source/class/task filter makes this a targeted rerun.  Resetting
+        # the whole stage in that case would strand unrelated tasks as
+        # pending, so reserve the stage-wide reset for an unfiltered rerun.
+        stage_force = (
+            force
+            and item_ids is None
+            and requested_task_ids is None
+            and source_filter is None
+            and content_class is None
+        )
+        stage_metadata = {
+            "reject_threshold": reject_threshold,
+            "freshness_window_hours": RECENT_WINDOW_HOURS,
+            "freshness_policy": FRESHNESS_POLICY_VERSION,
+            "reference_time": reference_time.isoformat() if reference_time else None,
+            "cutoff_at": result.cutoff_at.isoformat() if result.cutoff_at else None,
+            "freshness_counts": dict(result.time_filter_counts),
+            "eligible_total": len(all_contexts),
+        }
         stage = repo.ensure_stage(
             effective_run_id,
             "screen",
@@ -163,11 +216,12 @@ def run_stage_a_screen_job(
             # ask it to reset a just-created row before its auto-increment ID
             # has been flushed.
             force=stage_force if existing_stage is not None else False,
-            metadata={"reject_threshold": reject_threshold},
+            metadata=stage_metadata,
         )
         if retry_failed:
             repo.retry_failed(stage, include_blocked=include_blocked)
-        for context in contexts:
+        runnable_contexts: list[_ItemContext] = []
+        for context in all_contexts:
             existing = None
             if requested_task_ids is not None:
                 existing = repo.get_task(stage, subject_type="item", subject_id=context.item_id)
@@ -180,9 +234,67 @@ def run_stage_a_screen_job(
                 item_id=context.item_id,
                 input_fingerprint=context.input_fingerprint,
                 config_fingerprint=config_fingerprint,
-                force=bool(force and ((item_ids is not None) or (requested_task_ids is not None and existing is not None))),
+                force=bool(
+                    (force and not stage_force)
+                    or (existing is not None and existing.status in {"skipped", "cancelled"})
+                ),
             )
             task_ids_by_item[context.item_id] = int(task.id)
+            if _task_needs_provider_call(
+                repo,
+                task,
+                input_fingerprint=context.input_fingerprint,
+                config_fingerprint=config_fingerprint,
+            ):
+                runnable_contexts.append(context)
+        for filtered in time_filtered:
+            task = repo.ensure_stage_task(
+                stage,
+                subject_type="item",
+                subject_id=filtered.item_id,
+                item_id=filtered.item_id,
+                input_fingerprint=filtered.input_fingerprint,
+                config_fingerprint=config_fingerprint,
+                force=force,
+            )
+            repo.complete_stage_task(
+                task,
+                status="skipped",
+                result_ref={"projection": "RecentWindowDecision", "item_id": filtered.item_id},
+                result={"decision": "reject", **filtered.decision.metadata()},
+                metadata=filtered.decision.metadata(),
+            )
+            repo.update_run_item_status(
+                effective_run_id,
+                filtered.item_id,
+                status=f"time_{filtered.decision.reason}",
+            )
+        # Limit only the *remaining* tasks.  Previously completed prefix
+        # items do not consume the next batch, so ``--limit 1`` can resume its
+        # tail instead of repeatedly selecting the same first item.
+        result.partial = selected_limit is not None and len(runnable_contexts) > selected_limit
+        result.partial_reason = f"ai_limit:{selected_limit}" if result.partial else None
+        contexts = runnable_contexts if selected_limit is None else runnable_contexts[:selected_limit]
+        result.item_ids = [context.item_id for context in contexts]
+        result.processed = len(contexts)
+        stage_metadata.update(
+            {
+                "runnable_total": len(runnable_contexts),
+                "processed": len(contexts),
+                "truncated_by_limit": result.partial,
+            }
+        )
+        # Metadata is part of the current active projection as well.  A
+        # second idempotent ensure only merges metadata; it does not reset the
+        # tasks just materialized above.
+        repo.ensure_stage(
+            effective_run_id,
+            "screen",
+            config_fingerprint=config_fingerprint,
+            metadata=stage_metadata,
+        )
+        if not all_contexts and not time_filtered:
+            repo.finish_stage(stage, status="succeeded", metadata=stage_metadata)
         session.commit()
 
     def persist_outcome(
@@ -376,13 +488,14 @@ def _prepare_scope(
     force: bool,
     item_ids: Iterable[int] | None,
     dry_run: bool,
-) -> tuple[int | None, list[_ItemContext], bool]:
+    now: Any | None,
+) -> tuple[int | None, list[_ItemContext], list[_TimeFilteredItem], bool, datetime | None]:
     """Freeze/resolve the item scope and build detached provider envelopes."""
 
-    explicit_cap = limit is not None
     requested_ids = {int(value) for value in item_ids} if item_ids is not None else None
     with session_factory() as session:
         repo = IntelRepository(session)
+        run = None
         if run_id is None:
             # The compatibility facade has no explicit fetch run.  Create a
             # durable run and attach the currently selected pending items.
@@ -393,13 +506,36 @@ def _prepare_scope(
                 force=force,
                 stage="screen",
             )
-            if limit is not None:
-                candidates = candidates[:limit]
+            if requested_ids is not None:
+                candidates = [item for item in candidates if int(item.id) in requested_ids]
+            reference_time = _as_utc(now) or datetime.now(timezone.utc)
             if dry_run:
-                return None, [_context_from_item(item, source_specs) for item in candidates], explicit_cap
-            run = repo.start_run(run_type="ai_review", source_ids=[item.source_id for item in candidates])
+                eligible, filtered = _filter_recent_items(
+                    candidates,
+                    source_specs=source_specs,
+                    reference_time=reference_time,
+                )
+                truncated_by_limit = limit is not None and len(eligible) > limit
+                return (
+                    None,
+                    [_context_from_item(item, source_specs) for item in eligible],
+                    filtered,
+                    truncated_by_limit,
+                    reference_time,
+                )
+            run = repo.start_run(
+                run_type="ai_review",
+                source_ids=[item.source_id for item in candidates],
+                reference_time=reference_time,
+                scope=recent_window_scope(),
+            )
             for item in candidates:
                 repo.record_run_item(run.id, item.id, source_id=item.source_id, role="fetched", status="new")
+            repo.freeze_run_scope(
+                run.id,
+                source_ids=[item.source_id for item in candidates],
+                item_ids=[int(item.id) for item in candidates],
+            )
             session.commit()
             run_id = int(run.id)
         else:
@@ -419,12 +555,54 @@ def _prepare_scope(
                 candidates = [item for item in candidates if item.content_class == content_class]
             if requested_ids is not None:
                 candidates = [item for item in candidates if int(item.id) in requested_ids]
-            if limit is not None:
-                candidates = candidates[:limit]
+            run = session.get(IntelRun, int(run_id))
+        if run is None:
+            raise ValueError(f"intel run {run_id} does not exist")
+        reference_time = _as_utc(run.reference_time) or _as_utc(now) or datetime.now(timezone.utc)
+        eligible, filtered = _filter_recent_items(
+            candidates,
+            source_specs=source_specs,
+            reference_time=reference_time,
+        )
+        truncated_by_limit = limit is not None and len(eligible) > limit
         if dry_run:
-            return run_id, [_context_from_item(item, source_specs) for item in candidates], explicit_cap
-        contexts = [_context_from_item(item, source_specs) for item in candidates]
-        return run_id, contexts, explicit_cap
+            return (
+                run_id,
+                [_context_from_item(item, source_specs) for item in eligible],
+                filtered,
+                truncated_by_limit,
+                reference_time,
+            )
+        contexts = [_context_from_item(item, source_specs) for item in eligible]
+        return run_id, contexts, filtered, truncated_by_limit, reference_time
+
+
+def _filter_recent_items(
+    candidates: Iterable[IntelItem],
+    *,
+    source_specs: Mapping[str, SourceSpec],
+    reference_time: datetime,
+) -> tuple[list[IntelItem], list[_TimeFilteredItem]]:
+    eligible: list[IntelItem] = []
+    filtered: list[_TimeFilteredItem] = []
+    for item in candidates:
+        source_spec = source_specs.get(item.source_id) or _spec_from_row(item.source)
+        decision = recent_window_decision(
+            item,
+            source=source_spec,
+            reference_time=reference_time,
+        )
+        if decision.eligible:
+            eligible.append(item)
+        else:
+            filtered.append(
+                _TimeFilteredItem(
+                    item_id=int(item.id),
+                    input_fingerprint=_item_fingerprint(item),
+                    decision=decision,
+                )
+            )
+    return eligible, filtered
 
 
 def _context_from_item(item: IntelItem, source_specs: Mapping[str, SourceSpec]) -> _ItemContext:
@@ -451,6 +629,31 @@ def _context_from_item(item: IntelItem, source_specs: Mapping[str, SourceSpec]) 
             structural_error=str(exc)[:4000] or exc.__class__.__name__,
         )
     return _ItemContext(int(item.id), input_fingerprint, envelope, source_spec)
+
+
+def _task_needs_provider_call(
+    repo: IntelRepository,
+    task: IntelRunStageTask,
+    *,
+    input_fingerprint: str,
+    config_fingerprint: str,
+) -> bool:
+    """Return whether this invocation can advance a materialized task.
+
+    Successful reusable work is intentionally skipped before applying a
+    numeric provider cap.  That lets a later capped invocation advance the
+    next pending item rather than repeatedly attempting the already-complete
+    prefix.  Blocked/running work remains observable but does not consume the
+    cap until an explicit retry or lease recovery makes it runnable again.
+    """
+
+    if repo.task_is_reusable(
+        task,
+        input_fingerprint=input_fingerprint,
+        config_fingerprint=config_fingerprint,
+    ):
+        return False
+    return task.status in {"pending", "retry_waiting", "failed"}
 
 
 def _call_screen(client: Any, envelope: RawIntelEnvelope | None, *, reject_threshold: int) -> ScreenResult:
@@ -768,8 +971,19 @@ def _item_fingerprint(item: IntelItem) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def _config_fingerprint(*, stage: str, model: Any, reject_threshold: int) -> str:
+def _config_fingerprint(
+    *,
+    stage: str,
+    model: Any,
+    reject_threshold: int,
+    freshness_window_hours: int | None = None,
+    freshness_policy: str | None = None,
+) -> str:
     payload = {"stage": stage, "model": str(model or ""), "reject_threshold": int(reject_threshold)}
+    if freshness_window_hours is not None:
+        payload["freshness_window_hours"] = int(freshness_window_hours)
+    if freshness_policy:
+        payload["freshness_policy"] = freshness_policy
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -804,6 +1018,17 @@ def _json_dict(value: str | None) -> dict[str, Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _as_utc(value: Any) -> datetime | None:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
 __all__ = [

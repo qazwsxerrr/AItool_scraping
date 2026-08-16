@@ -127,8 +127,6 @@ def run_stage_b_analysis_job(
     specs = dict(source_specs or {})
     requested_ids = {int(value) for value in item_ids} if item_ids is not None else None
     requested_task_ids = {int(value) for value in task_ids} if task_ids is not None else None
-    result.partial = selected_limit is not None
-    result.partial_reason = f"ai_limit:{selected_limit}" if selected_limit is not None else None
 
     # Stage B has its own local contract preflight.  It must happen before any
     # analysis provider request and never causes Stage A to run.
@@ -144,7 +142,16 @@ def run_stage_b_analysis_job(
     with session_factory() as session:
         repo = IntelRepository(session)
         existing_stage = repo.get_stage(run_id, "analyze")
-        stage_force = force and requested_ids is None and requested_task_ids is None
+        # Reset a whole stage only for a genuinely unfiltered rerun.  A
+        # source/class/task filter is an operator-scoped retry and must not
+        # leave unrelated Stage-B tasks pending.
+        stage_force = (
+            force
+            and requested_ids is None
+            and requested_task_ids is None
+            and source_filter is None
+            and content_class is None
+        )
         stage = repo.ensure_stage(
             run_id,
             "analyze",
@@ -161,9 +168,22 @@ def run_stage_b_analysis_job(
             session.commit()
             return result
 
-        screen_tasks = repo.list_stage_tasks(screen_stage, statuses={"succeeded"}, subject_type="item")
+        # We need all current Stage-A task states, not only successful ones:
+        # a full Stage-B force resets prior task projections.  Old B work for
+        # a Stage-A reject/time-filter must become ``skipped`` again, while a
+        # still-pending Stage-A task must remain pending rather than being
+        # silently treated as an ineligible terminal result.
+        screen_tasks = repo.list_stage_tasks(screen_stage, subject_type="item", include_expired=True)
+        screen_tasks_by_item = {
+            int(task.item_id or task.subject_id): task
+            for task in screen_tasks
+            if task.item_id is not None or str(task.subject_id).isdigit()
+        }
         scope_items = {int(item.id): item for item in repo.list_run_items(run_id, role="fetched")}
+        eligible_contexts: list[_AnalysisContext] = []
         for screen_task in screen_tasks:
+            if screen_task.status != "succeeded":
+                continue
             item_id = int(screen_task.item_id or screen_task.subject_id)
             if requested_ids is not None and item_id not in requested_ids:
                 continue
@@ -195,23 +215,7 @@ def run_stage_b_analysis_job(
             except Exception as exc:
                 result.errors.append(f"intel_item_id={item_id}: analysis envelope failed: {exc}")
                 continue
-            task = repo.ensure_stage_task(
-                stage,
-                subject_type="item",
-                subject_id=item_id,
-                item_id=item_id,
-                input_fingerprint=_item_fingerprint(item),
-                config_fingerprint=config_fingerprint,
-                force=bool(
-                    force
-                    and (
-                        (requested_ids is not None and item_id in requested_ids)
-                        or (requested_task_ids is not None and existing_b is not None)
-                    )
-                ),
-            )
-            task_ids_by_item[item_id] = int(task.id)
-            contexts.append(
+            eligible_contexts.append(
                 _AnalysisContext(
                     item_id=item_id,
                     input_fingerprint=_item_fingerprint(item),
@@ -219,8 +223,80 @@ def run_stage_b_analysis_job(
                     content_class=item.content_class or spec.content_class or "community_social",
                 )
             )
-            if selected_limit is not None and len(contexts) >= selected_limit:
-                break
+
+        if stage_force:
+            active_eligible_item_ids = {context.item_id for context in eligible_contexts}
+            for analysis_task in repo.list_stage_tasks(stage, subject_type="item", include_expired=True):
+                item_id = analysis_task.item_id
+                if item_id is None and str(analysis_task.subject_id).isdigit():
+                    item_id = int(analysis_task.subject_id)
+                if item_id is None:
+                    continue
+                screen_task = screen_tasks_by_item.get(int(item_id))
+                if not _analysis_task_is_terminally_out_of_scope(
+                    screen_task,
+                    item_id=int(item_id),
+                    active_eligible_item_ids=active_eligible_item_ids,
+                    run_id=run_id,
+                    session=session,
+                ):
+                    continue
+                repo.complete_stage_task(
+                    analysis_task,
+                    status="skipped",
+                    result_ref={"projection": "StageBEligibility", "item_id": int(item_id)},
+                    result={
+                        "reason": "stage_a_not_eligible",
+                        "screen_task_status": screen_task.status if screen_task is not None else None,
+                    },
+                )
+                result.skipped += 1
+
+        # Materialize every current Stage-A eligible task before applying the
+        # provider cap.  Items outside the slice remain pending, while already
+        # successful items do not consume the next capped batch.
+        runnable_contexts: list[_AnalysisContext] = []
+        for context in eligible_contexts:
+            existing_b = repo.get_task(stage, subject_type="item", subject_id=context.item_id)
+            task = repo.ensure_stage_task(
+                stage,
+                subject_type="item",
+                subject_id=context.item_id,
+                item_id=context.item_id,
+                input_fingerprint=context.input_fingerprint,
+                config_fingerprint=config_fingerprint,
+                # A formerly skipped task is an active projection only while
+                # Stage A says it is ineligible.  If a later Stage-A rerun
+                # admits it, reactivate it without requiring a schema change
+                # or discarding its old attempt history.
+                force=bool(
+                    (force and not stage_force)
+                    or (existing_b is not None and existing_b.status in {"skipped", "cancelled"})
+                ),
+            )
+            task_ids_by_item[context.item_id] = int(task.id)
+            if _analysis_task_needs_provider_call(
+                repo,
+                task,
+                input_fingerprint=context.input_fingerprint,
+                config_fingerprint=config_fingerprint,
+            ):
+                runnable_contexts.append(context)
+        result.partial = selected_limit is not None and len(runnable_contexts) > selected_limit
+        result.partial_reason = f"ai_limit:{selected_limit}" if result.partial else None
+        contexts = runnable_contexts if selected_limit is None else runnable_contexts[:selected_limit]
+        repo.ensure_stage(
+            run_id,
+            "analyze",
+            config_fingerprint=config_fingerprint,
+            metadata={
+                "analysis_min_score": min_score,
+                "eligible_total": len(eligible_contexts),
+                "runnable_total": len(runnable_contexts),
+                "processed": len(contexts),
+                "truncated_by_limit": result.partial,
+            },
+        )
         session.commit()
 
     result.item_ids = [context.item_id for context in contexts]
@@ -378,7 +454,24 @@ def run_stage_b_analysis_job(
         stage = repo.get_stage(run_id, "analyze")
         if stage is not None:
             repo.recover_expired_stage_tasks(stage)
-            repo.refresh_stage_status(stage)
+            if contexts:
+                repo.refresh_stage_status(stage)
+            else:
+                existing_tasks = repo.list_stage_tasks(stage, include_expired=True)
+                if existing_tasks:
+                    # Terminal skipped tasks represent the current Stage-A
+                    # overlay; pending tasks are genuine remaining work.
+                    repo.refresh_stage_status(stage)
+                else:
+                    repo.finish_stage(
+                        stage,
+                        status="succeeded",
+                        metadata={
+                            "analysis_min_score": min_score,
+                            "eligible": 0,
+                            "reason": "stage_a_no_eligible_items",
+                        },
+                    )
             session.commit()
     return result
 
@@ -401,6 +494,73 @@ def _screen_task_is_eligible(task: IntelRunStageTask, *, run_id: int, session: S
     item = session.get(IntelItem, int(task.item_id or task.subject_id))
     screen = getattr(item, "ai_screen", None) if item is not None else None
     return bool(screen is not None and screen.run_id == int(run_id) and screen.status == "success" and screen.decision in {"pass", "uncertain"})
+
+
+def _screen_task_is_terminally_ineligible(
+    task: IntelRunStageTask | None,
+    *,
+    run_id: int,
+    session: Session,
+) -> bool:
+    """Return whether the current Stage-A state deterministically excludes B.
+
+    ``skipped`` is used for the run-local recent-window gate, while a
+    successful reject is a completed AI screen.  Provider failures and
+    pending work are deliberately *not* terminal here: their Stage-B task
+    must remain pending/retryable instead of being erased by a forced rerun.
+    """
+
+    if task is None:
+        return False
+    if task.status in {"skipped", "cancelled"}:
+        return True
+    return task.status == "succeeded" and not _screen_task_is_eligible(
+        task,
+        run_id=run_id,
+        session=session,
+    )
+
+
+def _analysis_task_is_terminally_out_of_scope(
+    task: IntelRunStageTask | None,
+    *,
+    item_id: int,
+    active_eligible_item_ids: set[int],
+    run_id: int,
+    session: Session,
+) -> bool:
+    """Return whether a forced Stage-B rerun must retire an old task.
+
+    A current Stage-A pending/failure is deliberately left pending for later
+    recovery.  Everything else that cannot enter this run's valid Stage-B
+    scope—missing Stage-A lineage, a terminal reject/time gate, changed
+    content, or an envelope that no longer builds—is terminally skipped so a
+    stale task cannot keep the run partial forever.
+    """
+
+    if task is None:
+        return True
+    if _screen_task_is_terminally_ineligible(task, run_id=run_id, session=session):
+        return True
+    return task.status == "succeeded" and int(item_id) not in active_eligible_item_ids
+
+
+def _analysis_task_needs_provider_call(
+    repo: IntelRepository,
+    task: IntelRunStageTask,
+    *,
+    input_fingerprint: str,
+    config_fingerprint: str,
+) -> bool:
+    """Whether a current Stage-B task can advance in this invocation."""
+
+    if repo.task_is_reusable(
+        task,
+        input_fingerprint=input_fingerprint,
+        config_fingerprint=config_fingerprint,
+    ):
+        return False
+    return task.status in {"pending", "retry_waiting", "failed"}
 
 
 def _call_analysis(client: Any, envelope: RawIntelEnvelope) -> AnalysisResult:

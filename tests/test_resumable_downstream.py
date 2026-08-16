@@ -12,6 +12,7 @@ from app.storage.db import create_engine_from_url, create_session_factory, init_
 from app.storage.models import (
     AIItemReview,
     IntelEvent,
+    IntelEventItem,
     IntelEventRankingSnapshot,
     IntelItem,
     IntelRun,
@@ -59,6 +60,7 @@ def _run_with_item(
             content_hash=(f"{run.id}-{title}" * 8)[:64],
             selection_score=score,
             status="analysis_failed",  # deliberately not the orchestration input
+            published_at=reference_time,
             captured_at=reference_time,
         )
         session.add(item)
@@ -121,6 +123,86 @@ def test_cluster_uses_frozen_reference_time_and_run_projection_on_retry():
         assert task.status == "succeeded"
 
 
+def test_cluster_excludes_analysis_filtered_stage_b_tasks():
+    session_factory = _db()
+    reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        run = repo.start_run(reference_time=reference)
+        source = Source(
+            id=f"source-{run.id}",
+            name="Source",
+            transport="feed",
+            url="https://source.example/feed",
+            content_class="official_model_company",
+        )
+        session.add(source)
+        session.flush()
+        analyze_stage = repo.ensure_stage(run.id, "analyze")
+        item_ids: dict[str, int] = {}
+        for label, score, reason, status in (
+            ("candidate", 85, "analysis candidate", "candidate"),
+            ("filtered", 42, "analysis_filtered:score_below_threshold", "analysis_filtered"),
+        ):
+            item = IntelItem(
+                source_id=source.id,
+                title=f"Orchid Systems {label}",
+                content_class="official_model_company",
+                content_hash=(f"{run.id}-{label}" * 8)[:64],
+                selection_score=score,
+                selection_reason=reason,
+                status=status,
+                published_at=reference,
+                captured_at=reference,
+            )
+            session.add(item)
+            session.flush()
+            item_ids[label] = int(item.id)
+            repo.record_run_item(run.id, item.id)
+            session.add(
+                AIItemReview(
+                    item_id=item.id,
+                    run_id=run.id,
+                    content_class="official_model_company",
+                    topic="model",
+                    topics_json='["model"]',
+                    keywords_json='["release"]',
+                    entities_json=json.dumps([{"type": "company", "name": "OpenAI"}]),
+                    summary_cn=f"{label} summary",
+                    selection_score=score,
+                    reason=reason,
+                    status="success",
+                )
+            )
+            task = repo.ensure_stage_task(
+                analyze_stage,
+                subject_type="item",
+                subject_id=item.id,
+                item_id=item.id,
+            )
+            task.status = "succeeded"
+            task.result = {
+                "item_id": item.id,
+                "status": "success",
+                "selection_score": score,
+                "reason": reason,
+            }
+        session.commit()
+
+    result = run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run.id,
+        reference_time=reference,
+    )
+    assert result.processed == 1
+    assert result.events == 1
+
+    with session_factory() as session:
+        relations = session.scalars(select(IntelEventItem)).all()
+        assert len(relations) == 1
+        assert relations[0].item_id == item_ids["candidate"]
+
+
 def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_path):
     session_factory = _db()
     reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
@@ -149,6 +231,23 @@ def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_
         )
         session.add_all([first, second])
         session.flush()
+        # Rank now consumes the durable current Stage-C projection rather
+        # than historical ``new_in_run_id`` provenance.  Persist the one
+        # event that this test's simulated Stage C emitted for run one.
+        cluster_stage = repo.ensure_stage(run_one.id, "cluster")
+        cluster_task = repo.ensure_stage_task(
+            cluster_stage,
+            subject_type="run",
+            subject_id=run_one.id,
+            target_run_id=run_one.id,
+        )
+        cluster_task.status = "succeeded"
+        cluster_task.result = {
+            "event_ids": [first.id],
+            "current_event_ids": [first.id],
+            "processed": 1,
+        }
+        repo.refresh_stage_status(cluster_stage)
         session.add_all(
             [
                 IntelEventRankingSnapshot(

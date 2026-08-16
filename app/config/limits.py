@@ -18,6 +18,9 @@ DEFAULT_AI_REVIEW_CONCURRENCY = 4
 DEFAULT_DAILY_REPORT_LIMIT = 30
 """Default number of items for one editorial/daily export."""
 
+RECENT_WINDOW_HOURS = 72
+"""Hard maximum age for items admitted to a run's AI/news pipeline."""
+
 
 __all__ = [
     "DEFAULT_AI_REVIEW_LIMIT",
@@ -26,4 +29,5 @@ __all__ = [
     "DEFAULT_AI_REVIEW_CONCURRENCY",
     "DEFAULT_DAILY_REPORT_LIMIT",
     "DEFAULT_FETCH_LIMIT_PER_SOURCE",
+    "RECENT_WINDOW_HOURS",
 ]

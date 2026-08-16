@@ -27,6 +27,7 @@ from app.config.limits import (
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
 from app.domain.models import SourceSpec
+from app.domain.recency import recent_window_scope
 from app.jobs.ai_review_job import AIReviewResult, run_ai_review_from_settings
 from app.jobs.editorial_rank_job import EditorialRankResult, run_editorial_rank_from_settings
 from app.jobs.event_cluster_job import EventClusterResult, run_event_cluster_from_settings
@@ -141,6 +142,17 @@ def normalize_stage(value: str) -> str:
     except KeyError as exc:
         allowed = ", ".join(sorted(set(STAGE_ALIASES.values())))
         raise ValueError(f"unknown pipeline stage {value!r}; expected one of: {allowed}") from exc
+
+
+def _stage_c_current_event_ids(result: Any) -> Iterable[int] | None:
+    """Expose Stage-C's complete current projection to the rank stage."""
+
+    current = getattr(result, "current_event_ids", None)
+    if current is not None:
+        return current
+    # Compatibility with injected/legacy cluster runners that only expose the
+    # historical new-event projection.
+    return getattr(result, "event_ids", None)
 
 
 def _engine_and_factory(settings: Settings):
@@ -290,8 +302,14 @@ def _sync_pipeline_run_status(
                 if changed:
                     session.commit()
                 return "running"
-            effective_partial = bool(run.partial or partial)
-            effective_reason = partial_reason or run.partial_reason
+            # ``IntelRun.partial`` is a mutable summary, not immutable
+            # provenance.  A same-run force rerun replaces the active stage
+            # projections, so a previous ``ai_limit:*`` (or any completed
+            # prior partial state) must not keep a now-complete run terminally
+            # partial.  Current stage/task state above remains authoritative;
+            # an explicit exporter partial still wins for this invocation.
+            effective_partial = bool(partial) if partial is not None else False
+            effective_reason = partial_reason if effective_partial else None
             target_status = "partial" if effective_partial else "completed"
             if (
                 run.status != target_status
@@ -435,6 +453,7 @@ def start_pipeline_run_from_settings(
                 "content_class": content_class,
                 "fetch_limit": limit,
                 "reference_time": datetime.now(timezone.utc).isoformat(),
+                **recent_window_scope(),
             },
         )
         session.commit()
@@ -832,10 +851,13 @@ def _stage_needs_resume(session_factory, run_id: int, stage_name: str) -> bool:
         # dependency still has retryable/blocked tasks.  Live pending/running
         # work still blocks the dependency, so a concurrent worker cannot race
         # a partially produced projection.
-        return (
-            _stage_progress(repo, dependency_stage) in {"succeeded", "partial"}
-            and _stage_has_successful_tasks(repo, dependency_stage)
-        )
+        dependency_progress = _stage_progress(repo, dependency_stage)
+        # A fully successful empty stage is a legitimate daily outcome.  It
+        # must still advance the remaining stages so an empty, auditable
+        # export is produced instead of leaving the run permanently pending.
+        if dependency_progress == "succeeded":
+            return True
+        return dependency_progress == "partial" and _stage_has_successful_tasks(repo, dependency_stage)
 
 
 def resume_pipeline_from_settings(
@@ -1061,7 +1083,7 @@ def run_pipeline_once_from_settings(
                 force=force,
                 snapshot_key=effective_snapshot_key,
                 run_id=review.run_id,
-                event_ids=getattr(cluster, "event_ids", None),
+                event_ids=_stage_c_current_event_ids(cluster),
             )
             exported = export_fn(
                 settings=ephemeral,
@@ -1082,7 +1104,12 @@ def run_pipeline_once_from_settings(
         run = IntelRepository(session).start_run(
             run_type="run_once",
             filters={"source": source, "content_class": content_class, "stage": "run-once"},
-            scope={"source": source, "content_class": content_class, "fetch_limit": limit},
+            scope={
+                "source": source,
+                "content_class": content_class,
+                "fetch_limit": limit,
+                **recent_window_scope(),
+            },
         )
         session.commit()
         run_id = int(run.id)
@@ -1130,7 +1157,7 @@ def run_pipeline_once_from_settings(
             force=force,
             snapshot_key=effective_snapshot_key,
             run_id=run_id,
-            event_ids=getattr(cluster, "event_ids", None),
+            event_ids=_stage_c_current_event_ids(cluster),
         )
         exported = export_fn(
             settings=settings,
