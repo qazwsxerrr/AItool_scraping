@@ -104,6 +104,7 @@ python -m app.main run-once [--source SOURCE_ID] [--class CONTENT_CLASS] [--limi
 python -m app.main source-health [--source SOURCE_ID]
 
 # 正式的可恢复链路
+python -m app.main pipeline run [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force] [--output-dir DIR]
 python -m app.main pipeline start [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N]
 python -m app.main pipeline stage-a --run-id RUN_ID
 python -m app.main pipeline stage-b --run-id RUN_ID
@@ -137,7 +138,16 @@ $PYTHON -m app.main run-once \
   --force \
   --output-dir output/intel
 
-# 正式逐阶段链路：start 只抓取并冻结 membership，后续阶段不会重复抓取
+# 推荐：一次完成正式可恢复链路。run_id 由程序创建并在内部传递，调用者无需手动复制。
+$PYTHON -m app.main pipeline run \
+  --limit 20 \
+  --force \
+  --output-dir output/intel
+
+# 如果流程中断，使用输出中的 run_id 从断点恢复：
+$PYTHON -m app.main pipeline resume --run-id RUN_ID --output-dir output/intel
+
+# 诊断或需要逐阶段观察时，才使用下面的独立命令：start 只抓取并冻结 membership，后续阶段不会重复抓取
 $PYTHON -m app.main pipeline start --limit 20
 # 使用上一步输出的 run_id
 $PYTHON -m app.main pipeline stage-a --run-id RUN_ID

@@ -103,6 +103,16 @@ class PipelineResumeResult:
 
 
 @dataclass(frozen=True)
+class PipelineExecutionResult:
+    """Result of one complete run-scoped pipeline execution."""
+
+    run_id: int
+    start: PipelineStartResult
+    resume: PipelineResumeResult
+    status: str
+
+
+@dataclass(frozen=True)
 class PipelineAdoptResult:
     run_id: int
     adopted: dict[str, int]
@@ -856,6 +866,62 @@ def resume_pipeline_from_settings(
     return result
 
 
+def run_pipeline_from_settings(
+    *,
+    settings: Settings,
+    source: str | None = None,
+    content_class: str | None = None,
+    limit: int | None = DEFAULT_FETCH_LIMIT_PER_SOURCE,
+    force: bool = False,
+    output_dir: str | Path = "output/intel",
+    snapshot_key: str | None = None,
+    profile_path: str | Path | None = None,
+    ai_client: Any | None = None,
+    registry_path=DEFAULT_REGISTRY_PATH,
+) -> PipelineExecutionResult:
+    """Create a run, fetch its immutable scope, then execute all stages.
+
+    This is the normal operator entry point.  The stage-specific commands
+    remain available for retries and recovery, but a successful invocation
+    never requires the caller to copy a generated ``run_id`` between commands.
+    ``limit`` applies to fetching per source; downstream stages process the
+    complete frozen membership unless their dedicated retry command supplies a
+    separate cap.
+    """
+
+    start = start_pipeline_run_from_settings(
+        settings=settings,
+        source=source,
+        content_class=content_class,
+        limit=limit,
+        force=force,
+        registry_path=registry_path,
+    )
+    if not start.scope_frozen or not start.run_id:
+        raise ValueError("pipeline run requires a durable run; remove --dry-run from the start command")
+
+    resumed = resume_pipeline_from_settings(
+        settings=settings,
+        run_id=int(start.run_id),
+        source=source,
+        content_class=content_class,
+        # The fetch limit is per source.  Do not accidentally reuse it as a
+        # global cap for the downstream stages.
+        limit=None,
+        output_dir=output_dir,
+        snapshot_key=snapshot_key,
+        profile_path=profile_path,
+        ai_client=ai_client,
+    )
+    status = pipeline_status_from_settings(settings=settings, run_id=int(start.run_id)).run_status
+    return PipelineExecutionResult(
+        run_id=int(start.run_id),
+        start=start,
+        resume=resumed,
+        status=status,
+    )
+
+
 def run_pipeline_once_from_settings(
     *,
     settings: Settings,
@@ -1081,6 +1147,7 @@ run_pipeline_export = run_pipeline_export_from_settings
 pipeline_status = pipeline_status_from_settings
 retry_pipeline_stage = retry_pipeline_stage_from_settings
 resume_pipeline = resume_pipeline_from_settings
+run_pipeline = run_pipeline_from_settings
 adopt_existing = adopt_existing_pipeline_from_settings
 
 
@@ -1088,6 +1155,7 @@ __all__ = [
     "DISPLAY_STAGE_NAMES",
     "PIPELINE_STAGES",
     "PipelineAdoptResult",
+    "PipelineExecutionResult",
     "PipelineResumeResult",
     "PipelineRunResult",
     "PipelineStartResult",
@@ -1099,6 +1167,8 @@ __all__ = [
     "pipeline_status",
     "resume_pipeline_from_settings",
     "resume_pipeline",
+    "run_pipeline_from_settings",
+    "run_pipeline",
     "retry_pipeline_stage_from_settings",
     "retry_pipeline_stage",
     "run_pipeline_export_from_settings",

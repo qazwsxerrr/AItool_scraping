@@ -20,6 +20,7 @@ from app.jobs.pipeline_orchestrator import (
     resume_pipeline_from_settings,
     retry_pipeline_stage_from_settings,
     run_pipeline_export_from_settings,
+    run_pipeline_from_settings,
     run_pipeline_rank_from_settings,
     run_pipeline_stage_a_from_settings,
     run_pipeline_stage_b_from_settings,
@@ -322,6 +323,51 @@ def pipeline_start(
     )
     if result.reference_time is not None:
         typer.echo(f"reference_time={result.reference_time.isoformat()}")
+
+
+@pipeline_app.command("run")
+def pipeline_run(
+    source: str | None = typer.Option(None, "--source", help="Only run one source id."),
+    content_class: str | None = typer.Option(None, "--class", help="Only run one content class."),
+    limit: int | None = typer.Option(
+        DEFAULT_FETCH_LIMIT_PER_SOURCE,
+        "--limit",
+        min=1,
+        help="Maximum items fetched per source for this run.",
+    ),
+    force: bool = typer.Option(False, "--force", help="Ignore source cooldown for this fetch stage only."),
+    output_dir: str = typer.Option("output/intel", "--output-dir"),
+    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Run-scoped snapshot key override."),
+    profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
+) -> None:
+    """Run the complete pipeline while keeping stage boundaries resumable."""
+
+    configure_logging()
+    _validate_content_class(content_class)
+    result = run_pipeline_from_settings(
+        settings=Settings.from_env(),
+        source=source,
+        content_class=content_class,
+        limit=limit,
+        force=force,
+        output_dir=output_dir,
+        snapshot_key=snapshot_key,
+        profile_path=profile,
+    )
+    typer.echo(f"run_id={result.run_id} status={result.status}")
+    typer.echo(
+        f"fetch: fetched={result.start.fetch.total_fetched} "
+        f"inserted={result.start.fetch.total_inserted} "
+        f"skipped={result.start.fetch.total_skipped} "
+        f"failed={result.start.fetch.total_failed}"
+    )
+    typer.echo(f"stages={','.join(result.resume.ran_stages) or '-'}")
+    if result.resume.skipped_stages:
+        typer.echo(f"skipped={','.join(result.resume.skipped_stages)}")
+    for error in result.resume.errors:
+        typer.echo(f"error={error}")
+    if result.status in {"failed", "partial"} or result.resume.errors:
+        raise typer.Exit(code=1)
 
 
 @pipeline_app.command("stage-a")

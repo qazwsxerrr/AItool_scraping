@@ -20,7 +20,7 @@ runner = CliRunner()
 def test_pipeline_help_lists_formal_commands():
     result = runner.invoke(main.app, ["pipeline", "--help"])
     assert result.exit_code == 0
-    for command in ("start", "stage-a", "stage-b", "stage-c", "rank", "export", "status", "retry", "resume", "adopt-existing"):
+    for command in ("run", "start", "stage-a", "stage-b", "stage-c", "rank", "export", "status", "retry", "resume", "adopt-existing"):
         assert command in result.stdout
 
 
@@ -126,3 +126,55 @@ def test_manual_pipeline_run_status_finalizes_only_after_export(tmp_path):
         run = session.get(orchestrator.IntelRun, run_id)
         assert run.status == "completed"
         assert run.finished_at is not None
+
+
+def test_pipeline_run_auto_creates_and_reuses_run_id(tmp_path, monkeypatch):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'pipeline.db'}")
+    seen: dict[str, object] = {}
+    start = orchestrator.PipelineStartResult(
+        run_id=42,
+        fetch=IntelFetchResult(run_id=42),
+        reference_time=datetime.now(timezone.utc),
+        scope_frozen=True,
+    )
+    resume = orchestrator.PipelineResumeResult(run_id=42, ran_stages=["screen", "analyze", "cluster", "rank", "export"])
+
+    def fake_start(**kwargs):
+        seen["start_limit"] = kwargs["limit"]
+        seen["force"] = kwargs["force"]
+        return start
+
+    def fake_resume(**kwargs):
+        seen["resume_run_id"] = kwargs["run_id"]
+        seen["resume_limit"] = kwargs["limit"]
+        seen["output_dir"] = kwargs["output_dir"]
+        return resume
+
+    monkeypatch.setattr(orchestrator, "start_pipeline_run_from_settings", fake_start)
+    monkeypatch.setattr(orchestrator, "resume_pipeline_from_settings", fake_resume)
+    monkeypatch.setattr(
+        orchestrator,
+        "pipeline_status_from_settings",
+        lambda **kwargs: orchestrator.PipelineStatus(
+            run_id=kwargs["run_id"],
+            run_status="completed",
+            reference_time=None,
+            scope_frozen=True,
+        ),
+    )
+
+    result = orchestrator.run_pipeline_from_settings(
+        settings=settings,
+        limit=30,
+        force=True,
+        output_dir=tmp_path / "out",
+    )
+
+    assert result.run_id == 42
+    assert seen == {
+        "start_limit": 30,
+        "force": True,
+        "resume_run_id": 42,
+        "resume_limit": None,
+        "output_dir": tmp_path / "out",
+    }
