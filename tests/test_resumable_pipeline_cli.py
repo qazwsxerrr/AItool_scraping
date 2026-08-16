@@ -181,3 +181,59 @@ def test_pipeline_run_auto_creates_and_reuses_run_id(tmp_path, monkeypatch):
         "resume_limit": None,
         "output_dir": tmp_path / "out",
     }
+
+
+def test_partial_stage_successes_allow_downstream_and_finalize_partial(tmp_path):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'pipeline.db'}")
+    engine = create_engine_from_url(settings.database_url)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        run = repo.start_run(reference_time=datetime.now(timezone.utc))
+        fetch = repo.ensure_stage(run.id, "fetch")
+        repo.finish_stage(fetch, status="failed", error_code="source_failed")
+        screen = repo.ensure_stage(run.id, "screen")
+        for index, status in enumerate(("succeeded", "succeeded"), start=1):
+            task = repo.ensure_stage_task(screen, subject_type="item", subject_id=index, item_id=index)
+            task.status = status
+        analyze = repo.ensure_stage(run.id, "analyze")
+        for index, status in enumerate(("succeeded", "retry_waiting"), start=10):
+            task = repo.ensure_stage_task(analyze, subject_type="item", subject_id=index, item_id=index)
+            task.status = status
+        for stage_name in ("screen", "analyze", "cluster", "rank", "export"):
+            stage = repo.get_stage(run.id, stage_name)
+            if stage is not None:
+                repo.refresh_stage_status(stage)
+        session.commit()
+        run_id = int(run.id)
+
+    assert orchestrator._stage_needs_resume(session_factory, run_id, "cluster") is True
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        cluster = repo.ensure_stage(run_id, "cluster")
+        cluster_task = repo.ensure_stage_task(
+            cluster, subject_type="run", subject_id=run_id, target_run_id=run_id
+        )
+        cluster_task.status = "succeeded"
+        repo.refresh_stage_status(cluster)
+        session.commit()
+
+    assert orchestrator._stage_needs_resume(session_factory, run_id, "rank") is True
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        for stage_name in ("rank", "export"):
+            stage = repo.ensure_stage(run_id, stage_name)
+            task = repo.ensure_stage_task(stage, subject_type="run", subject_id=run_id, target_run_id=run_id)
+            task.status = "succeeded"
+            repo.refresh_stage_status(stage)
+        session.commit()
+
+    assert orchestrator._sync_pipeline_run_status(session_factory, run_id, finalize=True) == "partial"
+    with session_factory() as session:
+        run = session.get(orchestrator.IntelRun, run_id)
+        assert run.status == "partial"
+        assert run.finished_at is not None

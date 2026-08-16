@@ -70,8 +70,9 @@ DISPLAY_STAGE_NAMES = {
 PIPELINE_STAGES = ("screen", "analyze", "cluster", "rank", "export")
 PIPELINE_STAGE_ORDER = ("fetch", *PIPELINE_STAGES)
 RETRYABLE_TASK_STATUSES = frozenset({"failed", "retry_waiting", "pending"})
-RUN_ACTIVE_STAGE_STATUSES = frozenset({"pending", "running", "retry_waiting"})
-RUN_FAILED_STAGE_STATUSES = frozenset({"failed", "blocked"})
+STAGE_ACTIVE_TASK_STATUSES = frozenset({"pending", "running"})
+STAGE_PARTIAL_TASK_STATUSES = frozenset({"failed", "retry_waiting", "blocked"})
+STAGE_TERMINAL_TASK_STATUSES = frozenset({"succeeded", "skipped", "cancelled"})
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,69 @@ def _registry(settings: Settings, registry_path=DEFAULT_REGISTRY_PATH) -> dict[s
     return {source.id: source for source in loaded.sources}
 
 
+def _stage_progress(repo: IntelRepository, stage: Any | None) -> str:
+    """Classify a stage by its durable task progress.
+
+    A stage with successful tasks plus retryable failures is *partial*, not
+    active.  Its successful projections are safe inputs for downstream work;
+    the failed tasks remain available to ``pipeline retry``.
+    """
+
+    if stage is None:
+        return "missing"
+    tasks = repo.list_stage_tasks(stage, include_expired=True)
+    if not tasks:
+        if str(stage.status) == "succeeded":
+            return "succeeded"
+        if str(stage.status) in {"failed", "blocked"}:
+            return "partial"
+        if str(stage.status) == "running":
+            expires = stage.lease_expires_at
+            if expires is None:
+                return "active"
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            return "active" if expires > datetime.now(timezone.utc) else "partial"
+        return "active"
+
+    now = datetime.now(timezone.utc)
+    for task in tasks:
+        status = str(task.status)
+        if status == "pending":
+            return "active"
+        if status == "running":
+            expires = task.lease_expires_at
+            if expires is None:
+                return "active"
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            if expires > now:
+                return "active"
+    if any(
+        str(task.status) in STAGE_PARTIAL_TASK_STATUSES
+        or (
+            str(task.status) == "running"
+            and task.lease_expires_at is not None
+            and (
+                task.lease_expires_at.replace(tzinfo=timezone.utc)
+                if task.lease_expires_at.tzinfo is None
+                else task.lease_expires_at
+            ) <= now
+        )
+        for task in tasks
+    ):
+        return "partial"
+    if all(str(task.status) in STAGE_TERMINAL_TASK_STATUSES for task in tasks):
+        return "succeeded"
+    return "active"
+
+
+def _stage_has_successful_tasks(repo: IntelRepository, stage: Any | None) -> bool:
+    """Return whether a stage has at least one reusable successful task."""
+
+    return bool(stage is not None and repo.list_stage_tasks(stage, statuses={"succeeded"}))
+
+
 def _sync_pipeline_run_status(
     session_factory: Any,
     run_id: int,
@@ -179,12 +243,12 @@ def _sync_pipeline_run_status(
             return None
 
         stages = {stage.stage_name: stage for stage in repo.list_stages(int(run_id))}
-        statuses = {
-            name: str(stages[name].status) if name in stages else "pending"
+        progress = {
+            name: _stage_progress(repo, stages.get(name))
             for name in PIPELINE_STAGE_ORDER
         }
 
-        if any(status in RUN_ACTIVE_STAGE_STATUSES for status in statuses.values()):
+        if "missing" in progress.values() or "active" in progress.values():
             changed = False
             if run.status != "running" or run.finished_at is not None:
                 run.status = "running"
@@ -202,9 +266,9 @@ def _sync_pipeline_run_status(
                 session.commit()
             return "running"
 
-        failed = [name for name, status in statuses.items() if status in RUN_FAILED_STAGE_STATUSES]
-        if failed:
-            reason = partial_reason or "stage_failure:" + ",".join(failed)
+        partial_stages = [name for name, state in progress.items() if state == "partial"]
+        if partial_stages:
+            reason = partial_reason or "stage_partial:" + ",".join(partial_stages)
             repo.finish_run(
                 int(run_id),
                 status="partial",
@@ -215,7 +279,7 @@ def _sync_pipeline_run_status(
             session.commit()
             return "partial"
 
-        if all(status == "succeeded" for status in statuses.values()):
+        if all(state == "succeeded" for state in progress.values()):
             if not finalize:
                 changed = False
                 if run.status != "running" or run.finished_at is not None:
@@ -763,7 +827,15 @@ def _stage_needs_resume(session_factory, run_id: int, stage_name: str) -> bool:
             return bool(repo.list_run_item_ids(run_id, role="fetched"))
         previous = {name: repo.get_stage(run_id, name) for name in PIPELINE_STAGES}
         dependency = {"analyze": "screen", "cluster": "analyze", "rank": "cluster", "export": "rank"}[stage_name]
-        return previous[dependency] is not None and previous[dependency].status == "succeeded"
+        dependency_stage = previous[dependency]
+        # Downstream stages may consume the successful subset while the
+        # dependency still has retryable/blocked tasks.  Live pending/running
+        # work still blocks the dependency, so a concurrent worker cannot race
+        # a partially produced projection.
+        return (
+            _stage_progress(repo, dependency_stage) in {"succeeded", "partial"}
+            and _stage_has_successful_tasks(repo, dependency_stage)
+        )
 
 
 def resume_pipeline_from_settings(
