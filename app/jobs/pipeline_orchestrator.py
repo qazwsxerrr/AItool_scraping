@@ -878,6 +878,7 @@ def run_pipeline_from_settings(
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
     registry_path=DEFAULT_REGISTRY_PATH,
+    on_start: Callable[[PipelineStartResult], None] | None = None,
 ) -> PipelineExecutionResult:
     """Create a run, fetch its immutable scope, then execute all stages.
 
@@ -899,6 +900,8 @@ def run_pipeline_from_settings(
     )
     if not start.scope_frozen or not start.run_id:
         raise ValueError("pipeline run requires a durable run; remove --dry-run from the start command")
+    if on_start is not None:
+        on_start(start)
 
     resumed = resume_pipeline_from_settings(
         settings=settings,

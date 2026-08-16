@@ -344,6 +344,10 @@ def pipeline_run(
 
     configure_logging()
     _validate_content_class(content_class)
+
+    def announce_start(start) -> None:
+        typer.echo(f"run_id={start.run_id} scope_frozen={start.scope_frozen}")
+
     result = run_pipeline_from_settings(
         settings=Settings.from_env(),
         source=source,
@@ -353,8 +357,9 @@ def pipeline_run(
         output_dir=output_dir,
         snapshot_key=snapshot_key,
         profile_path=profile,
+        on_start=announce_start,
     )
-    typer.echo(f"run_id={result.run_id} status={result.status}")
+    typer.echo(f"status={result.status}")
     typer.echo(
         f"fetch: fetched={result.start.fetch.total_fetched} "
         f"inserted={result.start.fetch.total_inserted} "

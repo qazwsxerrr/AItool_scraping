@@ -131,6 +131,7 @@ def test_manual_pipeline_run_status_finalizes_only_after_export(tmp_path):
 def test_pipeline_run_auto_creates_and_reuses_run_id(tmp_path, monkeypatch):
     settings = Settings(database_url=f"sqlite:///{tmp_path / 'pipeline.db'}")
     seen: dict[str, object] = {}
+    announced: list[int] = []
     start = orchestrator.PipelineStartResult(
         run_id=42,
         fetch=IntelFetchResult(run_id=42),
@@ -168,9 +169,11 @@ def test_pipeline_run_auto_creates_and_reuses_run_id(tmp_path, monkeypatch):
         limit=30,
         force=True,
         output_dir=tmp_path / "out",
+        on_start=lambda value: announced.append(value.run_id),
     )
 
     assert result.run_id == 42
+    assert announced == [42]
     assert seen == {
         "start_limit": 30,
         "force": True,
