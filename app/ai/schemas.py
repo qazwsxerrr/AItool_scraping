@@ -17,21 +17,24 @@ ContentClass: TypeAlias = Literal[
     "official_model_company",
     "project_tool",
     "community_social",
+    "news_media",
 ]
 
 OFFICIAL_MODEL_COMPANY = "official_model_company"
 PROJECT_TOOL = "project_tool"
 COMMUNITY_SOCIAL = "community_social"
+NEWS_MEDIA = "news_media"
 
 CONTENT_CLASSES: tuple[str, ...] = (
     OFFICIAL_MODEL_COMPANY,
     PROJECT_TOOL,
     COMMUNITY_SOCIAL,
+    NEWS_MEDIA,
 )
 
 ITEM_ANALYSIS_RESPONSE_SCHEMA: dict[str, str] = {
     "keep": "boolean",
-    "content_class": "official_model_company|project_tool|community_social",
+    "content_class": "official_model_company|project_tool|community_social|news_media",
     "topic_category": "string; one of the configured topic categories",
     "summary_cn": "string",
     "reason": "string",
@@ -443,6 +446,7 @@ __all__ = [
     "PROJECT_SUMMARY_RESPONSE_SCHEMA",
     "ItemAnalysisRequest",
     "ItemAnalysisResponse",
+    "NEWS_MEDIA",
     "OFFICIAL_MODEL_COMPANY",
     "PROJECT_TOOL",
     "apply_local_guard",

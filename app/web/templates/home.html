@@ -4,27 +4,28 @@
 {% block content %}
 <section class="hero-panel">
   <div class="hero-copy">
-    <p class="eyebrow">AI INTELLIGENCE · {{ stats.last_run_started_at | datetime if stats.last_run_started_at else 'LOCAL EDITION' }}</p>
-    <h1>今天值得读什么？</h1>
+    <p class="eyebrow">AI INTELLIGENCE · {{ stats.active_edition_date or (stats.last_run_started_at | datetime if stats.last_run_started_at else 'LOCAL EDITION') }}</p>
+    <h1>{{ stats.active_edition_date or '当前' }} 日报精选</h1>
     <p class="hero-lede">从抓取到 AI 筛选，再到主题归类与来源追溯，把噪声整理成可以快速浏览的 AI 信息流。</p>
     <div class="hero-actions">
-      <a class="button button-solid" href="/all">浏览全部动态 <span>→</span></a>
+      <a class="button button-solid" href="/all{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}">浏览本期精选 <span>→</span></a>
       <a class="button button-quiet" href="/sources">查看来源目录</a>
     </div>
   </div>
   <div class="hero-status">
     <div class="status-orb"><span></span></div>
     <div>
-      <span class="status-kicker">最近一次运行</span>
-      <strong>{{ stats.last_run_type or '尚未运行' }}</strong>
+      <span class="status-kicker">当前日报</span>
+      <strong>{{ stats.active_edition_date or stats.last_run_type or '尚未运行' }}</strong>
       <small>{{ stats.last_run_status | status_label if stats.last_run_status else '等待数据进入' }}</small>
+      {% if stats.active_partial_reason %}<small>{{ stats.active_partial_reason }}</small>{% endif %}
     </div>
   </div>
 </section>
 
 <section class="metric-strip" aria-label="数据概览">
-  <div class="metric-card metric-primary"><span>已抓取</span><strong>{{ stats.raw_items }}</strong><small>条原始动态</small></div>
-  <div class="metric-card"><span>今日精选</span><strong>{{ stats.selected_items }}</strong><small>条 AI 保留</small></div>
+  <div class="metric-card metric-primary"><span>本期入库</span><strong>{{ stats.raw_items }}</strong><small>条冻结资讯</small></div>
+  <div class="metric-card"><span>本期精选</span><strong>{{ stats.selected_items }}</strong><small>条最终事件</small></div>
   <div class="metric-card"><span>待处理</span><strong>{{ stats.pending_items }}</strong><small>条需要继续处理</small></div>
   <div class="metric-card"><span>主题分类</span><strong>{{ stats.category_counts | length }}</strong><small>个活跃类别</small></div>
   <div class="metric-card"><span>来源渠道</span><strong>{{ stats.source_counts | length }}</strong><small>个来源组</small></div>
@@ -32,15 +33,21 @@
 
 <section class="topic-toolbar" aria-label="主题和来源筛选">
   <div class="topic-tabs">
-    <a class="topic-tab {{ 'active' if not category else '' }}" href="/{% if source_group %}?source_group={{ source_group }}{% endif %}">全部主题</a>
+    <a class="topic-tab {{ 'active' if not category else '' }}" href="/?run_date={{ active_edition_date or '' }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">全部主题</a>
     {% for option in category_options %}
-      <a class="topic-tab {{ 'active' if category == option.value else '' }}" href="/?category={{ option.value }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">
+      <a class="topic-tab {{ 'active' if category == option.value else '' }}" href="/?run_date={{ active_edition_date or '' }}&amp;category={{ option.value }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">
         <span>{{ option.value }}</span><em>{{ option.count }}</em>
       </a>
     {% endfor %}
   </div>
   <form class="compact-select" action="/" method="get">
     {% if category %}<input type="hidden" name="category" value="{{ category }}">{% endif %}
+    <label for="home-edition">日报</label>
+    <select id="home-edition" name="run_date" onchange="this.form.submit()">
+      {% for option in edition_options %}
+        <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}{% if option.partial %} · partial{% endif %}</option>
+      {% endfor %}
+    </select>
     <label for="home-source">来源</label>
     <select id="home-source" name="source_group" onchange="this.form.submit()">
       <option value="">全部来源</option>
@@ -51,17 +58,8 @@
   </form>
 </section>
 
-<div class="content-layout">
+  <div class="content-layout">
   <div class="feed-column">
-    {% if top_card %}
-      <section class="top-story">
-        <div class="section-heading"><div><p class="eyebrow">EDITOR'S PICK</p><h2>今日头条</h2></div><span class="section-count">精选 #1</span></div>
-        {% with card=top_card, is_top=true %}
-          {% include "partials/recommendation_card.html" %}
-        {% endwith %}
-      </section>
-    {% endif %}
-
     {% if github_projects %}
       <section class="github-home-list feed-section">
         <div class="section-heading">
@@ -83,18 +81,16 @@
             <span class="section-count">{{ group.cards | length }} 条</span>
           </div>
           {% for card in group.cards %}
-            {% if not (loop.first and group.name == (top_card.topic_category if top_card else '')) or not top_card %}
-              {% include "partials/recommendation_card.html" %}
-            {% endif %}
+            {% include "partials/recommendation_card.html" %}
           {% endfor %}
         </section>
       {% endfor %}
-    {% elif not top_card %}
+    {% else %}
       <section class="empty-state empty-state-large">
         <div class="empty-icon">✦</div>
         <h3>暂无精选内容</h3>
-        <p>先运行 fetch 与 ai-review 生成可展示内容，或前往“全部动态”查看 AI 处理状态。</p>
-        <a class="button button-solid" href="/all">查看全部动态</a>
+        <p>当前日报尚无可展示的最终入选事件。</p>
+        <a class="button button-solid" href="/all{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}">查看本期精选</a>
       </section>
     {% endif %}
   </div>
@@ -105,7 +101,7 @@
       {% if source_options %}
         <div class="source-bars">
           {% for option in source_options[:8] %}
-            <a class="source-bar" href="/?source_group={{ option.value }}{% if category %}&amp;category={{ category }}{% endif %}">
+            <a class="source-bar" href="/?run_date={{ active_edition_date or '' }}&amp;source_group={{ option.value }}{% if category %}&amp;category={{ category }}{% endif %}">
               <span class="source-bar-label">{{ option.value | source_group_label }}</span>
               <span class="source-bar-track"><i style="width: {{ (option.count / (source_options[0].count or 1) * 100) | round(0) }}%"></i></span>
               <strong>{{ option.count }}</strong>

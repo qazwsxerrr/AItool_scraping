@@ -4,6 +4,7 @@ import pytest
 
 from app.domain import (
     COMMUNITY_SOCIAL,
+    NEWS_MEDIA,
     OFFICIAL_MODEL_COMPANY,
     PROJECT_TOOL,
     FetchBatch,
@@ -71,12 +72,40 @@ def test_source_classification_uses_explicit_value_then_registry_metadata():
     assert classify_source(_source()) == COMMUNITY_SOCIAL
     assert classify_source(
         _source(
+            id="media_feed",
+            source_group="tech_media",
+            source_role="news_media",
+        )
+    ) == NEWS_MEDIA
+    assert classify_source(
+        _source(
             id="x_account_vendor",
             source_group="x",
             source_subtype="account",
             source_role="official",
         )
     ) == COMMUNITY_SOCIAL
+    assert classify_source(
+        {
+            "id": "x_account_first_party",
+            "transport": "rsshub",
+            "url": "https://rsshub.example/twitter/user/FirstParty",
+            "source_group": "x_official",
+            "source_subtype": "account",
+            "source_role": "official",
+        }
+    ) == OFFICIAL_MODEL_COMPANY
+    assert classify_source(
+        {
+            "id": "x_account_override",
+            "transport": "rsshub",
+            "url": "https://rsshub.example/twitter/user/Override",
+            "source_group": "x_official",
+            "source_subtype": "account",
+            "source_role": "official",
+            "content_class": COMMUNITY_SOCIAL,
+        }
+    ) == OFFICIAL_MODEL_COMPANY
     assert classify_source({"id": "forced", "content_class": PROJECT_TOOL}) == PROJECT_TOOL
 
 
@@ -102,6 +131,17 @@ def test_source_spec_resolves_default_selection_policy():
         )
     )
     community = source_spec_from_config(_source())
+    first_party = source_spec_from_config(
+        _source(
+            id="x_account_first_party",
+            name="First-party X account",
+            transport="rsshub",
+            url="https://rsshub.example/twitter/user/FirstParty",
+            source_group="x_official",
+            source_subtype="account",
+            source_role="official",
+        )
+    )
 
     assert github.selection_policy.mode == "github_active_high_star"
     assert github.selection_policy.pushed_days == 30
@@ -109,6 +149,9 @@ def test_source_spec_resolves_default_selection_policy():
     assert github.selection_policy.sort_by == "stars"
     assert official.selection_policy.max_age_days == 30
     assert community.selection_policy.max_age_days == 7
+    assert first_party.content_class == OFFICIAL_MODEL_COMPANY
+    assert first_party.selection_policy.mode == "first_party_recent"
+    assert first_party.selection_policy.max_age_days == 7
 
 
 def test_explicit_policy_overrides_defaults_without_losing_class_defaults():
@@ -228,6 +271,25 @@ def test_official_change_signals_include_company_version_price_and_update(title)
     assert decision.selected is True
 
 
+def test_first_party_x_selection_uses_recency_without_keyword_gate_or_social_score_penalty():
+    source = {
+        "id": "x_account_first_party",
+        "transport": "rsshub",
+        "url": "https://rsshub.example/twitter/user/FirstParty",
+        "source_group": "x_official",
+        "source_subtype": "account",
+        "source_role": "official",
+    }
+    recent = _item(title="A note from the company", published_at=NOW)
+    stale = _item(title="A note from the company", published_at=NOW - timedelta(days=8))
+
+    decision = selection_decision(recent, source, now=NOW)
+    assert decision.selected is True
+    assert decision.reason == "selected:first_party_recent"
+    assert selection_decision(stale, source, now=NOW).reason == "first_party_item_too_old"
+    assert score_item(recent, source, now=NOW) == 100
+
+
 def test_producthunt_uses_votes_and_time_with_configurable_threshold():
     source = {
         "id": "producthunt_feed",
@@ -257,6 +319,25 @@ def test_community_is_seven_day_signal():
     decision = selection_decision(recent, source, now=NOW)
     assert decision.selected is True
     assert selection_decision(stale, source, now=NOW).reason == "community_item_too_old"
+
+
+def test_media_is_recent_and_can_opt_out_of_keyword_filtering_for_vertical_feeds():
+    source = {
+        "id": "media_feed",
+        "name": "AI Media",
+        "transport": "feed",
+        "url": "https://example.test/ai.xml",
+        "feed": {"format": "rss", "adapter": "generic"},
+        "source_group": "tech_media",
+        "source_role": "news_media",
+        "content_class": NEWS_MEDIA,
+        "selection_policy": {"mode": "media_recent", "max_age_days": 3, "keywords": []},
+    }
+    recent = _item(title="A report without an AI keyword", published_at=NOW - timedelta(days=3))
+    stale = _item(title="A report without an AI keyword", published_at=NOW - timedelta(days=4))
+
+    assert selection_decision(recent, source, now=NOW).selected is True
+    assert selection_decision(stale, source, now=NOW).reason == "media_item_too_old"
 
 
 def test_policy_rejects_legacy_source_routing_fields():

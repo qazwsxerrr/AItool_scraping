@@ -17,7 +17,7 @@ data/*.db
 data/*.sqlite*
 output/
 output/BACKUP/
-
+/reference
 # Local user workspace artifacts
 / - 副本.env
 /.cursor/

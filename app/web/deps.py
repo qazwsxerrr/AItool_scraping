@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterator
+from zoneinfo import ZoneInfo
 
 from fastapi import Request
 from fastapi.templating import Jinja2Templates
@@ -17,12 +18,13 @@ from app.storage.read_repository import UIReadRepository
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+DISPLAY_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def format_datetime(value: datetime | None) -> str:
     if value is None:
         return "未知时间"
-    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    return value.astimezone(DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M")
 
 
 def relative_time(value: datetime | None) -> str:
@@ -46,14 +48,17 @@ _CONTENT_CLASS_LABELS = {
     "official_model_company": "官方发布",
     "project_tool": "项目 / 工具",
     "community_social": "社区线索",
+    "news_media": "媒体报道",
 }
 _SOURCE_GROUP_LABELS = {
     "official_blog": "官方博客",
     "official_research": "官方研究",
+    "tech_media": "科技媒体",
     "github_trending": "GitHub 趋势",
     "github_release": "GitHub Releases",
     "github_search": "GitHub 搜索",
     "producthunt": "Product Hunt",
+    "hacker_news": "Hacker News",
     "reddit_fixed": "Reddit",
     "reddit_search": "Reddit 搜索",
     "linux_do": "LINUX DO",
@@ -71,6 +76,7 @@ _ROLE_LABELS = {
     "forum": "论坛",
     "code_hosting": "代码托管",
     "launch_platform": "产品发布平台",
+    "news_media": "媒体",
     "search": "搜索发现",
 }
 _STATUS_LABELS = {
@@ -120,7 +126,7 @@ def source_role_label(value: str | None) -> str:
 
 
 def current_date() -> str:
-    return datetime.now(timezone.utc).strftime("%Y.%m.%d")
+    return datetime.now(DISPLAY_TIMEZONE).strftime("%Y.%m.%d")
 
 
 templates.env.filters["datetime"] = format_datetime

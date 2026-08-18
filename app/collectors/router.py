@@ -22,12 +22,17 @@ class CollectorRouter:
         self,
         *,
         feed: Collector,
+        direct_feed: Collector | None = None,
         rsshub: Collector | None = None,
         github: Collector,
         github_trending: Collector,
         producthunt: Collector,
     ) -> None:
         self.feed = feed
+        # Some public feeds are reachable only without the user's outbound
+        # proxy. The registry makes that exception explicit per source instead
+        # of relying on process-wide NO_PROXY mutations.
+        self.direct_feed = direct_feed if direct_feed is not None else feed
         # RSSHub documents are parsed exactly like native feeds.  Keep the
         # optional name for callers migrating from the old constructor while
         # honoring a separately configured local RSSHub client when provided.
@@ -42,7 +47,7 @@ class CollectorRouter:
             if feed is None:
                 raise ValueError(f"feed source {source.id} requires feed options")
             if feed.adapter == "generic":
-                return self.feed
+                return self.direct_feed if getattr(source, "bypass_proxy", False) else self.feed
             if feed.adapter == "producthunt":
                 return self.producthunt
             raise ValueError(f"unsupported feed adapter for {source.id}: {feed.adapter}")

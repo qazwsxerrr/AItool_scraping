@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
 
 import typer
@@ -46,7 +47,13 @@ def main(
         f"analyzed={result.ai_review.analyzed} failed={result.ai_review.failed}"
     )
     typer.echo(f"export: exported={result.export.exported}")
-    typer.echo(f"run_id={result.run_id} status={result.status}")
+    try:
+        edition_date = date.fromisoformat(Path(result.export.markdown_path).parent.name).isoformat()
+    except (TypeError, ValueError):
+        edition_date = None
+    if edition_date:
+        typer.echo(f"edition_date={edition_date}")
+    typer.echo(f"status={result.status}")
     if result.status == "failed":
         raise typer.Exit(code=1)
 

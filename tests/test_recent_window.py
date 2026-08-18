@@ -18,7 +18,7 @@ from app.storage.models import (
     AIItemReview,
     IntelEvent,
     IntelEventItem,
-    IntelEventRankingSnapshot,
+    IntelEventStageDSnapshot,
     IntelItem,
     IntelRunItem,
     IntelRunStageTask,
@@ -379,11 +379,11 @@ def test_run_scoped_export_cannot_leak_a_stale_primary_item(tmp_path):
             )
         )
         session.add(
-            IntelEventRankingSnapshot(
-                snapshot_key=f"run-{run.id}",
+            IntelEventStageDSnapshot(
+                snapshot_key="daily-2026-08-16",
                 run_id=run.id,
                 event_id=event.id,
-                rank=1,
+                display_order=1,
                 display_score=90,
                 selected=True,
             )
@@ -398,4 +398,4 @@ def test_run_scoped_export_cannot_leak_a_stale_primary_item(tmp_path):
     )
 
     assert result.exported == 0
-    assert "保留条目：0" in (tmp_path / "runs" / f"run-{run_id}" / "intel_digest.md").read_text(encoding="utf-8")
+    assert "保留条目：0" in (tmp_path / "daily" / "2026-08-16" / "intel_digest.md").read_text(encoding="utf-8")

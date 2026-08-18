@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
-from app.jobs.editorial_rank_job import EditorialProfile, load_daily_profile
+from app.jobs.stage_d_job import StageDProfile, load_stage_d_profile
 from app.jobs.export_job import run_intel_export_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelEvent, IntelEventRankingSnapshot
+from app.storage.models import IntelEvent, IntelEventStageDSnapshot
 
 
-def test_daily_profile_defaults_to_thirty_and_allows_explicit_overrides():
-    profile = load_daily_profile()
+def test_stage_d_profile_defaults_to_thirty_and_caps_explicit_overrides():
+    profile = load_stage_d_profile()
 
     assert profile.total_max == DEFAULT_DAILY_REPORT_LIMIT
-    assert profile.topic_caps["model"] == 16
-    assert EditorialProfile.from_mapping({"total_max": 60}).total_max == 60
-    assert EditorialProfile.from_mapping({"total_max": 0}).total_max == 0
+    assert StageDProfile.from_mapping({"total_max": 60}).total_max == 30
+    assert StageDProfile.from_mapping({"total_max": 0}).total_max == 0
 
 
 def test_export_defaults_to_thirty_but_allows_explicit_overrides(tmp_path):
@@ -33,10 +32,10 @@ def test_export_defaults_to_thirty_but_allows_explicit_overrides(tmp_path):
             session.add(event)
             session.flush()
             session.add(
-                IntelEventRankingSnapshot(
+                IntelEventStageDSnapshot(
                     snapshot_key="latest",
                     event_id=event.id,
-                    rank=index + 1,
+                    display_order=index + 1,
                     display_score=index,
                     selected=True,
                     topic="model",

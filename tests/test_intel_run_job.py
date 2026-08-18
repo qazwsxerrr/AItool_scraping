@@ -5,10 +5,10 @@ from pathlib import Path
 from app.config.settings import Settings
 from app.jobs import run_job
 from app.jobs.ai_review_job import AIReviewResult
-from app.jobs.editorial_rank_job import EditorialRankResult
 from app.jobs.event_cluster_job import EventClusterResult
 from app.jobs.export_job import IntelExportResult
 from app.jobs.fetch_job import IntelFetchResult, IntelSourceStats
+from app.jobs.stage_d_job import StageDResult
 
 
 def test_run_once_threads_one_run_id_and_default_fetch_cap(tmp_path, monkeypatch):
@@ -27,7 +27,7 @@ def test_run_once_threads_one_run_id_and_default_fetch_cap(tmp_path, monkeypatch
     monkeypatch.setattr(run_job, "run_intel_fetch_from_settings", fake_fetch)
     monkeypatch.setattr(run_job, "run_ai_review_from_settings", fake_review)
     monkeypatch.setattr(run_job, "run_event_cluster_from_settings", lambda **kwargs: EventClusterResult())
-    monkeypatch.setattr(run_job, "run_editorial_rank_from_settings", lambda **kwargs: EditorialRankResult())
+    monkeypatch.setattr(run_job, "run_stage_d_from_settings", lambda **kwargs: StageDResult())
     monkeypatch.setattr(run_job, "run_intel_export_from_settings", lambda **kwargs: IntelExportResult(0, "items", "digest"))
 
     result = run_job.run_intel_once_from_settings(settings=Settings(database_url=f"sqlite:///{tmp_path / 'run.db'}"), output_dir=str(tmp_path / "out"))
@@ -47,7 +47,7 @@ def test_explicit_ai_cap_is_forwarded_for_partial_accounting(tmp_path, monkeypat
 
     monkeypatch.setattr(run_job, "run_ai_review_from_settings", fake_review)
     monkeypatch.setattr(run_job, "run_event_cluster_from_settings", lambda **kwargs: EventClusterResult())
-    monkeypatch.setattr(run_job, "run_editorial_rank_from_settings", lambda **kwargs: EditorialRankResult())
+    monkeypatch.setattr(run_job, "run_stage_d_from_settings", lambda **kwargs: StageDResult())
     monkeypatch.setattr(run_job, "run_intel_export_from_settings", lambda **kwargs: IntelExportResult(0, "items", "digest"))
     result = run_job.run_intel_once_from_settings(settings=Settings(database_url=f"sqlite:///{tmp_path / 'cap.db'}"), ai_limit=1)
     assert result.status == "completed"

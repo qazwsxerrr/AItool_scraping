@@ -283,6 +283,411 @@ sources:
   primary_eligible: true
   content_class: official_model_company
   default_limit: 6
+- id: google_blog_ai
+  name: Google Blog AI
+  transport: feed
+  url: https://blog.google/rss/
+  enabled: true
+  priority: 39
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: ai_product_blog
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  content_class: official_model_company
+  selection_policy:
+    mode: official_recent
+    max_age_days: 7
+    keywords:
+    - ai
+    - artificial intelligence
+    - gemini
+    - deepmind
+    - model
+    - agent
+    - machine learning
+    - 人工智能
+  default_limit: 12
+  tier: p1
+  topic_scopes:
+  - model_product
+  - industry_infrastructure
+  primary_eligible: true
+- id: ithome_ai_news
+  name: IT之家 AI 资讯
+  transport: feed
+  url: https://www.ithome.com/rss/
+  bypass_proxy: true
+  enabled: true
+  priority: 51
+  fetch_interval: 1800
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  source_subtype: chinese_ai_news
+  quality_weight: 0.75
+  source_role: news_media
+  spam_risk: medium
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 3
+    keywords:
+    - ai
+    - 人工智能
+    - 大模型
+    - 模型
+    - 智能体
+    - agent
+    - openai
+    - chatgpt
+    - claude
+    - gemini
+    - grok
+    - deepseek
+    - qwen
+    - 千问
+    - 智谱
+    - 机器人
+    - 推理
+    - gpu
+    - 芯片
+  default_limit: 30
+  tier: p2
+  topic_scopes:
+  - model_product
+  - industry_infrastructure
+  primary_eligible: true
+- id: the_decoder_ai_news
+  name: The Decoder AI News
+  transport: feed
+  url: https://the-decoder.com/feed/
+  enabled: true
+  priority: 52
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  source_subtype: ai_news
+  quality_weight: 0.85
+  source_role: news_media
+  spam_risk: low
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 3
+    keywords: []
+  default_limit: 20
+  tier: p2
+  topic_scopes:
+  - model_product
+  - industry_infrastructure
+  primary_eligible: true
+- id: techcrunch_ai
+  name: TechCrunch AI
+  transport: feed
+  url: https://techcrunch.com/category/artificial-intelligence/feed/
+  enabled: true
+  priority: 53
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  source_subtype: ai_news
+  quality_weight: 0.8
+  source_role: news_media
+  spam_risk: low
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 3
+    keywords: []
+  default_limit: 20
+  tier: p2
+  topic_scopes:
+  - model_product
+  - industry_infrastructure
+  primary_eligible: true
+- id: the_verge_ai
+  name: The Verge AI
+  transport: feed
+  url: https://www.theverge.com/rss/ai-artificial-intelligence/index.xml
+  enabled: true
+  priority: 54
+  fetch_interval: 3600
+  feed:
+    format: atom
+    adapter: generic
+  source_group: tech_media
+  source_subtype: ai_news
+  quality_weight: 0.8
+  source_role: news_media
+  spam_risk: low
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 3
+    keywords: []
+  default_limit: 20
+  tier: p2
+  topic_scopes:
+  - model_product
+  - industry_infrastructure
+  primary_eligible: true
+- id: ars_technica_ai
+  name: Ars Technica AI
+  transport: feed
+  url: https://arstechnica.com/ai/feed/
+  enabled: true
+  priority: 55
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  source_subtype: ai_news
+  quality_weight: 0.8
+  source_role: news_media
+  spam_risk: low
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 3
+    keywords: []
+  default_limit: 20
+  tier: p2
+  topic_scopes:
+  - model_product
+  - industry_infrastructure
+  primary_eligible: true
+- id: marktechpost_ai
+  name: MarkTechPost AI
+  transport: feed
+  url: https://www.marktechpost.com/feed/
+  enabled: true
+  priority: 56
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  source_subtype: ai_news
+  quality_weight: 0.7
+  source_role: news_media
+  spam_risk: medium
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 3
+    keywords: []
+  default_limit: 15
+  tier: p2
+  topic_scopes:
+  - model_product
+  - research
+  primary_eligible: true
+- id: artificial_intelligence_news
+  name: Artificial Intelligence News
+  transport: feed
+  url: https://www.artificialintelligence-news.com/feed/
+  enabled: true
+  priority: 57
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  source_subtype: ai_news
+  quality_weight: 0.75
+  source_role: news_media
+  spam_risk: low
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 3
+    keywords: []
+  default_limit: 15
+  tier: p2
+  topic_scopes:
+  - model_product
+  - industry_infrastructure
+  primary_eligible: true
+- id: simon_willison_blog
+  name: Simon Willison Blog
+  transport: feed
+  url: https://simonwillison.net/atom/everything/
+  enabled: true
+  priority: 58
+  fetch_interval: 7200
+  feed:
+    format: atom
+    adapter: generic
+  source_group: tech_media
+  source_subtype: analysis_blog
+  quality_weight: 0.8
+  source_role: analysis
+  spam_risk: low
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 3
+    keywords: []
+  default_limit: 15
+  tier: p2
+  topic_scopes:
+  - model_product
+  - practice_opinion
+  primary_eligible: true
+- id: interconnects_ai
+  name: Interconnects AI
+  transport: feed
+  url: https://www.interconnects.ai/feed
+  enabled: true
+  priority: 59
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  source_subtype: analysis_blog
+  quality_weight: 0.75
+  source_role: analysis
+  spam_risk: low
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 3
+    keywords: []
+  default_limit: 15
+  tier: p2
+  topic_scopes:
+  - research
+  - practice_opinion
+  primary_eligible: true
+- id: bytebytego_ai
+  name: ByteByteGo AI
+  transport: feed
+  url: https://blog.bytebytego.com/feed
+  enabled: true
+  priority: 60
+  fetch_interval: 14400
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  source_subtype: engineering_blog
+  quality_weight: 0.7
+  source_role: analysis
+  spam_risk: low
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 3
+    keywords:
+    - ai
+    - llm
+    - agent
+    - mcp
+    - model
+    - inference
+    - 人工智能
+    - 大模型
+  default_limit: 15
+  tier: p2
+  topic_scopes:
+  - model_product
+  - practice_opinion
+  primary_eligible: true
+- id: github_blog_ai
+  name: GitHub Blog AI
+  transport: feed
+  url: https://github.blog/feed/
+  enabled: true
+  priority: 61
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: developer_platform_blog
+  quality_weight: 0.8
+  source_role: official
+  spam_risk: low
+  content_class: official_model_company
+  selection_policy:
+    mode: official_recent
+    max_age_days: 7
+    keywords:
+    - ai
+    - copilot
+    - model
+    - agent
+    - mcp
+    - llm
+    - github models
+  default_limit: 15
+  tier: p2
+  topic_scopes:
+  - model_product
+  - open_source_tool
+  primary_eligible: true
+- id: hacker_news_ai
+  name: Hacker News AI
+  transport: feed
+  url: https://hnrss.org/newest?q=AI
+  bypass_proxy: true
+  enabled: true
+  priority: 62
+  fetch_interval: 1800
+  feed:
+    format: rss
+    adapter: generic
+  source_group: hacker_news
+  source_subtype: community_ai_links
+  quality_weight: 0.45
+  source_role: community
+  spam_risk: high
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 2
+    keywords: []
+  default_limit: 30
+  tier: p4
+  topic_scopes:
+  - practice_opinion
+  primary_eligible: false
+- id: github_releases_claude_code
+  name: GitHub Releases Claude Code
+  transport: github
+  url: https://api.github.com/repos/anthropics/claude-code/releases
+  enabled: true
+  priority: 49
+  fetch_interval: 21600
+  github:
+    mode: releases
+  source_group: github_release
+  source_subtype: repo_releases
+  quality_weight: 0.85
+  source_role: code_hosting
+  spam_risk: low
+  content_class: project_tool
+  selection_policy:
+    mode: project_recent
+    max_age_days: 30
+    sort: published_at
+  default_limit: 10
+  tier: p2
+  topic_scopes:
+  - open_source_tool
+  primary_eligible: true
 - id: producthunt_feed
   name: Product Hunt Feed
   transport: feed
@@ -1430,6 +1835,233 @@ sources:
   account_url: https://x.com/MiniMax_AI
   content_class: community_social
   default_limit: 5
+- id: x_account_baidu
+  name: X Baidu official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/Baidu_Inc
+  enabled: true
+  priority: 125
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  account_url: https://x.com/Baidu_Inc
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  default_limit: 5
+  tier: p2
+  topic_scopes:
+  - model_product
+  primary_eligible: false
+- id: x_account_alibaba_cloud
+  name: X Alibaba Cloud official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/alibaba_cloud
+  enabled: true
+  priority: 126
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  account_url: https://x.com/alibaba_cloud
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  default_limit: 5
+  tier: p2
+  topic_scopes:
+  - model_product
+  - industry_infrastructure
+  primary_eligible: false
+- id: x_account_siliconflow
+  name: X SiliconFlow official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/SiliconFlowAI
+  enabled: true
+  priority: 127
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  account_url: https://x.com/SiliconFlowAI
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  default_limit: 5
+  tier: p2
+  topic_scopes:
+  - model_product
+  primary_eligible: false
+- id: x_account_openrouter
+  name: X OpenRouter official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/OpenRouter
+  enabled: true
+  priority: 128
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  account_url: https://x.com/OpenRouter
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  default_limit: 5
+  tier: p2
+  topic_scopes:
+  - model_product
+  primary_eligible: false
+- id: x_account_runway
+  name: X Runway official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/runwayml
+  enabled: true
+  priority: 129
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  account_url: https://x.com/runwayml
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  default_limit: 5
+  tier: p2
+  topic_scopes:
+  - model_product
+  primary_eligible: false
+- id: x_account_replit
+  name: X Replit official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/Replit
+  enabled: true
+  priority: 130
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  account_url: https://x.com/Replit
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  default_limit: 5
+  tier: p2
+  topic_scopes:
+  - model_product
+  - open_source_tool
+  primary_eligible: false
+- id: x_account_openbmb
+  name: X OpenBMB official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/OpenBMB
+  enabled: true
+  priority: 131
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  account_url: https://x.com/OpenBMB
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  default_limit: 5
+  tier: p2
+  topic_scopes:
+  - model_product
+  primary_eligible: false
+- id: x_account_sensetime
+  name: X SenseTime official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/SenseTime_AI
+  enabled: true
+  priority: 132
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  account_url: https://x.com/SenseTime_AI
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  default_limit: 5
+  tier: p2
+  topic_scopes:
+  - model_product
+  primary_eligible: false
+- id: x_account_antling
+  name: X AntLing official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/AntLingAGI
+  enabled: true
+  priority: 133
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.75
+  source_role: official
+  spam_risk: medium
+  account_url: https://x.com/AntLingAGI
+  content_class: community_social
+  selection_policy:
+    mode: community_recent
+    max_age_days: 7
+  default_limit: 5
+  tier: p2
+  topic_scopes:
+  - model_product
+  primary_eligible: false
 - id: x_account_sam_altman
   name: X Sam Altman via RSSHub
   transport: rsshub
@@ -1666,7 +2298,7 @@ sources:
 - id: anthropic_research_rsshub
   name: Anthropic Research via RSSHub
   transport: rsshub
-  url: ${RSSHUB_BASE_URL}/anthropic/research
+  url: ${RSSHUB_BASE_URL}/anthropic/research?limit=6
   enabled: true
   priority: 120
   fetch_interval: 3600

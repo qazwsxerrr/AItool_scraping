@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, joinedload
@@ -20,7 +21,7 @@ from app.storage.models import (
     AIItemReview,
     IntelEvent,
     IntelEventItem,
-    IntelEventRankingSnapshot,
+    IntelEventStageDSnapshot,
     IntelItem,
     IntelRun,
     IntelRunItem,
@@ -71,8 +72,8 @@ class EventItemUpsertResult:
 
 
 @dataclass(frozen=True)
-class EventRankingSnapshotUpsertResult:
-    snapshot: IntelEventRankingSnapshot
+class EventStageDSnapshotUpsertResult:
+    snapshot: IntelEventStageDSnapshot
     created: bool
 
 
@@ -97,6 +98,7 @@ STAGE_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "blocked", "cancelle
 STAGE_RETRYABLE_STATUSES = frozenset({"pending", "retry_waiting", "failed"})
 STAGE_RUNNING_STATUSES = frozenset({"running", "in_progress"})
 TASK_REUSABLE_STATUS = "succeeded"
+DAILY_EDITION_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class IntelRepository:
@@ -234,9 +236,16 @@ class IntelRepository:
         # value already present in the initial scope, then fall back to now.
         reference = _as_utc(reference_time) or _as_utc(scope_values.get("reference_time")) or utcnow()
         scope_values["reference_time"] = reference.isoformat()
+        # ``edition_date`` is the human-facing daily grouping key.  It is not
+        # a primary key: several immutable runs may share a date while the UI
+        # points that date at the most recent ranked snapshot.
+        edition_date = reference.astimezone(DAILY_EDITION_TIMEZONE).date()
+        scope_values["edition_date"] = edition_date.isoformat()
+        scope_values["edition_timezone"] = "Asia/Shanghai"
         run = IntelRun(
             status="running",
             run_type=_text(run_type) or "run_once",
+            _edition_date=edition_date,
             filters_json=_dump_json(dict(filters or {})),
             scope_json=_dump_json(scope_values),
             source_ids_json=_dump_json(source_values),
@@ -1000,9 +1009,10 @@ class IntelRepository:
         """Create or refresh one canonical event without duplicate rows.
 
         ``event_key`` is the deterministic key selected by the clustering job.
-        ``identity_keys`` stores every exact alias observed for the event; this
-        lets a later fetch that only exposes a URL (or only an external id)
-        resolve the existing title-based event during a rerun.
+        ``identity_keys`` stores URL/external-id anchors only.  Titles are
+        deliberately not durable identity aliases: a repeated headline can
+        describe a different real-world event and must go through Stage C's
+        semantic/AI resolution instead of being auto-merged here.
         """
 
         values = _object_mapping(event)
@@ -1015,12 +1025,19 @@ class IntelRepository:
         norm_title = _normalize_event_title(normalized_title or values.get("normalized_title") or values.get("title"))
         aliases = _unique_strings(
             [
-                *(identity_keys or ()),
-                *(_string_values(values.get("identity_keys"))),
+                *(
+                    value
+                    for value in (identity_keys or ())
+                    if not str(value).strip().casefold().startswith("title:")
+                ),
+                *(
+                    value
+                    for value in _string_values(values.get("identity_keys"))
+                    if not str(value).strip().casefold().startswith("title:")
+                ),
                 _identity_alias_url(canonical),
                 _identity_alias_external(external),
-                _identity_alias_title(norm_title),
-                key,
+                key if key.startswith(("url:", "external:")) else None,
             ]
         )
 
@@ -1045,13 +1062,15 @@ class IntelRepository:
                 row = self.session.scalar(select(IntelEvent).where(IntelEvent.canonical_url == canonical))
             if row is None and external:
                 row = self.session.scalar(select(IntelEvent).where(IntelEvent.external_id == external))
-            if row is None and norm_title:
-                row = self.session.scalar(select(IntelEvent).where(IntelEvent.normalized_title == norm_title))
             if row is None and aliases:
                 rows = list(self.session.scalars(select(IntelEvent).order_by(IntelEvent.id.asc())).all())
-                alias_set = set(aliases)
+                alias_set = {alias for alias in aliases if alias.startswith(("url:", "external:"))}
                 for candidate in rows:
-                    existing_aliases = set(_load_json(candidate.identity_keys_json, []))
+                    existing_aliases = {
+                        alias
+                        for alias in _load_json(candidate.identity_keys_json, [])
+                        if isinstance(alias, str) and alias.startswith(("url:", "external:"))
+                    }
                     if existing_aliases & alias_set:
                         row = candidate
                         break
@@ -1070,7 +1089,11 @@ class IntelRepository:
         previous_entities = _load_json(row.entities_json, [])
         previous_sources = _load_json(row.source_ids_json, [])
         previous_source_groups = _load_json(row.source_groups_json, [])
-        previous_aliases = _load_json(row.identity_keys_json, [])
+        previous_aliases = [
+            alias
+            for alias in _load_json(row.identity_keys_json, [])
+            if isinstance(alias, str) and alias.startswith(("url:", "external:"))
+        ]
         merged_topics = _unique_strings([*(_string_values(previous_topics)), *values_topics])
         values_keywords = _unique_strings(
             [*(keywords or ()), *(_string_values(values.get("keywords"))), values.get("keyword")]
@@ -1183,11 +1206,16 @@ class IntelRepository:
         """Find an event by one persisted exact identity alias."""
 
         identity = _text(identity_key)
-        if not identity:
+        if not identity or not identity.startswith(("url:", "external:")):
             return None
         rows = list(self.session.scalars(select(IntelEvent).order_by(IntelEvent.id.asc())).all())
         for row in rows:
-            if identity in set(_load_json(row.identity_keys_json, [])):
+            aliases = {
+                alias
+                for alias in _load_json(row.identity_keys_json, [])
+                if isinstance(alias, str) and alias.startswith(("url:", "external:"))
+            }
+            if identity in aliases:
                 return row
         return None
 
@@ -1283,21 +1311,21 @@ class IntelRepository:
         if state:
             stmt = stmt.where(IntelEvent.state == state)
         if snapshot_key:
-            stmt = stmt.join(IntelEventRankingSnapshot, IntelEventRankingSnapshot.event_id == IntelEvent.id).where(
-                IntelEventRankingSnapshot.snapshot_key == snapshot_key,
-                IntelEventRankingSnapshot.selected.is_(True),
+            stmt = stmt.join(IntelEventStageDSnapshot, IntelEventStageDSnapshot.event_id == IntelEvent.id).where(
+                IntelEventStageDSnapshot.snapshot_key == snapshot_key,
+                IntelEventStageDSnapshot.selected.is_(True),
             )
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).unique().all())
 
-    def upsert_event_ranking_snapshot(
+    def upsert_event_stage_d_snapshot(
         self,
         event_id: int,
         *,
         snapshot_key: str = "latest",
         run_id: int | None = None,
-        rank: int = 0,
+        display_order: int = 0,
         display_score: float = 0.0,
         selected: bool = False,
         topic: str | None = None,
@@ -1305,19 +1333,19 @@ class IntelRepository:
         content_class: str | None = None,
         reason: str | None = None,
         metadata: Mapping[str, Any] | None = None,
-    ) -> EventRankingSnapshotUpsertResult:
+    ) -> EventStageDSnapshotUpsertResult:
         row = self.session.scalar(
-            select(IntelEventRankingSnapshot).where(
-                IntelEventRankingSnapshot.snapshot_key == snapshot_key,
-                IntelEventRankingSnapshot.event_id == int(event_id),
+            select(IntelEventStageDSnapshot).where(
+                IntelEventStageDSnapshot.snapshot_key == snapshot_key,
+                IntelEventStageDSnapshot.event_id == int(event_id),
             )
         )
         created = row is None
         if row is None:
-            row = IntelEventRankingSnapshot(snapshot_key=snapshot_key, event_id=int(event_id))
+            row = IntelEventStageDSnapshot(snapshot_key=snapshot_key, event_id=int(event_id))
             self.session.add(row)
         row.run_id = run_id
-        row.rank = max(0, int(rank))
+        row.display_order = max(0, int(display_order))
         try:
             row.display_score = max(0.0, min(100.0, float(display_score)))
         except (TypeError, ValueError, OverflowError):
@@ -1330,50 +1358,45 @@ class IntelRepository:
         row.metadata_json = _dump_json(metadata or {})
         row.updated_at = utcnow()
         self.session.flush()
-        return EventRankingSnapshotUpsertResult(row, created)
+        return EventStageDSnapshotUpsertResult(row, created)
 
-    save_event_ranking_snapshot = upsert_event_ranking_snapshot
-    upsert_event_rank_snapshot = upsert_event_ranking_snapshot
-
-    def get_event_ranking_snapshot(
+    def get_event_stage_d_snapshot(
         self,
         event_id: int,
         *,
         snapshot_key: str = "latest",
-    ) -> IntelEventRankingSnapshot | None:
+    ) -> IntelEventStageDSnapshot | None:
         return self.session.scalar(
-            select(IntelEventRankingSnapshot).where(
-                IntelEventRankingSnapshot.event_id == int(event_id),
-                IntelEventRankingSnapshot.snapshot_key == snapshot_key,
+            select(IntelEventStageDSnapshot).where(
+                IntelEventStageDSnapshot.event_id == int(event_id),
+                IntelEventStageDSnapshot.snapshot_key == snapshot_key,
             )
         )
 
-    def list_event_ranking_snapshots(
+    def list_event_stage_d_snapshots(
         self,
         *,
         snapshot_key: str = "latest",
         selected_only: bool = False,
         limit: int | None = None,
-    ) -> list[IntelEventRankingSnapshot]:
+    ) -> list[IntelEventStageDSnapshot]:
         stmt = (
-            select(IntelEventRankingSnapshot)
-            .where(IntelEventRankingSnapshot.snapshot_key == snapshot_key)
-            .order_by(IntelEventRankingSnapshot.rank.asc(), IntelEventRankingSnapshot.event_id.asc())
+            select(IntelEventStageDSnapshot)
+            .where(IntelEventStageDSnapshot.snapshot_key == snapshot_key)
+            .order_by(IntelEventStageDSnapshot.display_order.asc(), IntelEventStageDSnapshot.event_id.asc())
         )
         if selected_only:
-            stmt = stmt.where(IntelEventRankingSnapshot.selected.is_(True))
+            stmt = stmt.where(IntelEventStageDSnapshot.selected.is_(True))
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
 
-    list_event_rankings = list_event_ranking_snapshots
-
-    def clear_event_ranking_snapshot(self, *, snapshot_key: str = "latest") -> int:
+    def clear_event_stage_d_snapshot(self, *, snapshot_key: str = "latest") -> int:
         """Remove stale rows for a snapshot key before rebuilding it."""
 
         rows = list(
             self.session.scalars(
-                select(IntelEventRankingSnapshot).where(IntelEventRankingSnapshot.snapshot_key == snapshot_key)
+                select(IntelEventStageDSnapshot).where(IntelEventStageDSnapshot.snapshot_key == snapshot_key)
             ).all()
         )
         for row in rows:
@@ -2826,19 +2849,30 @@ def _identity_alias_external(value: str | None) -> str | None:
     return f"external:{value}" if value else None
 
 
-def _identity_alias_title(value: str | None) -> str | None:
-    return f"title:{value}" if value else None
-
-
 def _event_key_from_values(values: Mapping[str, Any]) -> str:
     canonical = _canonical_url(values.get("canonical_url") or values.get("url") or values.get("source_url"))
     if canonical:
-        return _identity_alias_url(canonical) or "title:unknown"
+        return _identity_alias_url(canonical) or "item:unknown"
     external = _normalize_event_external_id(values.get("external_id"))
     if external:
-        return _identity_alias_external(external) or "title:unknown"
-    title = _normalize_event_title(values.get("normalized_title") or values.get("title"))
-    return _identity_alias_title(title) or "title:unknown"
+        return _identity_alias_external(external) or "item:unknown"
+    for name in ("primary_item_id", "item_id", "id"):
+        try:
+            item_id = int(values.get(name))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if item_id > 0:
+            return f"item:{item_id}"
+    # This branch is only for direct repository callers that did not supply an
+    # event key or a stable anchor.  Incorporating the available provenance
+    # avoids making the headline itself an exact identity.
+    payload = {
+        "title": _normalize_event_title(values.get("normalized_title") or values.get("title")),
+        "source_id": _text(values.get("source_id")),
+        "published_at": str(values.get("published_at") or values.get("captured_at") or ""),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return "unanchored:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 def _normalize_novelty_status(value: Any) -> str | None:

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from .models import (
     COMMUNITY_SOCIAL,
     CONTENT_CLASSES,
+    NEWS_MEDIA,
     OFFICIAL_MODEL_COMPANY,
     PROJECT_TOOL,
     ContentClass,
@@ -57,13 +58,44 @@ DEFAULT_COMMUNITY_KEYWORDS: tuple[str, ...] = (
     "项目",
     "工具",
 )
+DEFAULT_MEDIA_KEYWORDS: tuple[str, ...] = (
+    "ai",
+    "artificial intelligence",
+    "人工智能",
+    "大模型",
+    "模型",
+    "llm",
+    "agent",
+    "智能体",
+    "mcp",
+    "openai",
+    "chatgpt",
+    "anthropic",
+    "claude",
+    "gemini",
+    "grok",
+    "deepseek",
+    "qwen",
+    "千问",
+    "智谱",
+    "机器学习",
+    "robot",
+    "机器人",
+    "inference",
+    "推理",
+    "gpu",
+    "芯片",
+)
 
 _OFFICIAL_ROLES = {"official"}
 _PROJECT_ROLES = {"code_hosting", "launch_platform"}
 _COMMUNITY_ROLES = {"community", "social", "social_search", "forum", "search"}
 _OFFICIAL_GROUPS = {"official_blog", "official_research"}
+_MEDIA_GROUPS = {"tech_media"}
+_MEDIA_ROLES = {"news_media", "analysis"}
 _PROJECT_GROUPS = {"github_trending", "github_release", "github_search", "producthunt"}
 _COMMUNITY_GROUPS = {
+    "hacker_news",
     "reddit_fixed",
     "reddit_search",
     "linux_do",
@@ -71,26 +103,56 @@ _COMMUNITY_GROUPS = {
     "x_social",
     "x_search",
 }
-_SOCIAL_GROUPS = {"x_official", "x_social", "x_search", "reddit_fixed", "reddit_search", "linux_do"}
+_SOCIAL_GROUPS = {"hacker_news", "x_official", "x_social", "x_search", "reddit_fixed", "reddit_search", "linux_do"}
+
+
+def _is_first_party_x_mapping(raw: Mapping[str, Any]) -> bool:
+    """Return whether registry metadata explicitly identifies a first-party X account."""
+
+    return (
+        _normalise_token(raw.get("source_group")) == "x_official"
+        and _normalise_token(raw.get("source_role")) == "official"
+        and _normalise_token(raw.get("source_subtype")) == "account"
+    )
+
+
+def is_first_party_x_source(source: Any) -> bool:
+    """Return whether an object carries the explicit first-party X triple.
+
+    This is deliberately based on identity metadata, rather than a stored
+    content class, so old rows created before the policy change are handled
+    consistently with newly fetched items.
+    """
+
+    return _is_first_party_x_mapping(_source_mapping(source))
+
+
+def _is_first_party_recent(source: SourceSpec) -> bool:
+    mode = source.selection_policy.mode.casefold().replace("-", "_")
+    return mode == "first_party_recent"
 
 
 def classify_source(source: Any) -> ContentClass:
-    """Classify a registry source, preferring an explicit ``content_class``.
+    """Classify a registry source from its explicit first-party boundary.
 
     ``source`` may be a current ``SourceSpec``, a future registry model, a
     ``SourceSpec``, a mapping, or a lightweight object used in tests.
     """
 
     raw = _source_mapping(source)
+    # ``x_official`` is an allowlisted first-party account set. Keep this
+    # boundary ahead of legacy source fields so old registry metadata cannot
+    # silently downgrade the account to a community lead.
+    if _is_first_party_x_mapping(raw):
+        return OFFICIAL_MODEL_COMPANY
     explicit = _normalise_content_class(raw.get("content_class"))
     if explicit is not None:
         return explicit
 
     source_group = _normalise_token(raw.get("source_group"))
     source_url = str(raw.get("url") or "").casefold()
-    # Social transports remain discovery signals even when the account itself
-    # is an official company account. A registry entry may explicitly override
-    # this only by setting content_class.
+    # Social transports remain discovery signals unless the strict first-party
+    # account metadata above (or an explicit content_class) promotes them.
     if (
         source_group in _SOCIAL_GROUPS
         or source_group == "x"
@@ -106,9 +168,8 @@ def classify_source(source: Any) -> ContentClass:
     group = _normalise_token(raw.get("source_group"))
     subtype = _normalise_token(raw.get("source_subtype"))
     source_id = _normalise_token(raw.get("id"))
-    # X/RSSHub account and search feeds remain discovery sources even when the
-    # account itself is official. The official article they link to is the
-    # direct source link, not the social post.
+    # Unmarked X/RSSHub account and search feeds remain discovery sources. The
+    # first-party exception is deliberately handled by the strict triple.
     if transport == "rsshub" and (
         group in {"x", "x_official", "x_social", "x_search"}
         or source_id.startswith("x_")
@@ -118,6 +179,8 @@ def classify_source(source: Any) -> ContentClass:
         return COMMUNITY_SOCIAL
     if group in _OFFICIAL_GROUPS or role in _OFFICIAL_ROLES:
         return OFFICIAL_MODEL_COMPANY
+    if group in _MEDIA_GROUPS or role in _MEDIA_ROLES:
+        return NEWS_MEDIA
     if group in _PROJECT_GROUPS or role in _PROJECT_ROLES:
         return PROJECT_TOOL
     if group in _COMMUNITY_GROUPS or role in _COMMUNITY_ROLES:
@@ -156,10 +219,13 @@ def classify_source(source: Any) -> ContentClass:
 def source_spec_from_config(source: Any) -> SourceSpec:
     """Resolve registry metadata into a complete, immutable ``SourceSpec``."""
 
+    source_mapping = _source_mapping(source)
+    is_first_party_x = _is_first_party_x_mapping(source_mapping)
+
     # A resolved spec can be passed between pipeline stages repeatedly. Keep
     # its already-resolved policy instead of feeding Pydantic's default values
     # back through the inference/merge step.
-    if isinstance(source, SourceSpec) and source.content_class is not None:
+    if isinstance(source, SourceSpec) and source.content_class is not None and not is_first_party_x:
         selection_is_resolved = (
             source.selection_policy.mode != "default"
             or "mode" in source.selection_policy.model_fields_set
@@ -167,7 +233,7 @@ def source_spec_from_config(source: Any) -> SourceSpec:
         if selection_is_resolved:
             return source
 
-    raw = _source_mapping(source)
+    raw = source_mapping
     source_id = str(raw.get("id") or "").strip()
     if not source_id:
         raise ValueError("source id is required")
@@ -185,6 +251,11 @@ def source_spec_from_config(source: Any) -> SourceSpec:
     content_class = classify_source(canonical)
     selection_defaults = _default_selection_policy(raw, content_class)
     selection_explicit = _policy_mapping(raw.get("selection_policy"))
+    if is_first_party_x:
+        # Existing registries used the same fields as community RSSHub feeds.
+        # The verified account triple is authoritative and keeps those legacy
+        # values from weakening first-party treatment at any pipeline entry.
+        selection_explicit.update({"mode": "first_party_recent", "max_age_days": 7})
     selection = SelectionPolicy.model_validate({**selection_defaults, **selection_explicit})
 
     data = canonical.model_dump(exclude={"selection_policy"})
@@ -196,6 +267,8 @@ def source_spec_from_config(source: Any) -> SourceSpec:
             "selection_policy": selection,
         }
     )
+    if is_first_party_x:
+        data.update({"tier": "p1", "primary_eligible": True})
     return SourceSpec.model_validate(data)
 
 
@@ -230,8 +303,12 @@ def selection_decision(
     if not spec.enabled:
         return SelectionDecision(selected=False, reason="source_disabled", **common)
 
+    if spec.content_class == OFFICIAL_MODEL_COMPANY and _is_first_party_recent(spec):
+        return _select_first_party_recent(fetch_item, policy, current_time, common)
     if spec.content_class == OFFICIAL_MODEL_COMPANY:
         return _select_official(fetch_item, policy, current_time, common)
+    if spec.content_class == NEWS_MEDIA:
+        return _select_media(fetch_item, policy, current_time, common)
     if spec.content_class == PROJECT_TOOL:
         return _select_project(fetch_item, spec, policy, current_time, common)
     return _select_community(fetch_item, policy, current_time, common)
@@ -276,6 +353,28 @@ def _select_official(
         matched_keywords=matched,
         **common,
     )
+
+
+def _select_first_party_recent(
+    item: FetchItem,
+    policy: SelectionPolicy,
+    now: datetime,
+    common: dict[str, Any],
+) -> SelectionDecision:
+    """Select configured first-party X announcements by recency only."""
+
+    window = policy.max_age_days or policy.time_window_days or 7
+    published = _item_datetime(item, "published_at")
+    if published is None:
+        return SelectionDecision(
+            selected=False,
+            reason="first_party_missing_published_at",
+            risk_flags=("missing_published_at",),
+            **common,
+        )
+    if not _within_days(published, now, window):
+        return SelectionDecision(selected=False, reason="first_party_item_too_old", **common)
+    return SelectionDecision(selected=True, reason="selected:first_party_recent", **common)
 
 
 def _select_project(
@@ -358,6 +457,40 @@ def _select_project(
     return SelectionDecision(selected=True, reason="selected:project_tool", **common)
 
 
+def _select_media(
+    item: FetchItem,
+    policy: SelectionPolicy,
+    now: datetime,
+    common: dict[str, Any],
+) -> SelectionDecision:
+    """Keep direct media reports recent without labelling them as official releases."""
+
+    window = policy.max_age_days or policy.time_window_days or 3
+    published = _item_datetime(item, "published_at")
+    if published is None:
+        return SelectionDecision(
+            selected=False,
+            reason="media_missing_published_at",
+            risk_flags=("missing_published_at",),
+            **common,
+        )
+    if not _within_days(published, now, window):
+        return SelectionDecision(selected=False, reason="media_item_too_old", **common)
+
+    # A vertical AI feed may opt out with ``keywords: []``; broad technology
+    # feeds retain the configured relevance gate.
+    keywords = policy.keywords
+    matched = _matched_keywords(item, keywords)
+    if keywords and not matched:
+        return SelectionDecision(selected=False, reason="media_keyword_missing", **common)
+    return SelectionDecision(
+        selected=True,
+        reason="selected:media_recent_keyword" if keywords else "selected:media_recent",
+        matched_keywords=matched,
+        **common,
+    )
+
+
 def _select_community(
     item: FetchItem,
     policy: SelectionPolicy,
@@ -414,6 +547,13 @@ def _select_community(
 
 def _default_selection_policy(raw: Mapping[str, Any], content_class: ContentClass) -> dict[str, Any]:
     if content_class == OFFICIAL_MODEL_COMPANY:
+        if _is_first_party_x_mapping(raw):
+            return {
+                "mode": "first_party_recent",
+                "max_age_days": 7,
+                "sort_by": "published_at",
+                "sort_order": "desc",
+            }
         return {
             "mode": "official_recent",
             "max_age_days": 30,
@@ -425,6 +565,14 @@ def _default_selection_policy(raw: Mapping[str, Any], content_class: ContentClas
         return {
             "mode": "community_recent",
             "max_age_days": 7,
+            "sort_by": "published_at",
+            "sort_order": "desc",
+        }
+    if content_class == NEWS_MEDIA:
+        return {
+            "mode": "media_recent",
+            "max_age_days": 3,
+            "keywords": DEFAULT_MEDIA_KEYWORDS,
             "sort_by": "published_at",
             "sort_order": "desc",
         }
@@ -491,6 +639,7 @@ def _source_mapping(source: Any) -> dict[str, Any]:
         "quality_weight",
         "source_role",
         "spam_risk",
+        "bypass_proxy",
         "default_limit",
         "content_class",
         "selection_policy",

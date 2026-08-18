@@ -4,14 +4,19 @@
 {% block content %}
 <section class="page-head">
   <div>
-    <p class="eyebrow">ARCHIVE / ALL SIGNALS</p>
-    <h1>全部动态</h1>
-    <p class="muted-text">主题分类与来源归属分开呈现，方便从“发生了什么”追溯到“信息从哪里来”。</p>
+    <p class="eyebrow">DAILY EDITION / SELECTED EVENTS</p>
+    <h1>{{ active_edition_date or '当前' }} 日报精选</h1>
+    <p class="muted-text">仅展示当前日报快照的最终入选事件；Stage A/B 排除的原始资讯不会出现在这里。</p>
   </div>
   <a class="button button-quiet" href="/sources">来源目录 →</a>
 </section>
 
 <form class="filters" action="/all" method="get">
+  <select name="run_date" aria-label="日报">
+    {% for option in edition_options %}
+      <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}{% if option.partial %} · partial{% endif %}</option>
+    {% endfor %}
+  </select>
   <label class="sr-only" for="all-query">搜索动态</label>
   <input id="all-query" name="q" type="search" placeholder="搜索标题、摘要..." value="{{ filters.query or '' }}">
   <select name="source_group">
@@ -32,28 +37,16 @@
       <option value="{{ value }}" {{ 'selected' if filters.topic_category == value else '' }}>{{ value }}</option>
     {% endfor %}
   </select>
-  <select name="status">
-    <option value="">全部状态</option>
-    {% for value in filter_options.statuses %}
-      <option value="{{ value }}" {{ 'selected' if filters.status == value else '' }}>{{ value | status_label }}</option>
-    {% endfor %}
-  </select>
-  <select name="screen_decision">
-    <option value="">Stage A 决策</option>
-    <option value="pass" {{ 'selected' if filters.screen_decision == 'pass' else '' }}>pass</option>
-    <option value="uncertain" {{ 'selected' if filters.screen_decision == 'uncertain' else '' }}>uncertain</option>
-    <option value="reject" {{ 'selected' if filters.screen_decision == 'reject' else '' }}>reject</option>
-  </select>
   <button type="submit">应用筛选</button>
-  {% if filters.query or filters.source_group or filters.content_class or filters.topic_category or filters.status or filters.screen_decision %}
-    <a class="button secondary" href="/all">清除</a>
+  {% if filters.query or filters.source_group or filters.content_class or filters.topic_category %}
+    <a class="button secondary" href="/all{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}">清除</a>
   {% endif %}
 </form>
 
 <section class="timeline">
   {% if items %}
     {% for item in items %}
-      {% include "partials/item_card.html" %}
+      {% with card=item %}{% include "partials/recommendation_card.html" %}{% endwith %}
     {% endfor %}
     <nav class="pagination">
       {% if page > 1 %}
@@ -67,7 +60,7 @@
   {% else %}
     <div class="empty-state">
       <h3>暂无动态</h3>
-      <p>可以先运行 fetch 与 ai-review，或调整筛选条件。</p>
+      <p>可以调整日期或筛选条件；原始筛除项仅在内部审计链路中保留。</p>
     </div>
   {% endif %}
 </section>

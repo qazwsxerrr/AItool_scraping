@@ -166,6 +166,59 @@ def test_default_registry_includes_official_feed_expansion():
         assert source.selection_policy.keywords
 
 
+def test_default_registry_includes_verified_aihot_feed_expansion():
+    result = load_source_registry(env={})
+    source_by_id = {source.id: source for source in result.sources}
+
+    expected = {
+        "google_blog_ai": ("https://blog.google/rss/", "official_blog", "official_model_company"),
+        "ithome_ai_news": ("https://www.ithome.com/rss/", "tech_media", "news_media"),
+        "the_decoder_ai_news": ("https://the-decoder.com/feed/", "tech_media", "news_media"),
+        "techcrunch_ai": ("https://techcrunch.com/category/artificial-intelligence/feed/", "tech_media", "news_media"),
+        "the_verge_ai": ("https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", "tech_media", "news_media"),
+        "hacker_news_ai": ("https://hnrss.org/newest?q=AI", "hacker_news", "community_social"),
+    }
+    for source_id, (url, group, content_class) in expected.items():
+        source = source_by_id[source_id]
+        assert source.url == url
+        assert source.source_group == group
+        assert source.content_class == content_class
+        assert source.feed is not None
+
+    assert source_by_id["the_verge_ai"].feed.format == "atom"
+    assert source_by_id["ithome_ai_news"].selection_policy.max_age_days == 3
+    assert source_by_id["ithome_ai_news"].bypass_proxy is True
+    assert source_by_id["hacker_news_ai"].bypass_proxy is True
+    assert source_by_id["the_decoder_ai_news"].selection_policy.keywords == ()
+
+
+def test_default_registry_includes_aihot_official_x_accounts():
+    result = load_source_registry(env={"RSSHUB_BASE_URL": "https://rsshub.example"})
+    source_by_id = {source.id: source for source in result.sources}
+
+    expected_handles = {
+        "x_account_baidu": "Baidu_Inc",
+        "x_account_alibaba_cloud": "alibaba_cloud",
+        "x_account_siliconflow": "SiliconFlowAI",
+        "x_account_openrouter": "OpenRouter",
+        "x_account_runway": "runwayml",
+        "x_account_replit": "Replit",
+        "x_account_openbmb": "OpenBMB",
+        "x_account_sensetime": "SenseTime_AI",
+        "x_account_antling": "AntLingAGI",
+    }
+    for source_id, handle in expected_handles.items():
+        source = source_by_id[source_id]
+        assert source.source_group == "x_official"
+        assert source.content_class == "official_model_company"
+        assert source.tier == "p1"
+        assert source.primary_eligible is True
+        assert source.selection_policy.mode == "first_party_recent"
+        assert source.selection_policy.max_age_days == 7
+        assert source.url.endswith(f"/twitter/user/{handle}")
+        assert source.account_url == f"https://x.com/{handle}"
+
+
 def test_legacy_routing_fields_are_rejected(tmp_path):
     path = tmp_path / "source_registry.yaml"
     path.write_text(
@@ -244,7 +297,7 @@ sources:
 
 
 def test_enabled_sources_use_canonical_groups_and_governance_defaults():
-    result = load_source_registry(env={})
+    result = load_source_registry(env={"RSSHUB_BASE_URL": "https://rsshub.example"})
     canonical = {
         "official_blog",
         "official_research",
@@ -252,18 +305,37 @@ def test_enabled_sources_use_canonical_groups_and_governance_defaults():
         "github_release",
         "github_search",
         "producthunt",
+        "hacker_news",
         "reddit_fixed",
         "reddit_search",
         "linux_do",
         "x_official",
         "x_social",
         "x_search",
+        "tech_media",
     }
     assert result.sources
     assert all(source.source_group in canonical for source in result.sources)
     assert all(source.tier in {"p1", "p2", "p3", "p4"} for source in result.sources)
     assert all(source.topic_scopes for source in result.sources)
-    assert all(not source.primary_eligible for source in result.sources if source.source_group.startswith("x_"))
+    first_party_x_sources = [
+        source
+        for source in result.sources
+        if source.source_group == "x_official"
+        and source.source_role == "official"
+        and source.source_subtype == "account"
+    ]
+    assert first_party_x_sources
+    assert all(source.content_class == "official_model_company" for source in first_party_x_sources)
+    assert all(source.tier == "p1" for source in first_party_x_sources)
+    assert all(source.primary_eligible for source in first_party_x_sources)
+    assert all(source.selection_policy.mode == "first_party_recent" for source in first_party_x_sources)
+    assert all(source.selection_policy.max_age_days == 7 for source in first_party_x_sources)
+    assert all(
+        not source.primary_eligible
+        for source in result.sources
+        if source.source_group in {"x_social", "x_search"}
+    )
 
 
 def test_default_registry_contains_v3_official_feeds_and_x_handles():
@@ -271,6 +343,7 @@ def test_default_registry_contains_v3_official_feeds_and_x_handles():
     source_by_id = {source.id: source for source in result.sources}
     assert source_by_id["anthropic_news_rsshub"].source_group == "official_blog"
     assert source_by_id["anthropic_research_rsshub"].source_group == "official_research"
+    assert source_by_id["anthropic_research_rsshub"].url == "https://rsshub.example/anthropic/research?limit=6"
     assert source_by_id["anthropic_engineering_rsshub"].source_group == "official_research"
     assert source_by_id["x_account_chatgpt"].url.endswith("/twitter/user/ChatGPT")
     assert source_by_id["x_account_xai"].url.endswith("/twitter/user/spacexai")
@@ -281,6 +354,9 @@ def test_default_registry_contains_v3_official_feeds_and_x_handles():
     }.items():
         source = source_by_id[source_id]
         assert source.source_group == "x_official"
-        assert source.primary_eligible is False
+        assert source.content_class == "official_model_company"
+        assert source.tier == "p1"
+        assert source.primary_eligible is True
+        assert source.selection_policy.mode == "first_party_recent"
         assert handle in source.url
         assert source.account_url == f"https://x.com/{handle}"

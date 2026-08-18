@@ -14,11 +14,11 @@ from app.config.limits import (
 )
 from app.config.settings import Settings
 from app.jobs.ai_review_job import AIReviewResult, run_ai_review_from_settings
-from app.jobs.editorial_rank_job import EditorialRankResult, run_editorial_rank_from_settings
 from app.jobs.event_cluster_job import EventClusterResult, run_event_cluster_from_settings
 from app.jobs.export_job import IntelExportResult, run_intel_export_from_settings
 from app.jobs.fetch_job import IntelFetchResult, run_intel_fetch_from_settings
 from app.jobs.pipeline_orchestrator import PipelineRunResult, run_pipeline_once_from_settings
+from app.jobs.stage_d_job import StageDResult, run_stage_d_from_settings
 
 
 IntelRunResult = PipelineRunResult
@@ -59,6 +59,6 @@ def run_intel_once_from_settings(
         fetch_runner=run_intel_fetch_from_settings,
         ai_review_runner=run_ai_review_from_settings,
         event_cluster_runner=run_event_cluster_from_settings,
-        editorial_rank_runner=run_editorial_rank_from_settings,
+        stage_d_runner=run_stage_d_from_settings,
         export_runner=run_intel_export_from_settings,
     )

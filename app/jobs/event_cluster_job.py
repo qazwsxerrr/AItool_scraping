@@ -18,17 +18,22 @@ from sqlalchemy.orm import Session, joinedload, sessionmaker
 from app.ai.event_resolution import event_resolution_client_from_settings, resolve_event_group
 from app.ai.skills.intel_triage import normalize_url
 from app.config.limits import DEFAULT_AI_REVIEW_LIMIT, RECENT_WINDOW_HOURS
+from app.domain.models import COMMUNITY_SOCIAL
+from app.domain.policies import is_first_party_x_source
 from app.domain.recency import recent_window_decision
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelEventRankingSnapshot, IntelItem, IntelRun, IntelRunItem
+from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelEventStageDSnapshot, IntelItem, IntelRun, IntelRunItem
 from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
 _STOPWORDS = {"a", "an", "and", "for", "from", "new", "the", "to", "of", "in", "on", "with", "发布", "推出", "上线", "更新", "官方", "ai", "model", "release", "update"}
-SEMANTIC_REPEAT_THRESHOLD = 0.70
-SEMANTIC_AMBIGUITY_THRESHOLD = 0.45
+# Stage C v2: only a high-confidence, multi-signal match is merged without
+# review.  Lower candidate matches are an AI ambiguity problem, never an
+# implicit transitive merge.
+SEMANTIC_REPEAT_THRESHOLD = 0.80
+SEMANTIC_AMBIGUITY_THRESHOLD = 0.55
 
 
 @dataclass
@@ -117,28 +122,60 @@ def _normalize_external_id(value: Any) -> str | None:
 
 
 def exact_identity_keys(value: Any) -> tuple[str, ...]:
+    """Return stable identity anchors only (URL/external id, never title)."""
+
     values = _mapping(value)
     url = canonical_event_url(values.get("canonical_url") or values.get("url") or values.get("source_url"))
     external_id = _normalize_external_id(values.get("external_id") or values.get("guid"))
-    title = normalize_event_title(values.get("normalized_title") or values.get("title") or values.get("original_title"))
     keys: list[str] = []
     if url:
         keys.append(f"url:{url}")
     if external_id:
         keys.append(f"external:{external_id}")
-    if title:
-        keys.append(f"title:{title}")
     return tuple(dict.fromkeys(keys))
+
+
+def _weak_title_key(value: Any) -> str | None:
+    values = _mapping(value)
+    title = normalize_event_title(values.get("normalized_title") or values.get("title") or values.get("original_title"))
+    return f"title:{title}" if title else None
+
+
+def _strong_identity_keys(value: Any) -> frozenset[str]:
+    return frozenset(key for key in exact_identity_keys(value) if key.startswith(("url:", "external:")))
 
 
 def canonical_event_key(value: Any) -> str:
     keys = exact_identity_keys(value)
-    return keys[0] if keys else "title:unknown"
+    if keys:
+        return keys[0]
+    values = _mapping(value)
+    for name in ("id", "item_id", "primary_item_id"):
+        try:
+            item_id = int(values.get(name))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if item_id > 0:
+            # A title-only item is a weak identity candidate, not a durable
+            # event key.  The primary item ID keeps it distinct until Stage C
+            # can establish a real URL/external-id or an explicit AI merge.
+            return f"item:{item_id}"
+    return _weak_title_key(value) or "item:unknown"
+
+
+def _text_tokens(value: Any) -> frozenset[str]:
+    normalized = normalize_event_title(value)
+    words = {token for token in re.findall(r"[a-z0-9_]+", normalized) if token not in _STOPWORDS and len(token) > 1}
+    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", normalized))
+    if len(cjk) >= 2:
+        words.update(cjk[index : index + 2] for index in range(len(cjk) - 1))
+    elif cjk:
+        words.add(cjk)
+    return frozenset(words)
 
 
 def _title_tokens(value: Any) -> frozenset[str]:
-    normalized = normalize_event_title(value)
-    return frozenset(token for token in re.findall(r"[\w\u4e00-\u9fff]+", normalized) if token not in _STOPWORDS and len(token) > 1)
+    return _text_tokens(value)
 
 
 def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
@@ -203,19 +240,25 @@ def _json_objects(value: Any) -> list[dict[str, Any]]:
 
 
 def _semantic_match_components(left: Any, right: Any) -> tuple[float, float, float, float]:
-    """Return title, keyword, entity, and combined semantic match scores."""
+    """Return title, keyword, entity and v2 weighted semantic score.
+
+    The public tuple shape remains stable for callers; summary similarity is
+    deliberately included in the combined score rather than being hidden
+    behind a title-only shortcut.
+    """
 
     title_score = _jaccard(_title_tokens(_field(left, "title") or _field(left, "normalized_title")), _title_tokens(_field(right, "title") or _field(right, "normalized_title")))
+    summary_score = _jaccard(
+        _text_tokens(_field(left, "summary_cn") or _field(left, "summary")),
+        _text_tokens(_field(right, "summary_cn") or _field(right, "summary")),
+    )
     left_keywords = _field(left, "keywords", [])
     right_keywords = _field(right, "keywords", _json_list(_field(right, "keywords_json")))
     keyword_score = _jaccard(_normalized_keyword_terms(left_keywords), _normalized_keyword_terms(right_keywords))
     left_entities = _field(left, "entities", [])
     right_entities = _field(right, "entities", _json_objects(_field(right, "entities_json")))
     entity_score = _jaccard(_typed_entity_keys(left_entities), _typed_entity_keys(right_entities))
-    # Title remains the strongest deterministic signal; metadata can rescue a
-    # close paraphrase only when both normalized keywords and typed entities
-    # agree.  Auto-repeat is gated at SEMANTIC_REPEAT_THRESHOLD below.
-    combined_score = max(title_score, 0.50 * title_score + 0.30 * keyword_score + 0.20 * entity_score)
+    combined_score = 0.40 * title_score + 0.25 * summary_score + 0.20 * entity_score + 0.15 * keyword_score
     return title_score, keyword_score, entity_score, combined_score
 
 
@@ -223,48 +266,12 @@ def _semantic_match_score(left: Any, right: Any) -> float:
     return _semantic_match_components(left, right)[3]
 
 
-def cluster_candidates(candidates: Iterable[Any], *, title_threshold: float = 0.45, fuzzy: bool = True) -> list[list[Any]]:
+def cluster_candidates(candidates: Iterable[Any], *, title_threshold: float = SEMANTIC_AMBIGUITY_THRESHOLD, fuzzy: bool = True) -> list[list[Any]]:
     rows = [_candidate(value) for value in candidates]
     if not rows:
         return []
-    parent = list(range(len(rows)))
-    kinds: dict[tuple[int, int], str] = {}
-
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    def union(left: int, right: int, kind: str) -> None:
-        left_root, right_root = find(left), find(right)
-        if left_root != right_root:
-            parent[right_root] = left_root
-        kinds[tuple(sorted((left, right)))] = kind
-
-    owners: dict[str, int] = {}
-    for index, row in enumerate(rows):
-        for identity in row["identity_keys"]:
-            if identity in owners:
-                union(owners[identity], index, "exact")
-            else:
-                owners[identity] = index
-    if fuzzy:
-        for left in range(len(rows)):
-            for right in range(left + 1, len(rows)):
-                if find(left) == find(right) or not _compatible_candidate(rows[left], rows[right]):
-                    continue
-                if _semantic_match_score(rows[left], rows[right]) >= title_threshold:
-                    union(left, right, "fuzzy")
-    grouped: dict[int, list[Any]] = {}
-    order: list[int] = []
-    for index, row in enumerate(rows):
-        root = find(index)
-        if root not in grouped:
-            grouped[root] = []
-            order.append(root)
-        grouped[root].append(row["item"])
-    return [grouped[root] for root in order]
+    groups = _safe_groups(rows, fuzzy_threshold=title_threshold if fuzzy else None)
+    return [[row["item"] for row in group] for group, _ambiguous in groups]
 
 
 def build_candidate_clusters(candidates: Iterable[Any], **kwargs: Any) -> list[list[Any]]:
@@ -274,15 +281,71 @@ def build_candidate_clusters(candidates: Iterable[Any], **kwargs: Any) -> list[l
 def _candidate(value: Any) -> dict[str, Any]:
     values = _mapping(value)
     title = values.get("title") or values.get("original_title") or ""
-    return {"item": value, "identity_keys": exact_identity_keys(values), "title": str(title), "title_tokens": _title_tokens(title), "topic": _text(values.get("topic")), "content_class": _text(values.get("content_class")), "keywords": values.get("keywords", []), "entities": values.get("entities", [])}
+    return {"item": value, "identity_keys": exact_identity_keys(values), "title": str(title), "summary_cn": values.get("summary_cn") or values.get("summary"), "title_tokens": _title_tokens(title), "topic": _text(values.get("topic")), "content_class": _text(values.get("content_class")), "keywords": values.get("keywords", []), "entities": values.get("entities", [])}
 
 
 def _compatible_candidate(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    left_topic, right_topic = left.get("topic"), right.get("topic")
-    if left_topic and right_topic and left_topic != right_topic:
-        return False
-    left_class, right_class = left.get("content_class"), right.get("content_class")
-    return not (left_class and right_class and left_class != right_class)
+    # Topic/content class describe presentation, not real-world identity.
+    # They must not force two reports about one announcement apart.
+    del left, right
+    return True
+
+
+def _safe_groups(
+    rows: Sequence[dict[str, Any]],
+    *,
+    fuzzy_threshold: float | None,
+) -> list[tuple[list[dict[str, Any]], bool]]:
+    """Build conservative groups without union-find transitive collapse.
+
+    A new fuzzy member must satisfy the threshold against every member of the
+    candidate group.  Thus A~B and B~C cannot pull C into A's event when
+    A~C is weak.  URL/external identity anchors may still join directly.
+    """
+
+    groups: list[list[dict[str, Any]]] = []
+    for row in rows:
+        anchors = set(row.get("identity_keys", ()))
+        exact_indexes = [
+            index
+            for index, group in enumerate(groups)
+            if anchors and any(anchors & set(member.get("identity_keys", ())) for member in group)
+        ]
+        if exact_indexes:
+            first = exact_indexes[0]
+            groups[first].append(row)
+            # Strong identity may bridge aliases.  This is intentionally the
+            # only transitive operation; fuzzy signals never use it.
+            for index in reversed(exact_indexes[1:]):
+                groups[first].extend(groups.pop(index))
+            continue
+        if fuzzy_threshold is None:
+            groups.append([row])
+            continue
+        eligible: list[tuple[float, int]] = []
+        for index, group in enumerate(groups):
+            if not all(_compatible_candidate(row, member) for member in group):
+                continue
+            scores = [_semantic_match_score(row, member) for member in group]
+            if scores and min(scores) >= fuzzy_threshold:
+                eligible.append((sum(scores) / len(scores), index))
+        if eligible:
+            _score, index = max(eligible, key=lambda value: (value[0], -value[1]))
+            groups[index].append(row)
+        else:
+            groups.append([row])
+
+    result: list[tuple[list[dict[str, Any]], bool]] = []
+    for group in groups:
+        fuzzy_scores = [
+            _semantic_match_score(group[left], group[right])
+            for left in range(len(group))
+            for right in range(left + 1, len(group))
+            if not (set(group[left].get("identity_keys", ())) & set(group[right].get("identity_keys", ())))
+        ]
+        ambiguous = bool(fuzzy_scores and min(fuzzy_scores) < SEMANTIC_REPEAT_THRESHOLD)
+        result.append((group, ambiguous))
+    return result
 
 
 def run_event_cluster_job(
@@ -350,7 +413,7 @@ def run_event_cluster_job(
                     subject_id=int(run_id),
                     target_run_id=int(run_id),
                     input_fingerprint=input_fingerprint,
-                    config_fingerprint="cluster-v1",
+                    config_fingerprint="cluster-v2",
                 )
                 claimed = repo.claim_stage_task(
                     stage,
@@ -358,13 +421,13 @@ def run_event_cluster_job(
                     owner=owner,
                     force=force,
                     input_fingerprint=input_fingerprint,
-                    config_fingerprint="cluster-v1",
+                    config_fingerprint="cluster-v2",
                 )
                 if claimed is None:
                     if repo.task_is_reusable(
                         stage_task,
                         input_fingerprint=input_fingerprint,
-                        config_fingerprint="cluster-v1",
+                        config_fingerprint="cluster-v2",
                     ):
                         stored = _mapping(stage_task.result)
                         result.event_ids = _event_id_list(stored.get("event_ids"))
@@ -496,8 +559,14 @@ def _cluster_input_fingerprint(candidates: Sequence[Mapping[str, Any]]) -> str:
         {
             "id": int(value.get("id")),
             "title": value.get("title"),
+            "summary_cn": value.get("summary_cn"),
             "url": value.get("canonical_url"),
             "external_id": value.get("external_id"),
+            "topic": value.get("topic"),
+            "content_class": value.get("content_class"),
+            "keywords": value.get("keywords"),
+            "entities": value.get("entities"),
+            "published_at": _iso_datetime(value.get("published_at")),
             "score": value.get("selection_score"),
         }
         for value in candidates
@@ -651,7 +720,7 @@ def _analysis_result_is_filtered(value: Any) -> bool:
 
 def _load_history_events(session: Session, *, current: datetime, snapshot_key: str) -> list[IntelEvent]:
     since = current - timedelta(hours=72)
-    snapshot_ids = select(IntelEventRankingSnapshot.event_id).where(IntelEventRankingSnapshot.snapshot_key == snapshot_key, IntelEventRankingSnapshot.selected.is_(True))
+    snapshot_ids = select(IntelEventStageDSnapshot.event_id).where(IntelEventStageDSnapshot.snapshot_key == snapshot_key, IntelEventStageDSnapshot.selected.is_(True))
     stmt = select(IntelEvent).options(joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_review), joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.source), joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source)).where(or_(IntelEvent.last_seen_at >= since, IntelEvent.first_seen_at >= since, IntelEvent.id.in_(snapshot_ids))).order_by(IntelEvent.id.asc())
     return list(session.scalars(stmt).unique().all())
 
@@ -673,67 +742,54 @@ def _item_candidate(item: IntelItem) -> dict[str, Any]:
 
 
 def _cluster_rows(candidates: Sequence[dict[str, Any]]) -> list[tuple[list[dict[str, Any]], bool]]:
-    if not candidates:
-        return []
-    parent = list(range(len(candidates)))
-    kinds: dict[tuple[int, int], str] = {}
-
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    def union(left: int, right: int, kind: str) -> None:
-        left_root, right_root = find(left), find(right)
-        if left_root != right_root:
-            parent[right_root] = left_root
-        kinds[tuple(sorted((left, right)))] = kind
-
-    owners: dict[str, int] = {}
-    for index, candidate in enumerate(candidates):
-        for identity in candidate["identity_keys"]:
-            if identity in owners:
-                union(owners[identity], index, "exact")
-            else:
-                owners[identity] = index
-    for left in range(len(candidates)):
-        for right in range(left + 1, len(candidates)):
-            if find(left) == find(right) or not _compatible_candidate(candidates[left], candidates[right]):
-                continue
-            score = _semantic_match_score(candidates[left], candidates[right])
-            if score >= SEMANTIC_AMBIGUITY_THRESHOLD:
-                union(left, right, "semantic_strong" if score >= SEMANTIC_REPEAT_THRESHOLD else "semantic_ambiguous")
-    groups: dict[int, list[dict[str, Any]]] = {}
-    order: list[int] = []
-    for index, candidate in enumerate(candidates):
-        root = find(index)
-        if root not in groups:
-            groups[root] = []
-            order.append(root)
-        groups[root].append(candidate)
-    result: list[tuple[list[dict[str, Any]], bool]] = []
-    for root in order:
-        members = groups[root]
-        ambiguous = any(kinds.get(tuple(sorted((left, right)))) == "semantic_ambiguous" for left in range(len(candidates)) for right in range(left + 1, len(candidates)) if find(left) == root and find(right) == root)
-        result.append((members, ambiguous))
-    return result
+    return _safe_groups(list(candidates), fuzzy_threshold=SEMANTIC_AMBIGUITY_THRESHOLD)
 
 
 def _resolve_ambiguous_group(values: list[dict[str, Any]], *, ai_client: Any | None, ambiguous: bool) -> _GroupResolution:
     if not ambiguous:
         return _GroupResolution((tuple(values),), "deterministic", 100)
     if ai_client is None:
-        return _GroupResolution((tuple(values),), "deterministic_fallback", 0, risk_flags=("cluster:ambiguous",))
+        return _GroupResolution(tuple((value,) for value in values), "deterministic_fallback", 0, risk_flags=("ambiguous_unresolved",))
     resolver = _find_resolver(ai_client)
     if resolver is None:
-        return _GroupResolution((tuple(values),), "deterministic_fallback", 0, risk_flags=("resolver_missing",))
+        return _GroupResolution(tuple((value,) for value in values), "deterministic_fallback", 0, risk_flags=("resolver_missing", "ambiguous_unresolved"))
     evidence = resolve_event_group(values, resolver)
-    if evidence.decision == "merge" and evidence.confidence >= 60:
+    if evidence.decision == "merge" and evidence.confidence >= 80:
         return _GroupResolution((tuple(values),), "ai_merge", evidence.confidence, evidence.raw)
+    if evidence.decision == "partition" and evidence.confidence >= 80:
+        groups = _resolution_partition(values, evidence.groups)
+        if groups is not None:
+            return _GroupResolution(groups, "ai_partition", evidence.confidence, evidence.raw)
     if evidence.decision == "separate":
         return _GroupResolution(tuple((value,) for value in values), "ai_separate", evidence.confidence, evidence.raw)
-    return _GroupResolution((tuple(values),), "deterministic_fallback", 0, evidence.raw, ("resolver_failed",))
+    return _GroupResolution(tuple((value,) for value in values), "deterministic_fallback", 0, evidence.raw, ("resolver_failed", "ambiguous_unresolved"))
+
+
+def _resolution_partition(
+    values: Sequence[Mapping[str, Any]],
+    groups: Sequence[Sequence[int]],
+) -> tuple[tuple[dict[str, Any], ...], ...] | None:
+    """Accept only a complete, disjoint partition of the supplied item ids."""
+
+    by_id = {int(value["id"]): dict(value) for value in values if value.get("id") is not None}
+    expected = set(by_id)
+    assigned: set[int] = set()
+    resolved: list[tuple[dict[str, Any], ...]] = []
+    for raw_group in groups:
+        ids: list[int] = []
+        for raw_id in raw_group:
+            try:
+                item_id = int(raw_id)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if item_id not in by_id:
+                return None
+            ids.append(item_id)
+        if not ids or len(ids) != len(set(ids)) or any(item_id in assigned for item_id in ids):
+            return None
+        assigned.update(ids)
+        resolved.append(tuple(by_id[item_id] for item_id in ids))
+    return tuple(resolved) if assigned == expected and resolved else None
 
 
 def resolve_ambiguous_group(values: Iterable[Any], ai_client: Any | None = None) -> list[list[Any]]:
@@ -756,7 +812,7 @@ def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, cur
     match, match_kind = _match_history_event(values, history_events, current=current, run_id=run_id, in_run_events=in_run_events)
     if match is not None and match_kind == "ambiguous_semantic":
         match, match_kind, resolver = _resolve_history_ambiguity(values, match, resolver=resolver, ai_client=ai_client)
-    if group_resolution_method == "ai_separate" and match_kind in {"repeat_semantic", "repeat_semantic_ai"}:
+    if group_resolution_method in {"ai_separate", "ai_partition", "deterministic_fallback"} and match_kind in {"repeat_semantic", "repeat_semantic_ai"}:
         match, match_kind = None, "new"
     is_new = match is None
     if match is not None:
@@ -776,11 +832,49 @@ def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, cur
     repo = IntelRepository(session)
     event = repo.upsert_event(**projection)
     for member in values:
-        exact = bool(set(member.get("identity_keys", ())) & set(_json_list(event.identity_keys_json)))
-        relation_type = match_kind if match is not None else ("exact" if exact else resolver.method)
-        repo.upsert_event_item(event.id, int(member["id"]), source_id=member.get("source_id"), source_group=member.get("source_group"), identity_key=_strongest_identity(member), match_type=relation_type, match_confidence=100 if relation_type in {"exact", "repeat_exact"} else max(0, resolver.confidence), is_primary=int(member["id"]) == int(projection["primary_item_id"]), lineage={"run_id": run_id, "provenance": "new" if is_new else "repeat", "match_type": relation_type, "source_id": member.get("source_id"), "source_group": member.get("source_group"), "canonical_url": member.get("canonical_url"), "external_id": member.get("external_id"), "title": member.get("title")})
+        exact = bool(_strong_identity_keys(member) & _strong_identity_keys({"canonical_url": event.canonical_url, "external_id": event.external_id}))
+        relation_type = match_kind if match is not None else ("exact_url_or_external" if exact else resolver.method)
+        repo.upsert_event_item(event.id, int(member["id"]), source_id=member.get("source_id"), source_group=member.get("source_group"), identity_key=_strongest_identity(member), match_type=relation_type, match_confidence=100 if relation_type in {"exact_url_or_external", "repeat_exact"} else max(0, resolver.confidence), is_primary=int(member["id"]) == int(projection["primary_item_id"]), lineage={"run_id": run_id, "provenance": "new" if is_new else "repeat", "match_type": relation_type, "source_id": member.get("source_id"), "source_group": member.get("source_group"), "canonical_url": member.get("canonical_url"), "external_id": member.get("external_id"), "title": member.get("title")})
+    _reconcile_event_social_only_risk(event)
     session.flush()
     return event, is_new, match_kind
+
+
+def _reconcile_event_social_only_risk(event: IntelEvent) -> None:
+    """Keep the event-level social-only flag aligned with its full lineage.
+
+    A historical official-X row can carry the former community classification.
+    The strict source identity triple remains authoritative, so an event with
+    any first-party or other non-community member is not a social-only event.
+    Individual source/item audits retain their original risk flags.
+    """
+
+    members = list(event.event_items)
+    if not members:
+        return
+    community_members = [member for member in members if _event_member_is_community(member)]
+    trusted_members = [member for member in members if not _event_member_is_community(member)]
+    flags = [flag for flag in _json_list(event.risk_flags_json) if flag != "source:social_only"]
+    if community_members and not trusted_members:
+        flags.append("source:social_only")
+    event.risk_flags_json = json.dumps(_clean_strings(flags), ensure_ascii=False)
+
+
+def _event_member_is_community(member: IntelEventItem) -> bool:
+    item = member.item
+    source = member.source or (item.source if item is not None else None)
+    # The configured account identity is stronger than stale stored classes
+    # from before the first-party X policy was introduced.
+    if source is not None and is_first_party_x_source(source):
+        return False
+    review = item.ai_review if item is not None else None
+    content_class = _text(
+        (review.content_class if review is not None else None)
+        or (item.content_class if item is not None else None)
+        or (source.content_class if source is not None else None)
+    )
+    review_flags = set(review.risk_flags if review is not None else [])
+    return content_class == COMMUNITY_SOCIAL or "source:social_only" in review_flags
 
 
 def _resolve_history_ambiguity(values: Sequence[Mapping[str, Any]], event: IntelEvent, *, resolver: _GroupResolution, ai_client: Any | None) -> tuple[IntelEvent | None, str, _GroupResolution]:
@@ -792,7 +886,7 @@ def _resolve_history_ambiguity(values: Sequence[Mapping[str, Any]], event: Intel
     if client_resolver is None:
         return None, "new_ambiguous", _GroupResolution(resolver.groups, "deterministic_fallback", 0, risk_flags=("history:resolver_missing",))
     evidence = resolve_event_group([*values, _event_resolution_value(event)], client_resolver)
-    if evidence.decision == "merge" and evidence.confidence >= 60:
+    if evidence.decision == "merge" and evidence.confidence >= 80:
         return event, "repeat_semantic_ai", _GroupResolution(resolver.groups, "ai_merge", evidence.confidence, evidence.raw)
     if evidence.decision == "separate":
         return None, "new", _GroupResolution(resolver.groups, "ai_separate", evidence.confidence, evidence.raw)
@@ -802,6 +896,8 @@ def _resolve_history_ambiguity(values: Sequence[Mapping[str, Any]], event: Intel
 def _event_resolution_value(event: IntelEvent) -> dict[str, Any]:
     return {
         "id": event.id,
+        "canonical_url": event.canonical_url,
+        "external_id": event.external_id,
         "title": event.title,
         "summary_cn": event.summary_cn,
         "topic": event.topic,
@@ -814,25 +910,21 @@ def _event_resolution_value(event: IntelEvent) -> dict[str, Any]:
 
 
 def _match_history_event(values: Sequence[Mapping[str, Any]], history_events: Sequence[IntelEvent], *, current: datetime, run_id: int | None, in_run_events: Mapping[int, IntelEvent]) -> tuple[IntelEvent | None, str]:
-    candidate_ids = {identity for value in values for identity in value.get("identity_keys", ())}
+    candidate_ids = {identity for value in values for identity in _strong_identity_keys(value)}
     item_ids = {int(value["id"]) for value in values if value.get("id") is not None}
     seen: set[int] = set()
     for event in [*in_run_events.values(), *history_events]:
         if event.id in seen:
             continue
         seen.add(event.id)
-        if any(int(relation.item_id) in item_ids for relation in event.event_items) or candidate_ids & set(_json_list(event.identity_keys_json)):
+        event_identity = _strong_identity_keys({"canonical_url": event.canonical_url, "external_id": event.external_id})
+        if any(int(relation.item_id) in item_ids for relation in event.event_items) or candidate_ids & event_identity:
             return event, "repeat_exact" if (run_id is None or event.new_in_run_id != run_id) else "same_run"
     primary = max(values, key=lambda value: (_number(value.get("selection_score")), _as_utc(value.get("published_at")) or datetime.min.replace(tzinfo=timezone.utc)))
-    topic, content_class = _text(primary.get("topic")), _text(primary.get("content_class"))
     candidates: list[tuple[float, IntelEvent]] = []
     for event in [*in_run_events.values(), *history_events]:
         event_time = _as_utc(event.last_seen_at or event.first_seen_at)
         if event_time is None or event_time < current - timedelta(hours=72):
-            continue
-        if topic and event.topic and topic.casefold() != str(event.topic).casefold():
-            continue
-        if content_class and event.content_class and content_class != event.content_class:
             continue
         similarity = _semantic_match_score(primary, event)
         if similarity >= SEMANTIC_AMBIGUITY_THRESHOLD:
@@ -942,6 +1034,11 @@ def _as_utc(value: Any) -> datetime | None:
     if value is None or not isinstance(value, datetime):
         return None
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _iso_datetime(value: Any) -> str | None:
+    current = _as_utc(value)
+    return current.isoformat() if current is not None else None
 
 
 __all__ = ["ClusterResult", "EventClusterResult", "build_candidate_clusters", "canonical_event_key", "canonical_event_url", "cluster_candidates", "exact_identity_keys", "normalize_event_title", "resolve_ambiguous_group", "run_cluster_job", "run_event_cluster_from_settings", "run_event_cluster_job"]

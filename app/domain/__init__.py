@@ -3,6 +3,7 @@
 from .models import (
     COMMUNITY_SOCIAL,
     CONTENT_CLASSES,
+    NEWS_MEDIA,
     OFFICIAL_MODEL_COMPANY,
     PROJECT_TOOL,
     ContentClass,
@@ -34,6 +35,7 @@ from .scoring import score_item
 __all__ = [
     "COMMUNITY_SOCIAL",
     "CONTENT_CLASSES",
+    "NEWS_MEDIA",
     "OFFICIAL_MODEL_COMPANY",
     "PROJECT_TOOL",
     "ContentClass",

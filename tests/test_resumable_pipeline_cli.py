@@ -21,7 +21,7 @@ runner = CliRunner()
 def test_pipeline_help_lists_formal_commands():
     result = runner.invoke(main.app, ["pipeline", "--help"])
     assert result.exit_code == 0
-    for command in ("run", "start", "stage-a", "stage-b", "stage-c", "rank", "export", "status", "retry", "resume", "adopt-existing"):
+    for command in ("run", "start", "stage-a", "stage-b", "stage-c", "stage-d", "export", "status", "retry", "resume", "adopt-existing"):
         assert command in result.stdout
 
 
@@ -109,7 +109,7 @@ def test_manual_pipeline_run_status_finalizes_only_after_export(tmp_path):
     with session_factory() as session:
         repo = IntelRepository(session)
         run = repo.start_run(reference_time=datetime.now(timezone.utc))
-        for stage_name in ("fetch", "screen", "analyze", "cluster", "rank"):
+        for stage_name in ("fetch", "screen", "analyze", "cluster", "stage_d"):
             stage = repo.ensure_stage(run.id, stage_name)
             repo.finish_stage(stage, status="succeeded")
         session.commit()
@@ -176,7 +176,7 @@ def test_pipeline_run_auto_creates_and_reuses_run_id(tmp_path, monkeypatch):
         reference_time=datetime.now(timezone.utc),
         scope_frozen=True,
     )
-    resume = orchestrator.PipelineResumeResult(run_id=42, ran_stages=["screen", "analyze", "cluster", "rank", "export"])
+    resume = orchestrator.PipelineResumeResult(run_id=42, ran_stages=["screen", "analyze", "cluster", "stage_d", "export"])
 
     def fake_start(**kwargs):
         seen["start_limit"] = kwargs["limit"]
@@ -240,7 +240,7 @@ def test_partial_stage_successes_allow_downstream_and_finalize_partial(tmp_path)
         for index, status in enumerate(("succeeded", "retry_waiting"), start=10):
             task = repo.ensure_stage_task(analyze, subject_type="item", subject_id=index, item_id=index)
             task.status = status
-        for stage_name in ("screen", "analyze", "cluster", "rank", "export"):
+        for stage_name in ("screen", "analyze", "cluster", "stage_d", "export"):
             stage = repo.get_stage(run.id, stage_name)
             if stage is not None:
                 repo.refresh_stage_status(stage)
@@ -259,11 +259,11 @@ def test_partial_stage_successes_allow_downstream_and_finalize_partial(tmp_path)
         repo.refresh_stage_status(cluster)
         session.commit()
 
-    assert orchestrator._stage_needs_resume(session_factory, run_id, "rank") is True
+    assert orchestrator._stage_needs_resume(session_factory, run_id, "stage_d") is True
 
     with session_factory() as session:
         repo = IntelRepository(session)
-        for stage_name in ("rank", "export"):
+        for stage_name in ("stage_d", "export"):
             stage = repo.ensure_stage(run_id, stage_name)
             task = repo.ensure_stage_task(stage, subject_type="run", subject_id=run_id, target_run_id=run_id)
             task.status = "succeeded"

@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 
 from app.domain.models import FetchBatch, FetchItem, SourceSpec
+from app.jobs.fetch_job import run_intel_fetch_job
 from app.jobs.fetch_only_job import run_fetch_only_export_job, run_fetch_only_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import IntelItem
@@ -36,9 +37,11 @@ class _Router:
     def __init__(self, batches):
         self.batches = batches
         self.calls = []
+        self.request_headers = []
 
     def collect(self, source, limit, request_headers=None):
         self.calls.append(source.id)
+        self.request_headers.append(dict(request_headers or {}))
         return self.batches[source.id]
 
 
@@ -132,3 +135,39 @@ def test_fetch_only_isolates_one_failed_source_from_successful_sources(tmp_path)
     assert result.fetch.total_failed == 1
     assert result.export is not None
     assert result.export.exported == 1
+
+
+def test_force_fetch_omits_conditional_headers_and_retrieves_current_window(tmp_path):
+    session_factory = _db(tmp_path)
+    source = _source("conditional_source")
+    batch = FetchBatch(
+        source=source,
+        items=[
+            FetchItem(
+                source_id=source.id,
+                external_id="conditional:1",
+                title="Current item",
+                captured_at=datetime.now(timezone.utc),
+            )
+        ],
+        http_status=200,
+        etag='"etag-v1"',
+        transport="httpx",
+    )
+    router = _Router({source.id: batch})
+
+    run_intel_fetch_job(
+        session_factory=session_factory,
+        sources=[source],
+        router=router,
+        force=True,
+    )
+    result = run_intel_fetch_job(
+        session_factory=session_factory,
+        sources=[source],
+        router=router,
+        force=True,
+    )
+
+    assert result.stats[source.id].fetched == 1
+    assert router.request_headers == [{}, {}]

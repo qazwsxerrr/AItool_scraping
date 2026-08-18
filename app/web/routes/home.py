@@ -15,13 +15,16 @@ def index(
     request: Request,
     category: str | None = None,
     source_group: str | None = None,
+    run_date: str | None = None,
     repo: UIReadRepository = Depends(get_repository),
     github_reader: GitHubProjectReader = Depends(get_github_project_reader),
 ):
-    stats = repo.get_dashboard_stats()
+    active_snapshot = repo.resolve_snapshot(edition_date=run_date)
+    stats = repo.get_dashboard_stats(snapshot=active_snapshot)
     cards = repo.list_featured_cards(
         category=category,
         source_group=source_group,
+        snapshot=active_snapshot,
         limit=30,
     )
     github_projects = github_reader.list_projects(limit=5)
@@ -40,10 +43,12 @@ def index(
             "active_nav": "home",
             "stats": stats,
             "cards": cards,
-            "top_card": cards[0] if cards else None,
             "grouped_cards": grouped_cards,
             "category": category,
             "source_group": source_group,
+            "active_snapshot": active_snapshot,
+            "active_edition_date": active_snapshot.edition_date if active_snapshot else None,
+            "edition_options": repo.list_daily_editions(),
             "category_options": stats.category_counts,
             "source_options": stats.source_counts,
             "github_projects": github_projects.rows,

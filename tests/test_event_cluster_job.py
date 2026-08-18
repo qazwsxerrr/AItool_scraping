@@ -26,7 +26,7 @@ def _seed(session_factory, rows, run_id: int | None = None):
             session.add(Source(id=source_id, name=source_id, transport="feed", url=f"https://{source_id}.example", content_class="official_model_company", source_group=source_id))
         session.flush()
         for index, row in enumerate(rows, start=1):
-            item = IntelItem(source_id=row["source_id"], canonical_url=row.get("url"), external_id=row.get("external_id"), title=row["title"], content_class="official_model_company", content_hash=f"{row['source_id']}:{index}".encode().hex().ljust(64, "0")[:64], selection_score=row.get("score", 70), status="candidate", captured_at=now)
+            item = IntelItem(source_id=row["source_id"], canonical_url=row.get("url"), external_id=row.get("external_id"), title=row["title"], summary=row.get("summary"), content_class="official_model_company", content_hash=f"{row['source_id']}:{index}".encode().hex().ljust(64, "0")[:64], selection_score=row.get("score", 70), status="candidate", captured_at=now)
             session.add(item)
             session.flush()
             session.add(
@@ -38,6 +38,7 @@ def _seed(session_factory, rows, run_id: int | None = None):
                     topics_json=json.dumps(row.get("topics", ["model"]), ensure_ascii=False),
                     keywords_json=json.dumps(row.get("keywords", ["model"]), ensure_ascii=False),
                     entities_json=json.dumps(row.get("entities", []), ensure_ascii=False),
+                    summary_cn=row.get("summary"),
                     selection_score=item.selection_score,
                     status="success",
                 )
@@ -66,13 +67,173 @@ def test_exact_repeat_attaches_lineage_without_new_event():
         assert session.query(IntelEventItem).count() == 2
 
 
+def test_same_title_with_different_urls_is_a_weak_candidate_not_exact_identity():
+    session_factory = _db()
+    _seed(
+        session_factory,
+        [
+            {
+                "source_id": "a",
+                "title": "Platform announcement",
+                "url": "https://example.test/a",
+                "summary": "The platform announced a developer program.",
+            },
+            {
+                "source_id": "b",
+                "title": "Platform announcement",
+                "url": "https://example.test/b",
+                "summary": "The platform announced a separate regional partnership.",
+            },
+        ],
+    )
+
+    result = run_event_cluster_job(session_factory=session_factory)
+
+    assert result.events == 2
+    with session_factory() as session:
+        assert session.query(IntelEvent).count() == 2
+
+
+def test_fuzzy_grouping_does_not_transitively_merge_a_b_and_b_c():
+    groups = cluster_candidates(
+        [
+            {
+                "id": 1,
+                "title": "one two three four alpha",
+                "summary_cn": "one two three four alpha",
+                "keywords": ["one", "two", "three", "four", "alpha"],
+                "entities": [{"type": "term", "name": value} for value in ("one", "two", "three", "four", "alpha")],
+            },
+            {
+                "id": 2,
+                "title": "one two three four five",
+                "summary_cn": "one two three four five",
+                "keywords": ["one", "two", "three", "four", "five"],
+                "entities": [{"type": "term", "name": value} for value in ("one", "two", "three", "four", "five")],
+            },
+            {
+                "id": 3,
+                "title": "two three four five charlie",
+                "summary_cn": "two three four five charlie",
+                "keywords": ["two", "three", "four", "five", "charlie"],
+                "entities": [{"type": "term", "name": value} for value in ("two", "three", "four", "five", "charlie")],
+            },
+        ],
+        title_threshold=0.55,
+    )
+
+    assert [len(group) for group in groups] == [2, 1]
+
+
+def test_first_party_x_identity_removes_legacy_social_only_event_flag():
+    session_factory = _db()
+    now = datetime.now(timezone.utc)
+    with session_factory() as session:
+        source = Source(
+            id="legacy_official_x",
+            name="Legacy official X",
+            transport="rsshub",
+            url="https://rsshub.example/twitter/user/legacy",
+            source_group="x_official",
+            source_subtype="account",
+            source_role="official",
+            # Simulate a row written before the official-X policy change.
+            content_class="community_social",
+        )
+        item = IntelItem(
+            source=source,
+            canonical_url="https://x.com/legacy/status/1",
+            title="Official launch",
+            content_class="community_social",
+            content_hash="l" * 64,
+            selection_score=90,
+            status="candidate",
+            captured_at=now,
+        )
+        review = AIItemReview(
+            item=item,
+            content_class="community_social",
+            topic="model",
+            topics_json='["model"]',
+            selection_score=90,
+            risk_flags_json='["source:social_only"]',
+            status="success",
+        )
+        session.add_all([source, item, review])
+        session.commit()
+
+    result = run_event_cluster_job(session_factory=session_factory)
+    assert result.events == 1
+    with session_factory() as session:
+        event = session.query(IntelEvent).one()
+        assert "source:social_only" not in json.loads(event.risk_flags_json)
+
+
 def test_ambiguous_group_can_be_split_by_narrow_resolver():
     session_factory = _db()
-    _seed(session_factory, [{"source_id": "a", "title": "Orchid Systems processor"}, {"source_id": "b", "title": "Orchid Systems launch"}])
+    _seed(
+        session_factory,
+        [
+            {
+                "source_id": "a",
+                "title": "Orchid Systems processor announcement",
+                "summary": "Orchid Systems announced a new processor launch for developers.",
+                "keywords": ["orchid", "processor", "launch"],
+                "entities": [{"type": "company", "name": "Orchid Systems"}],
+            },
+            {
+                "source_id": "b",
+                "title": "Orchid Systems processor launch",
+                "summary": "Orchid Systems published a processor launch update for developers.",
+                "keywords": ["orchid", "processor", "launch"],
+                "entities": [{"type": "company", "name": "Orchid Systems"}],
+            },
+        ],
+    )
+
+    class Resolver:
+        def __init__(self):
+            self.values = []
+
+        def resolve_event(self, values):
+            self.values.append(values)
+            return {"decision": "separate", "confidence": 95}
+
+    resolver = Resolver()
+    result = run_event_cluster_job(session_factory=session_factory, ai_client=resolver)
+    assert result.ambiguous == 1 and result.ai_resolved == 1 and result.events == 2
+    assert all(value.get("summary_cn") for value in resolver.values[0])
+
+
+def test_ambiguous_group_accepts_ai_partition_only_when_it_covers_every_item():
+    session_factory = _db()
+    _seed(
+        session_factory,
+        [
+            {
+                "source_id": "a",
+                "title": "Orchid Systems processor announcement",
+                "summary": "Orchid Systems announced a processor launch for developers.",
+                "keywords": ["orchid", "processor", "launch"],
+                "entities": [{"type": "company", "name": "Orchid Systems"}],
+            },
+            {
+                "source_id": "b",
+                "title": "Orchid Systems processor launch",
+                "summary": "Orchid Systems published a processor launch update for developers.",
+                "keywords": ["orchid", "processor", "launch"],
+                "entities": [{"type": "company", "name": "Orchid Systems"}],
+            },
+        ],
+    )
 
     class Resolver:
         def resolve_event(self, values):
-            return {"decision": "separate", "confidence": 95}
+            return {
+                "decision": "partition",
+                "confidence": 95,
+                "groups": [[row["id"]] for row in values],
+            }
 
     result = run_event_cluster_job(session_factory=session_factory, ai_client=Resolver())
     assert result.ambiguous == 1 and result.ai_resolved == 1 and result.events == 2
@@ -83,8 +244,20 @@ def test_strong_current_group_merges_without_resolver_call():
     _seed(
         session_factory,
         [
-            {"source_id": "a", "title": "Orchid Systems processor", "keywords": ["gpt-5"], "entities": [{"type": "company", "name": "OpenAI"}]},
-            {"source_id": "b", "title": "Orchid Systems accelerator", "keywords": ["GPT 5"], "entities": [{"entity_type": "company", "text": "openai"}]},
+            {
+                "source_id": "a",
+                "title": "OpenAI announces GPT-5 developer release",
+                "summary": "OpenAI announced GPT-5 availability for developers today.",
+                "keywords": ["gpt-5", "release"],
+                "entities": [{"type": "company", "name": "OpenAI"}],
+            },
+            {
+                "source_id": "b",
+                "title": "OpenAI announces GPT-5 developer release",
+                "summary": "OpenAI announced GPT-5 availability for developers today.",
+                "keywords": ["GPT 5", "release"],
+                "entities": [{"entity_type": "company", "text": "openai"}],
+            },
         ],
     )
 
@@ -105,11 +278,13 @@ def test_strong_current_group_merges_without_resolver_call():
 def test_semantic_repeat_score_uses_keywords_and_typed_entities_with_threshold():
     left = {
         "title": "Orchid Systems accelerator",
+        "summary_cn": "Orchid Systems announced an accelerator release for developers.",
         "keywords": ["gpt-5", "release"],
         "entities": [{"type": "company", "name": "OpenAI"}],
     }
     right = {
         "title": "Orchid Systems processor",
+        "summary_cn": "Orchid Systems announced a processor release for developers.",
         "keywords_json": json.dumps(["GPT 5", "release"]),
         "entities_json": json.dumps([{"entity_type": "company", "text": "openai"}]),
     }
@@ -119,11 +294,11 @@ def test_semantic_repeat_score_uses_keywords_and_typed_entities_with_threshold()
     assert entity_score == 1.0
     assert combined_score >= 0.70
 
-    weak = {**left, "title": "Unrelated platform launch"}
-    assert _semantic_match_components(weak, right)[3] < 0.70
+    weak = {**left, "title": "Unrelated platform launch", "summary_cn": "A different unrelated product announcement."}
+    assert _semantic_match_components(weak, right)[3] < 0.55
 
 
-def test_history_repeat_uses_metadata_overlap_when_title_is_only_partial():
+def test_history_weak_metadata_overlap_is_not_an_exact_repeat():
     session_factory = _db()
     _seed(
         session_factory,
@@ -131,6 +306,7 @@ def test_history_repeat_uses_metadata_overlap_when_title_is_only_partial():
             {
                 "source_id": "a",
                 "title": "Orchid Systems processor",
+                "summary": "Orchid Systems announced a processor product.",
                 "keywords": ["gpt-5", "release"],
                 "entities": [{"type": "company", "name": "OpenAI"}],
             }
@@ -144,25 +320,46 @@ def test_history_repeat_uses_metadata_overlap_when_title_is_only_partial():
             {
                 "source_id": "b",
                 "title": "Orchid Systems accelerator",
+                "summary": "Orchid Systems announced a separate accelerator product.",
                 "keywords": ["GPT 5", "release"],
                 "entities": [{"entity_type": "company", "text": "openai"}],
             }
         ],
     )
-    second = run_event_cluster_job(session_factory=session_factory, now=datetime.now(timezone.utc) + timedelta(hours=1))
-    assert second.events == 0 and second.repeats == 1 and second.event_ids == []
+    second = run_event_cluster_job(
+        session_factory=session_factory,
+        item_ids=[2],
+        now=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    assert second.events == 1 and second.repeats == 0 and second.event_ids == [2]
 
 
 def test_subthreshold_history_match_uses_resolver_instead_of_auto_repeat():
     session_factory = _db()
     _seed(
         session_factory,
-        [{"source_id": "a", "title": "Orchid Systems processor", "keywords": ["release"]}],
+        [
+            {
+                "source_id": "a",
+                "title": "Orchid Systems processor announcement",
+                "summary": "Orchid Systems announced a processor launch for developers.",
+                "keywords": ["orchid", "processor", "launch"],
+                "entities": [{"type": "company", "name": "Orchid Systems"}],
+            }
+        ],
     )
     run_event_cluster_job(session_factory=session_factory)
     _seed(
         session_factory,
-        [{"source_id": "b", "title": "Orchid Systems launch", "keywords": ["release"]}],
+        [
+            {
+                "source_id": "b",
+                "title": "Orchid Systems processor launch",
+                "summary": "Orchid Systems published a processor launch update for developers.",
+                "keywords": ["orchid", "processor", "launch"],
+                "entities": [{"type": "company", "name": "Orchid Systems"}],
+            }
+        ],
     )
 
     class Resolver:

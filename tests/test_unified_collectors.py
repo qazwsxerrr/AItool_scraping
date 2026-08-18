@@ -284,15 +284,18 @@ def test_producthunt_extracts_namespaced_vote_and_comment_fields():
 
 def test_router_uses_explicit_nested_routes_and_rejects_unknown_transport():
     feed = object()
+    direct_feed = object()
     rsshub = object()
     router = CollectorRouter(
         feed=feed,
+        direct_feed=direct_feed,
         rsshub=rsshub,
         github=object(),
         github_trending=object(),
         producthunt=object(),
     )
     assert router.collector_for(_feed_source()) is feed
+    assert router.collector_for(_feed_source(bypass_proxy=True)) is direct_feed
     assert router.collector_for(_feed_source(transport="rsshub")) is rsshub
     with pytest.raises(ValueError, match="unsupported source transport"):
         invalid = SourceSpec.model_construct(

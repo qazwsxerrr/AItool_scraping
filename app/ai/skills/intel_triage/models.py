@@ -54,16 +54,18 @@ _TOPIC_ALIASES: dict[str, IntelTopic] = {
 OFFICIAL_MODEL_COMPANY = "official_model_company"
 PROJECT_TOOL = "project_tool"
 COMMUNITY_SOCIAL = "community_social"
+NEWS_MEDIA = "news_media"
 ContentClass: TypeAlias = Literal[
-    "official_model_company", "project_tool", "community_social"
+    "official_model_company", "project_tool", "community_social", "news_media"
 ]
 CONTENT_CLASSES: tuple[ContentClass, ...] = (
-    OFFICIAL_MODEL_COMPANY, PROJECT_TOOL, COMMUNITY_SOCIAL,
+    OFFICIAL_MODEL_COMPANY, PROJECT_TOOL, COMMUNITY_SOCIAL, NEWS_MEDIA,
 )
 CONTENT_CLASS_TO_DEFAULT_TOPIC: dict[str, IntelTopic] = {
     OFFICIAL_MODEL_COMPANY: TOPIC_PRODUCT,
     PROJECT_TOOL: TOPIC_PROJECT,
     COMMUNITY_SOCIAL: TOPIC_OPINION,
+    NEWS_MEDIA: TOPIC_INDUSTRY,
 }
 
 ENTITY_COMPANY = "company"
@@ -106,6 +108,7 @@ def normalize_content_class(value: Any) -> ContentClass | None:
         "official": OFFICIAL_MODEL_COMPANY, "official_model": OFFICIAL_MODEL_COMPANY,
         "company": OFFICIAL_MODEL_COMPANY, "project": PROJECT_TOOL, "tool": PROJECT_TOOL,
         "community": COMMUNITY_SOCIAL, "social": COMMUNITY_SOCIAL,
+        "media": NEWS_MEDIA, "news": NEWS_MEDIA,
     }.get(text)  # type: ignore[return-value]
 
 
@@ -679,7 +682,7 @@ __all__ = [
     "AnalysisResult", "COMMUNITY_SOCIAL", "CONTENT_CLASSES", "CONTENT_CLASS_TO_DEFAULT_TOPIC",
     "ContentClass", "ENTITY_COMPANY", "ENTITY_INDUSTRY_CONCEPT", "ENTITY_PERSON", "ENTITY_PRODUCT",
     "ENTITY_TECHNOLOGY", "ENTITY_TYPES", "IntelEntity", "IntelEntityType", "IntelTopic",
-    "INTEL_TOPIC_LABELS", "INTEL_TOPICS", "OFFICIAL_MODEL_COMPANY", "PAPER_SUPPORT_LEVELS",
+    "INTEL_TOPIC_LABELS", "INTEL_TOPICS", "NEWS_MEDIA", "OFFICIAL_MODEL_COMPANY", "PAPER_SUPPORT_LEVELS",
     "PROJECT_TOOL", "PaperSupport", "PaperSupportLevel", "RawIntelEnvelope", "ScoreComponents",
     "ScreenResult", "SEVEN_TOPIC_TAXONOMY", "TOPIC_INDUSTRY", "TOPIC_MODEL", "TOPIC_OPINION",
     "TOPIC_PAPER", "TOPIC_PRODUCT", "TOPIC_PROJECT", "TOPIC_TUTORIAL", "normalize_content_class",

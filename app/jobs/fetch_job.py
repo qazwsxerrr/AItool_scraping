@@ -164,7 +164,11 @@ def run_intel_fetch_job(
                     attempt_id = attempt.id
                     stats.attempt_id = attempt_id
 
-            request_headers = _conditional_headers(source_row if not dry_run else None)
+            # A manual force run is an explicit request to retrieve the
+            # source's current window again.  Reusing validators here can
+            # turn it into a 304-only audit attempt and leave no item
+            # membership for the forced pipeline scope.
+            request_headers = {} if force else _conditional_headers(source_row if not dry_run else None)
             # The orchestration default is a uniform 30 items per source.
             # Registry ``default_limit`` remains available to callers that
             # pass an explicit value, but ``None`` must not silently fall back
@@ -275,12 +279,14 @@ def run_intel_fetch_from_settings(
     init_db(engine)
     session_factory = create_session_factory(engine)
     external_client = _build_http_client(settings, trust_env=True)
+    direct_client = _build_http_client(settings, trust_env=False)
     # The active RSSHub deployment is a local Node process. Its outbound X
     # proxy is configured by scripts/start_rsshub.sh; Python calls the
     # configured RSSHUB_BASE_URL directly instead of inheriting HTTP_PROXY.
     rsshub_client = _build_http_client(settings, trust_env=False)
     try:
         feed = FeedCollector(external_client, retries=settings.request_retries, user_agent=settings.user_agent)
+        direct_feed = FeedCollector(direct_client, retries=settings.request_retries, user_agent=settings.user_agent)
         rsshub = RSSHubCollector(rsshub_client, retries=settings.request_retries, user_agent=settings.user_agent)
         github = GitHubCollector(
             external_client,
@@ -304,6 +310,7 @@ def run_intel_fetch_from_settings(
         )
         router = CollectorRouter(
             feed=feed,
+            direct_feed=direct_feed,
             rsshub=rsshub,
             github=github,
             github_trending=github_trending,
@@ -322,6 +329,7 @@ def run_intel_fetch_from_settings(
         )
     finally:
         external_client.close()
+        direct_client.close()
         rsshub_client.close()
     result.skipped_sources.extend(f"{item.source_id}: {item.reason}" for item in registry.skipped)
     return result

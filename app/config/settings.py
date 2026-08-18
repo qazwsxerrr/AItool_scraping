@@ -54,12 +54,24 @@ class Settings:
     ai_review_concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY
     ai_review_categories: tuple[str, ...] = DEFAULT_AI_REVIEW_CATEGORIES
     ai_review_category_mode: str = "ai"
+    # Stage D is deliberately a separate editorial provider contract.  The
+    # environment fallback keeps existing deployments usable while making the
+    # separation explicit and independently configurable.
+    ai_stage_d_api_url: str | None = None
+    ai_stage_d_api_key: str | None = field(default=None, repr=False)
+    ai_stage_d_model: str | None = None
+    ai_stage_d_api_style: str = "generic_json"
+    ai_stage_d_timeout_seconds: float = 45.0
+    ai_stage_d_retries: int = 2
 
     @classmethod
     def from_env(cls, dotenv_path: str | Path = ".env") -> "Settings":
         load_dotenv(dotenv_path)
         rsshub_base_url = _env_value("RSSHUB_BASE_URL")
         ai_review_model = os.getenv("AI_REVIEW_MODEL") or None
+        ai_stage_d_api_url = os.getenv("AI_STAGE_D_API_URL") or os.getenv("AI_REVIEW_API_URL") or None
+        ai_stage_d_api_key = os.getenv("AI_STAGE_D_API_KEY") or os.getenv("AI_REVIEW_API_KEY") or None
+        ai_stage_d_model = os.getenv("AI_STAGE_D_MODEL") or ai_review_model
         categories = _parse_categories(os.getenv("AI_REVIEW_CATEGORIES"))
         category_mode = (os.getenv("AI_REVIEW_CATEGORY_MODE") or "ai").strip().lower()
         if category_mode not in {"ai", "source"}:
@@ -91,6 +103,12 @@ class Settings:
             ),
             ai_review_categories=categories,
             ai_review_category_mode=category_mode,
+            ai_stage_d_api_url=ai_stage_d_api_url,
+            ai_stage_d_api_key=ai_stage_d_api_key,
+            ai_stage_d_model=ai_stage_d_model,
+            ai_stage_d_api_style=os.getenv("AI_STAGE_D_API_STYLE") or os.getenv("AI_REVIEW_API_STYLE", "generic_json"),
+            ai_stage_d_timeout_seconds=float(os.getenv("AI_STAGE_D_TIMEOUT_SECONDS", os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "45"))),
+            ai_stage_d_retries=max(0, _bounded_int(os.getenv("AI_STAGE_D_RETRIES"), 2)),
         )
 
 

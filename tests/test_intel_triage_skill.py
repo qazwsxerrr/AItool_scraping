@@ -105,6 +105,25 @@ def test_stage_b_strict_parser_has_entities_and_no_legacy_decision_fields():
     assert result.raw_response == payload
 
 
+def test_first_party_x_accounts_are_not_marked_social_only_and_prompt_preserves_limits():
+    item = envelope(
+        source_content_class="official_model_company",
+        source_group="x_official",
+        source_role="official",
+        source_subtype="account",
+    )
+    result = parse_analysis_result(analysis_payload(), envelope=item)
+    assert result.source_content_class == "official_model_company"
+    assert "source:social_only" not in result.risk_flags
+
+    analysis_instructions = build_analysis_provider_payload(item)["instructions"]
+    screen_instructions = build_screen_provider_payload(item)["instructions"]
+    for instructions in (analysis_instructions, screen_instructions):
+        assert "source_group=x_official" in instructions
+        assert "不得补全正文未披露的交易细节" in instructions
+        assert "普通 x_social、x_search" in instructions
+
+
 def test_paper_guard_marks_arxiv_only_analysis():
     item = envelope(url="https://arxiv.org/abs/1234.5678")
     result = parse_analysis_result(

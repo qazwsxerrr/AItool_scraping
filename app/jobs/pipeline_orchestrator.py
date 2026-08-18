@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable
 import httpx
 
 from app.ai.skills.intel_triage import IntelTriageClient
+from app.ai.skills.stage_d_editorial import StageDEditorialClient
 from app.config.limits import (
     DEFAULT_AI_REVIEW_LIMIT,
     DEFAULT_DAILY_REPORT_LIMIT,
@@ -29,12 +30,12 @@ from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_regist
 from app.domain.models import SourceSpec
 from app.domain.recency import recent_window_scope
 from app.jobs.ai_review_job import AIReviewResult, run_ai_review_from_settings
-from app.jobs.editorial_rank_job import EditorialRankResult, run_editorial_rank_from_settings
 from app.jobs.event_cluster_job import EventClusterResult, run_event_cluster_from_settings
 from app.jobs.export_job import IntelExportResult, run_intel_export_from_settings
 from app.jobs.fetch_job import IntelFetchResult, run_intel_fetch_from_settings
 from app.jobs.stage_a_screen_job import StageAScreenResult, run_stage_a_screen_job
 from app.jobs.stage_b_analysis_job import StageBAnalysisResult, run_stage_b_analysis_job
+from app.jobs.stage_d_job import StageDResult, run_stage_d_from_settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import IntelRun
 from app.storage.repository import IntelCounts, IntelRepository, StageStateSummary
@@ -55,9 +56,9 @@ STAGE_ALIASES: dict[str, str] = {
     "stage-c": "cluster",
     "stage_c": "cluster",
     "cluster": "cluster",
-    "rank": "rank",
-    "editorial-rank": "rank",
-    "editorial_rank": "rank",
+    "d": "stage_d",
+    "stage-d": "stage_d",
+    "stage_d": "stage_d",
     "export": "export",
 }
 DISPLAY_STAGE_NAMES = {
@@ -65,10 +66,10 @@ DISPLAY_STAGE_NAMES = {
     "screen": "stage-a",
     "analyze": "stage-b",
     "cluster": "stage-c",
-    "rank": "rank",
+    "stage_d": "stage-d",
     "export": "export",
 }
-PIPELINE_STAGES = ("screen", "analyze", "cluster", "rank", "export")
+PIPELINE_STAGES = ("screen", "analyze", "cluster", "stage_d", "export")
 PIPELINE_STAGE_ORDER = ("fetch", *PIPELINE_STAGES)
 RETRYABLE_TASK_STATUSES = frozenset({"failed", "retry_waiting", "pending"})
 STAGE_ACTIVE_TASK_STATUSES = frozenset({"pending", "running"})
@@ -132,7 +133,7 @@ class PipelineRunResult:
     status: str
     error: str | None = None
     event_cluster: EventClusterResult | None = None
-    editorial_rank: EditorialRankResult | None = None
+    stage_d: StageDResult | None = None
 
 
 def normalize_stage(value: str) -> str:
@@ -145,13 +146,13 @@ def normalize_stage(value: str) -> str:
 
 
 def _stage_c_current_event_ids(result: Any) -> Iterable[int] | None:
-    """Expose Stage-C's complete current projection to the rank stage."""
+    """Expose Stage-C's complete current projection to Stage D."""
 
     current = getattr(result, "current_event_ids", None)
     if current is not None:
         return current
-    # Compatibility with injected/legacy cluster runners that only expose the
-    # historical new-event projection.
+    # Injected cluster runners may expose only the historical new-event
+    # projection; it remains a narrow fallback for old snapshots and tests.
     return getattr(result, "event_ids", None)
 
 
@@ -352,6 +353,14 @@ def _stage_ai_client(settings: Settings, ai_client: Any | None = None):
         client.close()
 
 
+def _stage_d_client_or_none(value: Any | None) -> Any | None:
+    """Do not accidentally pass a Stage-A/B triage client into Stage D."""
+
+    if value is None:
+        return None
+    return value if any(callable(getattr(value, name, None)) for name in ("select_events", "stage_d_editorial", "editorial_select")) else None
+
+
 def _freeze_after_fetch(
     settings: Settings,
     *,
@@ -422,7 +431,7 @@ def start_pipeline_run_from_settings(
     """Create/freeze one run and perform fetch only.
 
     The run is created before the fetch call, so every inserted item is
-    attached to this immutable run scope.  No AI, cluster, rank or export
+    attached to this immutable run scope.  No AI, cluster, Stage D or export
     function is called here.
     """
 
@@ -597,28 +606,44 @@ def run_pipeline_stage_c_from_settings(
     return result
 
 
-def run_pipeline_rank_from_settings(
+def run_pipeline_stage_d_from_settings(
     *,
     settings: Settings,
     run_id: int,
-    limit: int | None = None,
     force: bool = False,
     snapshot_key: str | None = None,
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
     event_ids: Iterable[int] | None = None,
-) -> EditorialRankResult:
+) -> StageDResult:
     _, session_factory = _engine_and_factory(settings)
-    result = run_editorial_rank_from_settings(
-        settings=settings,
-        run_id=int(run_id),
-        limit=limit,
-        force=force,
-        snapshot_key=snapshot_key or f"run-{int(run_id)}",
-        profile_path=profile_path,
-        ai_client=ai_client,
-        event_ids=event_ids,
-    )
+    if ai_client is None:
+        with httpx.Client(
+            timeout=settings.ai_stage_d_timeout_seconds,
+            follow_redirects=True,
+            http2=True,
+            trust_env=True,
+            headers={"User-Agent": settings.user_agent},
+        ) as http_client:
+            result = run_stage_d_from_settings(
+                settings=settings,
+                run_id=int(run_id),
+                force=force,
+                snapshot_key=snapshot_key,
+                profile_path=profile_path,
+                ai_client=StageDEditorialClient.from_settings(settings, http_client=http_client),
+                event_ids=event_ids,
+            )
+    else:
+        result = run_stage_d_from_settings(
+            settings=settings,
+            run_id=int(run_id),
+            force=force,
+            snapshot_key=snapshot_key,
+            profile_path=profile_path,
+            ai_client=ai_client,
+            event_ids=event_ids,
+        )
     _sync_pipeline_run_status(session_factory, int(run_id), finalize=False)
     return result
 
@@ -645,7 +670,7 @@ def run_pipeline_export_from_settings(
         content_class=content_class,
         output_dir=output_dir,
         dry_run=dry_run,
-        snapshot_key=snapshot_key or f"run-{int(run_id)}",
+        snapshot_key=snapshot_key,
         partial=partial,
         partial_reason=partial_reason,
     )
@@ -801,15 +826,14 @@ def retry_pipeline_stage_from_settings(
             snapshot_key=snapshot_key,
             ai_client=ai_client,
         )
-    if canonical == "rank":
-        return run_pipeline_rank_from_settings(
+    if canonical == "stage_d":
+        return run_pipeline_stage_d_from_settings(
             settings=settings,
             run_id=run_id,
-            limit=limit,
             force=True,
             snapshot_key=snapshot_key,
             profile_path=profile_path,
-            ai_client=ai_client,
+            ai_client=_stage_d_client_or_none(ai_client),
         )
     return run_pipeline_export_from_settings(
         settings=settings,
@@ -845,7 +869,7 @@ def _stage_needs_resume(session_factory, run_id: int, stage_name: str) -> bool:
         if stage_name == "screen":
             return bool(repo.list_run_item_ids(run_id, role="fetched"))
         previous = {name: repo.get_stage(run_id, name) for name in PIPELINE_STAGES}
-        dependency = {"analyze": "screen", "cluster": "analyze", "rank": "cluster", "export": "rank"}[stage_name]
+        dependency = {"analyze": "screen", "cluster": "analyze", "stage_d": "cluster", "export": "stage_d"}[stage_name]
         dependency_stage = previous[dependency]
         # Downstream stages may consume the successful subset while the
         # dependency still has retryable/blocked tasks.  Live pending/running
@@ -923,14 +947,13 @@ def resume_pipeline_from_settings(
                     snapshot_key=snapshot_key,
                     ai_client=ai_client,
                 )
-            elif stage_name == "rank":
-                value = run_pipeline_rank_from_settings(
+            elif stage_name == "stage_d":
+                value = run_pipeline_stage_d_from_settings(
                     settings=settings,
                     run_id=run_id,
-                    limit=limit,
                     snapshot_key=snapshot_key,
                     profile_path=profile_path,
-                    ai_client=ai_client,
+                    ai_client=_stage_d_client_or_none(ai_client),
                 )
             else:
                 value = run_pipeline_export_from_settings(
@@ -1035,7 +1058,7 @@ def run_pipeline_once_from_settings(
     fetch_runner: Callable[..., IntelFetchResult] | None = None,
     ai_review_runner: Callable[..., AIReviewResult] | None = None,
     event_cluster_runner: Callable[..., EventClusterResult] | None = None,
-    editorial_rank_runner: Callable[..., EditorialRankResult] | None = None,
+    stage_d_runner: Callable[..., StageDResult] | None = None,
     export_runner: Callable[..., IntelExportResult] | None = None,
 ) -> PipelineRunResult:
     """Full convenience facade used by legacy ``run-once``."""
@@ -1043,7 +1066,7 @@ def run_pipeline_once_from_settings(
     fetch_fn = fetch_runner or run_intel_fetch_from_settings
     review_fn = ai_review_runner or run_ai_review_from_settings
     cluster_fn = event_cluster_runner or run_event_cluster_from_settings
-    rank_fn = editorial_rank_runner or run_editorial_rank_from_settings
+    stage_d_fn = stage_d_runner or run_pipeline_stage_d_from_settings
     export_fn = export_runner or run_intel_export_from_settings
 
     if dry_run:
@@ -1076,14 +1099,14 @@ def run_pipeline_once_from_settings(
                 run_id=review.run_id,
                 item_ids=getattr(review, "candidate_ids", None),
             )
-            ranked = rank_fn(
+            stage_d = stage_d_fn(
                 settings=ephemeral,
                 profile_path=profile_path,
-                limit=None,
                 force=force,
                 snapshot_key=effective_snapshot_key,
                 run_id=review.run_id,
                 event_ids=_stage_c_current_event_ids(cluster),
+                ai_client=_stage_d_client_or_none(ai_client),
             )
             exported = export_fn(
                 settings=ephemeral,
@@ -1097,7 +1120,7 @@ def run_pipeline_once_from_settings(
                 partial_reason=getattr(review, "partial_reason", None),
             )
         fetch = replace(fetch, dry_run=True)
-        return PipelineRunResult(None, fetch, review, exported, "dry_run", None, cluster, ranked)
+        return PipelineRunResult(None, fetch, review, exported, "dry_run", None, cluster, stage_d)
 
     _, session_factory = _engine_and_factory(settings)
     with session_factory() as session:
@@ -1114,7 +1137,9 @@ def run_pipeline_once_from_settings(
         session.commit()
         run_id = int(run.id)
 
-    effective_snapshot_key = snapshot_key or f"run-{run_id}"
+    # Event clustering keeps a run-scoped internal key.  The user-visible
+    # Stage-D/export stages derive their default key from ``edition_date``.
+    cluster_snapshot_key = snapshot_key or f"run-{run_id}"
     try:
         fetch = fetch_fn(
             settings=settings,
@@ -1146,18 +1171,18 @@ def run_pipeline_once_from_settings(
             settings=settings,
             limit=None,
             force=force,
-            snapshot_key=effective_snapshot_key,
+            snapshot_key=cluster_snapshot_key,
             run_id=run_id,
             item_ids=getattr(review, "candidate_ids", None),
         )
-        ranked = rank_fn(
+        stage_d = stage_d_fn(
             settings=settings,
             profile_path=profile_path,
-            limit=None,
             force=force,
-            snapshot_key=effective_snapshot_key,
+            snapshot_key=snapshot_key,
             run_id=run_id,
             event_ids=_stage_c_current_event_ids(cluster),
+            ai_client=_stage_d_client_or_none(ai_client),
         )
         exported = export_fn(
             settings=settings,
@@ -1165,7 +1190,7 @@ def run_pipeline_once_from_settings(
             content_class=content_class,
             limit=DEFAULT_DAILY_REPORT_LIMIT,
             output_dir=output_dir,
-            snapshot_key=effective_snapshot_key,
+            snapshot_key=snapshot_key,
             run_id=run_id,
             partial=getattr(review, "partial", False),
             partial_reason=getattr(review, "partial_reason", None),
@@ -1197,7 +1222,7 @@ def run_pipeline_once_from_settings(
                 partial_reason=getattr(review, "partial_reason", None),
             )
             session.commit()
-        return PipelineRunResult(run_id, fetch, review, exported, status, None, cluster, ranked)
+        return PipelineRunResult(run_id, fetch, review, exported, status, None, cluster, stage_d)
     except Exception as exc:
         with session_factory() as session:
             IntelRepository(session).finish_run(run_id, status="failed", error=str(exc))
@@ -1242,7 +1267,7 @@ start_pipeline_run = start_pipeline_run_from_settings
 run_pipeline_stage_a = run_pipeline_stage_a_from_settings
 run_pipeline_stage_b = run_pipeline_stage_b_from_settings
 run_pipeline_stage_c = run_pipeline_stage_c_from_settings
-run_pipeline_rank = run_pipeline_rank_from_settings
+run_pipeline_stage_d = run_pipeline_stage_d_from_settings
 run_pipeline_export = run_pipeline_export_from_settings
 pipeline_status = pipeline_status_from_settings
 retry_pipeline_stage = retry_pipeline_stage_from_settings
@@ -1274,14 +1299,14 @@ __all__ = [
     "run_pipeline_export_from_settings",
     "run_pipeline_export",
     "run_pipeline_once_from_settings",
-    "run_pipeline_rank_from_settings",
-    "run_pipeline_rank",
     "run_pipeline_stage_a_from_settings",
     "run_pipeline_stage_a",
     "run_pipeline_stage_b_from_settings",
     "run_pipeline_stage_b",
     "run_pipeline_stage_c_from_settings",
     "run_pipeline_stage_c",
+    "run_pipeline_stage_d_from_settings",
+    "run_pipeline_stage_d",
     "start_pipeline_run_from_settings",
     "start_pipeline_run",
 ]

@@ -8,20 +8,21 @@ source registry
 → Stage A screen（确定性初筛与轻量 AI 筛选）
 → Stage B analyze（结构化分析、实体与评分）
 → Stage C cluster（固定 reference time 的事件聚类）
-→ rank（编辑排序）
+→ Stage D（日报主编选择、故事簇与展示标题）
 → export（仅导出当前 run 的结果）
 → UI（首页、搜索、全部动态只读展示）
 ```
 
-AI review 对每个候选条目执行一次结构化分析，输出 `keep`、来源类型 `content_class`、编辑主题 `topic_category`、中文摘要、理由、风险标记和置信度。AI 结果是编辑分析输出，不是来源背书；当前链路不会启动证据核实、claim、entity、事件聚类或日报编辑阶段。
+AI review 对每个候选条目执行一次结构化分析，输出 `keep`、来源类型 `content_class`、编辑主题 `topic_category`、中文摘要、理由、风险标记和置信度。AI 结果是编辑分析输出，不是来源背书；完整 pipeline 会继续由 Stage C 判断真实事件身份，并由独立的 Stage D 编辑 skill 选择当天的日报组合。
 
-`content_class` 描述来源/信号类型（官方发布、项目/工具、社区线索），`topic_category` 描述内容主题（模型、产品、行业、论文、教程、观点）。两者分开保存，UI 和导出会同时展示，避免把“arXiv 来源”误读成“官方产品发布”。
+`content_class` 描述来源/信号类型（官方发布、媒体报道、项目/工具、社区线索），`topic_category` 描述内容主题（模型、产品、行业、论文、教程、观点）。两者分开保存，UI 和导出会同时展示，避免把第三方媒体报道误读成“官方产品发布”。
 
 ## 内容类别与来源归因
 
 | `content_class` | 典型来源 | 处理方式 |
 | --- | --- | --- |
 | `official_model_company` | 官方模型、公司产品、API 和研究更新 | 按来源身份、时间窗口和关键词筛选，再交给 AI 分类和摘要 |
+| `news_media` | 科技媒体、垂直 AI 新闻和分析博客 | 保持来源归因，按较短时效窗口和来源级关键词筛选，不标注为官方发布 |
 | `project_tool` | GitHub、Product Hunt、AI 工具项目 | 按项目指标和时间窗口筛选；GitHub 项目可生成一次项目摘要 |
 | `community_social` | X、Reddit、RSSHub、论坛 | 作为社区线索参与 AI 分类；输出保留来源归因和风险标记 |
 
@@ -33,15 +34,15 @@ AI review 对每个候选条目执行一次结构化分析，输出 `keep`、来
 
 来源配置位于 `app/config/source_registry.yaml`。唯一的抓取路由字段是 `transport`：`feed`、`rsshub` 或 `github`；Feed 细节在 `feed` 下，GitHub 细节在 `github` 下。当前保留原生 RSS/Atom、RSSHub、GitHub Trending/Search/Releases 和 Product Hunt Atom 采集器。
 
-当前 registry 在配置 `RSSHUB_BASE_URL` 后有 60 个启用来源（具体数量以 YAML 为准）：
+当前 registry 在配置 `RSSHUB_BASE_URL` 后有 83 个启用来源（具体数量以 YAML 为准）：
 
 | `transport` | 当前数量 | 主要来源组 | 抓取方式与内容 |
 | --- | ---: | --- | --- |
-| `feed` | 18 | `official_blog`、`official_research`、`producthunt`、`linux_do`、`reddit_fixed` | HTTP 获取 RSS/Atom，统一解析为条目；包括官方博客/研究、Product Hunt、LINUX DO 和 LocalLLaMA Reddit Feed。 |
-| `github` | 10 | `github_trending`、`github_search`、`github_release` | 使用 GitHub API 或 Trending 页面抓取项目、Topic 搜索和 Release；保留 stars、forks、topics、Trending 周期等项目指标。 |
-| `rsshub` | 32 | 22 个 `x_official`、`x_social`、`x_search`，以及 Anthropic RSSHub 路由 | 访问本地 RSSHub 输出的 RSS/Atom；X 官方账号保留 `x_official=true` 等来源归因，不绕过 AI 筛选。 |
+| `feed` | 31 | `official_blog`、`official_research`、`tech_media`、`hacker_news`、`producthunt`、`linux_do`、`reddit_fixed` | HTTP 获取 RSS/Atom，统一解析为条目；包括官方博客/研究、AI 垂直媒体、IT之家、Hacker News、Product Hunt、LINUX DO 和 LocalLLaMA Reddit Feed。个别公开源可在 registry 中显式 `bypass_proxy`，避免依赖进程级 `NO_PROXY`。 |
+| `github` | 11 | `github_trending`、`github_search`、`github_release` | 使用 GitHub API 或 Trending 页面抓取项目、Topic 搜索和 Release；保留 stars、forks、topics、Trending 周期等项目指标。 |
+| `rsshub` | 41 | 31 个 `x_official`、`x_social`、`x_search`，以及 Anthropic RSSHub 路由 | 访问本地 RSSHub 输出的 RSS/Atom；X 官方账号保留 `x_official=true` 等来源归因，不绕过 AI 筛选。 |
 
-如果没有配置 `RSSHUB_BASE_URL`，32 个 RSSHub 模板会被安全跳过，CLI 会显示 `Registry skipped`；这不会阻断其它 Feed 和 GitHub 来源。单个来源失败也只记录在 `fetch_attempts` 和来源健康状态中，不会中断整个批次。
+如果没有配置 `RSSHUB_BASE_URL`，41 个 RSSHub 模板会被安全跳过，CLI 会显示 `Registry skipped`；这不会阻断其它 Feed 和 GitHub 来源。单个来源失败也只记录在 `fetch_attempts` 和来源健康状态中，不会中断整个批次。
 
 本地 RSSHub 的 X 认证路径只有 `TWITTER_AUTH_TOKEN`。`scripts/start_rsshub.sh` 会保留该 token 和 `PROXY_URI`，并显式移除 OAuth 与第三方 X API 变量；脚本在默认 Node 不受支持时会优先尝试 NVM Node 24，再回退到 Node 22。
 
@@ -85,6 +86,12 @@ AI_REVIEW_TIMEOUT_SECONDS=30
 AI_REVIEW_CONCURRENCY=4
 AI_REVIEW_CATEGORIES=模型,产品,行业,论文,教程,观点
 AI_REVIEW_CATEGORY_MODE=ai
+AI_STAGE_D_API_URL=
+AI_STAGE_D_API_KEY=
+AI_STAGE_D_MODEL=
+AI_STAGE_D_API_STYLE=generic_json
+AI_STAGE_D_TIMEOUT_SECONDS=45
+AI_STAGE_D_RETRIES=2
 ```
 
 `AI_REVIEW_CONCURRENCY` 取值为 `1..4`，默认 `4`，表示 Stage A/B provider 请求的并发上限。
@@ -109,7 +116,7 @@ python -m app.main pipeline start [--source SOURCE_ID] [--class CONTENT_CLASS] [
 python -m app.main pipeline stage-a --run-id RUN_ID
 python -m app.main pipeline stage-b --run-id RUN_ID
 python -m app.main pipeline stage-c --run-id RUN_ID
-python -m app.main pipeline rank --run-id RUN_ID
+python -m app.main pipeline stage-d --run-id RUN_ID
 python -m app.main pipeline export --run-id RUN_ID
 python -m app.main pipeline status --run-id RUN_ID
 ```
@@ -125,6 +132,11 @@ PYTHON=.venv/bin/python
 # 首次安装后，或明确删除旧库后，按当前 ORM 创建新数据库
 $PYTHON scripts/init_db.py
 
+# 如已有旧 Rank 快照数据库，先查看迁移计划，再显式执行一次迁移。
+# 该迁移会将 rank stage、快照表与 display order 转为 Stage D。
+$PYTHON scripts/migrate_rank_to_stage_d.py
+$PYTHON scripts/migrate_rank_to_stage_d.py --apply
+
 # 使用 X/RSSHub 来源时先启动本地 RSSHub；不使用 RSSHub 可跳过
 bash scripts/start_rsshub.sh
 
@@ -138,22 +150,19 @@ $PYTHON -m app.main run-once \
   --force \
   --output-dir output/intel
 
-# 推荐：一次完成正式可恢复链路。run_id 由程序创建并在内部传递，调用者无需手动复制。
+# 推荐：一次完成正式可恢复链路。程序内部维护执行 ID；对外以日报日期识别产物。
 $PYTHON -m app.main pipeline run \
   --limit 20 \
   --force \
   --output-dir output/intel
 
-# 如果流程中断，使用输出中的 run_id 从断点恢复：
-$PYTHON -m app.main pipeline resume --run-id RUN_ID --output-dir output/intel
-
-# 诊断或需要逐阶段观察时，才使用下面的独立命令：start 只抓取并冻结 membership，后续阶段不会重复抓取
+# 诊断或运维恢复时，才使用下面的内部命令：start 只抓取并冻结 membership，后续阶段不会重复抓取。
+# RUN_ID 是数据库审计/恢复键，正常日报运行不会在终端或产物中展示它。
 $PYTHON -m app.main pipeline start --limit 20
-# 使用上一步输出的 run_id
 $PYTHON -m app.main pipeline stage-a --run-id RUN_ID
 $PYTHON -m app.main pipeline stage-b --run-id RUN_ID
 $PYTHON -m app.main pipeline stage-c --run-id RUN_ID
-$PYTHON -m app.main pipeline rank --run-id RUN_ID
+$PYTHON -m app.main pipeline stage-d --run-id RUN_ID
 $PYTHON -m app.main pipeline export --run-id RUN_ID
 
 # 只抓取并检查原始/标准化结果，不调用 AI；这是诊断命令，不会创建正式 pipeline run
@@ -196,8 +205,10 @@ $PYTHON -m app.main source-health --source x_account_openai
 
 1. `fetch` 从 registry 载入启用来源，按 `transport` 调用 Feed/RSSHub/GitHub collector；完成解析、标准化、内容 hash 去重、幂等写入，并记录 `fetch_attempts`、HTTP 状态、重试、ETag/Last-Modified、失败原因和来源健康状态。
 2. `ai-review` 先执行来源级确定性初筛，再对保留条目调用结构化 AI。AI 返回 `keep`、`content_class`、`topic_category`、`summary_cn`、理由、风险标记和置信度；无关内容 `keep=false`，AI 失败或尚未处理的内容保留在数据库的阶段审计中，但不进入最终导出。主题列表由 `AI_REVIEW_CATEGORIES` 配置，`AI_REVIEW_CATEGORY_MODE=source` 可在模型不可用时使用来源规则回退。
-3. `export` 只查询 Rank 快照中 `selected=true` 的事件；日报默认输出最多 30 条，不足 30 条时不补内容，显式 `--limit` 可覆盖默认值。默认生成 `output/intel/intel_items.jsonl` 和 `intel_digest.md`。
-4. UI（`/`、`/search`、`/all`、`/github`）只读数据库或已生成报告，不在请求中执行抓取或 AI；首页、搜索和全部动态均保留来源归因及 AI 分类/摘要。
+3. `stage-c` 只处理真实世界事件身份：URL/external ID 是精确锚点，标题只是弱候选信号；摘要、实体和关键词用于候选召回，模糊组交由窄域 AI resolver 分区，失败时保守拆分。
+4. `stage-d` 只处理日报编辑：先应用论文证据硬门槛，再由独立编辑 skill 对本轮 Stage C canonical events 做全局选择、故事簇归并、展示顺序和中文展示标题。它不使用 topic/source/content/repeat 的本地配额，也不要求凑满 30 条；社区线索可被选中，但展示层会强制标注待核实。
+5. `export` 只查询 Stage D 快照中 `selected=true` 的事件；日报默认输出最多 30 条，不足 30 条时不补内容，显式 `--limit` 可覆盖默认值。日报按 `Asia/Shanghai` 日期写入 `output/daily/YYYY-MM-DD/`，包括 `intel_items.jsonl`、`intel_digest.md` 与 `manifest.json`；同一天重跑会原子更新这一份公开日报。内部执行 ID 仅保留在数据库审计链路中。
+6. UI（`/`、`/search`、`/all`、`/github`）只读数据库或已生成报告，不在请求中执行抓取或 AI；首页、搜索和“本期精选”默认只展示当前日报 Snapshot 的最终入选事件，展示标题与原始标题、故事簇关系和社区待核实标签都会保留。
 
 启动本地 UI：
 
@@ -209,16 +220,19 @@ $PYTHON -m uvicorn app.web.app:app --host 127.0.0.1 --port 8000
 
 Stage A/B 对每条 AI provider 任务执行瞬态错误自动重试：首次调用失败后最多再重试 5 次（最多 6 次 provider 调用）。429、5xx、timeout 和 rate-limit 属于可重试错误；永久性 4xx、鉴权失败和 schema 错误不会重复请求。达到上限后任务记录 `provider_retry_exhausted` 并转为终结失败，成功任务仍会继续进入下游阶段，整次 run 以 `partial` 保留审计状态。
 
-默认数量策略为：每个来源抓取 20 条，AI review 最多处理 1000 条已有条目，日报默认导出 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；`--ai-limit` 独立控制 AI review、事件聚合和编辑排序的处理量；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
+默认数量策略为：每个来源抓取 20 条，AI review 最多处理 1000 条已有条目，日报默认导出 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；`--ai-limit` 是 Stage A/B 的显式安全上限；Stage D 始终对本轮通过论文门槛的完整事件池做编辑选择；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
 
 - `ai_review_candidates.jsonl`：AI 选择且分析成功的候选。
 - `ai_review_audit.jsonl`：过滤、拒绝和 AI 失败等审计记录。
 - `ai_review_digest.md`：候选的中文摘要和来源信息。
 
-`export` 默认写入 `output/intel/`：
+`export` 的日报产物默认写入 `output/daily/YYYY-MM-DD/`：
 
 - `intel_items.jsonl`：AI 选择结果与来源归因。
 - `intel_digest.md`：分类、状态、指标、风险和链接摘要。
+- `manifest.json`：日报日期、公开状态、完整筛选漏斗、阶段状态/失败原因和文件校验信息；不包含内部执行 ID 或快照键。
+
+为兼容既有脚本，完整成功的 Run 仍会同步最新副本到 `output/intel/`；UI 的主数据源仍是数据库，而不是该副本。
 
 GitHub 项目保留抓取到的 stars、forks、Trending 周期指标、topics 和 README 摘要；AI 不替代项目指标筛选，也不会生成未提供的增长数据。
 

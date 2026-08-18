@@ -17,15 +17,18 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 OFFICIAL_MODEL_COMPANY = "official_model_company"
 PROJECT_TOOL = "project_tool"
 COMMUNITY_SOCIAL = "community_social"
+NEWS_MEDIA = "news_media"
 ContentClass: TypeAlias = Literal[
     "official_model_company",
     "project_tool",
     "community_social",
+    "news_media",
 ]
 CONTENT_CLASSES: tuple[ContentClass, ...] = (
     OFFICIAL_MODEL_COMPANY,
     PROJECT_TOOL,
     COMMUNITY_SOCIAL,
+    NEWS_MEDIA,
 )
 
 # Source governance vocabulary. These aliases intentionally live in the
@@ -42,10 +45,12 @@ TopicScope: TypeAlias = Literal[
 CanonicalSourceGroup: TypeAlias = Literal[
     "official_blog",
     "official_research",
+    "tech_media",
     "github_trending",
     "github_release",
     "github_search",
     "producthunt",
+    "hacker_news",
     "reddit_fixed",
     "reddit_search",
     "linux_do",
@@ -56,10 +61,12 @@ CanonicalSourceGroup: TypeAlias = Literal[
 CANONICAL_SOURCE_GROUPS: tuple[CanonicalSourceGroup, ...] = (
     "official_blog",
     "official_research",
+    "tech_media",
     "github_trending",
     "github_release",
     "github_search",
     "producthunt",
+    "hacker_news",
     "reddit_fixed",
     "reddit_search",
     "linux_do",
@@ -237,6 +244,7 @@ class SourceSpec(BaseModel):
     source_role: str | None = None
     spam_risk: Literal["low", "medium", "high"] | None = None
     account_url: str | None = None
+    bypass_proxy: bool = False
     default_limit: int = 30
     content_class: ContentClass | None = None
     selection_policy: SelectionPolicy = Field(default_factory=SelectionPolicy)

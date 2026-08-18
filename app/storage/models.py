@@ -1,23 +1,28 @@
 """SQLAlchemy models for the compact AI-only intelligence pipeline.
 
 The data layer contains sources, fetch telemetry, runs, normalized items,
-structured AI reviews, and the Wave 2 event/member/ranking snapshot tables.
-Historical stage tables are not migrated; the local SQLite database may be
-recreated from this metadata.
+structured AI reviews, and the Stage-C event/member plus Stage-D snapshot tables.
+Historical Rank snapshots have one explicit operator-run migration to Stage D;
+the only startup-time compatibility upgrade remains the additive indexed
+``intel_runs.edition_date`` column.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+DAILY_EDITION_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def _dump_json(value: object) -> str:
@@ -157,6 +162,10 @@ class IntelRun(Base):
     __table_args__ = (
         Index("ix_intel_runs_status", "status"),
         Index("ix_intel_runs_started_at", "started_at"),
+        # The logical daily edition is queried independently from an
+        # immutable execution attempt.  Keep the latter as ``id`` and index
+        # this real column instead of repeatedly decoding ``scope_json``.
+        Index("ix_intel_runs_edition_date", "edition_date"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -164,6 +173,10 @@ class IntelRun(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     run_type: Mapped[str] = mapped_column(String(32), nullable=False, default="run_once")
+    # ``edition_date`` used to live only in ``scope_json``.  The private
+    # attribute preserves the public string-returning property below, which
+    # keeps report/UI callers and legacy rows backward compatible.
+    _edition_date: Mapped[date | None] = mapped_column("edition_date", Date, nullable=True)
     scope_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     source_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     item_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -280,6 +293,43 @@ class IntelRun(Base):
             current = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
             scope["reference_time"] = current.isoformat()
         self.scope_json = _dump_json(scope)
+
+    @property
+    def edition_date(self) -> str | None:
+        """Stable daily label for UI/report grouping, without replacing ``id``.
+
+        ``id`` remains the immutable relational key used by stage and item
+        foreign keys.  New runs persist a real indexed ``edition_date``
+        column and retain the JSON copy for compatibility; old rows fall back
+        to JSON/reference-time derivation while an additive migration catches
+        them up.
+        """
+
+        if self._edition_date is not None:
+            return self._edition_date.isoformat()
+        value = self.scope.get("edition_date")
+        if value:
+            try:
+                return date.fromisoformat(str(value)).isoformat()
+            except (TypeError, ValueError):
+                pass
+        reference = self.reference_time or self.started_at
+        if reference is None:
+            return None
+        current = reference if reference.tzinfo is not None else reference.replace(tzinfo=timezone.utc)
+        return current.astimezone(DAILY_EDITION_TIMEZONE).date().isoformat()
+
+    @property
+    def daily_snapshot_key(self) -> str | None:
+        """Stable public Stage D key for this run's daily edition.
+
+        ``id`` remains an internal execution/audit key.  A date-addressed
+        snapshot intentionally lets a same-day rerun replace the public
+        editorial projection without exposing that implementation detail.
+        """
+
+        edition_date = self.edition_date
+        return f"daily-{edition_date}" if edition_date else None
 
 
 class IntelRunStage(Base):
@@ -862,10 +912,10 @@ class IntelEvent(Base):
         cascade="all, delete-orphan",
         order_by="IntelEventItem.id",
     )
-    ranking_snapshots: Mapped[list["IntelEventRankingSnapshot"]] = relationship(
+    stage_d_snapshots: Mapped[list["IntelEventStageDSnapshot"]] = relationship(
         back_populates="event",
         cascade="all, delete-orphan",
-        order_by="IntelEventRankingSnapshot.rank",
+        order_by="IntelEventStageDSnapshot.display_order",
     )
 
     @property
@@ -926,22 +976,22 @@ class IntelEventItem(Base):
     source: Mapped[Source] = relationship()
 
 
-class IntelEventRankingSnapshot(Base):
-    """Idempotent event-level ranking output consumed by later stages."""
+class IntelEventStageDSnapshot(Base):
+    """Idempotent Stage-D editorial output consumed by export and the UI."""
 
-    __tablename__ = "intel_event_ranking_snapshots"
+    __tablename__ = "intel_event_stage_d_snapshots"
     __table_args__ = (
-        UniqueConstraint("snapshot_key", "event_id", name="uq_intel_event_rank_snapshot_event"),
-        Index("ix_intel_event_rank_snapshot_key", "snapshot_key"),
-        Index("ix_intel_event_rank_snapshot_rank", "snapshot_key", "rank"),
-        Index("ix_intel_event_rank_snapshot_selected", "snapshot_key", "selected"),
+        UniqueConstraint("snapshot_key", "event_id", name="uq_intel_event_stage_d_snapshot_event"),
+        Index("ix_intel_event_stage_d_snapshot_key", "snapshot_key"),
+        Index("ix_intel_event_stage_d_snapshot_order", "snapshot_key", "display_order"),
+        Index("ix_intel_event_stage_d_snapshot_selected", "snapshot_key", "selected"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     snapshot_key: Mapped[str] = mapped_column(String(128), nullable=False, default="latest")
     event_id: Mapped[int] = mapped_column(ForeignKey("intel_events.id"), nullable=False)
     run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
-    rank: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     display_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     topic: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -954,8 +1004,8 @@ class IntelEventRankingSnapshot(Base):
         DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
     )
 
-    event: Mapped[IntelEvent] = relationship(back_populates="ranking_snapshots")
+    event: Mapped[IntelEvent] = relationship(back_populates="stage_d_snapshots")
 
 
-# Friendly aliases for callers that use the shorter historical name.
-EventRankingSnapshot = IntelEventRankingSnapshot
+# Friendly alias for callers that use the shorter Stage-D name.
+EventStageDSnapshot = IntelEventStageDSnapshot

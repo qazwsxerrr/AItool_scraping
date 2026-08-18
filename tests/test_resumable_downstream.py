@@ -5,7 +5,7 @@ import json
 
 from sqlalchemy import select
 
-from app.jobs.editorial_rank_job import EditorialProfile, run_editorial_rank_job
+from app.jobs.stage_d_job import StageDProfile, run_stage_d_job
 from app.jobs.event_cluster_job import run_event_cluster_job
 from app.jobs.export_job import run_intel_export_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
@@ -13,7 +13,7 @@ from app.storage.models import (
     AIItemReview,
     IntelEvent,
     IntelEventItem,
-    IntelEventRankingSnapshot,
+    IntelEventStageDSnapshot,
     IntelItem,
     IntelRun,
     IntelRunStage,
@@ -203,7 +203,7 @@ def test_cluster_excludes_analysis_filtered_stage_b_tasks():
         assert relations[0].item_id == item_ids["candidate"]
 
 
-def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_path):
+def test_stage_d_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_path):
     session_factory = _db()
     reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
     with session_factory() as session:
@@ -212,8 +212,8 @@ def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_
         run_two = repo.start_run(reference_time=reference)
         first = IntelEvent(
             event_key="title:one",
-            title="Run one",
-            summary_cn="one",
+            title="Run one update",
+            summary_cn="Run one event summary",
             topic="model",
             display_score=90,
             source_group="official_blog",
@@ -222,8 +222,8 @@ def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_
         )
         second = IntelEvent(
             event_key="title:two",
-            title="Run two",
-            summary_cn="two",
+            title="Run two update",
+            summary_cn="Run two event summary",
             topic="model",
             display_score=80,
             new_in_run_id=run_two.id,
@@ -231,7 +231,7 @@ def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_
         )
         session.add_all([first, second])
         session.flush()
-        # Rank now consumes the durable current Stage-C projection rather
+        # Stage D consumes the durable current Stage-C projection rather
         # than historical ``new_in_run_id`` provenance.  Persist the one
         # event that this test's simulated Stage C emitted for run one.
         cluster_stage = repo.ensure_stage(run_one.id, "cluster")
@@ -250,20 +250,20 @@ def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_
         repo.refresh_stage_status(cluster_stage)
         session.add_all(
             [
-                IntelEventRankingSnapshot(
-                    snapshot_key=f"run-{run_one.id}",
+                IntelEventStageDSnapshot(
+                    snapshot_key="daily-2026-08-15",
                     run_id=run_one.id,
                     event_id=first.id,
-                    rank=1,
+                    display_order=1,
                     display_score=90,
                     selected=True,
                     source_group="official_blog",
                 ),
-                IntelEventRankingSnapshot(
-                    snapshot_key=f"run-{run_two.id}",
+                IntelEventStageDSnapshot(
+                    snapshot_key="daily-2026-08-15-secondary",
                     run_id=run_two.id,
                     event_id=second.id,
-                    rank=1,
+                    display_order=1,
                     display_score=80,
                     selected=True,
                 ),
@@ -272,13 +272,13 @@ def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_
         session.commit()
         run_one_id, run_two_id = run_one.id, run_two.id
 
-    ranked = run_editorial_rank_job(
+    stage_d = run_stage_d_job(
         session_factory=session_factory,
         run_id=run_one_id,
-        profile=EditorialProfile(total_max=1),
+        profile=StageDProfile(total_max=1),
     )
-    assert ranked.snapshot_key == f"run-{run_one_id}"
-    assert ranked.selected == 1
+    assert stage_d.snapshot_key == "daily-2026-08-15"
+    assert stage_d.selected == 1
 
     final_dir = tmp_path / "intel"
     final_dir.mkdir()
@@ -291,7 +291,14 @@ def test_rank_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_
         partial_reason="upstream_failed",
     )
     assert (final_dir / "intel_digest.md").read_text(encoding="utf-8") == "previous-success"
-    assert (tmp_path / "runs" / f"run-{run_one_id}" / "intel_digest.md").exists()
+    daily_dir = tmp_path / "daily" / "2026-08-15"
+    assert (daily_dir / "intel_digest.md").exists()
+    manifest = json.loads((daily_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["edition_date"] == "2026-08-15"
+    assert "run_id" not in manifest
+    assert "snapshot_key" not in manifest
+    assert manifest["artifact_status"] == "partial"
+    assert not (tmp_path / "runs").exists()
 
     successful = run_intel_export_job(
         session_factory=session_factory,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import date
+from pathlib import Path
+
 import typer
 
 from app.config.limits import (
@@ -9,7 +12,7 @@ from app.config.limits import (
 )
 from app.config.settings import Settings
 from app.jobs.ai_review_job import run_ai_review_from_settings
-from app.jobs.editorial_rank_job import run_editorial_rank_from_settings
+from app.jobs.stage_d_job import run_stage_d_from_settings
 from app.jobs.export_job import run_intel_export_from_settings
 from app.jobs.fetch_job import run_intel_fetch_from_settings
 from app.jobs.fetch_only_job import run_fetch_only_from_settings
@@ -21,7 +24,7 @@ from app.jobs.pipeline_orchestrator import (
     retry_pipeline_stage_from_settings,
     run_pipeline_export_from_settings,
     run_pipeline_from_settings,
-    run_pipeline_rank_from_settings,
+    run_pipeline_stage_d_from_settings,
     run_pipeline_stage_a_from_settings,
     run_pipeline_stage_b_from_settings,
     run_pipeline_stage_c_from_settings,
@@ -35,7 +38,7 @@ from app.logging_config import configure_logging
 app = typer.Typer(help="AI tool intelligence ingestion CLI")
 pipeline_app = typer.Typer(help="Run-scoped, resumable intelligence pipeline")
 app.add_typer(pipeline_app, name="pipeline")
-_CONTENT_CLASSES = {"official_model_company", "project_tool", "community_social"}
+_CONTENT_CLASSES = {"official_model_company", "project_tool", "community_social", "news_media"}
 
 
 @app.command("fetch")
@@ -175,7 +178,7 @@ def export(
     ),
     output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Build records without writing files."),
-    snapshot_key: str = typer.Option("latest", "--snapshot", help="Editorial ranking snapshot key."),
+    snapshot_key: str = typer.Option("latest", "--snapshot", help="Stage D snapshot key."),
 ) -> None:
     configure_logging()
     _validate_content_class(content_class)
@@ -191,31 +194,31 @@ def export(
     typer.echo(f"exported={result.exported} dry_run={result.dry_run}")
     typer.echo(f"jsonl={result.jsonl_path}")
     typer.echo(f"markdown={result.markdown_path}")
+    if result.manifest_path:
+        typer.echo(f"manifest={result.manifest_path}")
     if result.github_report_path:
         typer.echo(f"github_report={result.github_report_path}")
 
 
-@app.command("editorial-rank")
-def editorial_rank(
-    limit: int | None = typer.Option(None, min=1, help="Maximum events to rank."),
-    force: bool = typer.Option(False, "--force", help="Rebuild the snapshot from all candidate events."),
-    snapshot_key: str = typer.Option("latest", "--snapshot", help="Ranking snapshot key."),
+@app.command("stage-d")
+def stage_d(
+    force: bool = typer.Option(False, "--force", help="Rebuild this Stage-D editorial snapshot."),
+    snapshot_key: str = typer.Option("latest", "--snapshot", help="Stage-D snapshot key."),
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
 ) -> None:
-    """Rank aggregated events and enforce the daily editorial quotas."""
+    """Select a final daily edition from Stage-C canonical events."""
 
     configure_logging()
-    result = run_editorial_rank_from_settings(
+    result = run_stage_d_from_settings(
         settings=Settings.from_env(),
         profile_path=profile,
-        limit=limit,
         force=force,
         snapshot_key=snapshot_key,
     )
     typer.echo(
-        f"processed={result.processed} selected={result.selected} rejected={result.rejected} "
-        f"snapshots={result.snapshots} ai_ranked={result.ai_ranked} ai_failed={result.ai_failed} "
-        f"fallback={result.used_fallback} snapshot={result.snapshot_key}"
+        f"processed={result.processed} eligible={result.eligible} selected={result.selected} omitted={result.omitted} "
+        f"paper_gated={result.paper_gated} snapshots={result.snapshots} ai_failed={result.ai_failed} "
+        f"fallback={result.used_fallback}"
     )
     for error in result.errors:
         typer.echo(f"error={error}")
@@ -242,7 +245,7 @@ def run_once(
     dry_run: bool = typer.Option(False, "--dry-run", help="Run without database or export writes."),
     output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
-    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Editorial ranking snapshot key (defaults to run-{run_id})."),
+    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Daily Stage D snapshot key override."),
 ) -> None:
     configure_logging()
     _validate_content_class(content_class)
@@ -275,14 +278,15 @@ def run_once(
             f"event-cluster: processed={result.event_cluster.processed} events={result.event_cluster.events} "
             f"failed={result.event_cluster.failed}"
         )
-    if result.editorial_rank is not None:
+    if result.stage_d is not None:
         typer.echo(
-            f"editorial-rank: selected={result.editorial_rank.selected} rejected={result.editorial_rank.rejected} "
-            f"ai_failed={result.editorial_rank.ai_failed}"
+            f"stage-d: selected={result.stage_d.selected} omitted={result.stage_d.omitted} "
+            f"ai_failed={result.stage_d.ai_failed}"
         )
     if result.export.github_report_path:
         typer.echo(f"github_report={result.export.github_report_path}")
-    typer.echo(f"run_id={result.run_id} status={result.status}")
+    _echo_daily_edition(result.export.markdown_path)
+    typer.echo(f"status={result.status}")
     if result.error:
         typer.echo(f"error={result.error}")
     if result.status == "failed":
@@ -314,7 +318,7 @@ def pipeline_start(
         force=force,
         dry_run=dry_run,
     )
-    typer.echo(f"run_id={result.run_id} scope_frozen={result.scope_frozen}")
+    typer.echo(f"scope_frozen={result.scope_frozen}")
     typer.echo(
         f"fetch: fetched={result.fetch.total_fetched} inserted={result.fetch.total_inserted} "
         f"skipped={result.fetch.total_skipped} failed={result.fetch.total_failed}"
@@ -335,7 +339,7 @@ def pipeline_run(
     ),
     force: bool = typer.Option(False, "--force", help="Ignore source cooldown for this fetch stage only."),
     output_dir: str = typer.Option("output/intel", "--output-dir"),
-    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Run-scoped snapshot key override."),
+    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Daily Stage D snapshot key override."),
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
 ) -> None:
     """Run the complete pipeline while keeping stage boundaries resumable."""
@@ -344,7 +348,7 @@ def pipeline_run(
     _validate_content_class(content_class)
 
     def announce_start(start) -> None:
-        typer.echo(f"run_id={start.run_id} scope_frozen={start.scope_frozen}")
+        typer.echo(f"scope_frozen={start.scope_frozen}")
 
     result = run_pipeline_from_settings(
         settings=Settings.from_env(),
@@ -358,6 +362,9 @@ def pipeline_run(
         on_start=announce_start,
     )
     typer.echo(f"status={result.status}")
+    export_result = result.resume.results.get("export")
+    if export_result is not None:
+        _echo_daily_edition(getattr(export_result, "markdown_path", None))
     typer.echo(
         f"fetch: fetched={result.start.fetch.total_fetched} "
         f"inserted={result.start.fetch.total_inserted} "
@@ -398,7 +405,7 @@ def pipeline_stage_a(
         include_blocked=include_blocked,
     )
     typer.echo(
-        f"run_id={run_id} stage-a: processed={result.processed} screened={result.screened} "
+        f"stage-a: processed={result.processed} screened={result.screened} "
         f"screened_out={result.screened_out} failed={result.screen_failed} skipped={result.skipped}"
     )
 
@@ -428,7 +435,7 @@ def pipeline_stage_b(
         include_blocked=include_blocked,
     )
     typer.echo(
-        f"run_id={run_id} stage-b: processed={result.processed} analyzed={result.analyzed} "
+        f"stage-b: processed={result.processed} analyzed={result.analyzed} "
         f"filtered={result.analysis_filtered} candidate={result.candidate} "
         f"failed={result.analysis_failed} skipped={result.skipped}"
     )
@@ -439,7 +446,7 @@ def pipeline_stage_c(
     run_id: int = typer.Option(..., "--run-id", min=1, help="Existing frozen pipeline run id."),
     limit: int | None = typer.Option(DEFAULT_AI_REVIEW_LIMIT, "--limit", min=1),
     force: bool = typer.Option(False, "--force", help="Re-run Stage C only."),
-    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Run-scoped snapshot key override."),
+    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Internal cluster snapshot override."),
 ) -> None:
     """Run only Stage C event clustering with the frozen reference time."""
 
@@ -452,33 +459,31 @@ def pipeline_stage_c(
         snapshot_key=snapshot_key,
     )
     typer.echo(
-        f"run_id={run_id} stage-c: processed={result.processed} events={result.events} "
-        f"repeats={result.repeats} failed={result.failed} snapshot={result.snapshot_key}"
+        f"stage-c: processed={result.processed} events={result.events} "
+        f"repeats={result.repeats} failed={result.failed}"
     )
 
 
-@pipeline_app.command("rank")
-def pipeline_rank(
+@pipeline_app.command("stage-d")
+def pipeline_stage_d(
     run_id: int = typer.Option(..., "--run-id", min=1, help="Existing frozen pipeline run id."),
-    limit: int | None = typer.Option(None, "--limit", min=1),
-    force: bool = typer.Option(False, "--force", help="Rebuild this run's ranking snapshot only."),
-    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Run-scoped snapshot key override."),
+    force: bool = typer.Option(False, "--force", help="Rebuild this run's Stage-D snapshot only."),
+    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Daily Stage-D snapshot key override."),
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
 ) -> None:
-    """Rank Stage-C events for one run."""
+    """Run final editorial selection for one Stage-C event pool."""
 
     configure_logging()
-    result = run_pipeline_rank_from_settings(
+    result = run_pipeline_stage_d_from_settings(
         settings=Settings.from_env(),
         run_id=run_id,
-        limit=limit,
         force=force,
         snapshot_key=snapshot_key,
         profile_path=profile,
     )
     typer.echo(
-        f"run_id={run_id} rank: processed={result.processed} selected={result.selected} "
-        f"rejected={result.rejected} failed={result.ai_failed} snapshot={result.snapshot_key}"
+        f"stage-d: processed={result.processed} eligible={result.eligible} selected={result.selected} "
+        f"omitted={result.omitted} failed={result.ai_failed}"
     )
 
 
@@ -490,9 +495,9 @@ def pipeline_export(
     limit: int = typer.Option(DEFAULT_DAILY_REPORT_LIMIT, "--limit", min=1),
     output_dir: str = typer.Option("output/intel", "--output-dir"),
     dry_run: bool = typer.Option(False, "--dry-run"),
-    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Run-scoped snapshot key override."),
+    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Daily Stage-D snapshot key override."),
 ) -> None:
-    """Export one run's selected ranked events."""
+    """Export one run's selected Stage-D events."""
 
     configure_logging()
     _validate_content_class(content_class)
@@ -507,11 +512,13 @@ def pipeline_export(
         snapshot_key=snapshot_key,
     )
     typer.echo(
-        f"run_id={run_id} export: exported={result.exported} partial={result.partial} "
-        f"snapshot={result.snapshot_key}"
+        f"export: exported={result.exported} partial={result.partial}"
     )
+    _echo_daily_edition(result.markdown_path)
     typer.echo(f"jsonl={result.jsonl_path}")
     typer.echo(f"markdown={result.markdown_path}")
+    if result.manifest_path:
+        typer.echo(f"manifest={result.manifest_path}")
 
 
 @pipeline_app.command("status")
@@ -523,7 +530,7 @@ def pipeline_status(
     configure_logging()
     status = pipeline_status_from_settings(settings=Settings.from_env(), run_id=run_id)
     typer.echo(
-        f"run_id={status.run_id} status={status.run_status} scope_frozen={status.scope_frozen} "
+        f"status={status.run_status} scope_frozen={status.scope_frozen} "
         f"reference_time={status.reference_time.isoformat() if status.reference_time else '-'}"
     )
     for row in status.stages:
@@ -538,7 +545,7 @@ def pipeline_status(
 @pipeline_app.command("retry")
 def pipeline_retry(
     run_id: int = typer.Option(..., "--run-id", min=1, help="Existing pipeline run id."),
-    stage: str = typer.Option(..., "--stage", help="One stage: stage-a, stage-b, stage-c, rank, export."),
+    stage: str = typer.Option(..., "--stage", help="One stage: stage-a, stage-b, stage-c, stage-d, export."),
     source: str | None = typer.Option(None, "--source"),
     content_class: str | None = typer.Option(None, "--class"),
     limit: int | None = typer.Option(None, "--limit", min=1),
@@ -570,9 +577,9 @@ def pipeline_retry(
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--stage") from exc
     if result is None:
-        typer.echo(f"run_id={run_id} stage={canonical} retryable=0")
+        typer.echo(f"stage={canonical} retryable=0")
         return
-    typer.echo(f"run_id={run_id} stage={canonical} retried=true")
+    typer.echo(f"stage={canonical} retried=true")
     if getattr(result, "errors", None):
         for error in result.errors:
             typer.echo(f"error={error}")
@@ -604,7 +611,7 @@ def pipeline_resume(
         snapshot_key=snapshot_key,
         profile_path=profile,
     )
-    typer.echo(f"run_id={run_id} resumed={','.join(result.ran_stages) or '-'}")
+    typer.echo(f"resumed={','.join(result.ran_stages) or '-'}")
     if result.skipped_stages:
         typer.echo(f"skipped={','.join(result.skipped_stages)}")
     for error in result.errors:
@@ -622,7 +629,7 @@ def pipeline_adopt_existing(
     configure_logging()
     result = adopt_existing_pipeline_from_settings(settings=Settings.from_env(), run_id=run_id)
     typer.echo(
-        f"run_id={run_id} adopted_stage_a={result.adopted.get('screen', 0)} "
+        f"adopted_stage_a={result.adopted.get('screen', 0)} "
         f"adopted_stage_b={result.adopted.get('analyze', 0)}"
     )
 
@@ -637,7 +644,21 @@ def source_health(source: str | None = typer.Option(None, "--source")) -> None:
 
 def _validate_content_class(value: str | None) -> None:
     if value is not None and value not in _CONTENT_CLASSES:
-        raise typer.BadParameter("--class must be official_model_company, project_tool, or community_social")
+        raise typer.BadParameter(
+            "--class must be official_model_company, project_tool, community_social, or news_media"
+        )
+
+
+def _echo_daily_edition(markdown_path: str | None) -> None:
+    """Print the public daily identifier instead of an internal run ID."""
+
+    if not markdown_path:
+        return
+    try:
+        edition_date = date.fromisoformat(Path(markdown_path).parent.name).isoformat()
+    except (TypeError, ValueError):
+        return
+    typer.echo(f"edition_date={edition_date}")
 
 
 if __name__ == "__main__":

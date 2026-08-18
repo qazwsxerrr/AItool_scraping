@@ -5,13 +5,13 @@ import json
 
 from sqlalchemy import select
 
-from app.jobs.editorial_rank_job import EditorialProfile, run_editorial_rank_job
 from app.jobs.event_cluster_job import run_event_cluster_job
+from app.jobs.stage_d_job import StageDProfile, run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import (
     AIItemReview,
     IntelEvent,
-    IntelEventRankingSnapshot,
+    IntelEventStageDSnapshot,
     IntelItem,
     IntelRun,
     IntelRunStageTask,
@@ -174,7 +174,7 @@ def test_same_run_cluster_keeps_new_ids_compatible_and_persists_current_ids():
         assert task.result["current_event_ids"] == [1]
 
 
-def test_rank_uses_only_latest_cluster_projection_for_same_run():
+def test_stage_d_uses_only_latest_cluster_projection_for_same_run():
     session_factory = _db()
     reference = datetime(2026, 8, 16, 6, tzinfo=timezone.utc)
     run_id = _new_run(session_factory, reference)
@@ -183,11 +183,11 @@ def test_rank_uses_only_latest_cluster_projection_for_same_run():
         old_id = _add_event(session, run_id=run_id, key="old-event", score=95)
         current_id = _add_event(session, run_id=run_id, key="current-event", score=80)
         session.add(
-            IntelEventRankingSnapshot(
+            IntelEventStageDSnapshot(
                 snapshot_key=snapshot_key,
                 run_id=run_id,
                 event_id=old_id,
-                rank=1,
+                display_order=1,
                 display_score=95,
                 selected=True,
             )
@@ -195,11 +195,11 @@ def test_rank_uses_only_latest_cluster_projection_for_same_run():
         _persist_cluster_projection(session, run_id=run_id, event_ids=[current_id])
         session.commit()
 
-    result = run_editorial_rank_job(
+    result = run_stage_d_job(
         session_factory=session_factory,
         run_id=run_id,
         snapshot_key=snapshot_key,
-        profile=EditorialProfile(total_max=10),
+        profile=StageDProfile(total_max=10),
     )
     assert result.processed == 1
     assert result.selected == 1
@@ -207,15 +207,15 @@ def test_rank_uses_only_latest_cluster_projection_for_same_run():
     with session_factory() as session:
         rows = list(
             session.scalars(
-                select(IntelEventRankingSnapshot).where(
-                    IntelEventRankingSnapshot.snapshot_key == snapshot_key
+                select(IntelEventStageDSnapshot).where(
+                    IntelEventStageDSnapshot.snapshot_key == snapshot_key
                 )
             )
         )
         assert [row.event_id for row in rows] == [current_id]
 
 
-def test_rank_missing_or_empty_cluster_projection_clears_snapshot():
+def test_stage_d_missing_or_empty_cluster_projection_clears_snapshot():
     session_factory = _db()
     reference = datetime(2026, 8, 16, 6, tzinfo=timezone.utc)
     run_id = _new_run(session_factory, reference)
@@ -223,11 +223,11 @@ def test_rank_missing_or_empty_cluster_projection_clears_snapshot():
     with session_factory() as session:
         old_id = _add_event(session, run_id=run_id, key="old-event", score=95)
         session.add(
-            IntelEventRankingSnapshot(
+            IntelEventStageDSnapshot(
                 snapshot_key=snapshot_key,
                 run_id=run_id,
                 event_id=old_id,
-                rank=1,
+                display_order=1,
                 display_score=95,
                 selected=True,
             )
@@ -235,25 +235,25 @@ def test_rank_missing_or_empty_cluster_projection_clears_snapshot():
         _persist_cluster_projection(session, run_id=run_id, event_ids=[])
         session.commit()
 
-    result = run_editorial_rank_job(
+    result = run_stage_d_job(
         session_factory=session_factory,
         run_id=run_id,
         snapshot_key=snapshot_key,
-        profile=EditorialProfile(total_max=10),
+        profile=StageDProfile(total_max=10),
     )
     assert result.processed == 0
     with session_factory() as session:
         assert session.scalar(
-            select(IntelEventRankingSnapshot.id).where(
-                IntelEventRankingSnapshot.snapshot_key == snapshot_key
+            select(IntelEventStageDSnapshot.id).where(
+                IntelEventStageDSnapshot.snapshot_key == snapshot_key
             )
         ) is None
 
     missing_key = f"run-{run_id}-missing"
-    result_missing = run_editorial_rank_job(
+    result_missing = run_stage_d_job(
         session_factory=session_factory,
         run_id=run_id,
         snapshot_key=missing_key,
-        profile=EditorialProfile(total_max=10),
+        profile=StageDProfile(total_max=10),
     )
     assert result_missing.processed == 0

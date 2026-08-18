@@ -15,19 +15,22 @@
       {% if card.published_at %}<time datetime="{{ card.published_at }}">{{ card.published_at | relative_time }}</time>{% endif %}
     </div>
     <h3>
-      {% if card.url %}<a href="{{ card.url }}" target="_blank" rel="noopener noreferrer">{{ card.title }}</a>{% else %}{{ card.title }}{% endif %}
+      <a href="/events/{{ card.id }}?{% if active_edition_date %}run_date={{ active_edition_date }}&amp;{% endif %}origin={{ active_nav or 'home' }}">{{ card.title }}</a>
     </h3>
     {% if card.summary %}<p class="summary-clamp" title="{{ card.summary }}">{{ card.summary }}</p>{% endif %}
     {% if card.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ card.selection_reason }}</p>{% endif %}
     <div class="card-footline">
       <div class="topic-label"><span class="topic-dot"></span>{{ card.topic_category or card.content_class or '未分类' }}</div>
-      {% if card.url %}<a class="inline-link" href="{{ card.url }}" target="_blank" rel="noopener noreferrer">阅读原文 <span>↗</span></a>{% endif %}
+      <div class="card-links">
+        {% if card.url %}<a class="inline-link" href="{{ card.url }}" target="_blank" rel="noopener noreferrer">阅读原文 <span>↗</span></a>{% endif %}
+      </div>
     </div>
     <div class="badges">
       <span class="badge primary">{{ card.status | status_label }}</span>
       {% if card.content_class %}<span class="badge badge-source">{{ card.content_class | content_class_label }}</span>{% endif %}
       {% if card.source_tier %}<span class="badge">{{ card.source_tier | tier_label }}</span>{% endif %}
       {% if card.ai_confidence is not none %}<span class="badge">AI 把握 {{ card.ai_confidence }}%</span>{% endif %}
+      {% for label in card.presentation_labels | default(()) %}<span class="badge warning">{{ label }}</span>{% endfor %}
       {% if card.risk_flags %}
         <details class="risk-details">
           <summary class="badge warning">风险提示 {{ card.risk_flags | length }}</summary>

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Sequence
 
+from .models import NEWS_MEDIA
+
 
 DEFAULT_TOPIC_CATEGORIES: tuple[str, ...] = (
     "模型",
@@ -46,6 +48,8 @@ def fallback_topic_category(
         candidates.insert(0, "行业")
     if content_class == "community_social":
         candidates.append("观点")
+    if content_class == NEWS_MEDIA:
+        candidates.append("行业")
     if any(token in text for token in ("应用", "enterprise", "医疗", "金融", "教育", "workflow", "工作流")):
         candidates.append("行业")
     if content_class == "official_model_company":

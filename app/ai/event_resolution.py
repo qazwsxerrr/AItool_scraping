@@ -1,6 +1,6 @@
 """Narrow ambiguity resolver used by Stage C event clustering.
 
-This module deliberately exposes only merge/separate evidence.  It is not an
+This module deliberately exposes only event-identity evidence.  It is not an
 item-analysis skill and must never invent event title, summary, topic, or
 other editorial fields.
 """
@@ -26,6 +26,7 @@ class EventResolution:
     confidence: int
     reason: str | None = None
     raw: Any = None
+    groups: tuple[tuple[int, ...], ...] = ()
 
     @property
     def merge(self) -> bool:
@@ -34,6 +35,10 @@ class EventResolution:
     @property
     def separate(self) -> bool:
         return self.decision == "separate"
+
+    @property
+    def partition(self) -> bool:
+        return self.decision == "partition"
 
 
 class EventResolutionClient:
@@ -82,9 +87,10 @@ class EventResolutionClient:
 
     def _payload(self, values: list[dict[str, Any]]) -> dict[str, Any]:
         instruction = (
-            "Compare the supplied reports only for event identity. Return strict JSON "
-            "with decision merge or separate, confidence 0-100, and short evidence. "
-            "Do not generate title, summary, topic, or any editorial copy."
+            "Compare the supplied reports only for real-world event identity. Return strict JSON with "
+            "decision merge, separate, partition, or unknown; confidence 0-100; short evidence; and, "
+            "for partition, groups containing only supplied item ids. Do not use company/model/topic similarity "
+            "as identity. Do not generate title, summary, topic, or editorial copy."
         )
         user = json.dumps(values, ensure_ascii=False, default=str)
         serialized_values = json.loads(user)
@@ -106,7 +112,16 @@ class EventResolutionClient:
             "task": "event_resolution",
             "instructions": instruction,
             "input": serialized_values,
-            "response_schema": {"type": "object", "required": ["decision", "confidence"], "additionalProperties": True},
+            "response_schema": {
+                "type": "object",
+                "required": ["decision", "confidence"],
+                "additionalProperties": True,
+                "properties": {
+                    "decision": {"type": "string", "enum": ["merge", "separate", "partition", "unknown"]},
+                    "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "groups": {"type": "array"},
+                },
+            },
         }
 
     def _post(self, payload: dict[str, Any]):
@@ -146,7 +161,7 @@ def event_resolution_client_from_settings(settings: Settings, http_client: _Supp
 
 
 def resolve_event_group(values: Iterable[Mapping[str, Any]], resolver: Callable[..., Any]) -> EventResolution:
-    """Ask a narrow resolver for merge/separate evidence.
+    """Ask a narrow resolver for merge/separate/partition identity evidence.
 
     Resolver adapters may accept the complete group or two values.  Any
     malformed/failed response is represented as ``unknown`` so callers can
@@ -154,6 +169,7 @@ def resolve_event_group(values: Iterable[Mapping[str, Any]], resolver: Callable[
     """
 
     rows = [dict(value) for value in values]
+    ids = tuple(_row_id(row) for row in rows if _row_id(row) is not None)
     if not rows:
         return EventResolution("unknown", 0, "empty_group")
     try:
@@ -177,9 +193,9 @@ def resolve_event_group(values: Iterable[Mapping[str, Any]], resolver: Callable[
             continue
         decisions.append(parsed)
     if decisions and all(value.merge for value in decisions):
-        return EventResolution("merge", min(value.confidence for value in decisions), "pairwise_merge", decisions)
+        return EventResolution("merge", min(value.confidence for value in decisions), "pairwise_merge", decisions, (ids,))
     if decisions and any(value.separate for value in decisions):
-        return EventResolution("separate", max(value.confidence for value in decisions), "pairwise_separate", decisions)
+        return EventResolution("separate", max(value.confidence for value in decisions), "pairwise_separate", decisions, tuple((value,) for value in ids))
     return EventResolution("unknown", 0, "resolver_no_decision", decisions)
 
 
@@ -198,14 +214,48 @@ def parse_event_resolution(raw: Any) -> EventResolution:
         decision = "merge"
     elif decision in {"split", "unrelated", "different", "no", "false"}:
         decision = "separate"
-    elif decision not in {"merge", "separate"}:
+    elif decision in {"partition", "split_group", "split_groups"}:
+        decision = "partition"
+    elif decision not in {"merge", "separate", "partition"}:
         decision = "unknown"
     try:
         confidence = max(0, min(100, int(float(data.get("confidence", data.get("score", 0))))))
     except (TypeError, ValueError, OverflowError):
         confidence = 0
     reason = data.get("reason") or data.get("evidence") or data.get("explanation")
-    return EventResolution(decision, confidence, str(reason) if reason else None, raw)
+    groups = _parse_groups(data.get("groups", data.get("partitions")))
+    return EventResolution(decision, confidence, str(reason) if reason else None, raw, groups)
+
+
+def _row_id(value: Mapping[str, Any]) -> int | None:
+    raw = value.get("id", value.get("item_id", value.get("event_id")))
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _parse_groups(value: Any) -> tuple[tuple[int, ...], ...]:
+    if not isinstance(value, list):
+        return ()
+    groups: list[tuple[int, ...]] = []
+    for raw_group in value:
+        values = raw_group
+        if isinstance(raw_group, Mapping):
+            values = raw_group.get("item_ids", raw_group.get("event_ids", raw_group.get("ids", [])))
+        if not isinstance(values, (list, tuple, set)):
+            continue
+        ids: list[int] = []
+        for raw_id in values:
+            try:
+                item_id = int(raw_id)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if item_id not in ids:
+                ids.append(item_id)
+        if ids:
+            groups.append(tuple(ids))
+    return tuple(groups)
 
 
 def _normalize_style(value: Any) -> str:

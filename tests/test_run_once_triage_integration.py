@@ -8,11 +8,11 @@ from app.domain.models import FetchItem, SourceSpec
 from app.domain.policies import source_spec_from_config
 from app.jobs import run_job
 from app.jobs.ai_review_job import run_ai_review_job
-from app.jobs.editorial_rank_job import run_editorial_rank_job
 from app.jobs.event_cluster_job import run_event_cluster_job
 from app.jobs.fetch_job import IntelFetchResult, IntelSourceStats
+from app.jobs.stage_d_job import run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelEvent, IntelEventItem, IntelItem, IntelEventRankingSnapshot
+from app.storage.models import IntelEvent, IntelEventItem, IntelEventStageDSnapshot, IntelItem
 from app.storage.repository import IntelRepository
 
 
@@ -92,6 +92,7 @@ class _FakeIntelProvider:
 
 
 def _insert_item(session_factory, source: SourceSpec, *, url: str, title: str) -> None:
+    captured_at = datetime.now(timezone.utc)
     with session_factory() as session:
         repo = IntelRepository(session)
         repo.upsert_source(source, policy=source_spec_from_config(source))
@@ -101,8 +102,8 @@ def _insert_item(session_factory, source: SourceSpec, *, url: str, title: str) -
                 external_id=f"fixture:{title}",
                 title=title,
                 url=url,
-                published_at=NOW,
-                captured_at=NOW,
+                published_at=captured_at,
+                captured_at=captured_at,
                 summary=title,
                 content_class=source.content_class,
             )
@@ -125,7 +126,7 @@ def test_stage_a_b_projection_drives_current_event(tmp_path):
         output_dir=tmp_path / "review",
     )
     events = run_event_cluster_job(session_factory=session_factory, item_ids=review.candidate_ids)
-    editorial = run_editorial_rank_job(session_factory=session_factory, event_ids=events.event_ids)
+    editorial = run_stage_d_job(session_factory=session_factory, event_ids=events.event_ids)
 
     assert review.candidate == 1
     assert provider.screen_calls == [1]
@@ -139,7 +140,7 @@ def test_stage_a_b_projection_drives_current_event(tmp_path):
         assert item.ai_screen is not None and item.ai_screen.decision == "pass"
         assert item.ai_review is not None and item.ai_review.topic == "model"
         assert event is not None and event.topic == "model"
-        assert session.query(IntelEventRankingSnapshot).count() == 1
+        assert session.query(IntelEventStageDSnapshot).count() == 1
 
 
 def test_repeat_item_attaches_to_history_without_current_new_event(tmp_path):
