@@ -17,9 +17,8 @@ from app.jobs.export_job import run_intel_export_from_settings
 from app.jobs.fetch_job import run_intel_fetch_from_settings
 from app.jobs.fetch_only_job import run_fetch_only_from_settings
 from app.jobs.pipeline_orchestrator import (
-    adopt_existing_pipeline_from_settings,
     normalize_stage,
-    pipeline_status_from_settings,
+    pipeline_edition_status_from_settings,
     resolve_pipeline_run_id_from_settings,
     resume_pipeline_from_settings,
     retry_pipeline_stage_from_settings,
@@ -37,7 +36,7 @@ from app.logging_config import configure_logging
 
 
 app = typer.Typer(help="AI tool intelligence ingestion CLI")
-pipeline_app = typer.Typer(help="Run-scoped, resumable intelligence pipeline")
+pipeline_app = typer.Typer(help="Date-addressed, resumable daily intelligence pipeline")
 app.add_typer(pipeline_app, name="pipeline")
 _CONTENT_CLASSES = {"official_model_company", "project_tool", "community_social", "news_media"}
 
@@ -227,8 +226,6 @@ def stage_d(
 
 @app.command("run-once")
 def run_once(
-    source: str | None = typer.Option(None, help="Only run one source id."),
-    content_class: str | None = typer.Option(None, "--class", help="Only run one content class."),
     limit: int = typer.Option(
         DEFAULT_FETCH_LIMIT_PER_SOURCE,
         "--limit",
@@ -236,14 +233,7 @@ def run_once(
         min=1,
         help=f"Maximum items to fetch per source (default: {DEFAULT_FETCH_LIMIT_PER_SOURCE}).",
     ),
-    ai_limit: int | None = typer.Option(
-        None,
-        "--ai-limit",
-        min=1,
-        help="Optional AI safety cap; omitted means no global cap. A supplied cap marks the run partial.",
-    ),
     force: bool = typer.Option(False, "--force", help="Ignore cooldown and re-review items."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Run without database or export writes."),
     edition_date: str | None = typer.Option(
         None,
         "--edition-date",
@@ -252,22 +242,15 @@ def run_once(
     ),
     output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
-    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Daily Stage D snapshot key override."),
 ) -> None:
     configure_logging()
-    _validate_content_class(content_class)
     result = run_intel_once_from_settings(
         settings=Settings.from_env(),
-        source=source,
-        content_class=content_class,
         limit=limit,
-        ai_limit=ai_limit,
         force=force,
-        dry_run=dry_run,
         edition_date=_optional_edition_date(edition_date),
         output_dir=output_dir,
         profile_path=profile,
-        snapshot_key=snapshot_key,
     )
     typer.echo(
         f"fetch: fetched={result.fetch.total_fetched} inserted={result.fetch.total_inserted} "
@@ -297,14 +280,12 @@ def run_once(
     typer.echo(f"status={result.status}")
     if result.error:
         typer.echo(f"error={result.error}")
-    if result.status == "failed":
+    if result.status != "published":
         raise typer.Exit(code=1)
 
 
 @pipeline_app.command("start")
 def pipeline_start(
-    source: str | None = typer.Option(None, "--source", help="Freeze one source id into the new run."),
-    content_class: str | None = typer.Option(None, "--class", help="Freeze one content class into the new run."),
     limit: int | None = typer.Option(
         DEFAULT_FETCH_LIMIT_PER_SOURCE,
         "--limit",
@@ -312,7 +293,6 @@ def pipeline_start(
         help="Maximum items fetched per source for this run.",
     ),
     force: bool = typer.Option(False, "--force", help="Ignore source cooldown for this fetch stage only."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Diagnostic fetch without creating a durable run."),
     edition_date: str | None = typer.Option(
         None,
         "--edition-date",
@@ -320,17 +300,13 @@ def pipeline_start(
         help="Public daily edition to update; defaults to the current Asia/Shanghai date.",
     ),
 ) -> None:
-    """Create and freeze a run scope, then perform fetch only."""
+    """Create one complete daily draft and perform its fetch stage."""
 
     configure_logging()
-    _validate_content_class(content_class)
     result = start_pipeline_run_from_settings(
         settings=Settings.from_env(),
-        source=source,
-        content_class=content_class,
         limit=limit,
         force=force,
-        dry_run=dry_run,
         edition_date=_optional_edition_date(edition_date),
     )
     if result.edition_date:
@@ -346,8 +322,6 @@ def pipeline_start(
 
 @pipeline_app.command("run")
 def pipeline_run(
-    source: str | None = typer.Option(None, "--source", help="Only run one source id."),
-    content_class: str | None = typer.Option(None, "--class", help="Only run one content class."),
     limit: int | None = typer.Option(
         DEFAULT_FETCH_LIMIT_PER_SOURCE,
         "--limit",
@@ -356,7 +330,6 @@ def pipeline_run(
     ),
     force: bool = typer.Option(False, "--force", help="Ignore source cooldown for this fetch stage only."),
     output_dir: str = typer.Option("output/intel", "--output-dir"),
-    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Daily Stage D snapshot key override."),
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
     edition_date: str | None = typer.Option(
         None,
@@ -368,7 +341,6 @@ def pipeline_run(
     """Run the complete pipeline while keeping stage boundaries resumable."""
 
     configure_logging()
-    _validate_content_class(content_class)
 
     def announce_start(start) -> None:
         typer.echo(f"scope_frozen={start.scope_frozen}")
@@ -377,13 +349,10 @@ def pipeline_run(
 
     result = run_pipeline_from_settings(
         settings=Settings.from_env(),
-        source=source,
-        content_class=content_class,
         limit=limit,
         force=force,
         edition_date=_optional_edition_date(edition_date),
         output_dir=output_dir,
-        snapshot_key=snapshot_key,
         profile_path=profile,
         on_start=announce_start,
     )
@@ -409,24 +378,19 @@ def pipeline_run(
 @pipeline_app.command("stage-a")
 def pipeline_stage_a(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to process."),
-    source: str | None = typer.Option(None, "--source"),
-    content_class: str | None = typer.Option(None, "--class"),
     limit: int | None = typer.Option(DEFAULT_AI_REVIEW_LIMIT, "--limit", min=1),
     force: bool = typer.Option(False, "--force", help="Re-run Stage A tasks only."),
     retry_failed: bool = typer.Option(False, "--retry-failed", help="Retry failed Stage A tasks only."),
     include_blocked: bool = typer.Option(False, "--include-blocked", help="Include blocked Stage A tasks."),
 ) -> None:
-    """Run only Stage A (lightweight screening) for an existing run."""
+    """Run only Stage A (lightweight screening) for the current daily draft."""
 
     configure_logging()
-    _validate_content_class(content_class)
     settings = Settings.from_env()
     run_id = _resolve_run_id(settings, edition_date)
     result = run_pipeline_stage_a_from_settings(
         settings=settings,
         run_id=run_id,
-        source=source,
-        content_class=content_class,
         limit=limit,
         force=force,
         retry_failed=retry_failed,
@@ -441,24 +405,19 @@ def pipeline_stage_a(
 @pipeline_app.command("stage-b")
 def pipeline_stage_b(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to process."),
-    source: str | None = typer.Option(None, "--source"),
-    content_class: str | None = typer.Option(None, "--class"),
     limit: int | None = typer.Option(DEFAULT_AI_REVIEW_LIMIT, "--limit", min=1),
     force: bool = typer.Option(False, "--force", help="Re-run Stage B tasks only."),
     retry_failed: bool = typer.Option(False, "--retry-failed", help="Retry failed Stage B tasks only."),
     include_blocked: bool = typer.Option(False, "--include-blocked", help="Include blocked Stage B tasks."),
 ) -> None:
-    """Run only Stage B (full analysis) for Stage-A eligible items."""
+    """Run only Stage B (full analysis) for the current daily draft."""
 
     configure_logging()
-    _validate_content_class(content_class)
     settings = Settings.from_env()
     run_id = _resolve_run_id(settings, edition_date)
     result = run_pipeline_stage_b_from_settings(
         settings=settings,
         run_id=run_id,
-        source=source,
-        content_class=content_class,
         limit=limit,
         force=force,
         retry_failed=retry_failed,
@@ -476,9 +435,8 @@ def pipeline_stage_c(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to process."),
     limit: int | None = typer.Option(DEFAULT_AI_REVIEW_LIMIT, "--limit", min=1),
     force: bool = typer.Option(False, "--force", help="Re-run Stage C only."),
-    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Internal cluster snapshot override."),
 ) -> None:
-    """Run only Stage C event clustering with the frozen reference time."""
+    """Run only Stage C event clustering for the current daily draft."""
 
     configure_logging()
     settings = Settings.from_env()
@@ -488,7 +446,6 @@ def pipeline_stage_c(
         run_id=run_id,
         limit=limit,
         force=force,
-        snapshot_key=snapshot_key,
     )
     typer.echo(
         f"stage-c: processed={result.processed} events={result.events} "
@@ -499,8 +456,7 @@ def pipeline_stage_c(
 @pipeline_app.command("stage-d")
 def pipeline_stage_d(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to process."),
-    force: bool = typer.Option(False, "--force", help="Rebuild this run's Stage-D snapshot only."),
-    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Daily Stage-D snapshot key override."),
+    force: bool = typer.Option(False, "--force", help="Rebuild this daily draft's Stage-D selection only."),
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
 ) -> None:
     """Run final editorial selection for one Stage-C event pool."""
@@ -512,7 +468,6 @@ def pipeline_stage_d(
         settings=settings,
         run_id=run_id,
         force=force,
-        snapshot_key=snapshot_key,
         profile_path=profile,
     )
     typer.echo(
@@ -524,28 +479,21 @@ def pipeline_stage_d(
 @pipeline_app.command("export")
 def pipeline_export(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to export."),
-    source: str | None = typer.Option(None, "--source"),
-    content_class: str | None = typer.Option(None, "--class"),
     limit: int = typer.Option(DEFAULT_DAILY_REPORT_LIMIT, "--limit", min=1),
     output_dir: str = typer.Option("output/intel", "--output-dir"),
     dry_run: bool = typer.Option(False, "--dry-run"),
-    snapshot_key: str | None = typer.Option(None, "--snapshot", help="Daily Stage-D snapshot key override."),
 ) -> None:
-    """Export one run's selected Stage-D events."""
+    """Publish the current daily draft's selected Stage-D events."""
 
     configure_logging()
-    _validate_content_class(content_class)
     settings = Settings.from_env()
     run_id = _resolve_run_id(settings, edition_date)
     result = run_pipeline_export_from_settings(
         settings=settings,
         run_id=run_id,
-        source=source,
-        content_class=content_class,
         limit=limit,
         output_dir=output_dir,
         dry_run=dry_run,
-        snapshot_key=snapshot_key,
     )
     typer.echo(
         f"export: exported={result.exported} partial={result.partial}"
@@ -561,17 +509,19 @@ def pipeline_export(
 def pipeline_status(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to inspect."),
 ) -> None:
-    """Show every stage's status and fail/block counts for one run."""
+    """Show draft or published state for one date-addressed daily report."""
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_run_id(settings, edition_date)
-    status = pipeline_status_from_settings(settings=settings, run_id=run_id)
-    if status.edition_date:
-        typer.echo(f"edition_date={status.edition_date}")
+    normalized = _required_edition_date(edition_date)
+    try:
+        status = pipeline_edition_status_from_settings(settings=settings, edition_date=normalized)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--edition-date") from exc
+    typer.echo(f"edition_date={status.edition_date}")
     typer.echo(
-        f"status={status.run_status} scope_frozen={status.scope_frozen} "
-        f"reference_time={status.reference_time.isoformat() if status.reference_time else '-'}"
+        f"status={status.status} draft_status={status.draft_status or '-'} "
+        f"published_at={status.published_at.isoformat() if status.published_at else '-'}"
     )
     for row in status.stages:
         typer.echo(
@@ -586,19 +536,15 @@ def pipeline_status(
 def pipeline_retry(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to retry."),
     stage: str = typer.Option(..., "--stage", help="One stage: stage-a, stage-b, stage-c, stage-d, export."),
-    source: str | None = typer.Option(None, "--source"),
-    content_class: str | None = typer.Option(None, "--class"),
     limit: int | None = typer.Option(None, "--limit", min=1),
     force: bool = typer.Option(False, "--force", help="Force only the named stage."),
     include_blocked: bool = typer.Option(False, "--include-blocked"),
     output_dir: str = typer.Option("output/intel", "--output-dir"),
-    snapshot_key: str | None = typer.Option(None, "--snapshot"),
     profile: str | None = typer.Option(None, "--profile"),
 ) -> None:
     """Retry failed/retry-waiting tasks in exactly one named stage."""
 
     configure_logging()
-    _validate_content_class(content_class)
     settings = Settings.from_env()
     run_id = _resolve_run_id(settings, edition_date)
     try:
@@ -609,11 +555,8 @@ def pipeline_retry(
             stage=canonical,
             include_blocked=include_blocked,
             force=force,
-            source=source,
-            content_class=content_class,
             limit=limit,
             output_dir=output_dir,
-            snapshot_key=snapshot_key,
             profile_path=profile,
         )
     except ValueError as exc:
@@ -630,29 +573,20 @@ def pipeline_retry(
 @pipeline_app.command("resume")
 def pipeline_resume(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to resume."),
-    fetch: bool = typer.Option(False, "--fetch", help="Explicitly attempt fetch for this existing run."),
-    source: str | None = typer.Option(None, "--source"),
-    content_class: str | None = typer.Option(None, "--class"),
     limit: int | None = typer.Option(None, "--limit", min=1),
     output_dir: str = typer.Option("output/intel", "--output-dir"),
-    snapshot_key: str | None = typer.Option(None, "--snapshot"),
     profile: str | None = typer.Option(None, "--profile"),
 ) -> None:
-    """Resume pending/retryable stages in dependency order without fetching."""
+    """Resume pending/retryable stages for the current daily draft."""
 
     configure_logging()
-    _validate_content_class(content_class)
     settings = Settings.from_env()
     run_id = _resolve_run_id(settings, edition_date)
     result = resume_pipeline_from_settings(
         settings=settings,
         run_id=run_id,
-        fetch=fetch,
-        source=source,
-        content_class=content_class,
         limit=limit,
         output_dir=output_dir,
-        snapshot_key=snapshot_key,
         profile_path=profile,
     )
     typer.echo(f"resumed={','.join(result.ran_stages) or '-'}")
@@ -662,23 +596,6 @@ def pipeline_resume(
         typer.echo(f"error={error}")
     if result.errors:
         raise typer.Exit(code=1)
-
-
-@pipeline_app.command("adopt-existing")
-def pipeline_adopt_existing(
-    edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to reconstruct."),
-) -> None:
-    """Adopt matching current Stage-A/B projections without any AI calls."""
-
-    configure_logging()
-    settings = Settings.from_env()
-    run_id = _resolve_run_id(settings, edition_date)
-    result = adopt_existing_pipeline_from_settings(settings=settings, run_id=run_id)
-    typer.echo(
-        f"adopted_stage_a={result.adopted.get('screen', 0)} "
-        f"adopted_stage_b={result.adopted.get('analyze', 0)}"
-    )
-
 
 @app.command("source-health")
 def source_health(source: str | None = typer.Option(None, "--source")) -> None:

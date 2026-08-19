@@ -98,3 +98,15 @@ def test_pipeline_commands_no_longer_accept_run_id_as_a_public_option():
     result = runner.invoke(main.app, ["pipeline", "status", "--run-id", "77"])
 
     assert result.exit_code != 0
+
+
+def test_formal_daily_commands_reject_source_and_class_overrides():
+    for arguments in (
+        ["pipeline", "run", "--source", "one"],
+        ["pipeline", "start", "--class", "news_media"],
+        ["pipeline", "stage-a", "--edition-date", "2026-08-19", "--source", "one"],
+        ["pipeline", "export", "--edition-date", "2026-08-19", "--class", "news_media"],
+        ["run-once", "--source", "one"],
+    ):
+        result = runner.invoke(main.app, arguments)
+        assert result.exit_code != 0, arguments

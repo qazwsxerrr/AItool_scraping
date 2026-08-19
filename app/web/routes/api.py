@@ -1,4 +1,4 @@
-"""Read-only Run/Snapshot JSON API for the public intelligence UI."""
+"""Read-only date-addressed daily-edition JSON API for the public UI."""
 
 from __future__ import annotations
 
@@ -17,17 +17,13 @@ router = APIRouter(prefix="/api", tags=["intelligence"])
 
 @router.get("/ui/current")
 def current_ui(
-    run_date: str | None = None,
-    snapshot_key: str | None = None,
+    edition_date: str | None = None,
     limit: int = Query(default=30, ge=1, le=100),
     repo: UIReadRepository = Depends(get_repository),
 ) -> dict[str, Any]:
-    """Return the selected event feed for the resolved public daily snapshot."""
+    """Return the selected event feed for the resolved public daily edition."""
 
-    snapshot = repo.resolve_snapshot(
-        edition_date=run_date,
-        snapshot_key=snapshot_key,
-    )
+    snapshot = repo.resolve_snapshot(edition_date=edition_date)
     summary = repo.get_run_snapshot_summary(snapshot)
     return _response(
         snapshot=snapshot,
@@ -39,32 +35,26 @@ def current_ui(
 
 
 @router.get("/editions")
-@router.get("/runs", include_in_schema=False)
 def list_editions(
     repo: UIReadRepository = Depends(get_repository),
 ) -> dict[str, Any]:
-    """List the current public snapshot for each daily edition."""
+    """List the public report for each daily edition."""
 
     editions = repo.list_daily_editions()
     return {"items": _encode(editions), "count": len(editions)}
 
 
-@router.get("/snapshots/{snapshot_key}/events")
-def snapshot_events(
-    snapshot_key: str,
-    run_date: str | None = None,
+@router.get("/editions/{edition_date}/events")
+def edition_events(
+    edition_date: str,
     topic: str | None = None,
     content_class: str | None = None,
     limit: int = Query(default=30, ge=1, le=100),
     repo: UIReadRepository = Depends(get_repository),
 ) -> dict[str, Any]:
-    """Read selected events from one public daily snapshot."""
+    """Read selected events from one public date-addressed daily report."""
 
-    snapshot = _require_snapshot(
-        repo,
-        snapshot_key=snapshot_key,
-        run_date=run_date,
-    )
+    snapshot = _require_edition(repo, edition_date=edition_date)
     events = repo.list_featured_events(
         snapshot=snapshot,
         topic=topic,
@@ -79,20 +69,15 @@ def snapshot_events(
     )
 
 
-@router.get("/snapshots/{snapshot_key}/events/{event_id}")
-def snapshot_event_detail(
-    snapshot_key: str,
+@router.get("/editions/{edition_date}/events/{event_id}")
+def edition_event_detail(
+    edition_date: str,
     event_id: int,
-    run_date: str | None = None,
     repo: UIReadRepository = Depends(get_repository),
 ) -> dict[str, Any]:
-    """Read one selected event and its public provenance/Stage A-B trace."""
+    """Read one selected event and its retained public provenance."""
 
-    snapshot = _require_snapshot(
-        repo,
-        snapshot_key=snapshot_key,
-        run_date=run_date,
-    )
+    snapshot = _require_edition(repo, edition_date=edition_date)
     detail = repo.get_selected_event_detail(event_id, snapshot=snapshot)
     if detail is None:
         raise HTTPException(status_code=404, detail="Selected event not found in this snapshot")
@@ -102,16 +87,12 @@ def snapshot_event_detail(
     }
 
 
-def _require_snapshot(
+def _require_edition(
     repo: UIReadRepository,
     *,
-    snapshot_key: str,
-    run_date: str | None,
+    edition_date: str,
 ):
-    snapshot = repo.resolve_snapshot(
-        edition_date=run_date,
-        snapshot_key=snapshot_key,
-    )
+    snapshot = repo.resolve_snapshot(edition_date=edition_date)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="Daily snapshot not found")
     return snapshot

@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import shutil
 import tempfile
+from uuid import uuid4
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -44,6 +46,19 @@ class IntelExportResult:
     partial_reason: str | None = None
     run_id: int | None = None
     snapshot_key: str = "latest"
+    # Internal hand-off to the daily publisher.  This is never serialized to
+    # the public manifest/CLI, but avoids re-reading a build after its files
+    # have been staged.
+    records: tuple[dict[str, Any], ...] = field(default_factory=tuple, repr=False)
+
+
+@dataclass(frozen=True)
+class DailyBundlePromotion:
+    """Reversible directory-level replacement of one public daily bundle."""
+
+    staging_dir: Path
+    final_dir: Path
+    backup_dir: Path | None = None
 
 
 def run_intel_export_job(
@@ -59,6 +74,8 @@ def run_intel_export_job(
     run_id: int | None = None,
     partial: bool = False,
     partial_reason: str | None = None,
+    artifact_dir: str | Path | None = None,
+    publish_root_mirror: bool = True,
 ) -> IntelExportResult:
     final_output = Path(output_dir)
     key = str(snapshot_key or "latest")
@@ -79,7 +96,7 @@ def run_intel_export_job(
             if run is not None and run_id is not None:
                 _ensure_stage_d_ready(repo, int(run_id))
             if run is not None and not dry_run:
-                artifact_output = _daily_output_dir(final_output, run)
+                artifact_output = Path(artifact_dir) if artifact_dir is not None else _daily_output_dir(final_output, run)
                 stage = repo.ensure_stage(
                     int(run_id),
                     "export",
@@ -146,7 +163,13 @@ def run_intel_export_job(
             session.rollback()
             raise
 
-    artifact_output = _daily_output_dir(final_output, run) if run is not None else final_output
+    artifact_output = (
+        Path(artifact_dir)
+        if artifact_dir is not None
+        else _daily_output_dir(final_output, run)
+        if run is not None
+        else final_output
+    )
     jsonl_path = artifact_output / "intel_items.jsonl"
     markdown_path = artifact_output / "intel_digest.md"
     manifest_path = artifact_output / "manifest.json"
@@ -196,7 +219,7 @@ def run_intel_export_job(
             )
             # A partial/failed upstream run is auditable in its per-run
             # directory but must never replace the last successful digest.
-            if run_id is not None and not partial:
+            if run_id is not None and not partial and publish_root_mirror:
                 final_payloads = {
                     final_output / "intel_items.jsonl": jsonl_payload,
                     final_output / "intel_digest.md": markdown_payload,
@@ -259,6 +282,7 @@ def run_intel_export_job(
         partial_reason=partial_reason,
         run_id=run_id,
         snapshot_key=key,
+        records=tuple(records),
     )
 
 
@@ -275,6 +299,8 @@ def run_intel_export_from_settings(
     run_id: int | None = None,
     partial: bool = False,
     partial_reason: str | None = None,
+    artifact_dir: str | Path | None = None,
+    publish_root_mirror: bool = True,
 ) -> IntelExportResult:
     database_url = _readable_database_url(settings.database_url, dry_run=dry_run)
     engine = create_engine_from_url(database_url)
@@ -292,7 +318,76 @@ def run_intel_export_from_settings(
         run_id=run_id,
         partial=partial,
         partial_reason=partial_reason,
+        artifact_dir=artifact_dir,
+        publish_root_mirror=publish_root_mirror,
     )
+
+
+def daily_output_dir_for_run(output_dir: str | Path, run: IntelRun) -> Path:
+    """Public helper used by the pipeline's success-only publisher."""
+
+    return _daily_output_dir(Path(output_dir), run)
+
+
+def create_daily_bundle_staging_dir(output_dir: str | Path, run: IntelRun) -> Path:
+    """Create an adjacent temporary directory safe to rename into place."""
+
+    final_dir = daily_output_dir_for_run(output_dir, run)
+    final_dir.parent.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.build-{int(run.id)}-", dir=str(final_dir.parent)))
+
+
+def promote_daily_bundle(*, staging_dir: str | Path, final_dir: str | Path) -> DailyBundlePromotion:
+    """Atomically replace a whole date directory while retaining one rollback copy."""
+
+    staging = Path(staging_dir)
+    final = Path(final_dir)
+    if not staging.is_dir():
+        raise ValueError(f"daily staging directory does not exist: {staging}")
+    final.parent.mkdir(parents=True, exist_ok=True)
+    backup: Path | None = None
+    if final.exists():
+        backup = final.parent / f".{final.name}.previous-{uuid4().hex}"
+        os.replace(final, backup)
+    try:
+        os.replace(staging, final)
+    except Exception:
+        if backup is not None and backup.exists() and not final.exists():
+            os.replace(backup, final)
+        raise
+    return DailyBundlePromotion(staging_dir=staging, final_dir=final, backup_dir=backup)
+
+
+def rollback_daily_bundle(promotion: DailyBundlePromotion) -> None:
+    """Restore the prior public bundle after a failed database publication."""
+
+    if promotion.final_dir.exists():
+        if promotion.staging_dir.exists():
+            shutil.rmtree(promotion.staging_dir)
+        os.replace(promotion.final_dir, promotion.staging_dir)
+    if promotion.backup_dir is not None and promotion.backup_dir.exists():
+        os.replace(promotion.backup_dir, promotion.final_dir)
+
+
+def finalize_daily_bundle(promotion: DailyBundlePromotion) -> None:
+    """Discard the rollback copy only after the new report is durable."""
+
+    if promotion.backup_dir is not None and promotion.backup_dir.exists():
+        shutil.rmtree(promotion.backup_dir)
+
+
+def refresh_daily_export_mirror(*, output_dir: str | Path, daily_dir: str | Path) -> None:
+    """Refresh compatibility files at ``output/intel`` after publication only."""
+
+    root = Path(output_dir)
+    bundle = Path(daily_dir)
+    payloads: dict[Path, str] = {}
+    for name in ("intel_items.jsonl", "intel_digest.md", "manifest.json"):
+        source = bundle / name
+        if source.exists():
+            payloads[root / name] = source.read_text(encoding="utf-8")
+    if payloads:
+        _atomic_write_bundle(payloads)
 
 
 def _daily_output_dir(final_output: Path, run: IntelRun) -> Path:
@@ -599,6 +694,9 @@ def _serialize_event(
     return {
         "record_type": "intel_event",
         "stage": "stage_d",
+        # Stable public history identity.  It is deliberately distinct from
+        # the temporary database event id, which is deleted after publication.
+        "event_key": event.event_key,
         "event_id": event.id,
         "id": event.id,
         "display_order": snapshot.display_order,

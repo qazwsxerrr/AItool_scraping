@@ -9,7 +9,7 @@ source registry
 → Stage B analyze（结构化分析、实体与评分）
 → Stage C cluster（固定 reference time 的事件聚类）
 → Stage D（日报主编选择、故事簇与展示标题）
-→ export（仅导出当前 run 的结果）
+→ export（成功后发布为该日期唯一日报）
 → UI（首页、搜索、全部动态只读展示）
 ```
 
@@ -48,13 +48,15 @@ AI review 对每个候选条目执行一次结构化分析，输出 `keep`、来
 
 ## 数据模型
 
-新数据库只由当前 ORM metadata 初始化，旧数据库不提供迁移兼容。保留的五张核心表为：
+日报以 `edition_date`（`YYYY-MM-DD`，Asia/Shanghai）作为唯一业务标识。正式日报每次都会创建一个仅内部使用的临时 build；成功发布后会物理删除该 build 的原始资讯、A/B/C/D 结果、事件、阶段任务和 provider 尝试，只保留最终日报。
 
-- `sources`：来源配置、内容类别、来源归因和健康状态。
-- `fetch_attempts`：请求状态、HTTP 信息、重试和错误记录。
-- `intel_runs`：一次抓取、AI review 或 `run-once` 的运行汇总。
-- `intel_items`：标准化条目、原始 payload、指标、选择状态和来源关联。
-- `ai_item_reviews`：每条最多一条结构化 AI 分析结果和原始响应。
+- `daily_editions`：每个日期一份最终日报的状态和发布时间。
+- `daily_edition_report_entries`：最终入选事件、来源归因和展示字段；历史 UI 与跨日报去重只读取这里。
+- `intel_runs`：临时 build 的内部外键，CLI、UI、导出和日报文件都不展示它。
+- `intel_items`、AI 投影、事件、阶段任务：仅在当前 draft 存在；成功发布后删除。
+- `sources`：来源配置与健康状态，会保留以供下一次抓取。
+
+旧数据库启动时会迁移每个过去日期最后一份可发布日报到日期级最终日报，然后清理旧原始/中间数据。
 
 ## 安装与配置
 
@@ -100,19 +102,19 @@ AI_STAGE_D_RETRIES=2
 
 ## CLI
 
-保留的旧命令与新的 run-scoped 命令：
+`fetch` / `fetch-only` 是诊断命令，可用 `--source`、`--class` 缩小范围；它们不会替换正式日报。正式日报命令始终使用全部当前启用来源：
 
 ```bash
 python -m app.main fetch [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
 python -m app.main fetch-only [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
 python -m app.main ai-review [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
 python -m app.main export [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N]
-python -m app.main run-once [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--ai-limit N] [--force] [--edition-date YYYY-MM-DD]
+python -m app.main run-once [--limit N] [--force] [--edition-date YYYY-MM-DD]
 python -m app.main source-health [--source SOURCE_ID]
 
-# 正式的可恢复链路
-python -m app.main pipeline run [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force] [--output-dir DIR] [--edition-date YYYY-MM-DD]
-python -m app.main pipeline start [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--edition-date YYYY-MM-DD]
+# 正式的日期级可恢复链路
+python -m app.main pipeline run [--limit N] [--force] [--output-dir DIR] [--edition-date YYYY-MM-DD]
+python -m app.main pipeline start [--limit N] [--force] [--edition-date YYYY-MM-DD]
 python -m app.main pipeline stage-a --edition-date YYYY-MM-DD
 python -m app.main pipeline stage-b --edition-date YYYY-MM-DD
 python -m app.main pipeline stage-c --edition-date YYYY-MM-DD
@@ -138,21 +140,20 @@ bash scripts/start_rsshub.sh
 # 查看来源健康状态和最近一次抓取结果
 $PYTHON -m app.main source-health
 
-# 推荐：一次完成完整兼容链路（需要逐阶段恢复时使用 pipeline 命令）
+# 兼容入口：与 pipeline run 使用同一套日期级全量重建规则
 $PYTHON -m app.main run-once \
   --limit 20 \
-  --ai-limit 1000 \
   --force \
   --output-dir output/intel
 
-# 推荐：一次完成正式可恢复链路。程序内部维护执行 ID；对外以日报日期识别产物。
+# 推荐：一次完成正式可恢复链路。对外唯一标识是日报日期。
 $PYTHON -m app.main pipeline run \
   --limit 20 \
   --force \
   --output-dir output/intel
 
-# 诊断或运维恢复时，仍用日报日期定位；start 只抓取并冻结 membership，后续阶段不会重复抓取。
-# 同一天多次重跑会更新同一份日报；内部尝试记录只用于审计和恢复。
+# 诊断或运维恢复时，仍用日报日期定位；start 创建一个新的完整 draft。
+# 同一天再次 pipeline run 会删除此前 draft，重新抓取全部启用来源；只有成功后才整体替换该日期日报。
 $PYTHON -m app.main pipeline start --limit 20 --edition-date 2026-08-18
 $PYTHON -m app.main pipeline stage-a --edition-date 2026-08-18
 $PYTHON -m app.main pipeline stage-b --edition-date 2026-08-18
@@ -173,24 +174,22 @@ $PYTHON -m app.main pipeline retry --edition-date 2026-08-18 --stage stage-b
 $PYTHON -m app.main pipeline resume --edition-date 2026-08-18
 ```
 
-单个来源或来源类别可以用同样的参数缩小范围：
+单个来源或来源类别只用于诊断，不会替换正式日报：
 
 ```bash
 # 单个 X 官方账号（RSSHub 必须已启动且 RSSHUB_BASE_URL 已配置）
-$PYTHON -m app.main run-once \
+$PYTHON -m app.main fetch-only \
   --source x_account_openai \
   --limit 5 \
-  --ai-limit 1000 \
   --force \
-  --output-dir output/intel-openai
+  --output-dir output/fetch-openai
 
 # 只处理官方模型/公司来源
-$PYTHON -m app.main run-once \
+$PYTHON -m app.main fetch-only \
   --class official_model_company \
   --limit 20 \
-  --ai-limit 1000 \
   --force \
-  --output-dir output/intel-official
+  --output-dir output/fetch-official
 
 # 查询单个来源的健康状态
 $PYTHON -m app.main source-health --source x_account_openai
@@ -198,12 +197,13 @@ $PYTHON -m app.main source-health --source x_account_openai
 
 各阶段的职责和门禁如下：
 
-1. `fetch` 从 registry 载入启用来源，按 `transport` 调用 Feed/RSSHub/GitHub collector；完成解析、标准化、内容 hash 去重、幂等写入，并记录 `fetch_attempts`、HTTP 状态、重试、ETag/Last-Modified、失败原因和来源健康状态。
+1. 正式日报的 `fetch` 从 registry 载入全部当前启用来源，强制完整请求（不使用 HTTP 304 条件请求），把本次响应视为当天完整集合；每个条目只在当前临时 build 内去重。
 2. `ai-review` 先执行来源级确定性初筛，再对保留条目调用结构化 AI。AI 返回 `keep`、`content_class`、`topic_category`、`summary_cn`、理由、风险标记和置信度；无关内容 `keep=false`，AI 失败或尚未处理的内容保留在数据库的阶段审计中，但不进入最终导出。主题列表由 `AI_REVIEW_CATEGORIES` 配置，`AI_REVIEW_CATEGORY_MODE=source` 可在模型不可用时使用来源规则回退。
 3. `stage-c` 只处理真实世界事件身份：URL/external ID 是精确锚点，标题只是弱候选信号；摘要、实体和关键词用于候选召回，模糊组交由窄域 AI resolver 分区，失败时保守拆分。
 4. `stage-d` 只处理日报编辑：先应用论文证据硬门槛，再由独立编辑 skill 对本轮 Stage C canonical events 做全局选择、故事簇归并、展示顺序和中文展示标题。它不使用 topic/source/content/repeat 的本地配额，也不要求凑满 30 条；社区线索可被选中，但展示层会强制标注待核实。
-5. `export` 只查询 Stage D 快照中 `selected=true` 的事件；日报默认输出最多 30 条，不足 30 条时不补内容，显式 `--limit` 可覆盖默认值。日报按 `Asia/Shanghai` 日期写入 `output/daily/YYYY-MM-DD/`，包括 `intel_items.jsonl`、`intel_digest.md` 与 `manifest.json`；同一天重跑会原子更新这一份公开日报。内部执行 ID 仅保留在数据库审计链路中。
-6. UI（`/`、`/search`、`/all`、`/github`）只读数据库或已生成报告，不在请求中执行抓取或 AI；首页、搜索和“本期精选”默认只展示当前日报 Snapshot 的最终入选事件，展示标题与原始标题、故事簇关系和社区待核实标签都会保留。
+5. `export` 先写入临时目录；只有所有来源和 AI 阶段完整成功时，才原子替换 `output/daily/YYYY-MM-DD/`，写入最终日报条目并删除临时 build。失败或 `partial` 不会触碰旧日报。
+6. 同日重新抓取不合并上午结果：下午响应中不存在的资讯、被移除来源的资讯及其派生事件，会在下午成功发布后从当天日报与数据库临时数据中消失。历史日期只保留其最终日报。
+7. UI（`/`、`/search`、`/all`、`/github`）只读日期级最终日报或已生成报告，不在请求中执行抓取或 AI；首页、搜索和“本期精选”默认只展示当前日期的最终入选事件。
 
 启动本地 UI：
 
@@ -211,11 +211,11 @@ $PYTHON -m app.main source-health --source x_account_openai
 $PYTHON -m uvicorn app.web.app:app --host 127.0.0.1 --port 8000
 ```
 
-`run-once` 是完整链路的兼容 facade。正式 pipeline 会把 fetch membership、reference time 和各阶段 task 状态写入 run；重试只作用于命名阶段。`fetch-only` 只抓取并输出标准化条目及来源归因，不调用 AI，也不代表一个可恢复的正式 run。`ai-review` 输出：
+`run-once` 是 `pipeline run` 的兼容 facade，两者使用相同的日期级全量重建和成功后替换规则。`fetch-only` 只抓取并输出标准化条目及来源归因，不调用 AI，也不代表正式日报。
 
 Stage A/B 对每条 AI provider 任务执行瞬态错误自动重试：首次调用失败后最多再重试 5 次（最多 6 次 provider 调用）。429、5xx、timeout 和 rate-limit 属于可重试错误；永久性 4xx、鉴权失败和 schema 错误不会重复请求。达到上限后任务记录 `provider_retry_exhausted` 并转为终结失败，成功任务仍会继续进入下游阶段，整次 run 以 `partial` 保留审计状态。
 
-默认数量策略为：每个来源抓取 20 条，AI review 最多处理 1000 条已有条目，日报默认导出 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；`--ai-limit` 是 Stage A/B 的显式安全上限；Stage D 始终对本轮通过论文门槛的完整事件池做编辑选择；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
+默认数量策略为：每个来源抓取 20 条，Stage A/B 处理当前完整 build，日报默认导出 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；Stage D 始终对本轮通过论文门槛的完整事件池做编辑选择；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
 
 - `ai_review_candidates.jsonl`：AI 选择且分析成功的候选。
 - `ai_review_audit.jsonl`：过滤、拒绝和 AI 失败等审计记录。
@@ -227,7 +227,7 @@ Stage A/B 对每条 AI provider 任务执行瞬态错误自动重试：首次调
 - `intel_digest.md`：分类、状态、指标、风险和链接摘要。
 - `manifest.json`：日报日期、公开状态、完整筛选漏斗、阶段状态/失败原因和文件校验信息；不包含内部执行 ID 或快照键。
 
-为兼容既有脚本，完整成功的 Run 仍会同步最新副本到 `output/intel/`；UI 的主数据源仍是数据库，而不是该副本。
+为兼容既有脚本，完整成功的日报仍会同步最新副本到 `output/intel/`；UI 的主数据源是日期级最终日报，而不是临时 build。
 
 GitHub 项目保留抓取到的 stars、forks、Trending 周期指标、topics 和 README 摘要；AI 不替代项目指标筛选，也不会生成未提供的增长数据。
 

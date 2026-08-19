@@ -7,8 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, AIItemScreen, IntelEvent, IntelEventItem, IntelEventStageDSnapshot, IntelItem, Source
-from app.storage.repository import IntelRepository
+from app.storage.models import DailyEdition, DailyEditionReportEntry
 from app.web.app import create_app
 from app.web.routes.api import _strip_internal_run_fields
 
@@ -18,41 +17,41 @@ def _app(tmp_path):
     init_db(engine)
     sf = create_session_factory(engine)
     with sf() as session:
-        run = IntelRepository(session).start_run(
-            reference_time=datetime(2026, 8, 16, 6, 35, 31, tzinfo=timezone.utc),
-            run_type="pipeline",
+        edition = DailyEdition(
+            edition_date=datetime(2026, 8, 16, tzinfo=timezone.utc).date(),
+            status="published",
+            published_at=datetime(2026, 8, 16, 6, 35, 31, tzinfo=timezone.utc),
         )
-        source = Source(id="web_source", name="Web source", transport="feed", url="https://web.example", source_group="official_blog", content_class="official_model_company")
-        item = IntelItem(source=source, title="<script>alert(1)</script> model update", canonical_url="https://web.example/update", content_class="official_model_company", content_hash="w" * 64, status="candidate", selection_score=90, captured_at=datetime.now(timezone.utc))
-        session.add_all([source, item])
-        session.flush()
-        session.add_all([
-            AIItemScreen(item=item, decision="pass", reason_code="signal", reason="useful", confidence=94),
-            AIItemReview(item=item, content_class="official_model_company", topic="model", topics_json='["model"]', summary_cn="摘要", selection_score=90, status="success"),
-        ])
-        session.flush()
-        event = IntelEvent(event_key="title:model update", title="Model update", summary_cn="摘要", topic="model", content_class="official_model_company", display_score=90, new_in_run_id=run.id, first_seen_at=datetime.now(timezone.utc))
-        session.add(event)
-        session.flush()
-        session.add(IntelEventItem(event=event, item=item, source=source, source_id=source.id, is_primary=True, match_type="exact"))
-        session.add(IntelEventStageDSnapshot(snapshot_key="daily-2026-08-16", event_id=event.id, run_id=run.id, display_order=1, display_score=90, selected=True, topic="model", content_class="official_model_company", metadata_json='{"display_title_zh":"Model update","title_supporting_fields":["title"]}'))
-        excluded = IntelItem(
-            source=source,
-            title="Excluded Stage A item",
-            content_class="official_model_company",
-            content_hash="x" * 64,
-            status="screened_out",
-        )
-        session.add(excluded)
+        session.add(edition)
         session.flush()
         session.add(
-            IntelEventItem(
-                event=event,
-                item=excluded,
-                source=source,
-                source_id=source.id,
-                is_primary=False,
-                match_type="related",
+            DailyEditionReportEntry(
+                edition_id=edition.id,
+                event_key="url:https://web.example/update",
+                display_order=1,
+                title="Model update",
+                original_title="<script>alert(1)</script> model update",
+                summary="摘要",
+                url="https://web.example/update",
+                display_score=90,
+                topic="model",
+                content_class="official_model_company",
+                source_group="official_blog",
+                source_ids_json='["web_source"]',
+                source_refs_json=json.dumps(
+                    [
+                        {
+                            "source_id": "web_source",
+                            "source_name": "Web source",
+                            "source_group": "official_blog",
+                            "source_url": "https://web.example/update",
+                            "title": "<script>alert(1)</script> model update",
+                            "match_type": "exact",
+                            "is_primary": True,
+                        }
+                    ]
+                ),
+                metadata_json='{"display_title_zh":"Model update"}',
             )
         )
         session.commit()
@@ -91,7 +90,7 @@ def test_event_detail_keeps_excluded_members_internal(tmp_path):
 
 def test_run_snapshot_api_returns_selected_events_only(tmp_path):
     client = TestClient(_app(tmp_path))
-    current = client.get("/api/ui/current?run_date=2026-08-16")
+    current = client.get("/api/ui/current?edition_date=2026-08-16")
     assert current.status_code == 200
     current_payload = current.json()
     assert current_payload["snapshot"]["edition_date"] == "2026-08-16"
@@ -101,12 +100,11 @@ def test_run_snapshot_api_returns_selected_events_only(tmp_path):
     assert "run_id" not in json.dumps(current_payload, ensure_ascii=False)
     assert "snapshot_key" not in json.dumps(current_payload, ensure_ascii=False)
 
-    events = client.get("/api/snapshots/daily-2026-08-16/events")
+    events = client.get("/api/editions/2026-08-16/events")
     assert events.status_code == 200
-    assert events.json()["funnel"]["stage_d_selected"] == 1
-    assert client.get("/api/snapshots/daily-2026-08-16/events?run_id=99").status_code == 200
+    assert events.json()["funnel"]["selected"] == 1
 
-    detail = client.get("/api/snapshots/daily-2026-08-16/events/1")
+    detail = client.get("/api/editions/2026-08-16/events/1")
     assert detail.status_code == 200
     assert detail.json()["event"]["members"][0]["title"] == "<script>alert(1)</script> model update"
     assert "raw_payload" not in json.dumps(detail.json(), ensure_ascii=False)

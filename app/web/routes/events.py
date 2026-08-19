@@ -1,4 +1,4 @@
-"""Selected-event detail pages backed by one resolved Stage-D snapshot."""
+"""Selected-event detail pages backed by one resolved daily edition."""
 
 from __future__ import annotations
 
@@ -18,15 +18,11 @@ def event_detail(
     request: Request,
     event_id: int,
     run_date: str | None = None,
-    snapshot_key: str | None = None,
     origin: str | None = None,
     return_q: str | None = None,
     repo: UIReadRepository = Depends(get_repository),
 ):
-    snapshot = repo.resolve_snapshot(
-        edition_date=run_date,
-        snapshot_key=snapshot_key,
-    )
+    snapshot = repo.resolve_snapshot(edition_date=run_date)
     detail = repo.get_selected_event_detail(event_id, snapshot=snapshot)
     if detail is None:
         raise HTTPException(status_code=404, detail="本期快照中不存在该入选事件")

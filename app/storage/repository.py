@@ -19,6 +19,8 @@ from app.domain.models import SourceSpec
 from app.storage.models import (
     AIItemScreen,
     AIItemReview,
+    DailyEdition,
+    DailyEditionReportEntry,
     IntelEvent,
     IntelEventItem,
     IntelEventStageDSnapshot,
@@ -304,6 +306,301 @@ class IntelRepository:
         )
         return self.session.scalars(statement).first()
 
+    # ------------------------------------------------------------------
+    # Date-addressed public editions and hidden draft builds
+    # ------------------------------------------------------------------
+
+    def get_daily_edition(self, edition_date: date | str) -> DailyEdition | None:
+        resolved = _as_edition_date(edition_date)
+        if resolved is None:
+            raise ValueError("edition_date must use YYYY-MM-DD")
+        return self.session.scalar(
+            select(DailyEdition).where(DailyEdition.edition_date == resolved)
+        )
+
+    def get_or_create_daily_edition(self, edition_date: date | str) -> DailyEdition:
+        resolved = _as_edition_date(edition_date)
+        if resolved is None:
+            raise ValueError("edition_date must use YYYY-MM-DD")
+        edition = self.get_daily_edition(resolved)
+        if edition is None:
+            edition = DailyEdition(edition_date=resolved)
+            self.session.add(edition)
+            self.session.flush()
+        return edition
+
+    def draft_run_for_edition(self, edition_date: date | str) -> IntelRun | None:
+        edition = self.get_daily_edition(edition_date)
+        if edition is None or edition.draft_run_id is None:
+            return None
+        return self.session.get(IntelRun, int(edition.draft_run_id))
+
+    def start_daily_build(
+        self,
+        *,
+        edition_date: date | str,
+        filters: Mapping[str, Any] | None = None,
+        scope: Mapping[str, Any] | None = None,
+        run_type: str = "daily_build",
+        source_ids: Iterable[str] | None = None,
+        reference_time: datetime | None = None,
+    ) -> tuple[DailyEdition, IntelRun]:
+        """Create the single fresh draft for a public date.
+
+        The prior report remains published while the replacement build runs,
+        but every previous build's raw items and A-D state are physically
+        deleted before fetching.  This prevents same-day work from becoming a
+        hidden incremental continuation.
+        """
+
+        edition = self.get_or_create_daily_edition(edition_date)
+        stale_build_ids = {int(edition.draft_run_id)} if edition.draft_run_id is not None else set()
+        edition.draft_run_id = None
+        self.session.flush()
+        for stale_build_id in stale_build_ids:
+            self.delete_build(stale_build_id)
+
+        run = self.start_run(
+            filters=filters,
+            scope=scope,
+            run_type=run_type,
+            source_ids=source_ids,
+            reference_time=reference_time,
+            edition_date=edition.edition_date,
+        )
+        run.edition_id = int(edition.id)
+        edition.draft_run_id = int(run.id)
+        # A previously published report remains readable while this draft is
+        # rebuilt.  The explicit state still tells operators whether the
+        # date is assembling its first report or replacing one.
+        edition.status = "rebuilding" if edition.published_at is not None else "building"
+        edition.error = None
+        self.session.flush()
+        return edition, run
+
+    def mark_daily_build_failed(self, run_id: int, *, error: str | None = None) -> DailyEdition | None:
+        run = self.session.get(IntelRun, int(run_id))
+        if run is None or run.edition_id is None:
+            return None
+        edition = self.session.get(DailyEdition, int(run.edition_id))
+        if edition is None or edition.draft_run_id != int(run_id):
+            return edition
+        edition.status = "draft_failed"
+        edition.error = _text(error) or run.error
+        self.session.flush()
+        return edition
+
+    def publish_daily_report(
+        self,
+        *,
+        run_id: int,
+        records: Iterable[Mapping[str, Any]],
+    ) -> DailyEdition:
+        """Atomically replace the public report entries for a completed draft."""
+
+        run = self.session.get(IntelRun, int(run_id))
+        if run is None or run.edition_id is None:
+            raise ValueError(f"daily build {run_id} does not belong to an edition")
+        edition = self.session.get(DailyEdition, int(run.edition_id))
+        if edition is None or edition.draft_run_id != int(run_id):
+            raise ValueError(f"daily build {run_id} is not the active draft")
+
+        for entry in list(edition.report_entries):
+            self.session.delete(entry)
+        self.session.flush()
+        for order, record in enumerate(records, start=1):
+            source_ids = record.get("source_ids") if isinstance(record.get("source_ids"), list) else []
+            source_refs = record.get("source_refs") if isinstance(record.get("source_refs"), list) else []
+            risk_flags = record.get("risk_flags") if isinstance(record.get("risk_flags"), list) else []
+            keywords = record.get("keywords") if isinstance(record.get("keywords"), list) else []
+            entities = record.get("entities") if isinstance(record.get("entities"), list) else []
+            metadata = dict(record.get("metadata") or {}) if isinstance(record.get("metadata"), Mapping) else {}
+            # The final report is the only durable UI/history payload after
+            # raw build rows are deleted. Preserve the small public editorial
+            # fields that used to live beside ``metadata`` on the export row.
+            for key in (
+                "reason",
+                "provenance",
+                "story_family_id",
+                "family_position",
+                "editorial_score",
+                "presentation_labels",
+            ):
+                if key in record and key not in metadata:
+                    metadata[key] = record[key]
+            event_key = _text(record.get("event_key")) or _text(record.get("canonical_key")) or f"build-{run_id}-entry-{order}"
+            self.session.add(
+                DailyEditionReportEntry(
+                    edition_id=int(edition.id),
+                    event_key=event_key[:512],
+                    # The final report owns a dense, date-local order.  Do
+                    # not let malformed provider output violate the unique
+                    # `(edition_id, display_order)` constraint.
+                    display_order=order,
+                    title=_text(record.get("title")) or "(untitled)",
+                    original_title=_text(record.get("original_title")) or _text(record.get("title")),
+                    summary=_text(record.get("summary_cn")) or _text(record.get("summary")),
+                    url=_text(record.get("url")) or _text(record.get("canonical_url")),
+                    display_score=float(record.get("display_score") or record.get("selection_score") or 0.0),
+                    topic=_text(record.get("topic")) or _text(record.get("topic_category")),
+                    content_class=_text(record.get("content_class")),
+                    source_group=_text(record.get("source_group")),
+                    source_ids_json=_dump_json(source_ids),
+                    source_refs_json=_dump_json(source_refs),
+                    risk_flags_json=_dump_json(risk_flags),
+                    keywords_json=_dump_json(keywords),
+                    entities_json=_dump_json(entities),
+                    metadata_json=_dump_json(dict(metadata)),
+                    published_at=_as_utc(record.get("published_at")),
+                )
+            )
+        # The selected result has been materialized above.  The caller then
+        # hard-deletes the temporary build, so never leave a durable public
+        # pointer to its opaque internal id.
+        edition.draft_run_id = None
+        edition.status = "published"
+        edition.published_at = utcnow()
+        edition.error = None
+        self.session.flush()
+        return edition
+
+    def list_daily_report_entries(
+        self,
+        edition_date: date | str,
+        *,
+        limit: int | None = None,
+    ) -> list[DailyEditionReportEntry]:
+        edition = self.get_daily_edition(edition_date)
+        if edition is None:
+            return []
+        stmt = (
+            select(DailyEditionReportEntry)
+            .where(DailyEditionReportEntry.edition_id == int(edition.id))
+            .order_by(DailyEditionReportEntry.display_order.asc(), DailyEditionReportEntry.id.asc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.session.scalars(stmt).all())
+
+    def list_prior_daily_report_entries(
+        self,
+        *,
+        edition_date: date | str,
+        days: int,
+    ) -> list[DailyEditionReportEntry]:
+        current = _as_edition_date(edition_date)
+        if current is None or days <= 0:
+            return []
+        earliest = current - timedelta(days=int(days))
+        stmt = (
+            select(DailyEditionReportEntry)
+            .join(DailyEdition, DailyEdition.id == DailyEditionReportEntry.edition_id)
+            .where(
+                DailyEdition.edition_date >= earliest,
+                DailyEdition.edition_date < current,
+                DailyEdition.published_at.is_not(None),
+            )
+            .order_by(DailyEdition.edition_date.desc(), DailyEditionReportEntry.display_order.asc())
+        )
+        return list(self.session.scalars(stmt).all())
+
+    def delete_build(self, run_id: int) -> None:
+        """Hard-delete one hidden build and every raw/intermediate descendant."""
+
+        run = self.session.get(IntelRun, int(run_id))
+        if run is None:
+            return
+        # Clear the pending-edition pointer before deleting the build.
+        for edition in self.session.scalars(
+            select(DailyEdition).where(
+                DailyEdition.draft_run_id == int(run_id)
+            )
+        ).all():
+            if edition.draft_run_id == int(run_id):
+                edition.draft_run_id = None
+
+        # Stage tasks refer to items/events and attempts refer back to tasks.
+        # Delete them first so SQLite installations with FK enforcement enabled
+        # can purge an entire build without depending on implicit cascades.
+        for stage in list(self.session.scalars(select(IntelRunStage).where(IntelRunStage.run_id == int(run_id))).all()):
+            for task in list(self.session.scalars(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id)).all()):
+                task.last_attempt_id = None
+                for attempt in list(
+                    self.session.scalars(select(IntelRunStageAttempt).where(IntelRunStageAttempt.task_id == task.id)).all()
+                ):
+                    self.session.delete(attempt)
+                self.session.delete(task)
+            self.session.delete(stage)
+
+        item_ids = [
+            int(value)
+            for value in self.session.scalars(
+                select(IntelItem.id).where(IntelItem.build_id == int(run_id))
+            ).all()
+        ]
+        # Legacy daily drafts created before the workspace migration do not
+        # carry build_id.  Their run scope still provides a safe deletion
+        # boundary while they are being replaced.
+        if not item_ids:
+            item_ids = [
+                int(value)
+                for value in self.session.scalars(
+                    select(IntelRunItem.item_id).where(IntelRunItem.run_id == int(run_id))
+                ).all()
+            ]
+        event_ids = [
+            int(value)
+            for value in self.session.scalars(
+                select(IntelEvent.id).where(
+                    or_(
+                        IntelEvent.build_id == int(run_id),
+                        IntelEvent.first_run_id == int(run_id),
+                        IntelEvent.last_run_id == int(run_id),
+                        IntelEvent.new_in_run_id == int(run_id),
+                    )
+                )
+            ).all()
+        ]
+        if item_ids:
+            event_ids.extend(
+                int(value)
+                for value in self.session.scalars(
+                    select(IntelEventItem.event_id).where(IntelEventItem.item_id.in_(item_ids))
+                ).all()
+            )
+        event_ids = list(dict.fromkeys(event_ids))
+
+        snapshot_conditions = [IntelEventStageDSnapshot.run_id == int(run_id)]
+        if event_ids:
+            snapshot_conditions.append(IntelEventStageDSnapshot.event_id.in_(event_ids))
+        for snapshot in list(self.session.scalars(select(IntelEventStageDSnapshot).where(or_(*snapshot_conditions))).all()):
+            self.session.delete(snapshot)
+        if event_ids:
+            for relation in list(
+                self.session.scalars(select(IntelEventItem).where(IntelEventItem.event_id.in_(event_ids))).all()
+            ):
+                self.session.delete(relation)
+            for event in list(self.session.scalars(select(IntelEvent).where(IntelEvent.id.in_(event_ids))).all()):
+                self.session.delete(event)
+        for item_id in item_ids:
+            item = self.session.get(IntelItem, item_id)
+            if item is None:
+                continue
+            screen = self.session.scalar(select(AIItemScreen).where(AIItemScreen.item_id == item_id))
+            review = self.session.scalar(select(AIItemReview).where(AIItemReview.item_id == item_id))
+            if screen is not None:
+                self.session.delete(screen)
+            if review is not None:
+                self.session.delete(review)
+            self.session.delete(item)
+        for relation in list(self.session.scalars(select(IntelRunItem).where(IntelRunItem.run_id == int(run_id))).all()):
+            self.session.delete(relation)
+        for attempt in list(self.session.scalars(select(FetchAttempt).where(FetchAttempt.run_id == int(run_id))).all()):
+            self.session.delete(attempt)
+        self.session.flush()
+        self.session.delete(run)
+        self.session.flush()
+
     def freeze_run_scope(
         self,
         run_id: int,
@@ -404,6 +701,11 @@ class IntelRepository:
         item = self.session.get(IntelItem, int(item_id))
         if item is None:
             raise ValueError(f"intel item {item_id} does not exist")
+        build_id = self._daily_build_id(run_id)
+        if build_id is not None and item.build_id != build_id:
+            raise ValueError(
+                f"intel item {item_id} does not belong to daily build {run_id}"
+            )
         relation = self.session.scalar(
             select(IntelRunItem).where(
                 IntelRunItem.run_id == int(run_id), IntelRunItem.item_id == int(item_id)
@@ -558,12 +860,21 @@ class IntelRepository:
                 attempt.error_code = getattr(error, "error_code", None) or attempt.error_code or type(error).__name__.lower()
             attempt.error_message = message[:4000]
 
-    def insert_item(self, item: Any, *, run_id: int | None = None, run_role: str = "fetched") -> IntelInsertResult:
-        """Insert or refresh one normalized item idempotently.
+    def _daily_build_id(self, run_id: int | None) -> int | None:
+        """Return the private build namespace for a public daily draft."""
 
-        GitHub repository identifiers are stable across search sources, so they
-        are deduplicated globally. Other sources use source + external id,
-        canonical URL, and finally the content hash.
+        if run_id is None:
+            return None
+        run = self.session.get(IntelRun, int(run_id))
+        return int(run.id) if run is not None and run.edition_id is not None else None
+
+    def insert_item(self, item: Any, *, run_id: int | None = None, run_role: str = "fetched") -> IntelInsertResult:
+        """Insert or refresh one normalized item inside its processing scope.
+
+        A date-addressed build gets a private ``build_id`` namespace, so every
+        enabled source response is re-evaluated from scratch.  Direct legacy
+        and diagnostic callers retain their ``NULL`` namespace and existing
+        idempotent behavior.
         """
 
         fields = _item_fields(item)
@@ -583,7 +894,8 @@ class IntelRepository:
             github_url = _canonical_github_url(fields.get("canonical_url"))
             if github_url and (str(fields.get("external_id") or "").casefold().startswith("github_repo:")):
                 fields["canonical_url"] = github_url
-        existing = self._find_existing(fields)
+        build_id = self._daily_build_id(run_id)
+        existing = self._find_existing(fields, build_id=build_id)
         if existing is not None:
             # Refresh volatile metrics/payload for audit. Only a material
             # content change creates daily A/B/C work; metric/payload churn
@@ -630,6 +942,7 @@ class IntelRepository:
             if content_hash_changed and not self.session.scalar(
                 select(IntelItem.id).where(
                     IntelItem.content_hash == fields["content_hash"],
+                    _build_scope(IntelItem.build_id, build_id),
                     IntelItem.id != existing.id,
                 )
             ):
@@ -657,11 +970,15 @@ class IntelRepository:
                     run_id,
                     existing.id,
                     source_id=existing.source_id,
-                    role=_daily_delta_run_role(
-                        run_role,
-                        inserted=False,
-                        material_change=material_change,
-                        retry_needed=retry_needed,
+                    role=(
+                        RUN_ITEM_ROLE_FETCHED
+                        if build_id is not None
+                        else _daily_delta_run_role(
+                            run_role,
+                            inserted=False,
+                            material_change=material_change,
+                            retry_needed=retry_needed,
+                        )
                     ),
                     status="fetched",
                 )
@@ -673,6 +990,7 @@ class IntelRepository:
             else fields["metrics"]
         )
         row = IntelItem(
+            build_id=build_id,
             source_id=fields["source_id"],
             external_id=fields["external_id"],
             canonical_url=fields["canonical_url"],
@@ -698,11 +1016,15 @@ class IntelRepository:
                 run_id,
                 row.id,
                 source_id=row.source_id,
-                role=_daily_delta_run_role(
-                    run_role,
-                    inserted=True,
-                    material_change=True,
-                    retry_needed=False,
+                role=(
+                    RUN_ITEM_ROLE_FETCHED
+                    if build_id is not None
+                    else _daily_delta_run_role(
+                        run_role,
+                        inserted=True,
+                        material_change=True,
+                        retry_needed=False,
+                    )
                 ),
                 status="fetched",
             )
@@ -765,18 +1087,24 @@ class IntelRepository:
         self.session.flush()
         return item
 
-    def _find_existing(self, fields: Mapping[str, Any]) -> IntelItem | None:
+    def _find_existing(self, fields: Mapping[str, Any], *, build_id: int | None = None) -> IntelItem | None:
         external_id = fields.get("external_id")
         if external_id:
             stmt = select(IntelItem).where(
+                _build_scope(IntelItem.build_id, build_id),
                 IntelItem.source_id == fields["source_id"],
                 IntelItem.external_id == external_id,
             )
             found = self.session.scalar(stmt)
             if found is not None:
                 return found
-            if str(external_id).startswith("github_repo:"):
-                found = self.session.scalar(select(IntelItem).where(IntelItem.external_id == external_id))
+            if build_id is None and str(external_id).startswith("github_repo:"):
+                found = self.session.scalar(
+                    select(IntelItem).where(
+                        IntelItem.build_id.is_(None),
+                        IntelItem.external_id == external_id,
+                    )
+                )
                 if found is not None:
                     return found
 
@@ -784,6 +1112,7 @@ class IntelRepository:
         if canonical_url and fields.get("content_class") == "project_tool":
             found = self.session.scalar(
                 select(IntelItem).where(
+                    _build_scope(IntelItem.build_id, build_id),
                     IntelItem.content_class == "project_tool",
                     IntelItem.canonical_url == canonical_url,
                 )
@@ -793,7 +1122,12 @@ class IntelRepository:
 
         content_hash = fields.get("content_hash")
         if content_hash:
-            return self.session.scalar(select(IntelItem).where(IntelItem.content_hash == content_hash))
+            return self.session.scalar(
+                select(IntelItem).where(
+                    _build_scope(IntelItem.build_id, build_id),
+                    IntelItem.content_hash == content_hash,
+                )
+            )
         return None
 
     def list_pending_items(
@@ -1104,6 +1438,12 @@ class IntelRepository:
         if not key:
             key = _event_key_from_values(values)
 
+        raw_run_id = run_id if run_id is not None else values.get("run_id")
+        try:
+            build_id = self._daily_build_id(int(raw_run_id)) if raw_run_id is not None else None
+        except (TypeError, ValueError):
+            build_id = None
+
         canonical = _canonical_url(canonical_url or values.get("canonical_url") or values.get("url"))
         external = _normalize_event_external_id(external_id or values.get("external_id"))
         norm_title = _normalize_event_title(normalized_title or values.get("normalized_title") or values.get("title"))
@@ -1125,7 +1465,12 @@ class IntelRepository:
             ]
         )
 
-        row = self.session.scalar(select(IntelEvent).where(IntelEvent.event_key == key))
+        row = self.session.scalar(
+            select(IntelEvent).where(
+                _build_scope(IntelEvent.build_id, build_id),
+                IntelEvent.event_key == key,
+            )
+        )
         if row is None:
             # Prefer an existing membership, then exact indexed identities,
             # and finally the persisted alias list.  The latter is intentionally
@@ -1139,15 +1484,34 @@ class IntelRepository:
                 row = self.session.scalar(
                     select(IntelEvent)
                     .join(IntelEventItem, IntelEventItem.event_id == IntelEvent.id)
-                    .where(IntelEventItem.item_id.in_(candidate_item_ids))
+                    .where(
+                        _build_scope(IntelEvent.build_id, build_id),
+                        IntelEventItem.item_id.in_(candidate_item_ids),
+                    )
                     .order_by(IntelEvent.id.asc())
                 )
             if row is None and canonical:
-                row = self.session.scalar(select(IntelEvent).where(IntelEvent.canonical_url == canonical))
+                row = self.session.scalar(
+                    select(IntelEvent).where(
+                        _build_scope(IntelEvent.build_id, build_id),
+                        IntelEvent.canonical_url == canonical,
+                    )
+                )
             if row is None and external:
-                row = self.session.scalar(select(IntelEvent).where(IntelEvent.external_id == external))
+                row = self.session.scalar(
+                    select(IntelEvent).where(
+                        _build_scope(IntelEvent.build_id, build_id),
+                        IntelEvent.external_id == external,
+                    )
+                )
             if row is None and aliases:
-                rows = list(self.session.scalars(select(IntelEvent).order_by(IntelEvent.id.asc())).all())
+                rows = list(
+                    self.session.scalars(
+                        select(IntelEvent)
+                        .where(_build_scope(IntelEvent.build_id, build_id))
+                        .order_by(IntelEvent.id.asc())
+                    ).all()
+                )
                 alias_set = {alias for alias in aliases if alias.startswith(("url:", "external:"))}
                 for candidate in rows:
                     existing_aliases = {
@@ -1160,7 +1524,7 @@ class IntelRepository:
                         break
 
         if row is None:
-            row = IntelEvent(event_key=key)
+            row = IntelEvent(event_key=key, build_id=build_id)
             self.session.add(row)
 
         values_topics = _unique_strings([*(topics or ()), *(_string_values(values.get("topics"))), values.get("topic")])
@@ -3289,6 +3653,12 @@ def _as_edition_date(value: Any) -> date | None:
         return date.fromisoformat(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _build_scope(column, build_id: int | None):
+    """Return the SQL predicate for one private build/legacy namespace."""
+
+    return column.is_(None) if build_id is None else column == int(build_id)
 
 
 def _identity_hash(external_id: str | None, url: str | None, title: str, content: str | None) -> str:

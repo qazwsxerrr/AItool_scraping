@@ -23,8 +23,18 @@ from app.domain.policies import is_first_party_x_source
 from app.domain.recency import recent_window_decision
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelEventStageDSnapshot, IntelItem, IntelRun, IntelRunItem
-from app.storage.repository import IntelRepository
+from app.storage.models import (
+    AIItemReview,
+    DailyEdition,
+    DailyEditionReportEntry,
+    IntelEvent,
+    IntelEventItem,
+    IntelEventStageDSnapshot,
+    IntelItem,
+    IntelRun,
+    IntelRunItem,
+)
+from app.storage.repository import DAILY_EDITION_TIMEZONE, IntelRepository
 
 LOGGER = logging.getLogger(__name__)
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
@@ -818,11 +828,75 @@ def _load_selected_daily_history_events(
 ) -> list[IntelEvent]:
     if days <= 0 or not run.edition_date:
         return []
+    # Direct/legacy callers still create a bare IntelRun rather than a daily
+    # build.  Keep their historical snapshot lookup isolated here so the
+    # public daily path can rely exclusively on published report entries.
+    if run.edition_id is None:
+        return _load_legacy_selected_daily_history_events(session, run=run, days=days)
     try:
         current_edition = date.fromisoformat(run.edition_date)
     except ValueError:
         return []
 
+    earliest = current_edition - timedelta(days=days)
+    # Published daily entries are the only historical source.  Old build
+    # items/events/snapshots are deliberately deleted after publication, so
+    # the history objects below are read-only in-memory projections.
+    prior_entries = list(
+        session.execute(
+            select(DailyEditionReportEntry, DailyEdition)
+            .join(DailyEdition, DailyEdition.id == DailyEditionReportEntry.edition_id)
+            .where(
+                DailyEdition.edition_date >= earliest,
+                DailyEdition.edition_date < current_edition,
+                DailyEdition.published_at.is_not(None),
+            )
+            .order_by(DailyEdition.edition_date.desc(), DailyEditionReportEntry.display_order.asc())
+        ).all()
+    )
+    history = [
+        _history_event_from_report(entry, edition_date=edition.edition_date)
+        for entry, edition in prior_entries
+    ]
+
+    # A Stage-C retry must also see events already materialized by this same
+    # draft. This is execution-local idempotency, not cross-day history.
+    current_events = list(
+        session.scalars(
+            select(IntelEvent)
+            .options(
+                joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_review),
+                joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.source),
+                joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source),
+            )
+            .where(
+                or_(
+                    IntelEvent.build_id == int(run.id),
+                    IntelEvent.first_run_id == int(run.id),
+                    IntelEvent.last_run_id == int(run.id),
+                    IntelEvent.new_in_run_id == int(run.id),
+                )
+            )
+            .order_by(IntelEvent.id.asc())
+        ).unique().all()
+    )
+    return [*history, *current_events]
+
+
+def _load_legacy_selected_daily_history_events(
+    session: Session,
+    *,
+    run: IntelRun,
+    days: int,
+) -> list[IntelEvent]:
+    """Compatibility lookup for non-daily direct job callers only."""
+
+    if days <= 0 or not run.edition_date:
+        return []
+    try:
+        current_edition = date.fromisoformat(run.edition_date)
+    except ValueError:
+        return []
     earliest = current_edition - timedelta(days=days)
     previous_runs = list(
         session.scalars(
@@ -835,8 +909,6 @@ def _load_selected_daily_history_events(
             .order_by(IntelRun._edition_date.desc(), IntelRun.id.desc())
         ).all()
     )
-    # A public date can have several internal attempts. Only its newest run
-    # represents the final daily output that subsequent editions compare to.
     latest_by_edition: dict[str, IntelRun] = {}
     for previous_run in previous_runs:
         if previous_run.edition_date:
@@ -859,9 +931,6 @@ def _load_selected_daily_history_events(
                 )
             ).all()
         )
-    # A Stage-C retry must also see events already materialized by this same
-    # run. This is execution-local idempotency, not cross-day historical
-    # recall, and prevents a retry from creating a second canonical event.
     event_ids.extend(
         int(event_id)
         for event_id in session.scalars(
@@ -888,6 +957,60 @@ def _load_selected_daily_history_events(
         .order_by(IntelEvent.id.asc())
     )
     return list(session.scalars(stmt).unique().all())
+
+
+def _history_event_from_report(
+    entry: DailyEditionReportEntry,
+    *,
+    edition_date: date,
+) -> IntelEvent:
+    """Adapt one final report row to Stage-C's conservative matcher shape."""
+
+    key = str(entry.event_key or "").strip() or f"report:{entry.id}"
+    canonical_url = canonical_event_url(entry.url)
+    external_id = key.removeprefix("external:") if key.startswith("external:") else None
+    aliases = [value for value in (key, f"url:{canonical_url}" if canonical_url else None) if value]
+    # History is bounded by *edition date*, not an article's original source
+    # timestamp. An old article selected into yesterday's final report must
+    # still be available to the current 3-day semantic repeat guard.
+    edition_anchor = datetime(
+        edition_date.year,
+        edition_date.month,
+        edition_date.day,
+        tzinfo=DAILY_EDITION_TIMEZONE,
+    ).astimezone(timezone.utc)
+    published = _as_utc(entry.published_at)
+    if published is None or published < edition_anchor:
+        published = edition_anchor
+    event = IntelEvent(
+        id=-int(entry.id),
+        event_key=key,
+        canonical_url=canonical_url,
+        external_id=external_id,
+        normalized_title=normalize_event_title(entry.original_title or entry.title),
+        title=entry.original_title or entry.title or "(untitled)",
+        summary_cn=entry.summary,
+        topic=entry.topic or "unknown",
+        topics_json=json.dumps([entry.topic] if entry.topic else [], ensure_ascii=False),
+        keywords_json=json.dumps(entry.keywords, ensure_ascii=False),
+        entities_json=json.dumps(entry.entities, ensure_ascii=False),
+        content_class=entry.content_class,
+        source_group=entry.source_group,
+        source_ids_json=json.dumps(entry.source_ids, ensure_ascii=False),
+        source_groups_json=json.dumps([entry.source_group] if entry.source_group else [], ensure_ascii=False),
+        identity_keys_json=json.dumps(aliases, ensure_ascii=False),
+        display_score=float(entry.display_score or 0.0),
+        novelty_status="repeat",
+        state="published_history",
+        resolution_method="published_history",
+        resolution_confidence=100,
+        first_seen_at=published,
+        last_seen_at=published,
+    )
+    # The object is intentionally detached and has no retained raw members.
+    # A negative id cannot collide with the current draft's database ids.
+    event.event_items = []
+    return event
 
 
 def _item_candidate(item: IntelItem) -> dict[str, Any]:
@@ -996,17 +1119,38 @@ def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, cur
         match, match_kind, resolver = _resolve_history_ambiguity(values, match, resolver=resolver, ai_client=ai_client)
     if group_resolution_method in {"ai_separate", "ai_partition", "deterministic_fallback"} and match_kind in {"repeat_semantic", "repeat_semantic_ai"}:
         match, match_kind = None, "new"
+    # A previous date's match is evidence for repeat suppression, never a row
+    # to mutate or reuse: published history has no retained working event.
+    # Only an event already created in *this* draft is reusable.
+    current_match = match is not None and int(match.id) in in_run_events
+    # A historical match still needs a fresh, build-private event row so its
+    # current source evidence can flow through Stage D.  It is nevertheless a
+    # repeat, not a newly discovered daily event.  Only an entirely unmatched
+    # group contributes to the new-event projection.
     is_new = match is None
     if match is not None:
-        if float(match.display_score or 0.0) > float(projection.get("display_score") or 0.0):
+        if current_match and float(match.display_score or 0.0) > float(projection.get("display_score") or 0.0):
             projection["title"] = match.title
             projection["summary_cn"] = match.summary_cn
             projection["normalized_title"] = match.normalized_title
             if match.primary_item_id is not None:
                 projection["primary_item_id"] = match.primary_item_id
-        projection.update(event_key=match.event_key, run_id=run_id, new_in_run_id=match.new_in_run_id, resolution_method=match_kind, resolution_confidence=100 if match_kind == "repeat_exact" else 85)
+        projection.update(
+            event_key=match.event_key,
+            run_id=run_id,
+            new_in_run_id=match.new_in_run_id,
+            novelty_status="repeat" if not current_match else match.novelty_status,
+            resolution_method=match_kind,
+            resolution_confidence=100 if match_kind == "repeat_exact" else 85,
+        )
     else:
-        projection.update(run_id=run_id, new_in_run_id=run_id, resolution_method=resolver.method, resolution_confidence=resolver.confidence)
+        projection.update(
+            run_id=run_id,
+            new_in_run_id=run_id,
+            novelty_status="new",
+            resolution_method=resolver.method,
+            resolution_confidence=resolver.confidence,
+        )
         if resolver.risk_flags:
             projection["risk_flags"] = _clean_strings([*projection.get("risk_flags", []), *resolver.risk_flags])
     if resolver.raw is not None:

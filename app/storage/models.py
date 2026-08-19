@@ -147,6 +147,99 @@ class FetchAttempt(Base):
     source: Mapped[Source] = relationship(back_populates="fetch_attempts")
 
 
+class DailyEdition(Base):
+    """The single public daily workspace addressed by ``edition_date``.
+
+    An edition is the only business-facing identity for a daily report.  The
+    optional draft run ID is deliberately opaque implementation detail: it
+    points at the one build currently being assembled. All user-facing
+    readers use the date and the persisted report entries below instead.
+    """
+
+    __tablename__ = "daily_editions"
+    __table_args__ = (
+        UniqueConstraint("edition_date", name="uq_daily_editions_edition_date"),
+        Index("ix_daily_editions_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    edition_date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="empty")
+    draft_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    report_entries: Mapped[list["DailyEditionReportEntry"]] = relationship(
+        back_populates="edition", cascade="all, delete-orphan", order_by="DailyEditionReportEntry.display_order"
+    )
+
+
+class DailyEditionReportEntry(Base):
+    """Published event payload retained after a build's working data is removed."""
+
+    __tablename__ = "daily_edition_report_entries"
+    __table_args__ = (
+        UniqueConstraint("edition_id", "display_order", name="uq_daily_edition_report_order"),
+        UniqueConstraint("edition_id", "event_key", name="uq_daily_edition_report_event"),
+        Index("ix_daily_edition_report_entries_edition", "edition_id"),
+        Index("ix_daily_edition_report_entries_event_key", "event_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    edition_id: Mapped[int] = mapped_column(ForeignKey("daily_editions.id"), nullable=False)
+    event_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    title: Mapped[str] = mapped_column(Text, nullable=False, default="(untitled)")
+    original_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    display_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    topic: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    content_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_group: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    source_refs_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    keywords_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    entities_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    edition: Mapped[DailyEdition] = relationship(back_populates="report_entries")
+
+    @property
+    def source_ids(self) -> list[str]:
+        return _decode_list(self.source_ids_json)
+
+    @property
+    def source_refs(self) -> list[dict[str, object]]:
+        value = _decode_json(self.source_refs_json, [])
+        return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+    @property
+    def risk_flags(self) -> list[str]:
+        return _decode_list(self.risk_flags_json)
+
+    @property
+    def keywords(self) -> list[str]:
+        return _decode_list(self.keywords_json)
+
+    @property
+    def entities(self) -> list[dict[str, object]]:
+        value = _decode_json(self.entities_json, [])
+        return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+    @property
+    def metadata_dict(self) -> dict[str, object]:
+        value = _decode_json(self.metadata_json, {})
+        return dict(value) if isinstance(value, dict) else {}
+
+
 class IntelRun(Base):
     """Summary and item scope for one intelligence run.
 
@@ -165,9 +258,13 @@ class IntelRun(Base):
         # immutable execution attempt.  Keep the latter as ``id`` and index
         # this real column instead of repeatedly decoding ``scope_json``.
         Index("ix_intel_runs_edition_date", "edition_date"),
+        Index("ix_intel_runs_edition_id", "edition_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # ``edition_id`` is an opaque build-owner pointer.  The public daily key
+    # lives in ``daily_editions.edition_date`` and is intentionally unique.
+    edition_id: Mapped[int | None] = mapped_column(ForeignKey("daily_editions.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -666,9 +763,13 @@ class IntelItem(Base):
 
     __tablename__ = "intel_items"
     __table_args__ = (
-        UniqueConstraint("source_id", "external_id", name="uq_intel_items_source_external_id"),
-        UniqueConstraint("content_hash", name="uq_intel_items_content_hash"),
+        # Daily builds are fully isolated workspaces.  The same source item
+        # may legitimately be fetched and re-evaluated on two edition dates,
+        # so identities are unique only inside one hidden build.
+        UniqueConstraint("build_id", "source_id", "external_id", name="uq_intel_items_build_source_external_id"),
+        UniqueConstraint("build_id", "content_hash", name="uq_intel_items_build_content_hash"),
         Index("ix_intel_items_status", "status"),
+        Index("ix_intel_items_build", "build_id"),
         Index("ix_intel_items_content_class", "content_class"),
         Index("ix_intel_items_published_at", "published_at"),
         Index("ix_intel_items_selection_score", "selection_score"),
@@ -676,6 +777,10 @@ class IntelItem(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # ``build_id`` is populated only for date-addressed DailyEdition drafts.
+    # Legacy diagnostic callers retain ``NULL`` and their compatibility
+    # behavior remains in the repository layer.
+    build_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False)
     latest_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     external_id: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -864,7 +969,11 @@ class IntelEvent(Base):
 
     __tablename__ = "intel_events"
     __table_args__ = (
-        UniqueConstraint("event_key", name="uq_intel_events_event_key"),
+        # Event rows are draft-private for the same reason as IntelItem rows:
+        # cross-edition repeat handling reads the published report table,
+        # never a retained historical event row.
+        UniqueConstraint("build_id", "event_key", name="uq_intel_events_build_event_key"),
+        Index("ix_intel_events_build", "build_id"),
         Index("ix_intel_events_state", "state"),
         Index("ix_intel_events_topic", "topic"),
         Index("ix_intel_events_novelty_status", "novelty_status"),
@@ -873,6 +982,7 @@ class IntelEvent(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    build_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     event_key: Mapped[str] = mapped_column(String(512), nullable=False)
     canonical_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     external_id: Mapped[str | None] = mapped_column(Text, nullable=True)

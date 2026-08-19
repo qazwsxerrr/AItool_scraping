@@ -24,6 +24,8 @@ def test_fresh_database_contains_only_ai_core_tables(tmp_path):
     assert tables == [
         "ai_item_reviews",
         "ai_item_screens",
+        "daily_edition_report_entries",
+        "daily_editions",
         "fetch_attempts",
         "intel_event_items",
         "intel_event_stage_d_snapshots",

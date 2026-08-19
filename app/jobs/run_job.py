@@ -14,12 +14,7 @@ from app.config.limits import (
     DEFAULT_FETCH_LIMIT_PER_SOURCE,
 )
 from app.config.settings import Settings
-from app.jobs.ai_review_job import AIReviewResult, run_ai_review_from_settings
-from app.jobs.event_cluster_job import EventClusterResult, run_event_cluster_from_settings
-from app.jobs.export_job import IntelExportResult, run_intel_export_from_settings
-from app.jobs.fetch_job import IntelFetchResult, run_intel_fetch_from_settings
 from app.jobs.pipeline_orchestrator import PipelineRunResult, run_pipeline_once_from_settings
-from app.jobs.stage_d_job import StageDResult, run_stage_d_from_settings
 
 
 IntelRunResult = PipelineRunResult
@@ -41,10 +36,9 @@ def run_intel_once_from_settings(
 ) -> IntelRunResult:
     """Run the complete convenience pipeline through the durable orchestrator.
 
-    The explicit runner arguments preserve the historical test/integration
-    injection seam: monkeypatching a runner on ``app.jobs.run_job`` still
-    affects this facade, while all run creation and final accounting are now
-    centralized in ``pipeline_orchestrator``.
+    The public command now shares the exact daily-build workflow used by
+    ``pipeline run``: a fresh all-source build, publish-on-success, then
+    deletion of its temporary working rows.
     """
     return run_pipeline_once_from_settings(
         settings=settings,
@@ -59,9 +53,4 @@ def run_intel_once_from_settings(
         profile_path=profile_path,
         snapshot_key=snapshot_key,
         ai_client=ai_client,
-        fetch_runner=run_intel_fetch_from_settings,
-        ai_review_runner=run_ai_review_from_settings,
-        event_cluster_runner=run_event_cluster_from_settings,
-        stage_d_runner=run_stage_d_from_settings,
-        export_runner=run_intel_export_from_settings,
     )

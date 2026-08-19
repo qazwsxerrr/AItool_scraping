@@ -21,6 +21,8 @@ from app.storage.run_snapshot_summary import build_run_snapshot_summary
 from app.storage.models import (
     AIItemReview,
     AIItemScreen,
+    DailyEdition,
+    DailyEditionReportEntry,
     IntelEvent,
     IntelEventItem,
     IntelEventStageDSnapshot,
@@ -103,7 +105,7 @@ class RunSnapshot:
 class RunSummary:
     """Public metadata for a durable processing run, without raw task data."""
 
-    run_id: int
+    run_id: int | None
     edition_date: str | None
     edition_timezone: str | None
     run_type: str
@@ -342,9 +344,58 @@ class UIReadRepository:
         configured = tuple(str(value).strip() for value in (topic_categories or DEFAULT_AI_REVIEW_CATEGORIES) if str(value).strip())
         self.topic_categories = configured or DEFAULT_AI_REVIEW_CATEGORIES
 
+    def _published_edition_snapshots(self) -> list[RunSnapshot]:
+        """Return the date-level reports that survive build cleanup."""
+
+        rows = self.session.execute(
+            select(DailyEdition, func.count(DailyEditionReportEntry.id))
+            .outerjoin(
+                DailyEditionReportEntry,
+                DailyEditionReportEntry.edition_id == DailyEdition.id,
+            )
+            .where(DailyEdition.published_at.is_not(None))
+            .group_by(DailyEdition.id)
+            .order_by(DailyEdition.edition_date.desc(), DailyEdition.published_at.desc())
+        ).all()
+        return [
+            RunSnapshot(
+                run_id=None,
+                edition_date=edition.edition_date.isoformat(),
+                # This is an in-process compatibility token only. It is not
+                # emitted by the public API and callers should address the
+                # edition by date.
+                snapshot_key=f"daily-{edition.edition_date.isoformat()}",
+                selected_items=int(selected),
+                stage_d_items=int(selected),
+                run_type="daily_edition",
+                run_status="published",
+                partial=False,
+                partial_reason=None,
+                started_at=edition.published_at,
+                updated_at=edition.updated_at,
+                edition_timezone="Asia/Shanghai",
+            )
+            for edition, selected in rows
+        ]
+
+    def _daily_edition_for_snapshot(self, snapshot: RunSnapshot) -> DailyEdition | None:
+        if snapshot.run_id is not None or not snapshot.edition_date:
+            return None
+        normalized = _normalize_edition_date(snapshot.edition_date)
+        if normalized is None:
+            return None
+        return self.session.scalar(
+            select(DailyEdition).where(
+                DailyEdition.edition_date == date.fromisoformat(normalized),
+                DailyEdition.published_at.is_not(None),
+            )
+        )
+
     def list_run_snapshots(self) -> list[RunSnapshot]:
         """List Stage-D snapshots without treating ``latest`` as a magic key."""
 
+        published = self._published_edition_snapshots()
+        published_dates = {value.edition_date for value in published if value.edition_date}
         stage_d_keys = {
             int(stage.run_id): str(value)
             for stage in self.session.scalars(
@@ -404,6 +455,13 @@ class UIReadRepository:
                     ),
                 )
             )
+        # A date-level published report is authoritative. Legacy snapshots
+        # are retained only as a read compatibility fallback for databases
+        # that have not yet been migrated.
+        result = [
+            *published,
+            *(value for value in result if value.edition_date not in published_dates),
+        ]
         return sorted(
             result,
             key=lambda value: (
@@ -416,8 +474,10 @@ class UIReadRepository:
         )
 
     def list_runs(self) -> list[RunSummary]:
-        """List durable runs, including runs that have no public snapshot yet."""
+        """List public daily reports, with legacy builds as a fallback."""
 
+        published_snapshots = self._published_edition_snapshots()
+        published_dates = {value.edition_date for value in published_snapshots if value.edition_date}
         snapshots_by_run: dict[int, list[RunSnapshot]] = {}
         for snapshot in self.list_run_snapshots():
             if snapshot.run_id is not None:
@@ -425,7 +485,24 @@ class UIReadRepository:
         runs = self.session.scalars(
             select(IntelRun).order_by(IntelRun.started_at.desc(), IntelRun.id.desc())
         ).all()
-        return [
+        reports = [
+            RunSummary(
+                run_id=None,
+                edition_date=snapshot.edition_date,
+                edition_timezone=snapshot.edition_timezone,
+                run_type="daily_edition",
+                status="published",
+                partial=False,
+                partial_reason=None,
+                reference_time=snapshot.started_at,
+                started_at=snapshot.started_at,
+                finished_at=snapshot.updated_at,
+                scope_frozen=True,
+                snapshots=(snapshot,),
+            )
+            for snapshot in published_snapshots
+        ]
+        legacy = [
             RunSummary(
                 run_id=int(run.id),
                 edition_date=run.edition_date,
@@ -441,12 +518,39 @@ class UIReadRepository:
                 snapshots=tuple(snapshots_by_run.get(int(run.id), [])),
             )
             for run in runs
+            if run.edition_date not in published_dates
         ]
+        return [*reports, *legacy]
 
     def get_run_snapshot_summary(self, snapshot: RunSnapshot | None) -> dict[str, Any] | None:
         """Return the public funnel/stage projection for one resolved snapshot."""
 
-        if snapshot is None or snapshot.run_id is None:
+        if snapshot is None:
+            return None
+        edition = self._daily_edition_for_snapshot(snapshot)
+        if edition is not None:
+            selected = self._count(
+                DailyEditionReportEntry,
+                DailyEditionReportEntry.edition_id == int(edition.id),
+            )
+            return {
+                "edition_date": edition.edition_date.isoformat(),
+                "funnel": {
+                    "raw": 0,
+                    "screened": 0,
+                    "analyzed": 0,
+                    "clustered": selected,
+                    "selected": selected,
+                },
+                "stages": {
+                    "publication": {
+                        "status": "published",
+                        "selected": selected,
+                    }
+                },
+                "failure_reasons": [],
+            }
+        if snapshot.run_id is None:
             return None
         run = self.session.get(IntelRun, int(snapshot.run_id))
         if run is None:
@@ -489,6 +593,46 @@ class UIReadRepository:
 
     def get_dashboard_stats(self, *, snapshot: RunSnapshot | None = None) -> DashboardStats:
         active_snapshot = snapshot or self.resolve_snapshot()
+        edition = self._daily_edition_for_snapshot(active_snapshot) if active_snapshot is not None else None
+        if edition is not None:
+            entries = list(
+                self.session.scalars(
+                    select(DailyEditionReportEntry)
+                    .where(DailyEditionReportEntry.edition_id == int(edition.id))
+                    .order_by(DailyEditionReportEntry.display_order.asc())
+                ).all()
+            )
+            categories: dict[str, int] = {}
+            sources: dict[str, int] = {}
+            for entry in entries:
+                category = str(entry.topic or entry.content_class or "未分类")
+                categories[category] = categories.get(category, 0) + 1
+                source_group = str(entry.source_group or "general")
+                sources[source_group] = sources.get(source_group, 0) + 1
+            return DashboardStats(
+                raw_items=0,
+                selected_items=len(entries),
+                pending_items=0,
+                ai_failed_items=0,
+                filtered_items=0,
+                rejected_items=0,
+                last_run_type="daily_edition",
+                last_run_status="published",
+                last_run_started_at=edition.published_at,
+                active_run_id=None,
+                active_edition_date=edition.edition_date.isoformat(),
+                active_snapshot_key=None,
+                active_partial=False,
+                active_partial_reason=None,
+                category_counts=tuple(
+                    FacetCount(value=value, count=count)
+                    for value, count in sorted(categories.items(), key=lambda item: (-item[1], item[0]))
+                ),
+                source_counts=tuple(
+                    FacetCount(value=value, count=count)
+                    for value, count in sorted(sources.items(), key=lambda item: (-item[1], item[0]))
+                ),
+            )
         last_run = (
             self.session.get(IntelRun, int(active_snapshot.run_id))
             if active_snapshot is not None and active_snapshot.run_id is not None
@@ -593,6 +737,21 @@ class UIReadRepository:
             ).all()
             if value
         )
+        report_source_groups = tuple(
+            value
+            for (value,) in self.session.execute(
+                select(DailyEditionReportEntry.source_group)
+                .join(DailyEdition, DailyEdition.id == DailyEditionReportEntry.edition_id)
+                .where(
+                    DailyEdition.published_at.is_not(None),
+                    DailyEditionReportEntry.source_group.is_not(None),
+                    DailyEditionReportEntry.source_group != "",
+                )
+                .distinct()
+                .order_by(DailyEditionReportEntry.source_group.asc())
+            ).all()
+            if value
+        )
         persisted_content_classes = tuple(
             value
             for (value,) in self.session.execute(
@@ -603,7 +762,21 @@ class UIReadRepository:
             ).all()
             if value
         )
-        content_classes = tuple(sorted(set(CONTENT_CLASSES).union(persisted_content_classes)))
+        report_content_classes = tuple(
+            value
+            for (value,) in self.session.execute(
+                select(DailyEditionReportEntry.content_class)
+                .join(DailyEdition, DailyEdition.id == DailyEditionReportEntry.edition_id)
+                .where(
+                    DailyEdition.published_at.is_not(None),
+                    DailyEditionReportEntry.content_class.is_not(None),
+                    DailyEditionReportEntry.content_class != "",
+                )
+                .distinct()
+            ).all()
+            if value
+        )
+        content_classes = tuple(sorted(set(CONTENT_CLASSES).union(persisted_content_classes, report_content_classes)))
         persisted_statuses = tuple(
             value
             for (value,) in self.session.execute(
@@ -625,9 +798,23 @@ class UIReadRepository:
             ).all()
             if value
         )
-        topic_categories = tuple(dict.fromkeys((*self.topic_categories, *persisted_topic_categories)))
+        report_topic_categories = tuple(
+            value
+            for (value,) in self.session.execute(
+                select(DailyEditionReportEntry.topic)
+                .join(DailyEdition, DailyEdition.id == DailyEditionReportEntry.edition_id)
+                .where(
+                    DailyEdition.published_at.is_not(None),
+                    DailyEditionReportEntry.topic.is_not(None),
+                    DailyEditionReportEntry.topic != "",
+                )
+                .distinct()
+            ).all()
+            if value
+        )
+        topic_categories = tuple(dict.fromkeys((*self.topic_categories, *persisted_topic_categories, *report_topic_categories)))
         return UIFilterOptions(
-            source_groups=source_groups,
+            source_groups=tuple(dict.fromkeys((*source_groups, *report_source_groups))),
             content_classes=content_classes,
             statuses=statuses,
             topic_categories=topic_categories,
@@ -688,6 +875,13 @@ class UIReadRepository:
         )
         if active_snapshot is None:
             return []
+        if self._daily_edition_for_snapshot(active_snapshot) is not None:
+            return self._list_daily_report_events(
+                snapshot=active_snapshot,
+                topic=topic,
+                content_class=content_class,
+                limit=limit,
+            )
         stmt = (
             select(IntelEventStageDSnapshot, IntelEvent)
             .join(IntelEvent, IntelEvent.id == IntelEventStageDSnapshot.event_id)
@@ -722,6 +916,26 @@ class UIReadRepository:
         )
         if active_snapshot is None:
             return None
+        edition = self._daily_edition_for_snapshot(active_snapshot)
+        if edition is not None:
+            entry = self.session.scalar(
+                select(DailyEditionReportEntry).where(
+                    DailyEditionReportEntry.edition_id == int(edition.id),
+                    DailyEditionReportEntry.id == int(event_id),
+                )
+            )
+            if entry is None:
+                return None
+            metadata = entry.metadata_dict
+            return EventDetailRow(
+                run_id=None,
+                snapshot_key=active_snapshot.snapshot_key,
+                event=self._report_event_row(entry),
+                selection_reason=str(metadata.get("reason") or "").strip() or None,
+                resolution_method="published_report",
+                resolution_confidence=100,
+                members=self._report_member_rows(entry),
+            )
         row = self.session.execute(
             select(IntelEventStageDSnapshot, IntelEvent)
             .join(IntelEvent, IntelEvent.id == IntelEventStageDSnapshot.event_id)
@@ -802,6 +1016,16 @@ class UIReadRepository:
         offset: int,
         limit: int,
     ) -> list[FeaturedItemRow]:
+        if self._daily_edition_for_snapshot(snapshot) is not None:
+            return self._list_daily_report_cards(
+                snapshot=snapshot,
+                category=category,
+                source_group=source_group,
+                content_class=content_class,
+                query=query,
+                offset=offset,
+                limit=limit,
+            )
         stmt = (
             select(IntelEventStageDSnapshot, IntelEvent)
             .join(IntelEvent, IntelEvent.id == IntelEventStageDSnapshot.event_id)
@@ -861,6 +1085,204 @@ class UIReadRepository:
                 )
             )
         return cards
+
+    def _daily_report_entries(
+        self,
+        *,
+        snapshot: RunSnapshot,
+        topic: str | None = None,
+        category: str | None = None,
+        source_group: str | None = None,
+        content_class: str | None = None,
+        query: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> list[DailyEditionReportEntry]:
+        edition = self._daily_edition_for_snapshot(snapshot)
+        if edition is None:
+            return []
+        stmt = (
+            select(DailyEditionReportEntry)
+            .where(DailyEditionReportEntry.edition_id == int(edition.id))
+            .order_by(DailyEditionReportEntry.display_order.asc(), DailyEditionReportEntry.id.asc())
+        )
+        if topic:
+            stmt = stmt.where(DailyEditionReportEntry.topic == topic)
+        if category:
+            stmt = stmt.where(
+                or_(
+                    DailyEditionReportEntry.topic == category,
+                    DailyEditionReportEntry.content_class == category,
+                )
+            )
+        if source_group:
+            stmt = stmt.where(DailyEditionReportEntry.source_group == source_group)
+        if content_class:
+            stmt = stmt.where(DailyEditionReportEntry.content_class == content_class)
+        normalized_query = query.strip() if query else ""
+        if normalized_query:
+            like = f"%{normalized_query}%"
+            stmt = stmt.where(
+                or_(
+                    DailyEditionReportEntry.title.ilike(like),
+                    DailyEditionReportEntry.original_title.ilike(like),
+                    DailyEditionReportEntry.summary.ilike(like),
+                    DailyEditionReportEntry.url.ilike(like),
+                )
+            )
+        return list(
+            self.session.scalars(
+                stmt.offset(max(0, offset)).limit(min(max(limit, 1), 100))
+            ).all()
+        )
+
+    def _list_daily_report_events(
+        self,
+        *,
+        snapshot: RunSnapshot,
+        topic: str | None,
+        content_class: str | None,
+        limit: int,
+    ) -> list[FeaturedEventRow]:
+        return [
+            self._report_event_row(entry)
+            for entry in self._daily_report_entries(
+                snapshot=snapshot,
+                topic=topic,
+                content_class=content_class,
+                limit=limit,
+            )
+        ]
+
+    def _list_daily_report_cards(
+        self,
+        *,
+        snapshot: RunSnapshot,
+        category: str | None,
+        source_group: str | None,
+        content_class: str | None,
+        query: str | None,
+        offset: int,
+        limit: int,
+    ) -> list[FeaturedItemRow]:
+        cards: list[FeaturedItemRow] = []
+        for entry in self._daily_report_entries(
+            snapshot=snapshot,
+            category=category,
+            source_group=source_group,
+            content_class=content_class,
+            query=query,
+            offset=offset,
+            limit=limit,
+        ):
+            row = self._report_event_row(entry)
+            cards.append(
+                FeaturedItemRow(
+                    id=row.event_id,
+                    title=row.title,
+                    summary=row.summary,
+                    selection_reason=f"daily_report:{row.display_order}",
+                    url=row.url,
+                    risk_note="；".join(row.risk_flags) if row.risk_flags else None,
+                    status="selected",
+                    selection_score=int(round(row.display_score)),
+                    ai_confidence=100,
+                    content_class=row.content_class,
+                    source_name=row.source_name,
+                    source_group=row.source_group,
+                    source_subtype=row.source_subtype,
+                    risk_flags=row.risk_flags,
+                    published_at=row.published_at,
+                    created_at=entry.created_at,
+                    screen_decision="pass",
+                    screen_confidence=100,
+                    ai_status="published_daily_report",
+                    topic_category=row.topic,
+                    source_id=row.source_ids[0] if row.source_ids else None,
+                    presentation_labels=row.presentation_labels,
+                )
+            )
+        return cards
+
+    def _report_event_row(self, entry: DailyEditionReportEntry) -> FeaturedEventRow:
+        metadata = entry.metadata_dict
+        refs: list[dict[str, object]] = []
+        source_names: list[str] = []
+        for raw_ref in entry.source_refs:
+            ref = dict(raw_ref)
+            ref["source_url"] = _safe_url(_as_optional_text(ref.get("source_url")))
+            refs.append(ref)
+            source_name = _as_optional_text(ref.get("source_name"))
+            if source_name and source_name not in source_names:
+                source_names.append(source_name)
+        display_title = _as_optional_text(metadata.get("display_title_zh")) or entry.title
+        source_presentation = _as_optional_text(metadata.get("source_presentation"))
+        labels = {
+            "community_signal_pending_verification": "社区线索 / 待核实",
+            "multi_community_signal_pending_verification": "多源社区线索 / 待核实",
+        }
+        provenance = metadata.get("provenance")
+        if isinstance(provenance, dict):
+            provenance = provenance.get("kind")
+        return FeaturedEventRow(
+            event_id=int(entry.id),
+            display_order=int(entry.display_order or 0),
+            title=display_title,
+            original_title=entry.original_title or entry.title,
+            summary=entry.summary,
+            url=_safe_url(entry.url),
+            display_score=float(entry.display_score or 0.0),
+            topic=entry.topic,
+            content_class=entry.content_class,
+            source_name="、".join(source_names) or (entry.source_ids[0] if entry.source_ids else None),
+            source_group=entry.source_group,
+            source_subtype=None,
+            source_ids=tuple(entry.source_ids),
+            risk_flags=list(entry.risk_flags),
+            published_at=entry.published_at,
+            keywords=tuple(entry.keywords),
+            entities=tuple(value for value in entry.entities if isinstance(value, dict)),
+            provenance=str(provenance or "new"),
+            source_refs=tuple(refs),
+            story_family_id=_as_optional_text(metadata.get("story_family_id")),
+            family_position=_as_optional_int(metadata.get("family_position")),
+            presentation_labels=(labels[source_presentation],) if source_presentation in labels else (),
+        )
+
+    def _report_member_rows(self, entry: DailyEditionReportEntry) -> tuple[EventMemberRow, ...]:
+        rows: list[EventMemberRow] = []
+        for position, ref in enumerate(entry.source_refs, start=1):
+            item_id = _as_optional_int(ref.get("item_id")) or -(int(entry.id) * 1000 + position)
+            rows.append(
+                EventMemberRow(
+                    item_id=item_id,
+                    title=_as_optional_text(ref.get("title")) or entry.original_title or entry.title,
+                    summary=entry.summary,
+                    url=_safe_url(_as_optional_text(ref.get("source_url"))) or _safe_url(entry.url),
+                    published_at=entry.published_at,
+                    captured_at=None,
+                    source_id=_as_optional_text(ref.get("source_id")),
+                    source_name=_as_optional_text(ref.get("source_name")),
+                    source_group=_as_optional_text(ref.get("source_group")) or entry.source_group,
+                    source_url=_safe_url(_as_optional_text(ref.get("source_url"))),
+                    is_primary=bool(ref.get("is_primary")),
+                    match_type=_as_optional_text(ref.get("match_type")),
+                    match_confidence=_as_optional_int(ref.get("match_confidence")),
+                    screen_decision=None,
+                    screen_reason_code=None,
+                    screen_reason=None,
+                    screen_confidence=None,
+                    screen_risk_flags=(),
+                    review_status=None,
+                    review_topic=entry.topic,
+                    review_summary=entry.summary,
+                    review_reason=None,
+                    review_score=None,
+                    review_confidence=None,
+                    review_risk_flags=(),
+                )
+            )
+        return tuple(rows)
 
     def _event_row(
         self,
@@ -1183,6 +1605,11 @@ def _as_optional_int(value: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _as_optional_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
 
 
 def _normalize_edition_date(value: str | None) -> str | None:

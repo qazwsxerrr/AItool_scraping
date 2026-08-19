@@ -37,6 +37,8 @@ from app.domain.policies import is_first_party_x_source
 from app.jobs.provider_retry import call_with_provider_retries
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import (
+    DailyEdition,
+    DailyEditionReportEntry,
     IntelEvent,
     IntelEventItem,
     IntelEventStageDSnapshot,
@@ -1105,7 +1107,49 @@ def _recent_daily_history(
         current = date.fromisoformat(run.edition_date)
     except ValueError:
         return {}
-    event_ids = [int(candidate["event"].id) for candidate in candidates]
+    events = [candidate.get("event") for candidate in candidates if candidate.get("event") is not None]
+    if not events:
+        return {}
+    if run.edition_id is None:
+        return _legacy_recent_daily_history(session, events=events, run=run, current=current, days=days)
+    earliest = current - timedelta(days=days)
+    rows = session.execute(
+        select(DailyEditionReportEntry, DailyEdition)
+        .join(DailyEdition, DailyEdition.id == DailyEditionReportEntry.edition_id)
+        .where(
+            DailyEdition.edition_date >= earliest,
+            DailyEdition.edition_date < current,
+            DailyEdition.published_at.is_not(None),
+        )
+        .order_by(DailyEdition.edition_date.desc(), DailyEditionReportEntry.display_order.asc())
+    ).all()
+    entry_keys = [(_published_entry_identity_keys(entry), edition.edition_date.isoformat()) for entry, edition in rows]
+    history: dict[int, list[str]] = {}
+    for event in events:
+        event_id = int(event.id)
+        event_keys = _event_history_identity_keys(event)
+        if not event_keys:
+            continue
+        editions = [edition_date for entry_identity, edition_date in entry_keys if event_keys & entry_identity]
+        if editions:
+            history[event_id] = list(dict.fromkeys(editions))
+    return {
+        event_id: {"appeared_recently": True, "prior_editions": editions}
+        for event_id, editions in history.items()
+    }
+
+
+def _legacy_recent_daily_history(
+    session: Session,
+    *,
+    events: Sequence[IntelEvent],
+    run: IntelRun,
+    current: date,
+    days: int,
+) -> dict[int, dict[str, Any]]:
+    """Compatibility path for direct jobs that predate DailyEdition."""
+
+    event_ids = [int(event.id) for event in events]
     if not event_ids:
         return {}
     earliest = current - timedelta(days=days)
@@ -1120,8 +1164,6 @@ def _recent_daily_history(
             .order_by(IntelRun._edition_date.desc(), IntelRun.id.desc())
         ).all()
     )
-    # A date can have multiple internal runs. Compare only against the newest
-    # date-addressed edition, because that is the prior day's final output.
     latest_by_edition: dict[str, IntelRun] = {}
     for previous_run in previous_runs:
         if previous_run.edition_date:
@@ -1154,6 +1196,35 @@ def _recent_daily_history(
         event_id: {"appeared_recently": True, "prior_editions": editions}
         for event_id, editions in history.items()
     }
+
+
+def _event_history_identity_keys(event: IntelEvent) -> set[str]:
+    keys = {_history_identity("event", event.event_key)}
+    if event.event_key and str(event.event_key).startswith(("url:", "external:")):
+        keys.add(_history_identity("stable", event.event_key))
+    if event.canonical_url:
+        keys.add(_history_identity("url", event.canonical_url))
+    if event.external_id:
+        keys.add(_history_identity("external", event.external_id))
+    return {value for value in keys if value}
+
+
+def _published_entry_identity_keys(entry: DailyEditionReportEntry) -> set[str]:
+    keys = {_history_identity("event", entry.event_key)}
+    if entry.event_key and str(entry.event_key).startswith(("url:", "external:")):
+        keys.add(_history_identity("stable", entry.event_key))
+    if entry.url:
+        keys.add(_history_identity("url", entry.url))
+    return {value for value in keys if value}
+
+
+def _history_identity(kind: str, value: Any) -> str | None:
+    text = str(value or "").strip().casefold()
+    if not text:
+        return None
+    if kind == "url":
+        text = text.rstrip("/")
+    return f"{kind}:{text}"
 
 
 def _call_editorial_provider(

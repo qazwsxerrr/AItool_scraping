@@ -539,12 +539,15 @@ def _prepare_scope(
             session.commit()
             run_id = int(run.id)
         else:
-            # A daily run only screens this fetch's editorial delta.  An
-            # explicitly targeted item remains an operator override, while a
-            # normal invocation never falls back to unchanged run members.
+            # Date-addressed daily builds are complete replacement snapshots:
+            # every item fetched into the hidden build is screened again.
+            # Legacy run callers retain the former delta-only compatibility
+            # behavior until they are migrated to a DailyEdition build.
+            run = session.get(IntelRun, int(run_id))
+            daily_build = getattr(run, "edition_id", None) is not None if run is not None else False
             candidates = repo.list_run_items(
                 run_id,
-                role=None if requested_ids is not None else DAILY_DELTA_RUN_ITEM_ROLES,
+                role=None if requested_ids is not None or daily_build else DAILY_DELTA_RUN_ITEM_ROLES,
             )
             if source_filter:
                 candidates = [item for item in candidates if item.source_id == source_filter]
@@ -552,7 +555,6 @@ def _prepare_scope(
                 candidates = [item for item in candidates if item.content_class == content_class]
             if requested_ids is not None:
                 candidates = [item for item in candidates if int(item.id) in requested_ids]
-            run = session.get(IntelRun, int(run_id))
         if run is None:
             raise ValueError(f"intel run {run_id} does not exist")
         reference_time = _as_utc(run.reference_time) or _as_utc(now) or datetime.now(timezone.utc)

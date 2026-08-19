@@ -154,15 +154,14 @@ def build_run_snapshot_summary(
     within_72h = screen_task_count - sum(
         1 for task in screen_tasks if task.status == "skipped"
     )
+    scope_items = frozen if run.edition_id is not None else daily_delta
     if not screen_task_count:
-        within_72h = max(0, daily_delta - time_excluded)
+        within_72h = max(0, scope_items - time_excluded)
 
-    return {
-        "funnel": {
+    funnel = {
             "fetched": fetched,
             "inserted": inserted,
             "frozen": frozen,
-            "daily_delta": daily_delta,
             "within_72h": max(0, within_72h),
             "time_excluded": time_excluded,
             "time_excluded_by_reason": time_excluded_by_reason,
@@ -177,7 +176,16 @@ def build_run_snapshot_summary(
             "stage_d_selected": stage_d_selected,
             "stage_d_watchlist": stage_d_watchlist,
             "stage_d_shortlisted": stage_d_shortlisted,
-        },
+    }
+    if run.edition_id is not None:
+        # A date-addressed report always evaluates the complete fresh source
+        # response. Calling it a "daily delta" would incorrectly imply that
+        # old build rows were reused.
+        funnel["full_rebuild_items"] = frozen
+    else:
+        funnel["daily_delta"] = daily_delta
+    return {
+        "funnel": funnel,
         "stages": stages_payload,
         "failure_reasons": failure_reasons,
     }

@@ -21,8 +21,9 @@ runner = CliRunner()
 def test_pipeline_help_lists_formal_commands():
     result = runner.invoke(main.app, ["pipeline", "--help"])
     assert result.exit_code == 0
-    for command in ("run", "start", "stage-a", "stage-b", "stage-c", "stage-d", "export", "status", "retry", "resume", "adopt-existing"):
+    for command in ("run", "start", "stage-a", "stage-b", "stage-c", "stage-d", "export", "status", "retry", "resume"):
         assert command in result.stdout
+    assert "adopt-existing" not in result.stdout
 
 
 def test_start_creates_and_freezes_scope(tmp_path):
