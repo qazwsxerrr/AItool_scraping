@@ -23,13 +23,13 @@ def current_ui(
 ) -> dict[str, Any]:
     """Return the selected event feed for the resolved public daily edition."""
 
-    snapshot = repo.resolve_snapshot(edition_date=edition_date)
-    summary = repo.get_run_snapshot_summary(snapshot)
+    edition = repo.resolve_edition(edition_date=edition_date)
+    summary = repo.get_edition_summary(edition)
     return _response(
-        snapshot=snapshot,
-        stats=repo.get_dashboard_stats(snapshot=snapshot) if snapshot is not None else None,
+        edition=edition,
+        stats=repo.get_dashboard_stats(edition=edition) if edition is not None else None,
         editions=repo.list_daily_editions(),
-        events=repo.list_featured_events(snapshot=snapshot, limit=limit),
+        events=repo.list_featured_events(edition=edition, limit=limit),
         **_summary_fields(summary),
     )
 
@@ -54,16 +54,16 @@ def edition_events(
 ) -> dict[str, Any]:
     """Read selected events from one public date-addressed daily report."""
 
-    snapshot = _require_edition(repo, edition_date=edition_date)
+    edition = _require_edition(repo, edition_date=edition_date)
     events = repo.list_featured_events(
-        snapshot=snapshot,
+        edition=edition,
         topic=topic,
         content_class=content_class,
         limit=limit,
     )
-    summary = repo.get_run_snapshot_summary(snapshot)
+    summary = repo.get_edition_summary(edition)
     return _response(
-        snapshot=snapshot,
+        edition=edition,
         events=events,
         **_summary_fields(summary),
     )
@@ -77,12 +77,12 @@ def edition_event_detail(
 ) -> dict[str, Any]:
     """Read one selected event and its retained public provenance."""
 
-    snapshot = _require_edition(repo, edition_date=edition_date)
-    detail = repo.get_selected_event_detail(event_id, snapshot=snapshot)
+    edition = _require_edition(repo, edition_date=edition_date)
+    detail = repo.get_selected_event_detail(event_id, edition=edition)
     if detail is None:
-        raise HTTPException(status_code=404, detail="Selected event not found in this snapshot")
+        raise HTTPException(status_code=404, detail="Selected event not found in this daily edition")
     return {
-        "snapshot": _encode(snapshot),
+        "edition": _encode(edition),
         "event": _encode(detail),
     }
 
@@ -92,10 +92,10 @@ def _require_edition(
     *,
     edition_date: str,
 ):
-    snapshot = repo.resolve_snapshot(edition_date=edition_date)
-    if snapshot is None:
-        raise HTTPException(status_code=404, detail="Daily snapshot not found")
-    return snapshot
+    edition = repo.resolve_edition(edition_date=edition_date)
+    if edition is None:
+        raise HTTPException(status_code=404, detail="Daily edition not found")
+    return edition
 
 
 def _response(**values: Any) -> dict[str, Any]:
@@ -119,29 +119,4 @@ def _summary_fields(summary: dict[str, Any] | None) -> dict[str, Any]:
 def _encode(value: Any) -> Any:
     if value is None:
         return None
-    encoded = jsonable_encoder(asdict(value) if hasattr(value, "__dataclass_fields__") else value)
-    return _strip_internal_run_fields(encoded)
-
-
-def _strip_internal_run_fields(value: Any) -> Any:
-    """Keep durable run identifiers out of the public read API."""
-
-    if isinstance(value, dict):
-        return {
-            key: _strip_internal_run_fields(child)
-            for key, child in value.items()
-            if not _is_internal_execution_key(key)
-        }
-    if isinstance(value, list):
-        return [_strip_internal_run_fields(child) for child in value]
-    return value
-
-
-def _is_internal_execution_key(key: object) -> bool:
-    normalized = str(key).strip().casefold()
-    return (
-        normalized == "run_id"
-        or normalized.endswith("_run_id")
-        or normalized == "snapshot_key"
-        or normalized.endswith("_snapshot_key")
-    )
+    return jsonable_encoder(asdict(value) if hasattr(value, "__dataclass_fields__") else value)

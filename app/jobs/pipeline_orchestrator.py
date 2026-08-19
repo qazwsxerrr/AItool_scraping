@@ -3,8 +3,7 @@
 The individual jobs own their stage semantics.  This module only creates and
 creates a private build scope, dispatches one named stage at a time, and
 exposes the small control-plane operations used by the CLI (status, retry and
-resume).  Keeping those decisions here prevents a retry command from
-silently falling back to the legacy all-in-one AI job.
+resume).
 """
 
 from __future__ import annotations
@@ -29,7 +28,6 @@ from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
 from app.domain.models import SourceSpec
 from app.domain.recency import recent_window_scope
-from app.jobs.ai_review_job import AIReviewResult
 from app.jobs.event_cluster_job import EventClusterResult, run_event_cluster_from_settings
 from app.jobs.export_job import (
     IntelExportResult,
@@ -37,7 +35,6 @@ from app.jobs.export_job import (
     daily_output_dir_for_run,
     finalize_daily_bundle,
     promote_daily_bundle,
-    refresh_daily_export_mirror,
     rollback_daily_bundle,
     run_intel_export_from_settings,
 )
@@ -47,27 +44,15 @@ from app.jobs.stage_b_analysis_job import StageBAnalysisResult, run_stage_b_anal
 from app.jobs.stage_d_job import StageDResult, run_stage_d_from_settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import DailyEdition, IntelRun
-from app.storage.repository import DAILY_DELTA_RUN_ITEM_ROLES, DAILY_EDITION_TIMEZONE, IntelRepository, StageStateSummary
+from app.storage.repository import DAILY_EDITION_TIMEZONE, IntelRepository, StageStateSummary
 
 
 STAGE_ALIASES: dict[str, str] = {
     "fetch": "fetch",
-    "a": "screen",
     "stage-a": "screen",
-    "stage_a": "screen",
-    "screen": "screen",
-    "b": "analyze",
     "stage-b": "analyze",
-    "stage_b": "analyze",
-    "analyze": "analyze",
-    "analysis": "analyze",
-    "c": "cluster",
     "stage-c": "cluster",
-    "stage_c": "cluster",
-    "cluster": "cluster",
-    "d": "stage_d",
     "stage-d": "stage_d",
-    "stage_d": "stage_d",
     "export": "export",
 }
 DISPLAY_STAGE_NAMES = {
@@ -140,20 +125,6 @@ class PipelineExecutionResult:
     status: str
 
 
-@dataclass(frozen=True)
-class PipelineRunResult:
-    """Compatibility result returned by the historical ``run-once`` facade."""
-
-    run_id: int | None
-    fetch: IntelFetchResult
-    ai_review: AIReviewResult
-    export: IntelExportResult
-    status: str
-    error: str | None = None
-    event_cluster: EventClusterResult | None = None
-    stage_d: StageDResult | None = None
-
-
 def normalize_stage(value: str) -> str:
     key = str(value or "").strip().casefold()
     try:
@@ -163,40 +134,10 @@ def normalize_stage(value: str) -> str:
         raise ValueError(f"unknown pipeline stage {value!r}; expected one of: {allowed}") from exc
 
 
-def _stage_c_current_event_ids(result: Any) -> Iterable[int] | None:
-    """Expose Stage-C's complete current projection to Stage D."""
-
-    current = getattr(result, "current_event_ids", None)
-    if current is not None:
-        return current
-    # Injected cluster runners may expose only the historical new-event
-    # projection; it remains a narrow fallback for old snapshots and tests.
-    return getattr(result, "event_ids", None)
-
-
 def _engine_and_factory(settings: Settings):
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
     return engine, create_session_factory(engine)
-
-
-def _reject_daily_scope_overrides(
-    session_factory: Any,
-    *,
-    run_id: int,
-    source: str | None,
-    content_class: str | None,
-) -> None:
-    """Prevent a single-source/class slice from replacing a full edition."""
-
-    if source is None and content_class is None:
-        return
-    with session_factory() as session:
-        run = session.get(IntelRun, int(run_id))
-        if run is not None and run.edition_id is not None:
-            raise ValueError(
-                "daily rebuild stages require the complete enabled-source build; use fetch/fetch-only for --source or --class diagnostics"
-            )
 
 
 def _registry(settings: Settings, registry_path=DEFAULT_REGISTRY_PATH) -> dict[str, SourceSpec]:
@@ -390,34 +331,10 @@ def _stage_ai_client(settings: Settings, ai_client: Any | None = None):
         client.close()
 
 
-def _stage_d_client_or_none(value: Any | None) -> Any | None:
-    """Do not accidentally pass a Stage-A/B triage client into Stage D."""
-
-    if value is None:
-        return None
-    return value if any(callable(getattr(value, name, None)) for name in ("select_events", "stage_d_editorial", "editorial_select")) else None
-
-
-def _stage_result_errors(stage_name: str, value: Any) -> list[str]:
-    """Normalize explicit stage result errors for downstream safety guards.
-
-    Stage D historically returned a result with ``errors`` after materializing
-    a fallback snapshot.  Keep this compatibility check scoped to Stage D so
-    the existing partial-success semantics of Stage A/B are unchanged.
-    """
-
-    if stage_name != "stage_d":
-        return []
-    errors = getattr(value, "errors", None)
-    if not isinstance(errors, (list, tuple)):
-        return []
-    return [str(error) for error in errors if str(error).strip()]
-
-
 def _daily_stage_result_errors(stage_name: str, value: Any) -> list[str]:
     """Failures that must block publication of a complete daily rebuild."""
 
-    errors = _stage_result_errors(stage_name, value)
+    errors: list[str] = []
     explicit = getattr(value, "errors", None)
     if isinstance(explicit, (list, tuple)):
         errors.extend(str(error) for error in explicit if str(error).strip() and str(error) not in errors)
@@ -437,8 +354,6 @@ def _freeze_after_fetch(
     settings: Settings,
     *,
     run_id: int,
-    source: str | None,
-    content_class: str | None,
     limit: int | None,
     fetch: IntelFetchResult,
 ) -> datetime | None:
@@ -450,7 +365,7 @@ def _freeze_after_fetch(
         run = session.get(IntelRun, int(run_id))
         if run is None:
             raise ValueError(f"intel run {run_id} disappeared during fetch")
-        # A DailyEdition build is a full replacement snapshot.  Freeze every
+        # A DailyEdition build is a full replacement build. Freeze every
         # fetched item; Stage A consumes the complete draft scope rather than
         # a global incremental delta.
         item_ids = repo.list_run_item_ids(run_id)
@@ -465,8 +380,6 @@ def _freeze_after_fetch(
             source_ids=source_ids,
             item_ids=item_ids,
             scope={
-                "source": source,
-                "content_class": content_class,
                 "fetch_limit": limit,
             },
         )
@@ -474,8 +387,6 @@ def _freeze_after_fetch(
             run_id,
             "fetch",
             metadata={
-                "source": source,
-                "content_class": content_class,
                 "items": len(item_ids),
             },
         )
@@ -525,53 +436,20 @@ def _remap_staged_artifact_path(
 def start_pipeline_run_from_settings(
     *,
     settings: Settings,
-    source: str | None = None,
-    content_class: str | None = None,
     limit: int | None = DEFAULT_FETCH_LIMIT_PER_SOURCE,
-    force: bool = False,
-    dry_run: bool = False,
     edition_date: date | str | None = None,
     registry_path=DEFAULT_REGISTRY_PATH,
     fetch_runner: Callable[..., IntelFetchResult] | None = None,
 ) -> PipelineStartResult:
     """Create a full replacement draft for one public daily edition."""
 
-    if source is not None or content_class is not None:
-        raise ValueError(
-            "daily pipeline rebuilds require all enabled sources; use fetch/fetch-only for --source or --class diagnostics"
-        )
     normalized_edition = _normalize_edition_date(edition_date)
-
-    if dry_run:
-        # ``pipeline start --dry-run`` remains a diagnostic operation.  It
-        # cannot produce a durable run id and therefore never claims to have
-        # frozen a scope.
-        runner = fetch_runner or run_intel_fetch_from_settings
-        fetch = runner(
-            settings=settings,
-            registry_path=registry_path,
-            limit_per_source=limit,
-            source_filter=None,
-            content_class=None,
-            # A replacement snapshot must never become an empty 304-only
-            # build, so daily fetches bypass conditional validators.
-            force=True,
-            dry_run=True,
-        )
-        return PipelineStartResult(
-            run_id=int(fetch.run_id or 0),
-            fetch=fetch,
-            reference_time=None,
-            scope_frozen=False,
-            edition_date=normalized_edition,
-        )
 
     _, session_factory = _engine_and_factory(settings)
     with session_factory() as session:
         repo = IntelRepository(session)
         edition, run = repo.start_daily_build(
             edition_date=normalized_edition or datetime.now(timezone.utc).astimezone(DAILY_EDITION_TIMEZONE).date(),
-            run_type="daily_build",
             filters={"stage": "fetch"},
             scope={
                 "fetch_limit": limit,
@@ -600,8 +478,6 @@ def start_pipeline_run_from_settings(
     frozen_reference = _freeze_after_fetch(
         settings,
         run_id=run_id,
-        source=None,
-        content_class=None,
         limit=limit,
         fetch=fetch,
     )
@@ -618,8 +494,6 @@ def run_pipeline_stage_a_from_settings(
     *,
     settings: Settings,
     run_id: int,
-    source: str | None = None,
-    content_class: str | None = None,
     limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
     force: bool = False,
     retry_failed: bool = False,
@@ -630,12 +504,6 @@ def run_pipeline_stage_a_from_settings(
     registry_path=DEFAULT_REGISTRY_PATH,
 ) -> StageAScreenResult:
     _, session_factory = _engine_and_factory(settings)
-    _reject_daily_scope_overrides(
-        session_factory,
-        run_id=int(run_id),
-        source=source,
-        content_class=content_class,
-    )
     specs = _registry(settings, registry_path)
     with _stage_ai_client(settings, ai_client) as provider:
         result = run_stage_a_screen_job(
@@ -644,8 +512,8 @@ def run_pipeline_stage_a_from_settings(
             ai_client=provider,
             run_id=int(run_id),
             limit=limit,
-            source_filter=source,
-            content_class=content_class,
+            source_filter=None,
+            content_class=None,
             force=force,
             retry_failed=retry_failed,
             include_blocked=include_blocked,
@@ -668,8 +536,6 @@ def run_pipeline_stage_b_from_settings(
     *,
     settings: Settings,
     run_id: int,
-    source: str | None = None,
-    content_class: str | None = None,
     limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
     force: bool = False,
     retry_failed: bool = False,
@@ -680,12 +546,6 @@ def run_pipeline_stage_b_from_settings(
     registry_path=DEFAULT_REGISTRY_PATH,
 ) -> StageBAnalysisResult:
     _, session_factory = _engine_and_factory(settings)
-    _reject_daily_scope_overrides(
-        session_factory,
-        run_id=int(run_id),
-        source=source,
-        content_class=content_class,
-    )
     specs = _registry(settings, registry_path)
     with _stage_ai_client(settings, ai_client) as provider:
         result = run_stage_b_analysis_job(
@@ -694,8 +554,8 @@ def run_pipeline_stage_b_from_settings(
             ai_client=provider,
             run_id=int(run_id),
             limit=limit,
-            source_filter=source,
-            content_class=content_class,
+            source_filter=None,
+            content_class=None,
             force=force,
             retry_failed=retry_failed,
             include_blocked=include_blocked,
@@ -720,7 +580,6 @@ def run_pipeline_stage_c_from_settings(
     run_id: int,
     limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
     force: bool = False,
-    snapshot_key: str | None = None,
     ai_client: Any | None = None,
     item_ids: Iterable[int] | None = None,
 ) -> EventClusterResult:
@@ -730,7 +589,6 @@ def run_pipeline_stage_c_from_settings(
         run_id=int(run_id),
         limit=limit,
         force=force,
-        snapshot_key=snapshot_key or f"run-{int(run_id)}",
         item_ids=item_ids,
         ai_client=ai_client,
     )
@@ -743,7 +601,6 @@ def run_pipeline_stage_d_from_settings(
     settings: Settings,
     run_id: int,
     force: bool = False,
-    snapshot_key: str | None = None,
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
     event_ids: Iterable[int] | None = None,
@@ -761,7 +618,6 @@ def run_pipeline_stage_d_from_settings(
                 settings=settings,
                 run_id=int(run_id),
                 force=force,
-                snapshot_key=snapshot_key,
                 profile_path=profile_path,
                 ai_client=StageDEditorialClient.from_settings(settings, http_client=http_client),
                 event_ids=event_ids,
@@ -771,7 +627,6 @@ def run_pipeline_stage_d_from_settings(
             settings=settings,
             run_id=int(run_id),
             force=force,
-            snapshot_key=snapshot_key,
             profile_path=profile_path,
             ai_client=ai_client,
             event_ids=event_ids,
@@ -785,13 +640,7 @@ def run_pipeline_export_from_settings(
     settings: Settings,
     run_id: int,
     limit: int | None = DEFAULT_DAILY_REPORT_LIMIT,
-    source: str | None = None,
-    content_class: str | None = None,
     output_dir: str | Path = "output/intel",
-    dry_run: bool = False,
-    snapshot_key: str | None = None,
-    partial: bool = False,
-    partial_reason: str | None = None,
 ) -> IntelExportResult:
     _, session_factory = _engine_and_factory(settings)
     with session_factory() as session:
@@ -799,42 +648,13 @@ def run_pipeline_export_from_settings(
         run = session.get(IntelRun, int(run_id))
         if run is None:
             raise ValueError(f"intel run {run_id} does not exist")
-        is_daily_draft = run.edition_id is not None
-        if is_daily_draft:
-            edition = session.get(DailyEdition, int(run.edition_id))
-            if edition is None or edition.draft_run_id != int(run.id):
-                raise ValueError("daily export requires the edition's current pending build")
-            if source is not None or content_class is not None:
-                raise ValueError("daily report export does not accept --source or --class")
-            final_daily_dir = daily_output_dir_for_run(output_dir, run)
-        else:
-            final_daily_dir = None
+        if run.edition_id is None:
+            raise ValueError("daily export requires the current daily edition build")
+        edition = session.get(DailyEdition, int(run.edition_id))
+        if edition is None or edition.draft_run_id != int(run.id):
+            raise ValueError("daily export requires the edition's current pending build")
+        final_daily_dir = daily_output_dir_for_run(output_dir, run)
 
-    # Non-daily callers keep the diagnostic exporter behavior. A daily dry
-    # run is also non-publishing and never touches the public date directory.
-    if not is_daily_draft or dry_run:
-        result = run_intel_export_from_settings(
-            settings=settings,
-            run_id=int(run_id),
-            limit=limit,
-            source_filter=source,
-            content_class=content_class,
-            output_dir=output_dir,
-            dry_run=dry_run,
-            snapshot_key=snapshot_key,
-            partial=partial,
-            partial_reason=partial_reason,
-        )
-        _sync_pipeline_run_status(
-            session_factory,
-            int(run_id),
-            finalize=True,
-            partial=result.partial,
-            partial_reason=result.partial_reason,
-        )
-        return result
-
-    assert final_daily_dir is not None
     staging_dir: Path | None = None
     with session_factory() as session:
         current_run = session.get(IntelRun, int(run_id))
@@ -849,21 +669,11 @@ def run_pipeline_export_from_settings(
             limit=limit,
             output_dir=output_dir,
             dry_run=False,
-            snapshot_key=snapshot_key,
-            partial=partial,
-            partial_reason=partial_reason,
             artifact_dir=staging_dir,
-            publish_root_mirror=False,
         )
-        run_status = _sync_pipeline_run_status(
-            session_factory,
-            int(run_id),
-            finalize=True,
-            partial=result.partial,
-            partial_reason=result.partial_reason,
-        )
-        if result.partial or run_status != "completed":
-            reason = result.partial_reason or f"daily build is not publishable: {run_status or 'unknown'}"
+        run_status = _sync_pipeline_run_status(session_factory, int(run_id), finalize=True)
+        if run_status != "completed":
+            reason = f"daily build is not publishable: {run_status or 'unknown'}"
             _mark_daily_build_failed(session_factory, int(run_id), reason)
             raise RuntimeError(reason)
 
@@ -880,7 +690,6 @@ def run_pipeline_export_from_settings(
             rollback_daily_bundle(promotion)
             raise
         finalize_daily_bundle(promotion)
-        refresh_daily_export_mirror(output_dir=output_dir, daily_dir=final_daily_dir)
         return replace(
             result,
             jsonl_path=str(final_daily_dir / "intel_items.jsonl"),
@@ -899,7 +708,7 @@ def run_pipeline_export_from_settings(
         raise
 
 
-def resolve_pipeline_run_id_from_settings(*, settings: Settings, edition_date: date | str) -> int:
+def resolve_pending_daily_build_id_from_settings(*, settings: Settings, edition_date: date | str) -> int:
     """Resolve a public date to its one pending private build.
 
     Published reports intentionally have no retained run row.  Stage/retry/
@@ -1006,11 +815,8 @@ def retry_pipeline_stage_from_settings(
     stage: str,
     include_blocked: bool = False,
     force: bool = False,
-    source: str | None = None,
-    content_class: str | None = None,
     limit: int | None = None,
     output_dir: str | Path = "output/intel",
-    snapshot_key: str | None = None,
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
 ) -> Any:
@@ -1025,8 +831,8 @@ def retry_pipeline_stage_from_settings(
         run = session.get(IntelRun, int(run_id))
         if run is None:
             raise ValueError(f"intel run {run_id} does not exist")
-        if run.edition_id is not None and (source is not None or content_class is not None):
-            raise ValueError("daily rebuild retry does not accept --source or --class")
+        if run.edition_id is None:
+            raise ValueError("pipeline retry requires the current daily edition build")
         stage_row = repo.get_stage(run_id, canonical)
         if stage_row is None:
             return None
@@ -1049,8 +855,6 @@ def retry_pipeline_stage_from_settings(
         return run_pipeline_stage_a_from_settings(
             settings=settings,
             run_id=run_id,
-            source=source,
-            content_class=content_class,
             limit=limit if limit is not None else DEFAULT_AI_REVIEW_LIMIT,
             force=force,
             retry_failed=False,
@@ -1061,8 +865,6 @@ def retry_pipeline_stage_from_settings(
         return run_pipeline_stage_b_from_settings(
             settings=settings,
             run_id=run_id,
-            source=source,
-            content_class=content_class,
             limit=limit if limit is not None else DEFAULT_AI_REVIEW_LIMIT,
             force=force,
             retry_failed=False,
@@ -1075,7 +877,6 @@ def retry_pipeline_stage_from_settings(
             run_id=run_id,
             limit=limit,
             force=force,
-            snapshot_key=snapshot_key,
             ai_client=ai_client,
         )
     if canonical == "stage_d":
@@ -1083,16 +884,14 @@ def retry_pipeline_stage_from_settings(
             settings=settings,
             run_id=run_id,
             force=True,
-            snapshot_key=snapshot_key,
             profile_path=profile_path,
-            ai_client=_stage_d_client_or_none(ai_client),
+            ai_client=ai_client,
         )
     return run_pipeline_export_from_settings(
         settings=settings,
         run_id=run_id,
         limit=limit if limit is not None else DEFAULT_DAILY_REPORT_LIMIT,
         output_dir=output_dir,
-        snapshot_key=snapshot_key,
     )
 
 
@@ -1119,13 +918,7 @@ def _stage_needs_resume(session_factory, run_id: int, stage_name: str) -> bool:
                 return bool(expires <= datetime.now(timezone.utc))
             return False
         if stage_name == "screen":
-            daily_build = run.edition_id is not None
-            return bool(
-                repo.list_run_item_ids(
-                    run_id,
-                    role=None if daily_build else DAILY_DELTA_RUN_ITEM_ROLES,
-                )
-            )
+            return bool(repo.list_run_item_ids(run_id, role=None))
         previous = {name: repo.get_stage(run_id, name) for name in PIPELINE_STAGES}
         dependency = {"analyze": "screen", "cluster": "analyze", "stage_d": "cluster", "export": "stage_d"}[stage_name]
         dependency_stage = previous[dependency]
@@ -1146,16 +939,12 @@ def resume_pipeline_from_settings(
     *,
     settings: Settings,
     run_id: int,
-    fetch: bool = False,
-    source: str | None = None,
-    content_class: str | None = None,
     limit: int | None = None,
     output_dir: str | Path = "output/intel",
-    snapshot_key: str | None = None,
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
 ) -> PipelineResumeResult:
-    """Resume eligible work in dependency order, never fetching by default."""
+    """Resume the one pending daily build in dependency order."""
 
     _, session_factory = _engine_and_factory(settings)
     result = PipelineResumeResult(run_id=int(run_id))
@@ -1164,32 +953,15 @@ def resume_pipeline_from_settings(
         run = session.get(IntelRun, int(run_id))
         if run is None:
             raise ValueError(f"intel run {run_id} does not exist")
-        daily_build = run.edition_id is not None
-        if daily_build and (source is not None or content_class is not None):
-            raise ValueError("daily rebuild resume does not accept --source or --class")
+        if run.edition_id is None:
+            raise ValueError("pipeline resume requires the current daily edition build")
         fetch_stage = repo.get_stage(int(run_id), "fetch")
-        if daily_build and fetch_stage is not None and fetch_stage.status != "succeeded":
+        if fetch_stage is None or fetch_stage.status != "succeeded":
             reason = "fetch stage is incomplete; start a fresh full pipeline run for this edition"
             repo.mark_daily_build_failed(int(run_id), error=reason)
             session.commit()
             result.errors.append(reason)
             return result
-    if fetch:
-        if daily_build:
-            raise ValueError("daily rebuild fetch retries require a fresh pipeline run")
-        # Explicit opt-in is kept for operators recovering an interrupted
-        # fetch.  A frozen run still rejects genuinely new membership in the
-        # repository, preserving the immutable scope contract.
-        fetch_result = run_intel_fetch_from_settings(
-            settings=settings,
-            limit_per_source=limit if limit is not None else DEFAULT_FETCH_LIMIT_PER_SOURCE,
-            source_filter=source,
-            content_class=content_class,
-            force=False,
-            run_id=int(run_id),
-        )
-        result.ran_stages.append("fetch")
-        result.results["fetch"] = fetch_result
 
     for stage_name in PIPELINE_STAGES:
         if not _stage_needs_resume(session_factory, run_id, stage_name):
@@ -1200,8 +972,6 @@ def resume_pipeline_from_settings(
                 value = run_pipeline_stage_a_from_settings(
                     settings=settings,
                     run_id=run_id,
-                    source=source,
-                    content_class=content_class,
                     limit=limit if limit is not None else DEFAULT_AI_REVIEW_LIMIT,
                     ai_client=ai_client,
                 )
@@ -1209,8 +979,6 @@ def resume_pipeline_from_settings(
                 value = run_pipeline_stage_b_from_settings(
                     settings=settings,
                     run_id=run_id,
-                    source=source,
-                    content_class=content_class,
                     limit=limit if limit is not None else DEFAULT_AI_REVIEW_LIMIT,
                     ai_client=ai_client,
                 )
@@ -1219,16 +987,14 @@ def resume_pipeline_from_settings(
                     settings=settings,
                     run_id=run_id,
                     limit=limit,
-                    snapshot_key=snapshot_key,
                     ai_client=ai_client,
                 )
             elif stage_name == "stage_d":
                 value = run_pipeline_stage_d_from_settings(
                     settings=settings,
                     run_id=run_id,
-                    snapshot_key=snapshot_key,
                     profile_path=profile_path,
-                    ai_client=_stage_d_client_or_none(ai_client),
+                    ai_client=ai_client,
                 )
             else:
                 value = run_pipeline_export_from_settings(
@@ -1236,19 +1002,13 @@ def resume_pipeline_from_settings(
                     run_id=run_id,
                     limit=limit if limit is not None else DEFAULT_DAILY_REPORT_LIMIT,
                     output_dir=output_dir,
-                    snapshot_key=snapshot_key,
                 )
             result.ran_stages.append(stage_name)
             result.results[stage_name] = value
-            stage_errors = (
-                _daily_stage_result_errors(stage_name, value)
-                if daily_build
-                else _stage_result_errors(stage_name, value)
-            )
+            stage_errors = _daily_stage_result_errors(stage_name, value)
             if stage_errors:
                 result.errors.extend(f"{stage_name}: {error}" for error in stage_errors)
-                if daily_build:
-                    _mark_daily_build_failed(session_factory, int(run_id), "; ".join(result.errors))
+                _mark_daily_build_failed(session_factory, int(run_id), "; ".join(result.errors))
                 break
         except Exception as exc:
             result.errors.append(f"{stage_name}: {exc}")
@@ -1262,8 +1022,7 @@ def resume_pipeline_from_settings(
             repo = IntelRepository(session)
             if session.get(IntelRun, int(run_id)) is not None:
                 repo.finish_run(run_id, status="failed", error="; ".join(result.errors))
-                if daily_build:
-                    repo.mark_daily_build_failed(run_id, error="; ".join(result.errors))
+                repo.mark_daily_build_failed(run_id, error="; ".join(result.errors))
                 session.commit()
     else:
         _sync_pipeline_run_status(session_factory, int(run_id), finalize=True)
@@ -1273,174 +1032,50 @@ def resume_pipeline_from_settings(
 def run_pipeline_from_settings(
     *,
     settings: Settings,
-    source: str | None = None,
-    content_class: str | None = None,
     limit: int | None = DEFAULT_FETCH_LIMIT_PER_SOURCE,
-    force: bool = False,
     edition_date: date | str | None = None,
     output_dir: str | Path = "output/intel",
-    snapshot_key: str | None = None,
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
     registry_path=DEFAULT_REGISTRY_PATH,
     on_start: Callable[[PipelineStartResult], None] | None = None,
 ) -> PipelineExecutionResult:
-    """Create a run, fetch its immutable scope, then execute all stages.
-
-    This is the normal operator entry point.  The stage-specific commands
-    remain available for retries and recovery, but a successful invocation
-    never requires the caller to copy a generated ``run_id`` between commands.
-    ``limit`` applies to fetching per source; downstream stages process the
-    complete frozen membership unless their dedicated retry command supplies a
-    separate cap.
-    """
+    """Fully rebuild and publish one date-addressed daily edition."""
 
     start = start_pipeline_run_from_settings(
         settings=settings,
-        source=source,
-        content_class=content_class,
         limit=limit,
-        force=force,
         edition_date=edition_date,
         registry_path=registry_path,
     )
-    if not start.scope_frozen or not start.run_id:
-        raise ValueError("pipeline run requires a durable run; remove --dry-run from the start command")
+    if not start.scope_frozen:
+        raise RuntimeError("daily build did not freeze its fetched scope")
     if on_start is not None:
         on_start(start)
 
     resumed = resume_pipeline_from_settings(
         settings=settings,
         run_id=int(start.run_id),
-        source=source,
-        content_class=content_class,
         # The fetch limit is per source.  Do not accidentally reuse it as a
         # global cap for the downstream stages.
         limit=None,
         output_dir=output_dir,
-        snapshot_key=snapshot_key,
         profile_path=profile_path,
         ai_client=ai_client,
     )
     resolved_date = start.edition_date or _normalize_edition_date(edition_date)
-    status = (
-        pipeline_edition_status_from_settings(settings=settings, edition_date=resolved_date).status
-        if resolved_date is not None
-        else pipeline_status_from_settings(settings=settings, run_id=int(start.run_id)).run_status
-    )
+    if resolved_date is None:
+        raise RuntimeError("daily build did not resolve an edition date")
+    status = pipeline_edition_status_from_settings(settings=settings, edition_date=resolved_date).status
     return PipelineExecutionResult(
         run_id=int(start.run_id),
         start=start,
         resume=resumed,
         status=status,
     )
-
-
-def run_pipeline_once_from_settings(
-    *,
-    settings: Settings,
-    source: str | None = None,
-    content_class: str | None = None,
-    limit: int = DEFAULT_FETCH_LIMIT_PER_SOURCE,
-    ai_limit: int | None = None,
-    force: bool = False,
-    dry_run: bool = False,
-    edition_date: date | str | None = None,
-    output_dir: str | Path = "output/intel",
-    profile_path: str | Path | None = None,
-    snapshot_key: str | None = None,
-    ai_client: Any | None = None,
-    fetch_runner: Callable[..., IntelFetchResult] | None = None,
-    ai_review_runner: Callable[..., AIReviewResult] | None = None,
-    event_cluster_runner: Callable[..., EventClusterResult] | None = None,
-    stage_d_runner: Callable[..., StageDResult] | None = None,
-    export_runner: Callable[..., IntelExportResult] | None = None,
-) -> PipelineRunResult:
-    """Run the same date-addressed full rebuild as ``pipeline run``.
-
-    ``run-once`` remains only as a convenience spelling.  It must not create
-    a second, legacy incremental workflow with different source scope or
-    publication semantics.
-    """
-
-    if source is not None or content_class is not None:
-        raise ValueError(
-            "run-once daily rebuilds require all enabled sources; use fetch/fetch-only for --source or --class diagnostics"
-        )
-    if ai_limit is not None:
-        raise ValueError("run-once does not support --ai-limit; a daily report must complete its full AI workflow")
-    if dry_run:
-        raise ValueError("run-once --dry-run is not a publishable daily build; use fetch/fetch-only for diagnostics")
-    if any(
-        value is not None
-        for value in (fetch_runner, ai_review_runner, event_cluster_runner, stage_d_runner, export_runner)
-    ):
-        raise ValueError("run-once custom stage runners are retired; invoke the individual diagnostic jobs instead")
-
-    try:
-        execution = run_pipeline_from_settings(
-            settings=settings,
-            limit=limit,
-            force=force,
-            edition_date=edition_date,
-            output_dir=output_dir,
-            snapshot_key=snapshot_key,
-            profile_path=profile_path,
-            ai_client=ai_client,
-        )
-    except Exception as exc:
-        return PipelineRunResult(
-            None,
-            IntelFetchResult(),
-            AIReviewResult(),
-            IntelExportResult(0, f"{output_dir}/intel_items.jsonl", f"{output_dir}/intel_digest.md"),
-            "failed",
-            str(exc),
-        )
-
-    screen = execution.resume.results.get("screen")
-    analysis = execution.resume.results.get("analyze")
-    review = AIReviewResult(
-        run_id=execution.run_id,
-        processed=int(getattr(screen, "processed", 0)) + int(getattr(analysis, "processed", 0)),
-        screened=int(getattr(screen, "screened", 0)),
-        screened_out=int(getattr(screen, "screened_out", 0)),
-        screen_failed=int(getattr(screen, "screen_failed", 0)),
-        analyzed=int(getattr(analysis, "analyzed", 0)),
-        analysis_filtered=int(getattr(analysis, "analysis_filtered", 0)),
-        analysis_failed=int(getattr(analysis, "analysis_failed", 0)),
-        candidate=int(getattr(analysis, "candidate", 0)),
-        candidate_ids=list(getattr(analysis, "candidate_ids", []) or []),
-        partial=bool(getattr(screen, "partial", False) or getattr(analysis, "partial", False)),
-        partial_reason=getattr(screen, "partial_reason", None) or getattr(analysis, "partial_reason", None),
-        errors=[
-            *list(getattr(screen, "errors", []) or []),
-            *list(getattr(analysis, "errors", []) or []),
-        ],
-    )
-    exported = execution.resume.results.get("export")
-    if not isinstance(exported, IntelExportResult):
-        resolved_date = execution.start.edition_date or _normalize_edition_date(edition_date) or "unknown"
-        exported = IntelExportResult(
-            0,
-            str(Path(output_dir) / "daily" / resolved_date / "intel_items.jsonl"),
-            str(Path(output_dir) / "daily" / resolved_date / "intel_digest.md"),
-        )
-    return PipelineRunResult(
-        execution.run_id,
-        execution.start.fetch,
-        review,
-        exported,
-        execution.status,
-        "; ".join(execution.resume.errors) or None,
-        execution.resume.results.get("cluster"),
-        execution.resume.results.get("stage_d"),
-    )
-
 def _summary_dict(summary: StageStateSummary) -> dict[str, Any]:
     return {
         "stage_id": summary.stage_id,
-        "run_id": summary.run_id,
         "stage_name": summary.stage_name,
         "status": summary.status,
         "total": summary.total,
@@ -1466,50 +1101,23 @@ def _normalize_edition_date(value: date | str | None) -> str | None:
         raise ValueError("edition_date must use YYYY-MM-DD") from exc
 
 
-# Short aliases make the orchestration layer convenient for non-CLI callers
-# while the explicit ``*_from_settings`` names remain the dependency-injection
-# seam used by the command handlers and tests.
-start_pipeline_run = start_pipeline_run_from_settings
-run_pipeline_stage_a = run_pipeline_stage_a_from_settings
-run_pipeline_stage_b = run_pipeline_stage_b_from_settings
-run_pipeline_stage_c = run_pipeline_stage_c_from_settings
-run_pipeline_stage_d = run_pipeline_stage_d_from_settings
-run_pipeline_export = run_pipeline_export_from_settings
-pipeline_status = pipeline_status_from_settings
-retry_pipeline_stage = retry_pipeline_stage_from_settings
-resume_pipeline = resume_pipeline_from_settings
-run_pipeline = run_pipeline_from_settings
-
-
 __all__ = [
     "DISPLAY_STAGE_NAMES",
     "PIPELINE_STAGES",
     "PipelineExecutionResult",
     "PipelineResumeResult",
-    "PipelineRunResult",
     "PipelineStartResult",
     "PipelineStatus",
     "normalize_stage",
     "pipeline_status_from_settings",
-    "pipeline_status",
-    "resolve_pipeline_run_id_from_settings",
+    "resolve_pending_daily_build_id_from_settings",
     "resume_pipeline_from_settings",
-    "resume_pipeline",
     "run_pipeline_from_settings",
-    "run_pipeline",
     "retry_pipeline_stage_from_settings",
-    "retry_pipeline_stage",
     "run_pipeline_export_from_settings",
-    "run_pipeline_export",
-    "run_pipeline_once_from_settings",
     "run_pipeline_stage_a_from_settings",
-    "run_pipeline_stage_a",
     "run_pipeline_stage_b_from_settings",
-    "run_pipeline_stage_b",
     "run_pipeline_stage_c_from_settings",
-    "run_pipeline_stage_c",
     "run_pipeline_stage_d_from_settings",
-    "run_pipeline_stage_d",
     "start_pipeline_run_from_settings",
-    "start_pipeline_run",
 ]

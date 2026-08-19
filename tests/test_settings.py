@@ -35,7 +35,7 @@ def test_settings_read_ai_review_model(monkeypatch):
     assert settings.ai_review_model == "review-model"
 
 
-def test_settings_stage_d_has_own_overrides_and_review_fallback(monkeypatch):
+def test_settings_stage_d_requires_its_own_configuration(monkeypatch):
     for name in (
         "AI_REVIEW_API_URL",
         "AI_REVIEW_API_KEY",
@@ -50,10 +50,10 @@ def test_settings_stage_d_has_own_overrides_and_review_fallback(monkeypatch):
     monkeypatch.setenv("AI_REVIEW_API_KEY", "review-secret")
     monkeypatch.setenv("AI_REVIEW_MODEL", "review-model")
 
-    fallback = Settings.from_env(dotenv_path="/path/that/does/not/exist")
-    assert fallback.ai_stage_d_api_url == "https://review.example/v1"
-    assert fallback.ai_stage_d_api_key == "review-secret"
-    assert fallback.ai_stage_d_model == "review-model"
+    unconfigured = Settings.from_env(dotenv_path="/path/that/does/not/exist")
+    assert unconfigured.ai_stage_d_api_url is None
+    assert unconfigured.ai_stage_d_api_key is None
+    assert unconfigured.ai_stage_d_model is None
 
     monkeypatch.setenv("AI_STAGE_D_API_URL", "https://editor.example/v1")
     monkeypatch.setenv("AI_STAGE_D_API_KEY", "editor-secret")
@@ -95,5 +95,5 @@ def test_init_db_rejects_incompatible_legacy_schema_without_backfill(tmp_path):
     connection.execute("CREATE TABLE ai_item_reviews (id INTEGER PRIMARY KEY)")
     connection.commit()
     connection.close()
-    with pytest.raises(RuntimeError, match="incompatible.*no migrations/backfill"):
+    with pytest.raises(RuntimeError, match="unsupported.*no conversion"):
         init_db(create_engine_from_url(f"sqlite:///{path}"))

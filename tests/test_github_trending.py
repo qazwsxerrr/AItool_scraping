@@ -79,6 +79,7 @@ def test_github_metrics_merge_preserves_daily_weekly_and_search_signals(tmp_path
         for config in configs:
             repo.upsert_source(config)
         session.flush()
+        _, build = repo.start_daily_build(edition_date="2026-08-19")
 
         base = {
             "title": "GitHub repo: owner/tool",
@@ -94,39 +95,35 @@ def test_github_metrics_merge_preserves_daily_weekly_and_search_signals(tmp_path
                 source_id=configs[0].id,
                 metrics={"stars": 1000, "forks": 20, "stars_since": 30, "trending_period": "daily", "trending_rank": 2},
                 **base,
-            )
+            ),
+            run_id=build.id,
         )
         repo.insert_item(
             FetchItem(
                 source_id=configs[1].id,
                 metrics={"stars": 1010, "forks": 21, "stars_since": 180, "trending_period": "weekly", "trending_rank": 5},
                 **base,
-            )
+            ),
+            run_id=build.id,
         )
         repo.insert_item(
             FetchItem(
                 source_id=configs[2].id,
                 metrics={"stars": 1020, "forks": 22, "pushed_at": "2026-08-05T00:00:00Z", "search_query": "topic:llm"},
                 **base,
-            )
+            ),
+            run_id=build.id,
         )
         session.commit()
 
-        row = session.query(IntelItem).one()
-        metrics = json.loads(row.metrics_json)
-        assert metrics["trending"]["daily"]["stars_since"] == 30
-        assert metrics["trending"]["weekly"]["stars_since"] == 180
-        assert metrics["search_topics"] == ["llm"]
-        assert set(metrics["discovery_sources"]) == {
-            "github_trending_daily_native",
-            "github_trending_weekly_native",
-            "github_search_topic_llm",
-        }
-        assert metrics["stars_since"] == 180
-        assert metrics["trending_period"] == "weekly"
+        rows = {row.source_id: json.loads(row.metrics_json) for row in session.query(IntelItem).all()}
+        assert set(rows) == {config.id for config in configs}
+        assert rows["github_trending_daily_native"]["trending"]["daily"]["stars_since"] == 30
+        assert rows["github_trending_weekly_native"]["trending"]["weekly"]["stars_since"] == 180
+        assert rows["github_search_topic_llm"]["search_topics"] == ["llm"]
 
 
-def test_github_search_and_trending_rows_dedupe_by_canonical_repository_url(tmp_path):
+def test_github_search_and_trending_rows_remain_separate_source_observations(tmp_path):
     engine = create_engine_from_url(f"sqlite:///{tmp_path / 'dedupe.db'}")
     init_db(engine)
     session_factory = create_session_factory(engine)
@@ -156,6 +153,7 @@ def test_github_search_and_trending_rows_dedupe_by_canonical_repository_url(tmp_
         repo = IntelRepository(session)
         repo.upsert_source(trending)
         repo.upsert_source(search)
+        _, build = repo.start_daily_build(edition_date="2026-08-19")
         base = {
             "title": "GitHub repo: owner/tool",
             "url": "https://github.com/owner/tool",
@@ -169,7 +167,8 @@ def test_github_search_and_trending_rows_dedupe_by_canonical_repository_url(tmp_
                 external_id="github_repo:owner/tool",
                 metrics={"stars": 1000, "stars_since": 50, "trending_period": "weekly"},
                 **base,
-            )
+            ),
+            run_id=build.id,
         )
         second = repo.insert_item(
             FetchItem(
@@ -177,15 +176,17 @@ def test_github_search_and_trending_rows_dedupe_by_canonical_repository_url(tmp_
                 external_id="github_repo:12345",
                 metrics={"stars": 1010, "search_query": "topic:llm"},
                 **base,
-            )
+            ),
+            run_id=build.id,
         )
         session.commit()
-        row = session.query(IntelItem).one()
+        rows = list(session.query(IntelItem).order_by(IntelItem.source_id).all())
 
     assert first.inserted is True
-    assert second.inserted is False
-    assert json.loads(row.metrics_json)["trending"]["weekly"]["stars_since"] == 50
-    assert json.loads(row.metrics_json)["search_topics"] == ["llm"]
+    assert second.inserted is True
+    assert [row.source_id for row in rows] == [search.id, trending.id]
+    assert json.loads(rows[1].metrics_json)["trending"]["weekly"]["stars_since"] == 50
+    assert json.loads(rows[0].metrics_json)["search_topics"] == ["llm"]
 
 
 def test_github_enrichment_persists_readme_and_does_not_expose_metrics_as_readme(tmp_path):
@@ -206,6 +207,7 @@ def test_github_enrichment_persists_readme_and_does_not_expose_metrics_as_readme
     with session_factory() as session:
         repo = IntelRepository(session)
         repo.upsert_source(source)
+        _, build = repo.start_daily_build(edition_date="2026-08-19")
         inserted = repo.insert_item(
             FetchItem(
                 source_id=source.id,
@@ -216,7 +218,8 @@ def test_github_enrichment_persists_readme_and_does_not_expose_metrics_as_readme
                 metrics={"stars": 1200, "forks": 10},
                 raw_payload={"github_item_type": "repository", "full_name": "owner/tool"},
                 content_class="project_tool",
-            )
+            ),
+            run_id=build.id,
         )
         session.flush()
         repo.save_github_enrichment(

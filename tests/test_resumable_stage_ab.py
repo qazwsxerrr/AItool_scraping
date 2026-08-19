@@ -11,7 +11,6 @@ from app.ai.skills.intel_triage.prompts import INTEL_ANALYSIS_JSON_SCHEMA
 from app.domain.models import FetchItem, SourceSpec
 from app.jobs.stage_a_screen_job import run_stage_a_screen_job
 from app.jobs.stage_b_analysis_job import run_stage_b_analysis_job
-from app.jobs.ai_review_job import run_ai_review_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import AIItemScreen, IntelItem, IntelRun, IntelRunStageTask
 from app.storage.repository import IntelRepository
@@ -43,7 +42,7 @@ def _run_with_items(session_factory, titles: list[str]) -> tuple[SourceSpec, int
         repo = IntelRepository(session)
         repo.upsert_source(source, policy=source)
         reference_time = datetime(2026, 8, 16, 12, tzinfo=timezone.utc)
-        run = repo.start_run(run_type="resumable_test", reference_time=reference_time)
+        _, run = repo.start_daily_build(edition_date="2026-08-16", reference_time=reference_time)
         for index, title in enumerate(titles, 1):
             repo.insert_item(
                 FetchItem(
@@ -57,6 +56,7 @@ def _run_with_items(session_factory, titles: list[str]) -> tuple[SourceSpec, int
                 ),
                 run_id=run.id,
             )
+        repo.freeze_run_scope(run.id)
         session.commit()
         return source, int(run.id)
 
@@ -386,7 +386,7 @@ def test_provider_retryable_failure_is_terminal_after_automatic_retries(tmp_path
         assert len(provider.screen_calls) == 7
 
 
-def test_provider_concurrency_is_bounded_and_facade_forwards_limit(tmp_path):
+def test_provider_concurrency_is_bounded_per_daily_stage(tmp_path):
     class Concurrent(_Provider):
         def __init__(self):
             super().__init__()
@@ -422,7 +422,14 @@ def test_provider_concurrency_is_bounded_and_facade_forwards_limit(tmp_path):
     sf = _factory(tmp_path)
     source, run_id = _run_with_items(sf, [f"item-{index}" for index in range(8)])
     provider = Concurrent()
-    result = run_ai_review_job(
+    stage_a = run_stage_a_screen_job(
+        session_factory=sf,
+        source_specs={source.id: source},
+        ai_client=provider,
+        run_id=run_id,
+        concurrency=2,
+    )
+    stage_b = run_stage_b_analysis_job(
         session_factory=sf,
         source_specs={source.id: source},
         ai_client=provider,
@@ -430,7 +437,8 @@ def test_provider_concurrency_is_bounded_and_facade_forwards_limit(tmp_path):
         concurrency=2,
     )
 
-    assert result.candidate == 8
+    assert stage_a.screened == 8
+    assert stage_b.candidate == 8
     assert provider.max_active > 1
     assert provider.max_active <= 2
 

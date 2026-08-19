@@ -8,12 +8,12 @@ from app import main
 runner = CliRunner()
 
 
-def test_cli_exposes_ai_only_commands():
+def test_cli_exposes_current_daily_commands_only():
     result = runner.invoke(main.app, ["--help"])
     assert result.exit_code == 0
-    for command in ("fetch", "fetch-only", "ai-review", "stage-d", "export", "run-once", "source-health"):
+    for command in ("fetch", "fetch-only", "run-once", "source-health", "pipeline"):
         assert command in result.stdout
-    for legacy in ("process", "run-daily", "enrich", "triage", "cluster", "compose", "rank", "editorial-rank", "daily-export", "claim-extract", "evidence-search", "ai-verify", "recommendation-write"):
+    for legacy in ("ai-review", "stage-d", "adopt-existing", "process", "run-daily", "enrich", "triage", "cluster", "compose", "rank", "editorial-rank", "daily-export", "claim-extract", "evidence-search", "ai-verify", "recommendation-write"):
         assert legacy not in result.stdout
 
 
@@ -36,7 +36,7 @@ def test_cli_accepts_content_class_and_force(monkeypatch):
         return Result()
 
     monkeypatch.setattr(main, "run_intel_fetch_from_settings", fake_run)
-    result = runner.invoke(main.app, ["fetch", "--class", "project_tool", "--force", "--dry-run"])
+    result = runner.invoke(main.app, ["fetch", "--class", "project_tool", "--force"])
     assert result.exit_code == 0
     assert captured["content_class"] == "project_tool"
     assert captured["force"] is True
@@ -57,7 +57,7 @@ def test_cli_accepts_news_media_content_class(monkeypatch):
         return Result()
 
     monkeypatch.setattr(main, "run_intel_fetch_from_settings", fake_run)
-    result = runner.invoke(main.app, ["fetch", "--class", "news_media", "--dry-run"])
+    result = runner.invoke(main.app, ["fetch", "--class", "news_media"])
 
     assert result.exit_code == 0
     assert captured["content_class"] == "news_media"
@@ -82,7 +82,7 @@ def test_pipeline_export_uses_the_public_edition_not_the_internal_run_id(monkeyp
         captured["run_id"] = kwargs["run_id"]
         return Result()
 
-    monkeypatch.setattr(main, "resolve_pipeline_run_id_from_settings", resolve_run)
+    monkeypatch.setattr(main, "_resolve_pending_build_id", lambda settings, edition_date: resolve_run(edition_date=edition_date))
     monkeypatch.setattr(main, "run_pipeline_export_from_settings", export_run)
 
     result = runner.invoke(main.app, ["pipeline", "export", "--edition-date", "2026-08-16", "--output-dir", str(tmp_path)])

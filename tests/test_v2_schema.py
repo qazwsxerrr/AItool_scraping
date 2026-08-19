@@ -47,5 +47,5 @@ def test_init_db_rejects_incompatible_legacy_sqlite_without_backfill(tmp_path):
         connection.commit()
 
     engine = create_engine_from_url(f"sqlite:///{database}")
-    with pytest.raises(RuntimeError, match="incompatible.*no migrations/backfill"):
+    with pytest.raises(RuntimeError, match="unsupported.*no conversion"):
         init_db(engine)

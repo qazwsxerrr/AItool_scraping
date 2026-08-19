@@ -117,7 +117,11 @@ def test_stage_a_does_not_time_filter_github_trending_projects(tmp_path):
     with session_factory() as session:
         repo = IntelRepository(session)
         repo.upsert_source(source, policy=source)
-        run = repo.start_run(reference_time=REFERENCE, scope=recent_window_scope())
+        _, run = repo.start_daily_build(
+            edition_date="2026-08-16",
+            reference_time=REFERENCE,
+            scope=recent_window_scope(),
+        )
         repo.insert_item(
             FetchItem(
                 source_id=source.id,
@@ -157,7 +161,11 @@ def test_stage_a_keeps_only_recent_items_and_records_run_local_audit(tmp_path):
     with session_factory() as session:
         repo = IntelRepository(session)
         repo.upsert_source(source, policy=source)
-        run = repo.start_run(reference_time=REFERENCE, scope=recent_window_scope())
+        _, run = repo.start_daily_build(
+            edition_date="2026-08-16",
+            reference_time=REFERENCE,
+            scope=recent_window_scope(),
+        )
         for index, (title, published_at) in enumerate(
             (
                 ("fresh boundary", REFERENCE - timedelta(hours=72)),
@@ -229,7 +237,11 @@ def test_stage_c_rechecks_the_frozen_recent_window(tmp_path):
     with session_factory() as session:
         repo = IntelRepository(session)
         repo.upsert_source(source, policy=source)
-        run = repo.start_run(reference_time=REFERENCE, scope=recent_window_scope())
+        _, run = repo.start_daily_build(
+            edition_date="2026-08-16",
+            reference_time=REFERENCE,
+            scope=recent_window_scope(),
+        )
         analyze_stage = repo.ensure_stage(run.id, "analyze")
         item_ids: dict[str, int] = {}
         for index, (title, published_at) in enumerate(
@@ -239,24 +251,27 @@ def test_stage_c_rechecks_the_frozen_recent_window(tmp_path):
             ),
             start=1,
         ):
-            item = IntelItem(
-                source_id=source.id,
-                title=title,
-                content_class=source.content_class,
-                content_hash=(f"recent-window-event-{index}" * 8)[:64],
-                selection_score=80,
-                status="candidate",
-                published_at=published_at,
-                captured_at=REFERENCE,
+            inserted = repo.insert_item(
+                FetchItem(
+                    source_id=source.id,
+                    external_id=f"recent-window-event-{index}",
+                    title=title,
+                    url=f"https://example.test/recent-window-event-{index}",
+                    content_class=source.content_class,
+                    published_at=published_at,
+                    captured_at=REFERENCE,
+                ),
+                run_id=run.id,
             )
-            session.add(item)
-            session.flush()
+            assert inserted.item_id is not None
+            item = session.get(IntelItem, inserted.item_id)
+            assert item is not None
+            item.selection_score = 80
+            item.status = "candidate"
             item_ids[title] = int(item.id)
-            repo.record_run_item(run.id, item.id)
             session.add(
                 AIItemReview(
                     item_id=item.id,
-                    run_id=run.id,
                     content_class=source.content_class,
                     topic="model",
                     topics_json='["model"]',
@@ -272,8 +287,9 @@ def test_stage_c_rechecks_the_frozen_recent_window(tmp_path):
                 subject_id=item.id,
                 item_id=item.id,
             )
-            task.status = "succeeded"
-            task.result = {"item_id": item.id, "reason": "candidate"}
+            repo.complete_stage_task(task, result={"item_id": item.id, "reason": "candidate"})
+        repo.freeze_run_scope(run.id)
+        repo.finish_stage(analyze_stage, status="succeeded")
         session.commit()
         run_id = int(run.id)
 
@@ -296,7 +312,11 @@ def test_all_time_filtered_items_advance_the_empty_pipeline_path(tmp_path):
     with session_factory() as session:
         repo = IntelRepository(session)
         repo.upsert_source(source, policy=source)
-        run = repo.start_run(reference_time=REFERENCE, scope=recent_window_scope())
+        _, run = repo.start_daily_build(
+            edition_date="2026-08-16",
+            reference_time=REFERENCE,
+            scope=recent_window_scope(),
+        )
         repo.insert_item(
             FetchItem(
                 source_id=source.id,
@@ -340,47 +360,49 @@ def test_all_time_filtered_items_advance_the_empty_pipeline_path(tmp_path):
     assert pipeline_orchestrator._stage_needs_resume(session_factory, run_id, "cluster") is True
 
 
-def test_run_scoped_export_cannot_leak_a_stale_primary_item(tmp_path):
+def test_daily_build_export_cannot_leak_a_stale_primary_item(tmp_path):
     session_factory = _factory(tmp_path)
     source = _feed_source()
     with session_factory() as session:
         repo = IntelRepository(session)
         repo.upsert_source(source, policy=source)
-        run = repo.start_run(reference_time=REFERENCE, scope=recent_window_scope())
-        stale = IntelItem(
-            source_id=source.id,
-            title="stale selected event",
-            content_class=source.content_class,
-            content_hash="stale-selected-event".ljust(64, "x"),
-            status="candidate",
-            published_at=REFERENCE - timedelta(hours=73),
-            captured_at=REFERENCE,
+        _, run = repo.start_daily_build(
+            edition_date="2026-08-16",
+            reference_time=REFERENCE,
+            scope=recent_window_scope(),
         )
-        session.add(stale)
-        session.flush()
-        repo.record_run_item(run.id, stale.id)
-        event = IntelEvent(
-            event_key="title:stale-selected-event",
+        inserted = repo.insert_item(
+            FetchItem(
+                source_id=source.id,
+                external_id="stale-selected-event",
+                title="stale selected event",
+                url="https://example.test/stale-selected-event",
+                content_class=source.content_class,
+                published_at=REFERENCE - timedelta(hours=73),
+                captured_at=REFERENCE,
+            ),
+            run_id=run.id,
+        )
+        assert inserted.item_id is not None
+        stale = session.get(IntelItem, inserted.item_id)
+        assert stale is not None
+        stale.status = "candidate"
+        event = repo.upsert_event(
+            run_id=run.id,
+            event_key="url:https://example.test/stale-selected-event",
+            canonical_url=stale.canonical_url,
             title="stale selected event",
             summary_cn="stale",
             topic="model",
             display_score=90,
-            new_in_run_id=run.id,
-            first_run_id=run.id,
+            novelty_status="new",
+            primary_item_id=stale.id,
+            first_seen_at=stale.published_at,
+            last_seen_at=stale.published_at,
         )
-        session.add(event)
-        session.flush()
-        session.add(
-            IntelEventItem(
-                event_id=event.id,
-                item_id=stale.id,
-                source_id=source.id,
-                is_primary=True,
-            )
-        )
+        repo.upsert_event_item(event.id, stale.id, source_id=source.id, is_primary=True)
         session.add(
             IntelEventStageDSnapshot(
-                snapshot_key="daily-2026-08-16",
                 run_id=run.id,
                 event_id=event.id,
                 display_order=1,
@@ -388,14 +410,28 @@ def test_run_scoped_export_cannot_leak_a_stale_primary_item(tmp_path):
                 selected=True,
             )
         )
+        cluster = repo.ensure_stage(run.id, "cluster")
+        cluster_task = repo.ensure_stage_task(
+            cluster, subject_type="run", subject_id=run.id, target_run_id=run.id
+        )
+        repo.complete_stage_task(cluster_task, result={"current_event_ids": [event.id]})
+        repo.finish_stage(cluster, status="succeeded")
+        stage_d = repo.ensure_stage(run.id, "stage_d")
+        stage_d_task = repo.ensure_stage_task(
+            stage_d, subject_type="run", subject_id=run.id, target_run_id=run.id
+        )
+        repo.complete_stage_task(stage_d_task, result={"selected": 1})
+        repo.finish_stage(stage_d, status="succeeded")
+        repo.freeze_run_scope(run.id)
         session.commit()
         run_id = int(run.id)
 
     result = run_intel_export_job(
         session_factory=session_factory,
         output_dir=tmp_path / "intel",
+        artifact_dir=tmp_path / "draft",
         run_id=run_id,
     )
 
     assert result.exported == 0
-    assert "保留条目：0" in (tmp_path / "daily" / "2026-08-16" / "intel_digest.md").read_text(encoding="utf-8")
+    assert "保留条目：0" in (tmp_path / "draft" / "intel_digest.md").read_text(encoding="utf-8")

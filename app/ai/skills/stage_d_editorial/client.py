@@ -12,8 +12,8 @@ import httpx
 
 from app.config.settings import Settings
 
-from .models import StageDAssessmentResponse, StageDCompositionResponse, StageDEditorialResponse
-from .parser import strict_parse_stage_d, strict_parse_stage_d_assessment, strict_parse_stage_d_composition
+from .models import StageDAssessmentResponse, StageDCompositionResponse
+from .parser import strict_parse_stage_d_assessment, strict_parse_stage_d_composition
 from .prompts import (
     build_stage_d_assessment_payload,
     build_stage_d_composition_payload,
@@ -163,10 +163,7 @@ class StageDEditorialClient:
             events=events,
             total_max=total_max,
             watchlist_max=watchlist_max,
-            # The compatibility entry point accepts an old v1 provider reply
-            # during rolling deployment; new compose_events callers still
-            # receive strict v2 because the normal provider schema is v2.
-            parser=lambda value: strict_parse_stage_d(
+            parser=lambda value: strict_parse_stage_d_composition(
                 value,
                 event_ids=event_ids,
                 total_max=total_max,
@@ -174,26 +171,6 @@ class StageDEditorialClient:
                 events=events,
             ),
         )
-
-    def select_events(
-        self,
-        events: Sequence[Mapping[str, Any]],
-        *,
-        edition: Mapping[str, Any],
-        total_max: int = 30,
-    ) -> StageDEditorialResponse:
-        """Compatibility entry point returning only the parsed D3 response."""
-
-        # ``select_events`` intentionally exposes the old return shape while
-        # using the strict v2 composition protocol underneath.
-        parsed = self.compose_events(events, edition=edition, total_max=total_max).parsed
-        # A legacy v1 provider response is returned as a plain mapping so
-        # older jobs can feed it through their existing strict parser.  New
-        # v2 composition responses retain the parsed model envelope payload.
-        if isinstance(parsed, StageDEditorialResponse):
-            return parsed
-        model_dump = getattr(parsed, "model_dump", None)
-        return model_dump(mode="json") if callable(model_dump) else parsed
 
     def _call_phase(
         self,

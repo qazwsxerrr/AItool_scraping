@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.ai.skills.stage_d_editorial import (
@@ -26,8 +26,6 @@ from app.ai.skills.stage_d_editorial import (
     StageDCompositionResponse,
     StageDProviderCallResult,
     StageDEditorialClient,
-    StageDEditorialResponse,
-    strict_parse_stage_d,
     strict_parse_stage_d_assessment,
     strict_parse_stage_d_composition,
 )
@@ -90,7 +88,6 @@ class StageDProviderCallError(RuntimeError):
 class StageDProfile:
     """Durable Stage-D v2 policy shared by D1, D2 and D3."""
 
-    snapshot_key: str = "latest"
     total_max: int = DEFAULT_DAILY_REPORT_LIMIT
     paper_hard_gate: bool = True
     recent_history_days: int = 3
@@ -106,7 +103,6 @@ class StageDProfile:
         data = dict(value or {})
         paper = data.get("paper") if isinstance(data.get("paper"), Mapping) else {}
         return cls(
-            snapshot_key=str(data.get("snapshot_key") or "latest"),
             total_max=_bounded_int(data.get("total_max"), DEFAULT_DAILY_REPORT_LIMIT, lower=0, upper=30),
             paper_hard_gate=_coerce_bool(data.get("paper_hard_gate", paper.get("hard_gate", True)), True),
             recent_history_days=_bounded_int(data.get("recent_history_days"), 3, lower=0, upper=30),
@@ -146,8 +142,7 @@ class StageDProfile:
 
 @dataclass
 class StageDResult:
-    run_id: int | None = None
-    snapshot_key: str = "latest"
+    run_id: int
     processed: int = 0
     eligible: int = 0
     selected: int = 0
@@ -164,7 +159,6 @@ class StageDResult:
     assessment_provider_attempts: int = 0
     composition_provider_attempts: int = 0
     failed_phase: str | None = None
-    used_fallback: bool = False
     errors: list[str] = field(default_factory=list)
 
 
@@ -187,34 +181,27 @@ def run_stage_d_job(
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
     force: bool = False,
-    snapshot_key: str | None = None,
-    run_id: int | None = None,
+    run_id: int,
     event_ids: Iterable[int] | None = None,
 ) -> StageDResult:
     """Run Stage D v2: assess batches, build a local shortlist, then compose."""
 
     policy = _coerce_profile(profile if profile is not None else profile_path)
-    result = StageDResult(run_id=run_id, snapshot_key=str(snapshot_key or policy.snapshot_key))
+    result = StageDResult(run_id=run_id)
     owner = "stage-d-editorial"
     stage: IntelRunStage | None = None
     try:
         with session_factory() as session:
             repo = IntelRepository(session)
-            if run_id is None and event_ids is None:
-                latest_run_id = session.scalar(select(func.max(IntelRun.id)))
-                if latest_run_id is not None:
-                    run_id = int(latest_run_id)
-                    result.run_id = run_id
-            run = session.get(IntelRun, int(run_id)) if run_id is not None else None
-            key = str(snapshot_key or (run.daily_snapshot_key if run is not None else None) or policy.snapshot_key)
-            result.snapshot_key = key
-            if run is not None:
-                stage = repo.ensure_stage(
-                    int(run_id),
-                    STAGE_D_NAME,
-                    metadata=_stage_d_stage_metadata(policy, key, ai_client),
-                )
-            if run_id is not None and event_ids is None:
+            run = session.get(IntelRun, int(run_id))
+            if run is None or run.edition_id is None:
+                raise ValueError("Stage D requires the current daily edition build")
+            stage = repo.ensure_stage(
+                int(run_id),
+                STAGE_D_NAME,
+                metadata=_stage_d_stage_metadata(policy, ai_client),
+            )
+            if event_ids is None:
                 event_ids = _load_current_cluster_event_ids(session, int(run_id))
             events = _load_events(session, run_id=run_id, event_ids=event_ids)
             result.processed = len(events)
@@ -236,13 +223,12 @@ def run_stage_d_job(
                 eligible,
                 policy.assessment_batch_size,
                 d1_config,
-                seed=str(run_id or key),
+                seed=str(run_id),
             )
             result.assessment_batches = len(batches)
             assessments: dict[int, dict[str, Any]] = {}
-            if stage is not None:
-                _mark_stale_stage_d_batches(repo, stage, {batch["subject_id"] for batch in batches})
-                session.flush()
+            _mark_stale_stage_d_batches(repo, stage, {batch["subject_id"] for batch in batches})
+            session.flush()
 
             pending_batches: list[dict[str, Any]] = []
             for batch in batches:
@@ -489,7 +475,7 @@ def run_stage_d_job(
                     repo.complete_stage_task(
                         d3_task,
                         owner=owner,
-                        result_ref={"phase": "composition", "snapshot_key": key},
+                        result_ref={"phase": "composition"},
                         result={
                             "phase": "composition",
                             "event_ids": list(shortlist_by_id),
@@ -505,12 +491,11 @@ def run_stage_d_job(
                     )
                     session.commit()
 
-            # Public snapshot replacement starts only after all provider work
+            # Replace build-local Stage-D rows only after all provider work
             # and exact D3 coverage have succeeded. DELETE+INSERT remains one
-            # transaction, so rollback leaves the previous snapshot untouched.
+            # transaction, so rollback leaves the prior draft state untouched.
             _replace_stage_d_snapshot(
                 repo,
-                key=key,
                 run_id=run_id,
                 candidates=candidates,
                 gated_event_ids={int(candidate["event"].id) for candidate in gated},
@@ -524,7 +509,6 @@ def run_stage_d_job(
             session.commit()
             stage_metadata = _stage_d_stage_metadata(
                 policy,
-                key,
                 ai_client,
                 assessment_batch_count=result.assessment_batches,
                 assessed_count=result.assessed,
@@ -556,8 +540,7 @@ def run_stage_d_from_settings(
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
     force: bool = False,
-    snapshot_key: str | None = None,
-    run_id: int | None = None,
+    run_id: int,
     event_ids: Iterable[int] | None = None,
 ) -> StageDResult:
     engine = create_engine_from_url(settings.database_url)
@@ -567,7 +550,6 @@ def run_stage_d_from_settings(
         profile=profile if profile is not None else profile_path,
         ai_client=ai_client if ai_client is not None else StageDEditorialClient.from_settings(settings),
         force=force,
-        snapshot_key=snapshot_key,
         run_id=run_id,
         event_ids=event_ids,
     )
@@ -585,12 +567,10 @@ def _coerce_profile(value: StageDProfile | Mapping[str, Any] | str | Path | None
 
 def _stage_d_stage_metadata(
     policy: StageDProfile,
-    snapshot_key: str,
     ai_client: Any | None,
     **counts: Any,
 ) -> dict[str, Any]:
     metadata = {
-        "snapshot_key": snapshot_key,
         "profile_version": policy.version,
         "stage_d_version": STAGE_D_VERSION,
         "assessment_prompt_version": STAGE_D_ASSESSMENT_PROMPT_VERSION,
@@ -695,7 +675,7 @@ def _stored_assessments(
     input_fingerprint: str,
     config_fingerprint: str,
 ) -> dict[int, dict[str, Any]] | None:
-    if not task or not task_is_reusable_compat(task, input_fingerprint, config_fingerprint):
+    if not task or not _task_is_reusable(task, input_fingerprint, config_fingerprint):
         return None
     stored = task.result
     if not isinstance(stored, Mapping) or stored.get("phase") != "assessment":
@@ -711,7 +691,7 @@ def _stored_composition(
     input_fingerprint: str,
     config_fingerprint: str,
 ) -> dict[int, dict[str, Any]] | None:
-    if not task or not task_is_reusable_compat(task, input_fingerprint, config_fingerprint):
+    if not task or not _task_is_reusable(task, input_fingerprint, config_fingerprint):
         return None
     stored = task.result
     if not isinstance(stored, Mapping) or stored.get("phase") != "composition":
@@ -720,7 +700,7 @@ def _stored_composition(
     return rows if set(rows) == set(int(value) for value in shortlist_by_id) else None
 
 
-def task_is_reusable_compat(task: IntelRunStageTask, input_fingerprint: str, config_fingerprint: str) -> bool:
+def _task_is_reusable(task: IntelRunStageTask, input_fingerprint: str, config_fingerprint: str) -> bool:
     return task.status == "succeeded" and task.input_fingerprint == str(input_fingerprint) and task.config_fingerprint == str(config_fingerprint)
 
 
@@ -854,13 +834,9 @@ def _call_composition_provider(
 
     def operation() -> Any:
         method = getattr(ai_client, "compose_events", None)
-        if callable(method):
-            value = method(events, edition=edition, total_max=total_max, watchlist_max=watchlist_max)
-        else:
-            method = getattr(ai_client, "select_events", None)
-            if not callable(method):
-                raise RuntimeError("Stage D composition client is not configured")
-            value = method(events, edition=edition, total_max=total_max)
+        if not callable(method):
+            raise RuntimeError("Stage D composition client is not configured")
+        value = method(events, edition=edition, total_max=total_max, watchlist_max=watchlist_max)
         parsed, _audit = _provider_envelope(value)
         if isinstance(parsed, StageDCompositionResponse):
             return value
@@ -890,8 +866,7 @@ def _call_composition_provider(
 def _replace_stage_d_snapshot(
     repo: IntelRepository,
     *,
-    key: str,
-    run_id: int | None,
+    run_id: int,
     candidates: Sequence[Mapping[str, Any]],
     gated_event_ids: set[int],
     assessments: Mapping[int, Mapping[str, Any]],
@@ -901,7 +876,7 @@ def _replace_stage_d_snapshot(
     policy: StageDProfile,
     result: StageDResult,
 ) -> None:
-    repo.clear_event_stage_d_snapshot(snapshot_key=key)
+    repo.clear_event_stage_d_snapshot(run_id=run_id)
     selected_order = 0
     watchlist_order = 0
     for candidate in candidates:
@@ -957,7 +932,6 @@ def _replace_stage_d_snapshot(
         }
         snapshot = repo.upsert_event_stage_d_snapshot(
             event_id,
-            snapshot_key=key,
             run_id=run_id,
             display_order=display_order,
             display_score=float(event.display_score or 0.0),
@@ -971,9 +945,7 @@ def _replace_stage_d_snapshot(
         result.snapshots += int(snapshot.created)
 
 
-def _persist_stage_d_failure(session_factory: sessionmaker[Session], run_id: int | None, result: StageDResult) -> None:
-    if run_id is None:
-        return
+def _persist_stage_d_failure(session_factory: sessionmaker[Session], run_id: int, result: StageDResult) -> None:
     try:
         with session_factory() as session:
             repo = IntelRepository(session)
@@ -991,7 +963,7 @@ def _persist_stage_d_failure(session_factory: sessionmaker[Session], run_id: int
         LOGGER.exception("Unable to persist Stage D failure")
 
 
-def _load_events(session: Session, *, run_id: int | None, event_ids: Iterable[int] | None) -> list[IntelEvent]:
+def _load_events(session: Session, *, run_id: int, event_ids: Iterable[int] | None) -> list[IntelEvent]:
     stmt = (
         select(IntelEvent)
         .options(
@@ -1002,16 +974,13 @@ def _load_events(session: Session, *, run_id: int | None, event_ids: Iterable[in
         .where(IntelEvent.state.not_in(("rejected", "discarded", "filtered")))
         .order_by(IntelEvent.display_score.desc(), IntelEvent.event_key.asc(), IntelEvent.id.asc())
     )
-    if event_ids is not None:
-        ids = _normalize_event_ids(event_ids)
-        stmt = stmt.where(IntelEvent.id.in_(ids or [-1]))
-    elif run_id is not None:
-        # A run must consume an explicit Stage-C current projection; it must
-        # never fall back to all historical events.
-        stmt = stmt.where(IntelEvent.id.in_([-1]))
-    else:
-        latest_run = session.scalar(select(func.max(IntelRun.id)))
-        stmt = stmt.where(IntelEvent.new_in_run_id == latest_run if latest_run else IntelEvent.new_in_run_id.is_(None))
+    ids = _normalize_event_ids(event_ids or ())
+    # Stage D may only consume the current Stage-C projection of this draft;
+    # report history is read separately from DailyEditionReportEntry.
+    stmt = stmt.where(
+        IntelEvent.build_id == int(run_id),
+        IntelEvent.id.in_(ids or [-1]),
+    )
     return list(session.scalars(stmt).unique().all())
 
 
@@ -1098,10 +1067,10 @@ def _recent_daily_history(
     session: Session,
     *,
     candidates: Sequence[Mapping[str, Any]],
-    run: IntelRun | None,
+    run: IntelRun,
     days: int,
 ) -> dict[int, dict[str, Any]]:
-    if run is None or days <= 0 or not run.edition_date:
+    if days <= 0 or run.edition_id is None or not run.edition_date:
         return {}
     try:
         current = date.fromisoformat(run.edition_date)
@@ -1110,8 +1079,6 @@ def _recent_daily_history(
     events = [candidate.get("event") for candidate in candidates if candidate.get("event") is not None]
     if not events:
         return {}
-    if run.edition_id is None:
-        return _legacy_recent_daily_history(session, events=events, run=run, current=current, days=days)
     earliest = current - timedelta(days=days)
     rows = session.execute(
         select(DailyEditionReportEntry, DailyEdition)
@@ -1137,67 +1104,6 @@ def _recent_daily_history(
         event_id: {"appeared_recently": True, "prior_editions": editions}
         for event_id, editions in history.items()
     }
-
-
-def _legacy_recent_daily_history(
-    session: Session,
-    *,
-    events: Sequence[IntelEvent],
-    run: IntelRun,
-    current: date,
-    days: int,
-) -> dict[int, dict[str, Any]]:
-    """Compatibility path for direct jobs that predate DailyEdition."""
-
-    event_ids = [int(event.id) for event in events]
-    if not event_ids:
-        return {}
-    earliest = current - timedelta(days=days)
-    previous_runs = list(
-        session.scalars(
-            select(IntelRun)
-            .where(
-                IntelRun.status.in_(("completed", "completed_with_errors", "partial")),
-                IntelRun._edition_date >= earliest,
-                IntelRun._edition_date < current,
-            )
-            .order_by(IntelRun._edition_date.desc(), IntelRun.id.desc())
-        ).all()
-    )
-    latest_by_edition: dict[str, IntelRun] = {}
-    for previous_run in previous_runs:
-        if previous_run.edition_date:
-            latest_by_edition.setdefault(previous_run.edition_date, previous_run)
-    conditions = [
-        and_(
-            IntelEventStageDSnapshot.run_id == int(previous_run.id),
-            IntelEventStageDSnapshot.snapshot_key == previous_run.daily_snapshot_key,
-        )
-        for previous_run in latest_by_edition.values()
-    ]
-    if not conditions:
-        return {}
-    rows = session.execute(
-        select(IntelEventStageDSnapshot, IntelRun)
-        .join(IntelRun, IntelRun.id == IntelEventStageDSnapshot.run_id)
-        .where(
-            IntelEventStageDSnapshot.event_id.in_(event_ids),
-            IntelEventStageDSnapshot.selected.is_(True),
-            or_(*conditions),
-        )
-        .order_by(IntelRun._edition_date.desc(), IntelEventStageDSnapshot.updated_at.desc())
-    ).all()
-    history: dict[int, list[str]] = {}
-    for snapshot, previous_run in rows:
-        history.setdefault(int(snapshot.event_id), [])
-        if previous_run.edition_date and previous_run.edition_date not in history[int(snapshot.event_id)]:
-            history[int(snapshot.event_id)].append(previous_run.edition_date)
-    return {
-        event_id: {"appeared_recently": True, "prior_editions": editions}
-        for event_id, editions in history.items()
-    }
-
-
 def _event_history_identity_keys(event: IntelEvent) -> set[str]:
     keys = {_history_identity("event", event.event_key)}
     if event.event_key and str(event.event_key).startswith(("url:", "external:")):
@@ -1225,52 +1131,6 @@ def _history_identity(kind: str, value: Any) -> str | None:
     if kind == "url":
         text = text.rstrip("/")
     return f"{kind}:{text}"
-
-
-def _call_editorial_provider(
-    ai_client: Any | None,
-    events: Sequence[Mapping[str, Any]],
-    *,
-    edition: Mapping[str, Any],
-    total_max: int,
-    retries: Any,
-) -> tuple[StageDEditorialResponse, int]:
-    if ai_client is None:
-        raise RuntimeError("Stage D editorial client is not configured")
-
-    def operation() -> StageDEditorialResponse:
-        method = getattr(ai_client, "select_events", None)
-        if not callable(method):
-            method = getattr(ai_client, "stage_d_editorial", None)
-        if not callable(method):
-            method = getattr(ai_client, "editorial_select", None)
-        if not callable(method):
-            raise TypeError("Stage D client does not expose select_events")
-        value = method(events, edition=edition, total_max=total_max)
-        if isinstance(value, StageDEditorialResponse):
-            return strict_parse_stage_d(
-                value.model_dump(mode="json"),
-                event_ids=[int(item["event_id"]) for item in events],
-                total_max=total_max,
-                events=events,
-            )
-        return strict_parse_stage_d(
-            value,
-            event_ids=[int(item["event_id"]) for item in events],
-            total_max=total_max,
-            events=events,
-        )
-
-    value, failure, attempts = call_with_provider_retries(
-        operation,
-        is_retryable=_provider_failure_is_retryable,
-        stage="stage_d",
-        max_retries=_bounded_int(retries, 2, lower=0, upper=5),
-    )
-    if failure is not None or value is None:
-        cause = failure if failure is not None else RuntimeError("Stage D provider returned no result")
-        raise StageDProviderCallError(cause, attempts) from cause
-    return value, attempts
 
 
 def _provider_failure_is_retryable(exc: BaseException) -> bool:
@@ -1312,241 +1172,6 @@ def _provider_audit(exc: BaseException, ai_client: Any | None) -> dict[str, Any]
     }
 
 
-_FALLBACK_SOURCE_PENALTY_STEP = 6
-_FALLBACK_SOURCE_PENALTY_MAX = 12
-_FALLBACK_CONTENT_PENALTY_STEP = 4
-_FALLBACK_CONTENT_PENALTY_MAX = 8
-_FALLBACK_TOPIC_PENALTY_STEP = 3
-_FALLBACK_TOPIC_PENALTY_MAX = 6
-_FALLBACK_ENTITY_PENALTY_STEP = 4
-_FALLBACK_ENTITY_PENALTY_MAX = 8
-_FALLBACK_STORY_PENALTY_STEP = 4
-_FALLBACK_STORY_PENALTY_MAX = 8
-_FALLBACK_TRUSTED_BONUS = 3
-
-
-def _fallback_decisions(candidates: Sequence[Mapping[str, Any]], *, total_max: int) -> dict[int, dict[str, Any]]:
-    """Choose a deterministic fallback edition with bounded soft diversity signals."""
-
-    remaining = list(candidates)
-    selected_context: list[dict[str, str | None]] = []
-    decisions: dict[int, dict[str, Any]] = {}
-    selected_count = 0
-    rank = 0
-    limit = max(0, int(total_max))
-    while remaining:
-        scored: list[tuple[dict[str, Any], Mapping[str, Any], str | None, int]] = []
-        for index, candidate in enumerate(remaining):
-            event = candidate["event"]
-            components = _fallback_score_components(candidate, selected_context)
-            title = _fallback_title(event, community_signal=_source_presentation(candidate) is not None)
-            scored.append((components, candidate, title, index))
-        scored.sort(
-            key=lambda row: (
-                -float(row[0]["adjusted"]),
-                -float(row[0]["base"]),
-                int(row[1]["event"].id),
-            )
-        )
-        components, candidate, title, index = scored[0]
-        remaining.pop(index)
-        event = candidate["event"]
-        event_id = int(event.id)
-        rank += 1
-        reason_codes = _fallback_reason_codes(components)
-        if title is not None and selected_count < limit:
-            selected_count += 1
-            selected_context.append(_fallback_signal_keys(candidate))
-            decisions[event_id] = {
-                "event_id": event_id,
-                "decision": "selected",
-                "display_order": selected_count,
-                "editorial_score": round(float(components["base"])),
-                "story_family_id": f"fallback_{event_id}",
-                "family_position": 1,
-                "display_title_zh": title,
-                "title_supporting_fields": ["summary_cn", "title"],
-                "reason_codes": reason_codes,
-                "editorial_reason": "编辑服务不可用，按 display_score 主导的确定性软多样性回退排序。",
-                "confidence": 0,
-                "fallback_rank": rank,
-                "fallback_score_components": components,
-            }
-            continue
-
-        if title is None:
-            reason_codes.append("title_unavailable")
-            reason = "编辑服务不可用，候选标题不可用，未进入回退展示列表。"
-        else:
-            reason_codes.append("fallback_limit")
-            reason = "编辑服务不可用，已达到回退展示上限。"
-        decisions[event_id] = {
-            **_omitted_decision(reason_codes[-1], reason, event_id=event_id),
-            "editorial_score": round(float(components["base"])),
-            "reason_codes": reason_codes,
-            "fallback_rank": rank,
-            "fallback_score_components": components,
-        }
-    return decisions
-
-
-def _fallback_score_components(
-    candidate: Mapping[str, Any],
-    selected_context: Sequence[Mapping[str, str | None]],
-) -> dict[str, float | int]:
-    keys = _fallback_signal_keys(candidate)
-    counts = {
-        "source_group": _fallback_repeat_count(keys.get("source_group"), selected_context, "source_group"),
-        "content_class": _fallback_repeat_count(keys.get("content_class"), selected_context, "content_class"),
-        "topic": _fallback_repeat_count(keys.get("topic"), selected_context, "topic"),
-        "primary_entity": _fallback_repeat_count(keys.get("primary_entity"), selected_context, "primary_entity"),
-        "story": _fallback_repeat_count(keys.get("story"), selected_context, "story"),
-    }
-    source_penalty = min(_FALLBACK_SOURCE_PENALTY_MAX, counts["source_group"] * _FALLBACK_SOURCE_PENALTY_STEP)
-    content_penalty = min(_FALLBACK_CONTENT_PENALTY_MAX, counts["content_class"] * _FALLBACK_CONTENT_PENALTY_STEP)
-    topic_penalty = min(_FALLBACK_TOPIC_PENALTY_MAX, counts["topic"] * _FALLBACK_TOPIC_PENALTY_STEP)
-    entity_penalty = min(_FALLBACK_ENTITY_PENALTY_MAX, counts["primary_entity"] * _FALLBACK_ENTITY_PENALTY_STEP)
-    story_penalty = min(_FALLBACK_STORY_PENALTY_MAX, counts["story"] * _FALLBACK_STORY_PENALTY_STEP)
-    bonus = _fallback_trusted_bonus(candidate)
-    base = _number(candidate["event"].display_score)
-    adjusted = base + bonus - source_penalty - content_penalty - topic_penalty - entity_penalty - story_penalty
-    return {
-        "base": round(base, 4),
-        "bonus": bonus,
-        "same_source_group_penalty": source_penalty,
-        "same_content_class_penalty": content_penalty,
-        "same_topic_penalty": topic_penalty,
-        "same_primary_entity_penalty": entity_penalty,
-        "same_story_penalty": story_penalty,
-        "adjusted": round(adjusted, 4),
-    }
-
-
-def _fallback_reason_codes(components: Mapping[str, Any]) -> list[str]:
-    codes = ["deterministic_fallback"]
-    for key, code in (
-        ("same_source_group_penalty", "fallback_repeat_source_group"),
-        ("same_content_class_penalty", "fallback_repeat_content_class"),
-        ("same_topic_penalty", "fallback_repeat_topic"),
-        ("same_primary_entity_penalty", "fallback_repeat_primary_entity"),
-        ("same_story_penalty", "fallback_repeat_story"),
-    ):
-        if _number(components.get(key)) > 0:
-            codes.append(code)
-    if _number(components.get("bonus")) > 0:
-        codes.append("fallback_trusted_evidence_bonus")
-    return codes
-
-
-def _fallback_repeat_count(
-    value: str | None,
-    selected_context: Sequence[Mapping[str, str | None]],
-    key: str,
-) -> int:
-    if not value:
-        return 0
-    return sum(1 for selected in selected_context if selected.get(key) == value)
-
-
-def _fallback_signal_keys(candidate: Mapping[str, Any]) -> dict[str, str | None]:
-    event = candidate["event"]
-    source_groups = candidate.get("source_groups")
-    if not source_groups:
-        source_groups = _json_strings(getattr(event, "source_groups_json", None))
-    if isinstance(source_groups, str):
-        source_groups = [source_groups]
-    source_group = candidate.get("source_group") or next((str(value) for value in source_groups or [] if value), None)
-    content_class = candidate.get("content_class") or getattr(event, "content_class", None)
-    topic = candidate.get("topic") or getattr(event, "topic", None)
-    return {
-        "source_group": _fallback_token(source_group),
-        "content_class": _fallback_token(content_class),
-        "topic": _fallback_token(topic),
-        "primary_entity": _fallback_primary_entity(candidate),
-        "story": _fallback_story_key(candidate),
-    }
-
-
-def _fallback_primary_entity(candidate: Mapping[str, Any]) -> str | None:
-    explicit = candidate.get("primary_entity") or candidate.get("primary_entity_name")
-    if explicit:
-        return _fallback_token(explicit)
-    event = candidate["event"]
-    entities = candidate.get("entities")
-    if not entities:
-        entities = getattr(event, "entities", None)
-    if not entities:
-        entities = _json_value(getattr(event, "entities_json", None), [])
-    if not isinstance(entities, (list, tuple)):
-        return None
-    for entity in entities:
-        if isinstance(entity, Mapping):
-            value = entity.get("name") or entity.get("text") or entity.get("value") or entity.get("entity")
-        else:
-            value = entity
-        token = _fallback_token(value)
-        if token:
-            return token
-    return None
-
-
-def _fallback_story_key(candidate: Mapping[str, Any]) -> str | None:
-    event = candidate["event"]
-    for value in (
-        candidate.get("story_family_id"),
-        candidate.get("story_key"),
-        getattr(event, "story_family_id", None),
-        getattr(event, "story_key", None),
-    ):
-        token = _fallback_token(value)
-        if token:
-            return token
-    return None
-
-
-def _fallback_trusted_bonus(candidate: Mapping[str, Any]) -> int:
-    evidence = _fallback_token(candidate.get("source_evidence_level"))
-    if evidence != "trusted_or_first_party_supported":
-        return 0
-    event = candidate["event"]
-    groups = candidate.get("source_groups") or _json_strings(getattr(event, "source_groups_json", None))
-    if not groups and candidate.get("source_group"):
-        groups = (candidate.get("source_group"),)
-    if isinstance(groups, str):
-        groups = (groups,)
-    content_class = _fallback_token(candidate.get("content_class") or getattr(candidate["event"], "content_class", None)) or ""
-    trusted_group = any(
-        (token := _fallback_token(group))
-        and (token.startswith("official_") or token.endswith("_official") or token in {"official", "vendor_docs", "research"})
-        for group in groups
-    )
-    if trusted_group or content_class.startswith("official_") or content_class in {"news_media", "academic_paper"}:
-        return _FALLBACK_TRUSTED_BONUS
-    return 0
-
-
-def _fallback_token(value: Any) -> str | None:
-    text = " ".join(str(value or "").strip().casefold().split())
-    return text or None
-
-
-def _fallback_title(event: IntelEvent, *, community_signal: bool = False) -> str | None:
-    for raw in (event.summary_cn, event.title):
-        text = str(raw or "").strip().replace("\n", " ").replace("\r", " ")
-        if not text:
-            continue
-        text = text[:36].strip(" ，。；;:：-—")
-        if (
-            8 <= len(text) <= 36
-            and not any(word in text for word in ("重磅", "颠覆", "史上最强", "最强", "革命性"))
-            and not any(token in text.casefold() for token in ("http://", "https://", "www.", "`", "[", "]", "<", ">"))
-        ):
-            if community_signal and not any(cue in text for cue in ("社区", "传闻", "据称", "报道称", "消息称", "待核实", "爆料")):
-                text = ("社区称：" + text)[:36].strip(" ，。；;:：-—")
-            return text if 8 <= len(text) <= 36 else None
-    return None
-
-
 def _gated_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
     return _omitted_decision(
         str(candidate.get("paper_gate_reason") or "paper_gate:unsupported"),
@@ -1580,9 +1205,8 @@ def _source_presentation(candidate: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _stage_d_input_fingerprint(candidates: Sequence[Mapping[str, Any]], policy: StageDProfile, snapshot_key: str) -> str:
+def _stage_d_input_fingerprint(candidates: Sequence[Mapping[str, Any]], policy: StageDProfile) -> str:
     payload = {
-        "snapshot_key": snapshot_key,
         "profile": {"version": policy.version, "total_max": policy.total_max, "paper_hard_gate": policy.paper_hard_gate},
         "events": [
             {

@@ -4,14 +4,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
 
 from app.jobs.event_cluster_job import _load_selected_daily_history_events
 from app.jobs.export_job import IntelExportResult
 from app.jobs import pipeline_orchestrator as orchestrator
 from app.jobs.stage_d_job import _recent_daily_history
 from app.config.settings import Settings
-from app.storage.db import create_engine_from_url, create_session_factory, init_db
+from app.storage.db import (
+    _migrate_historical_daily_reports,
+    create_engine_from_url,
+    create_session_factory,
+    init_db,
+)
 from app.storage.models import (
     AIItemReview,
     AIItemScreen,
@@ -145,10 +150,9 @@ def test_same_day_successful_rebuild_replaces_final_report_and_deletes_all_worki
             FetchAttempt,
         ):
             assert session.scalar(select(func.count()).select_from(model)) == 0
-        snapshot = UIReadRepository(session).resolve_snapshot(edition_date="2026-08-19")
-        assert snapshot is not None
-        assert snapshot.run_id is None
-        assert [card.title for card in UIReadRepository(session).list_featured_cards(snapshot=snapshot)] == [
+        edition = UIReadRepository(session).resolve_edition(edition_date="2026-08-19")
+        assert edition is not None
+        assert [card.title for card in UIReadRepository(session).list_featured_cards(edition=edition)] == [
             "Afternoon replacement"
         ]
 
@@ -335,3 +339,83 @@ def test_daily_export_failure_keeps_the_prior_bundle_and_report(tmp_path, monkey
         assert edition.status == "draft_failed"
         assert [entry.title for entry in edition.report_entries] == ["Old report"]
         assert session.get(IntelRun, draft_id) is not None
+
+
+def test_historical_report_import_keeps_only_final_entries_and_sources(tmp_path):
+    """The one-time importer has no runtime fallback or retained build data."""
+
+    database_url = f"sqlite:///{tmp_path / 'historical.db'}"
+    engine = create_engine_from_url(database_url)
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        _source(session)
+        _, build = repo.start_daily_build(edition_date="2026-08-18")
+        event = _draft_event(repo, build.id, external_id="historical", title="Historical original")
+        repo.upsert_event_stage_d_snapshot(
+            event.id,
+            run_id=build.id,
+            display_order=1,
+            display_score=88,
+            selected=True,
+            topic="model",
+            source_group="official_blog",
+            content_class="official_model_company",
+            metadata={
+                "display_title_zh": "历史最终标题",
+                "run_id": build.id,
+                "snapshot_key": "daily-2026-08-18",
+                "nested": {"target_run_id": build.id, "visible": True},
+            },
+        )
+        build.status = "completed"
+        build.partial = False
+        build.scope_json = '{"edition_date":"2026-08-18"}'
+        build.finished_at = datetime(2026, 8, 18, 12, tzinfo=timezone.utc)
+        session.flush()
+        # ``snapshot_key`` exists only in the historical table layout. Add it
+        # to this isolated fixture solely to exercise the one-time importer.
+        session.execute(text("ALTER TABLE intel_event_stage_d_snapshots ADD COLUMN snapshot_key TEXT"))
+        session.execute(
+            text(
+                "UPDATE intel_event_stage_d_snapshots "
+                "SET snapshot_key = :snapshot_key WHERE run_id = :run_id"
+            ),
+            {"snapshot_key": "daily-2026-08-18", "run_id": build.id},
+        )
+        session.commit()
+
+    _migrate_historical_daily_reports(engine)
+
+    with session_factory() as session:
+        edition = session.scalar(select(DailyEdition).where(DailyEdition.edition_date == datetime(2026, 8, 18).date()))
+        assert edition is not None
+        assert edition.status == "published"
+        assert edition.draft_run_id is None
+        assert [entry.title for entry in edition.report_entries] == ["历史最终标题"]
+        assert edition.report_entries[0].metadata_dict == {
+            "display_title_zh": "历史最终标题",
+            "nested": {"visible": True},
+        }
+        assert session.scalar(select(func.count()).select_from(Source)) == 1
+        for model in (
+            IntelRun,
+            IntelItem,
+            IntelEvent,
+            IntelEventItem,
+            IntelEventStageDSnapshot,
+            IntelRunItem,
+            IntelRunStage,
+            IntelRunStageTask,
+            IntelRunStageAttempt,
+            AIItemScreen,
+            AIItemReview,
+            FetchAttempt,
+        ):
+            assert session.scalar(select(func.count()).select_from(model)) == 0
+
+    assert "snapshot_key" not in {
+        column["name"] for column in inspect(engine).get_columns("intel_event_stage_d_snapshots")
+    }

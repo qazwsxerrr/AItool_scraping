@@ -1,8 +1,7 @@
 version: stage-d-v2
-snapshot_key: latest
 
 # Default editorial pool size.  There is intentionally no minimum: an empty or
-# fully gated day produces an empty snapshot rather than padded content.
+# fully gated day produces an empty report rather than padded content.
 total_max: 30
 assessment_batch_size: 24
 assessment_concurrency: 2

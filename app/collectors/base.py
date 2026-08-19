@@ -16,7 +16,4 @@ class Collector(Protocol):
     ) -> FetchBatch:
         """Fetch and map one source without database or AI side effects."""
 
-
-FeedCollector = Collector
-
-__all__ = ["Collector", "FeedCollector"]
+__all__ = ["Collector"]

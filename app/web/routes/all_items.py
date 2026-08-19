@@ -16,11 +16,11 @@ def all_items(
     source_group: str | None = None,
     content_class: str | None = None,
     topic_category: str | None = None,
-    run_date: str | None = None,
+    edition_date: str | None = None,
     page: int = Query(default=1, ge=1),
     repo: UIReadRepository = Depends(get_repository),
 ):
-    active_snapshot = repo.resolve_snapshot(edition_date=run_date)
+    active_edition = repo.resolve_edition(edition_date=edition_date)
     filters = AllItemFilters(
         query=q,
         source_group=source_group,
@@ -29,7 +29,7 @@ def all_items(
     )
     page_size = 50
     rows = repo.list_featured_cards(
-        snapshot=active_snapshot,
+        edition=active_edition,
         query=filters.query,
         source_group=filters.source_group,
         content_class=filters.content_class,
@@ -48,8 +48,8 @@ def all_items(
             "items": items,
             "filters": filters,
             "filter_options": filter_options,
-            "active_snapshot": active_snapshot,
-            "active_edition_date": active_snapshot.edition_date if active_snapshot else None,
+            "active_edition": active_edition,
+            "active_edition_date": active_edition.edition_date if active_edition else None,
             "edition_options": repo.list_daily_editions(),
             "page": page,
             "has_next_page": len(rows) > page_size,

@@ -31,7 +31,7 @@ from app.storage.models import (
 # These tables are additive durable coordinator state.  ``init_db`` may create
 # them in an otherwise complete Stage A/B database.  The DailyEdition upgrade
 # is intentionally the one exception: it migrates only final historical daily
-# reports, then physically removes legacy raw/intermediate data as requested.
+# reports, then physically removes superseded raw/intermediate data as requested.
 STATE_TABLE_NAMES = frozenset(
     {
         "intel_run_stages",
@@ -57,54 +57,38 @@ def create_session_factory(engine: Engine) -> sessionmaker[Session]:
 
 
 def init_db(engine: Engine) -> None:
-    migrate_legacy_daily_workspace = _needs_daily_workspace_migration(engine)
-    _upgrade_intel_run_edition_date(engine)
-    _upgrade_daily_workspace_columns(engine)
-    _assert_fresh_or_compatible_schema(engine)
+    migrate_historical_reports = _needs_historical_report_migration(engine)
+    if migrate_historical_reports:
+        _prepare_historical_report_migration(engine)
+    _assert_supported_schema(engine)
     Base.metadata.create_all(bind=engine)
-    _ensure_intel_run_edition_date_index(engine)
-    if migrate_legacy_daily_workspace:
-        _migrate_legacy_daily_workspace(engine)
+    if migrate_historical_reports:
+        _migrate_historical_daily_reports(engine)
 
 
-def _upgrade_intel_run_edition_date(engine: Engine) -> None:
-    """Add and backfill the indexed daily label on an otherwise complete DB.
-
-    The project normally rejects arbitrary legacy schemas rather than trying
-    to repair them.  This is intentionally narrower: only a complete current
-    schema missing *exactly* the additive ``intel_runs.edition_date`` column
-    is upgraded.  That keeps existing local databases usable without changing
-    run IDs, foreign keys, or historical audit rows.
-    """
+def _prepare_historical_report_migration(engine: Engine) -> None:
+    """Add only the temporary pointers needed to materialize old reports once."""
 
     inspector = inspect(engine)
-    if "intel_runs" not in inspector.get_table_names():
-        return
-    actual = {column["name"] for column in inspector.get_columns("intel_runs")}
-    if "edition_date" in actual:
-        return
-
+    statements: list[str] = []
+    if "intel_runs" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("intel_runs")}
+        if "edition_id" not in columns:
+            statements.append("ALTER TABLE intel_runs ADD COLUMN edition_id INTEGER")
+    if "intel_items" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("intel_items")}
+        if "build_id" not in columns:
+            statements.append("ALTER TABLE intel_items ADD COLUMN build_id INTEGER")
+    if "intel_events" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("intel_events")}
+        if "build_id" not in columns:
+            statements.append("ALTER TABLE intel_events ADD COLUMN build_id INTEGER")
     with engine.begin() as connection:
-        connection.execute(text("ALTER TABLE intel_runs ADD COLUMN edition_date DATE"))
-        rows = connection.execute(
-            text(
-                "SELECT id, scope_json, started_at "
-                "FROM intel_runs WHERE edition_date IS NULL"
-            )
-        ).mappings()
-        updates = [
-            {"id": int(row["id"]), "edition_date": value}
-            for row in rows
-            if (value := _legacy_edition_date(row.get("scope_json"), row.get("started_at"))) is not None
-        ]
-        if updates:
-            connection.execute(
-                text("UPDATE intel_runs SET edition_date = :edition_date WHERE id = :id"),
-                updates,
-            )
+        for statement in statements:
+            connection.execute(text(statement))
 
 
-def _needs_daily_workspace_migration(engine: Engine) -> bool:
+def _needs_historical_report_migration(engine: Engine) -> bool:
     """Whether a complete pre-workspace DB needs its one-way final-report migration."""
 
     inspector = inspect(engine)
@@ -129,48 +113,7 @@ def _needs_daily_workspace_migration(engine: Engine) -> bool:
     )
 
 
-def _upgrade_daily_workspace_columns(engine: Engine) -> None:
-    """Add the private workspace pointers before ORM-backed migration runs."""
-
-    inspector = inspect(engine)
-    statements: list[str] = []
-    if "intel_runs" in inspector.get_table_names():
-        columns = {column["name"] for column in inspector.get_columns("intel_runs")}
-        if "edition_id" not in columns:
-            statements.append("ALTER TABLE intel_runs ADD COLUMN edition_id INTEGER")
-    if "intel_items" in inspector.get_table_names():
-        columns = {column["name"] for column in inspector.get_columns("intel_items")}
-        if "build_id" not in columns:
-            statements.append("ALTER TABLE intel_items ADD COLUMN build_id INTEGER")
-    if "intel_events" in inspector.get_table_names():
-        columns = {column["name"] for column in inspector.get_columns("intel_events")}
-        if "build_id" not in columns:
-            statements.append("ALTER TABLE intel_events ADD COLUMN build_id INTEGER")
-    if not statements:
-        return
-    with engine.begin() as connection:
-        for statement in statements:
-            connection.execute(text(statement))
-
-
-def _ensure_intel_run_edition_date_index(engine: Engine) -> None:
-    """Create the new date index for both fresh and additive-upgrade DBs."""
-
-    inspector = inspect(engine)
-    if "intel_runs" not in inspector.get_table_names():
-        return
-    columns = {column["name"] for column in inspector.get_columns("intel_runs")}
-    if "edition_date" not in columns:
-        return
-    table = Base.metadata.tables["intel_runs"]
-    index = next((value for value in table.indexes if value.name == "ix_intel_runs_edition_date"), None)
-    if index is None:
-        return
-    with engine.begin() as connection:
-        index.create(bind=connection, checkfirst=True)
-
-
-def _migrate_legacy_daily_workspace(engine: Engine) -> None:
+def _migrate_historical_daily_reports(engine: Engine) -> None:
     """Persist old publishable daily reports, then discard old build state.
 
     This migration is deliberately destructive *only* for data the new
@@ -185,17 +128,22 @@ def _migrate_legacy_daily_workspace(engine: Engine) -> None:
             session.scalars(
                 select(IntelRun)
                 .where(
-                    IntelRun._edition_date.is_not(None),
                     IntelRun.status.in_(("completed", "completed_with_errors")),
                     IntelRun.partial.is_(False),
                 )
-                .order_by(IntelRun._edition_date.desc(), IntelRun.finished_at.desc(), IntelRun.id.desc())
+                .order_by(IntelRun.finished_at.desc(), IntelRun.id.desc())
             ).all()
         )
         latest_by_date: dict[date, IntelRun] = {}
         for run in runs:
-            if run._edition_date is not None:
-                latest_by_date.setdefault(run._edition_date, run)
+            edition_text = _migration_edition_date(run.scope_json, run.started_at)
+            if edition_text is None:
+                continue
+            try:
+                edition_date = date.fromisoformat(edition_text)
+            except ValueError:
+                continue
+            latest_by_date.setdefault(edition_date, run)
 
         for edition_date, run in latest_by_date.items():
             snapshot_rows = list(
@@ -204,7 +152,10 @@ def _migrate_legacy_daily_workspace(engine: Engine) -> None:
                     .join(IntelEvent, IntelEvent.id == IntelEventStageDSnapshot.event_id)
                     .where(
                         IntelEventStageDSnapshot.run_id == int(run.id),
-                        IntelEventStageDSnapshot.snapshot_key == run.daily_snapshot_key,
+                        # Migration-only predicate for the pre-edition table.
+                        text("intel_event_stage_d_snapshots.snapshot_key = :snapshot_key").bindparams(
+                            snapshot_key=f"daily-{edition_date.isoformat()}"
+                        ),
                         IntelEventStageDSnapshot.selected.is_(True),
                     )
                     .order_by(IntelEventStageDSnapshot.display_order.asc(), IntelEvent.id.asc())
@@ -222,7 +173,7 @@ def _migrate_legacy_daily_workspace(engine: Engine) -> None:
                 session.delete(entry)
             session.flush()
             for order, (snapshot, event) in enumerate(snapshot_rows, start=1):
-                metadata = _json_object(snapshot.metadata_json)
+                metadata = _public_historical_metadata(_json_object(snapshot.metadata_json))
                 primary = session.get(IntelItem, event.primary_item_id) if event.primary_item_id is not None else None
                 session.add(
                     DailyEditionReportEntry(
@@ -276,7 +227,7 @@ def _migrate_legacy_daily_workspace(engine: Engine) -> None:
 
 
 def _rebuild_private_workspace_tables(engine: Engine) -> None:
-    """Recreate empty item/event tables with build-scoped unique constraints."""
+    """Recreate the now-empty private build workspace with the new schema."""
 
     if not engine.dialect.name.startswith("sqlite"):
         raise RuntimeError(
@@ -292,10 +243,36 @@ def _rebuild_private_workspace_tables(engine: Engine) -> None:
         connection.commit()
         try:
             with connection.begin():
-                Base.metadata.tables["intel_events"].drop(bind=connection, checkfirst=True)
-                Base.metadata.tables["intel_items"].drop(bind=connection, checkfirst=True)
-                Base.metadata.tables["intel_items"].create(bind=connection)
-                Base.metadata.tables["intel_events"].create(bind=connection)
+                for table_name in (
+                    "intel_run_stage_attempts",
+                    "intel_run_stage_tasks",
+                    "intel_run_stages",
+                    "intel_event_stage_d_snapshots",
+                    "intel_event_items",
+                    "ai_item_screens",
+                    "ai_item_reviews",
+                    "intel_run_items",
+                    "fetch_attempts",
+                    "intel_events",
+                    "intel_items",
+                    "intel_runs",
+                ):
+                    Base.metadata.tables[table_name].drop(bind=connection, checkfirst=True)
+                for table_name in (
+                    "intel_runs",
+                    "intel_items",
+                    "fetch_attempts",
+                    "ai_item_screens",
+                    "ai_item_reviews",
+                    "intel_run_items",
+                    "intel_events",
+                    "intel_event_items",
+                    "intel_event_stage_d_snapshots",
+                    "intel_run_stages",
+                    "intel_run_stage_tasks",
+                    "intel_run_stage_attempts",
+                ):
+                    Base.metadata.tables[table_name].create(bind=connection)
         finally:
             connection.exec_driver_sql("PRAGMA foreign_keys=ON")
             connection.commit()
@@ -309,8 +286,34 @@ def _json_object(value: str | None) -> dict[str, object]:
     return dict(parsed) if isinstance(parsed, dict) else {}
 
 
-def _legacy_edition_date(scope_json: object, started_at: object) -> str | None:
-    """Derive a Shanghai daily label for a pre-column run row."""
+def _public_historical_metadata(value: object) -> object:
+    """Drop obsolete execution keys while importing a historical report."""
+
+    if isinstance(value, dict):
+        return {
+            str(key): _public_historical_metadata(child)
+            for key, child in value.items()
+            if not _historical_execution_key(key)
+        }
+    if isinstance(value, list):
+        return [_public_historical_metadata(child) for child in value]
+    if isinstance(value, tuple):
+        return [_public_historical_metadata(child) for child in value]
+    return value
+
+
+def _historical_execution_key(key: object) -> bool:
+    normalized = str(key).strip().casefold()
+    return (
+        normalized == "run_id"
+        or normalized.endswith("_run_id")
+        or normalized == "snapshot_key"
+        or normalized.endswith("_snapshot_key")
+    )
+
+
+def _migration_edition_date(scope_json: object, started_at: object) -> str | None:
+    """Derive the report date while importing a pre-edition database."""
 
     scope: object = {}
     try:
@@ -327,11 +330,11 @@ def _legacy_edition_date(scope_json: object, started_at: object) -> str | None:
         reference = scope.get("reference_time")
     else:
         reference = None
-    current = _as_utc_datetime(reference) or _as_utc_datetime(started_at)
+    current = _migration_utc_datetime(reference) or _migration_utc_datetime(started_at)
     return current.astimezone(DAILY_EDITION_TIMEZONE).date().isoformat() if current is not None else None
 
 
-def _as_utc_datetime(value: object) -> datetime | None:
+def _migration_utc_datetime(value: object) -> datetime | None:
     if isinstance(value, datetime):
         return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     if isinstance(value, date):
@@ -345,15 +348,13 @@ def _as_utc_datetime(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def _assert_fresh_or_compatible_schema(engine: Engine) -> None:
-    """Reject pre-Stage-A databases instead of mutating them in place.
+def _assert_supported_schema(engine: Engine) -> None:
+    """Reject unsupported schemas before normal daily-build execution.
 
-    ``MetaData.create_all`` is intentionally create-only.  Existing local
-    SQLite files from the old single-call triage pipeline are not migrated or
-    backfilled; callers must explicitly remove/reinitialize those files.  A
-    complete schema created by this metadata is accepted for idempotent
-    startup.  The only migration exception is the one-column, additive run
-    edition upgrade performed before this compatibility check.
+    ``MetaData.create_all`` is intentionally create-only. A complete schema
+    created by this metadata is accepted for idempotent startup. The only
+    supported conversion is the one-way historical daily-report migration
+    prepared before this validation for an eligible older database.
     """
 
     inspector = inspect(engine)
@@ -362,14 +363,11 @@ def _assert_fresh_or_compatible_schema(engine: Engine) -> None:
     if not existing:
         return
 
-    # Ignore SQLite's internal bookkeeping tables, but reject any user table
-    # set that is not the fresh contract.  This catches both old schemas with
-    # missing Stage A/B columns and partial databases that would otherwise
-    # fail later on the first query.
+    # Ignore SQLite bookkeeping, but reject databases that are neither the
+    # fresh schema nor an eligible one-way historical-report migration target.
     user_tables = {name for name in existing if not name.startswith("sqlite_")}
-    # Existing databases from before resumable stages are accepted when their
-    # complete legacy contract is present.  Missing coordinator tables are
-    # additive and will be created by ``create_all`` below.
+    # The report migration adds only the coordinator/report tables before
+    # final published entries are materialized and private rows are purged.
     missing_tables = (expected - ADDITIVE_TABLE_NAMES) - user_tables
     extra_tables = user_tables - expected
     incompatible_columns: dict[str, set[str]] = {}
@@ -392,8 +390,8 @@ def _assert_fresh_or_compatible_schema(engine: Engine) -> None:
                 for table, columns in sorted(incompatible_columns.items())
             )
         raise RuntimeError(
-            "Existing database schema is incompatible with the fresh Stage A/B "
-            "intelligence schema (no migrations/backfill are supported): "
+            "Existing database schema is unsupported by the daily-edition "
+            "pipeline (no conversion is available): "
             + "; ".join(details)
             + ". Reinitialize the database explicitly."
         )

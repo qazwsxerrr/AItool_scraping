@@ -7,6 +7,8 @@ from app.ai.skills.intel_triage import (
     IntelTriageClient,
     RawIntelEnvelope,
     ScreenResult,
+    analysis_guard_failure,
+    apply_analysis_guards,
     apply_screen_guard,
     build_analysis_provider_payload,
     build_screen_provider_payload,
@@ -85,6 +87,47 @@ def test_stage_a_low_confidence_reject_becomes_uncertain():
     assert "screen:low_confidence_reject" in result.risk_flags
 
 
+def test_stage_a_only_hard_reject_reasons_survive_at_high_confidence():
+    canonical = parse_screen_result(
+        {
+            "decision": "reject",
+            "reason_code": "irrelevant",
+            "reason": "明确与 AI 情报无关",
+            "confidence": 90,
+            "risk_flags": [],
+        },
+        envelope=envelope(),
+    )
+    alias = parse_screen_result(
+        {
+            "decision": "reject",
+            "reason_code": "ad",
+            "reason": "广告营销",
+            "confidence": 95,
+            "risk_flags": [],
+        },
+        envelope=envelope(),
+    )
+    assert canonical.decision == "reject"
+    assert alias.decision == "reject"
+
+
+def test_stage_a_non_hard_reject_reaches_stage_b_even_at_high_confidence():
+    for reason_code in ("low_information", "insufficient_content", "source_uncertain", "unknown"):
+        result = parse_screen_result(
+            {
+                "decision": "reject",
+                "reason_code": reason_code,
+                "reason": "内容仍需后续分析",
+                "confidence": 99,
+                "risk_flags": [],
+            },
+            envelope=envelope(),
+        )
+        assert result.decision == "uncertain"
+        assert "screen:non_hard_reject_reason" in result.risk_flags
+
+
 def test_stage_a_strict_parser_preserves_raw_and_threshold_compatible_fields():
     payload = {"decision": "reject", "reason_code": "ad", "reason": "marketing", "confidence": 95, "risk_flags": ["ad"]}
     result = parse_screen_result(payload, envelope=envelope())
@@ -113,6 +156,31 @@ def test_stage_b_parser_normalizes_null_paper_source_type():
     assert result.paper_support.source_type == "unknown"
 
 
+def test_stage_b_empty_summary_falls_back_to_source_and_paper_is_risk_only():
+    item = envelope(summary="来源原始摘要，包含明确的项目变化。")
+    result = parse_analysis_result(
+        analysis_payload(
+            summary_cn="",
+            topic="paper",
+            topics=["paper"],
+            paper_support={"is_paper": True, "supported": False},
+        ),
+        envelope=item,
+    )
+    assert result.summary_cn == item.summary
+    assert "summary:fallback" in result.risk_flags
+    assert "paper:unsupported" in result.risk_flags
+    assert analysis_guard_failure(result) is None
+
+
+def test_stage_b_empty_summary_without_source_text_remains_structural_failure():
+    result = apply_analysis_guards(
+        AnalysisResult.model_validate(analysis_payload(summary_cn="")),
+    )
+    assert result.summary_cn == ""
+    assert analysis_guard_failure(result) == "summary_empty"
+
+
 def test_first_party_x_accounts_are_not_marked_social_only_and_prompt_preserves_limits():
     item = envelope(
         source_content_class="official_model_company",
@@ -130,6 +198,9 @@ def test_first_party_x_accounts_are_not_marked_social_only_and_prompt_preserves_
         assert "source_group=x_official" in instructions
         assert "不得补全正文未披露的交易细节" in instructions
         assert "普通 x_social、x_search" in instructions
+
+    assert "irrelevant、spam、pure_advertisement、navigation_or_index、empty_content、duplicate_without_update" in screen_instructions
+    assert "low_information、insufficient_content" in screen_instructions
 
 
 def test_paper_guard_marks_arxiv_only_analysis():

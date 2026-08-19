@@ -4,11 +4,11 @@
 {% block content %}
 <section class="hero-panel">
   <div class="hero-copy">
-    <p class="eyebrow">AI INTELLIGENCE · {{ stats.active_edition_date or (stats.last_run_started_at | datetime if stats.last_run_started_at else 'LOCAL EDITION') }}</p>
-    <h1>{{ stats.active_edition_date or '当前' }} 日报精选</h1>
+    <p class="eyebrow">AI INTELLIGENCE · {{ stats.edition_date or 'LOCAL EDITION' }}</p>
+    <h1>{{ stats.edition_date or '当前' }} 日报精选</h1>
     <p class="hero-lede">从抓取到 AI 筛选，再到主题归类与来源追溯，把噪声整理成可以快速浏览的 AI 信息流。</p>
     <div class="hero-actions">
-      <a class="button button-solid" href="/all{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}">浏览本期精选 <span>→</span></a>
+      <a class="button button-solid" href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">浏览本期精选 <span>→</span></a>
       <a class="button button-quiet" href="/sources">查看来源目录</a>
     </div>
   </div>
@@ -16,26 +16,24 @@
     <div class="status-orb"><span></span></div>
     <div>
       <span class="status-kicker">当前日报</span>
-      <strong>{{ stats.active_edition_date or stats.last_run_type or '尚未运行' }}</strong>
-      <small>{{ stats.last_run_status | status_label if stats.last_run_status else '等待数据进入' }}</small>
-      {% if stats.active_partial_reason %}<small>{{ stats.active_partial_reason }}</small>{% endif %}
+      <strong>{{ stats.edition_date or '尚未发布' }}</strong>
+      <small>{{ stats.status | status_label if stats.status else '等待数据进入' }}</small>
     </div>
   </div>
 </section>
 
 <section class="metric-strip" aria-label="数据概览">
-  <div class="metric-card metric-primary"><span>本期入库</span><strong>{{ stats.raw_items }}</strong><small>条冻结资讯</small></div>
+  <div class="metric-card metric-primary"><span>本期发布</span><strong>{{ stats.selected_items }}</strong><small>条最终事件</small></div>
   <div class="metric-card"><span>本期精选</span><strong>{{ stats.selected_items }}</strong><small>条最终事件</small></div>
-  <div class="metric-card"><span>待处理</span><strong>{{ stats.pending_items }}</strong><small>条需要继续处理</small></div>
   <div class="metric-card"><span>主题分类</span><strong>{{ stats.category_counts | length }}</strong><small>个活跃类别</small></div>
   <div class="metric-card"><span>来源渠道</span><strong>{{ stats.source_counts | length }}</strong><small>个来源组</small></div>
 </section>
 
 <section class="topic-toolbar" aria-label="主题和来源筛选">
   <div class="topic-tabs">
-    <a class="topic-tab {{ 'active' if not category else '' }}" href="/?run_date={{ active_edition_date or '' }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">全部主题</a>
+    <a class="topic-tab {{ 'active' if not category else '' }}" href="/?edition_date={{ active_edition_date or '' }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">全部主题</a>
     {% for option in category_options %}
-      <a class="topic-tab {{ 'active' if category == option.value else '' }}" href="/?run_date={{ active_edition_date or '' }}&amp;category={{ option.value }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">
+      <a class="topic-tab {{ 'active' if category == option.value else '' }}" href="/?edition_date={{ active_edition_date or '' }}&amp;category={{ option.value }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">
         <span>{{ option.value }}</span><em>{{ option.count }}</em>
       </a>
     {% endfor %}
@@ -43,9 +41,9 @@
   <form class="compact-select" action="/" method="get">
     {% if category %}<input type="hidden" name="category" value="{{ category }}">{% endif %}
     <label for="home-edition">日报</label>
-    <select id="home-edition" name="run_date" onchange="this.form.submit()">
+    <select id="home-edition" name="edition_date" onchange="this.form.submit()">
       {% for option in edition_options %}
-        <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}{% if option.partial %} · partial{% endif %}</option>
+        <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}</option>
       {% endfor %}
     </select>
     <label for="home-source">来源</label>
@@ -90,7 +88,7 @@
         <div class="empty-icon">✦</div>
         <h3>暂无精选内容</h3>
         <p>当前日报尚无可展示的最终入选事件。</p>
-        <a class="button button-solid" href="/all{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}">查看本期精选</a>
+        <a class="button button-solid" href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">查看本期精选</a>
       </section>
     {% endif %}
   </div>
@@ -101,7 +99,7 @@
       {% if source_options %}
         <div class="source-bars">
           {% for option in source_options[:8] %}
-            <a class="source-bar" href="/?run_date={{ active_edition_date or '' }}&amp;source_group={{ option.value }}{% if category %}&amp;category={{ category }}{% endif %}">
+            <a class="source-bar" href="/?edition_date={{ active_edition_date or '' }}&amp;source_group={{ option.value }}{% if category %}&amp;category={{ category }}{% endif %}">
               <span class="source-bar-label">{{ option.value | source_group_label }}</span>
               <span class="source-bar-track"><i style="width: {{ (option.count / (source_options[0].count or 1) * 100) | round(0) }}%"></i></span>
               <strong>{{ option.count }}</strong>
@@ -121,7 +119,4 @@
   </aside>
 </div>
 
-<section class="timeline legacy-anchor">
-  <h2>精选时间线</h2>
-</section>
 {% endblock %}

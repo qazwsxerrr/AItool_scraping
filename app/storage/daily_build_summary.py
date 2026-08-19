@@ -1,9 +1,8 @@
-"""Public, run-scoped summary data shared by export and read-only UI code.
+"""Private build summary data used while publishing an edition.
 
 The pipeline keeps durable detail in run items, stage tasks and Stage-D rows.
 This module derives the compact funnel/status projection needed by a daily
-manifest and by the Run/Snapshot API without relying on the legacy aggregate
-counter columns on :class:`IntelRun`.
+manifest without relying on aggregate counter columns on :class:`IntelRun`.
 """
 
 from __future__ import annotations
@@ -23,7 +22,6 @@ from app.storage.models import (
     IntelRunStage,
     IntelRunStageTask,
 )
-from app.storage.repository import DAILY_DELTA_RUN_ITEM_ROLES
 
 
 CANONICAL_STAGE_NAMES = ("fetch", "screen", "analyze", "cluster", "stage_d", "export")
@@ -40,15 +38,14 @@ TASK_STATUS_NAMES = (
 TIME_EXCLUSION_REASONS = ("too_old", "future_timestamp", "missing_published_at")
 
 
-def build_run_snapshot_summary(
+def build_daily_build_summary(
     session: Session,
     *,
     run: IntelRun,
-    snapshot_key: str,
     export_status: str | None = None,
     export_error: str | None = None,
 ) -> dict[str, Any]:
-    """Return a safe, run-scoped public summary for one Stage-D snapshot.
+    """Return a safe, build-scoped manifest summary for one Stage-D result.
 
     The result intentionally contains counts and structured error summaries
     only.  It never includes collector payloads, AI raw responses or stage
@@ -71,14 +68,6 @@ def build_run_snapshot_summary(
             )
         ).scalar_one()
     )
-    daily_delta = int(
-        session.execute(
-            select(func.count(IntelRunItem.id)).where(
-                IntelRunItem.run_id == run_id,
-                IntelRunItem.role.in_(DAILY_DELTA_RUN_ITEM_ROLES),
-            )
-        ).scalar_one()
-    )
 
     stages_payload: dict[str, dict[str, Any]] = {}
     failure_reasons: list[dict[str, str]] = []
@@ -93,7 +82,7 @@ def build_run_snapshot_summary(
             task_counts = _terminal_export_task_counts(task_counts, export_status)
             if export_error:
                 error = {"category": "upstream", "code": "partial_upstream", "message": export_error}
-        details = _stage_details(stage_name, stage, snapshot_key)
+        details = _stage_details(stage_name, stage)
         stages_payload[stage_name] = {
             "status": status,
             "started_at": _iso(stage.started_at) if stage is not None else None,
@@ -141,7 +130,6 @@ def build_run_snapshot_summary(
     stage_d_total, stage_d_selected, stage_d_watchlist, stage_d_shortlisted = _stage_d_counts(
         session,
         run_id=run_id,
-        snapshot_key=snapshot_key,
     )
     stage_d_metadata = stages_by_name.get("stage_d").metadata_dict if stages_by_name.get("stage_d") else {}
     stage_d_shortlisted = max(
@@ -154,7 +142,7 @@ def build_run_snapshot_summary(
     within_72h = screen_task_count - sum(
         1 for task in screen_tasks if task.status == "skipped"
     )
-    scope_items = frozen if run.edition_id is not None else daily_delta
+    scope_items = frozen
     if not screen_task_count:
         within_72h = max(0, scope_items - time_excluded)
 
@@ -177,13 +165,7 @@ def build_run_snapshot_summary(
             "stage_d_watchlist": stage_d_watchlist,
             "stage_d_shortlisted": stage_d_shortlisted,
     }
-    if run.edition_id is not None:
-        # A date-addressed report always evaluates the complete fresh source
-        # response. Calling it a "daily delta" would incorrectly imply that
-        # old build rows were reused.
-        funnel["full_rebuild_items"] = frozen
-    else:
-        funnel["daily_delta"] = daily_delta
+    funnel["full_rebuild_items"] = frozen
     return {
         "funnel": funnel,
         "stages": stages_payload,
@@ -243,7 +225,6 @@ def _terminal_export_task_counts(counts: dict[str, int], export_status: str) -> 
 def _stage_details(
     stage_name: str,
     stage: IntelRunStage | None,
-    snapshot_key: str,
 ) -> dict[str, Any]:
     if stage is None:
         return {}
@@ -325,8 +306,7 @@ def _stage_details(
             }
         return details
     if stage_name in {"cluster", "export"}:
-        # Snapshot keys are execution plumbing.  Public daily status is
-        # addressed by ``edition_date`` at the caller boundary instead.
+        # These stages expose their public state through the edition manifest.
         return {}
     return {}
 
@@ -431,13 +411,11 @@ def _stage_d_counts(
     session: Session,
     *,
     run_id: int,
-    snapshot_key: str,
 ) -> tuple[int, int, int, int]:
     rows = session.scalars(
         select(IntelEventStageDSnapshot)
         .where(
             IntelEventStageDSnapshot.run_id == run_id,
-            IntelEventStageDSnapshot.snapshot_key == snapshot_key,
         )
     ).all()
     total = len(rows)

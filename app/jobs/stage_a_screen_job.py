@@ -38,11 +38,10 @@ from app.domain.recency import (
     FRESHNESS_POLICY_VERSION,
     RecentWindowDecision,
     recent_window_decision,
-    recent_window_scope,
 )
 from app.jobs.provider_retry import ProviderResponseFailure, ProviderRetryExhausted, call_with_provider_retries
 from app.storage.models import IntelItem, IntelRun, IntelRunStageTask
-from app.storage.repository import DAILY_DELTA_RUN_ITEM_ROLES, IntelRepository
+from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
 
@@ -109,11 +108,9 @@ def run_stage_a_screen_job(
     session_factory: sessionmaker[Session],
     source_specs: Mapping[str, SourceSpec] | None = None,
     ai_client: Any | None = None,
-    run_id: int | None = None,
+    run_id: int,
     limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
     ai_limit: int | None = None,
-    source_filter: str | None = None,
-    content_class: str | None = None,
     force: bool = False,
     retry_failed: bool = False,
     retry: bool | None = None,
@@ -150,8 +147,6 @@ def run_stage_a_screen_job(
         session_factory,
         run_id=run_id,
         source_specs=specs,
-        source_filter=source_filter,
-        content_class=content_class,
         limit=selected_limit,
         force=force,
         item_ids=item_ids,
@@ -174,9 +169,6 @@ def run_stage_a_screen_job(
         result.processed = len(contexts)
         return result
 
-    if effective_run_id is None:
-        return result
-
     config_fingerprint = _config_fingerprint(
         stage="screen",
         model=getattr(ai_client, "model", None),
@@ -189,15 +181,11 @@ def run_stage_a_screen_job(
     with session_factory() as session:
         repo = IntelRepository(session)
         existing_stage = repo.get_stage(effective_run_id, "screen")
-        # A source/class/task filter makes this a targeted rerun.  Resetting
-        # the whole stage in that case would strand unrelated tasks as
-        # pending, so reserve the stage-wide reset for an unfiltered rerun.
+        # Only an explicit item/task retry may narrow the current build.
         stage_force = (
             force
             and item_ids is None
             and requested_task_ids is None
-            and source_filter is None
-            and content_class is None
         )
         stage_metadata = {
             "reject_threshold": reject_threshold,
@@ -359,7 +347,7 @@ def run_stage_a_screen_job(
                 # projection and task state in this same transaction so a
                 # stale worker cannot publish a result for a task it no
                 # longer owns.
-                repo.save_screen(
+                repo.upsert_ai_screen(
                     context.item_id,
                     screen,
                     run_id=effective_run_id,
@@ -370,7 +358,7 @@ def run_stage_a_screen_job(
                 if screened_out:
                     repo.set_item_status(context.item_id, "screened_out", run_id=effective_run_id)
                 else:
-                    # Keep the legacy projection in ``new`` until Stage B.
+                    # Keep the current build item in ``new`` until Stage B.
                     repo.set_item_status(context.item_id, "new", run_id=effective_run_id)
                 session.commit()
             if screened_out:
@@ -469,94 +457,30 @@ def run_stage_a_screen_job(
     return result
 
 
-# Descriptive aliases used by callers that name stages instead of jobs.
-run_stage_a = run_stage_a_screen_job
-run_screen_stage = run_stage_a_screen_job
-run_stage_a_job = run_stage_a_screen_job
-run_stage_a_screen = run_stage_a_screen_job
-StageAResult = StageAScreenResult
-
-
 def _prepare_scope(
     session_factory: sessionmaker[Session],
     *,
-    run_id: int | None,
+    run_id: int,
     source_specs: Mapping[str, SourceSpec],
-    source_filter: str | None,
-    content_class: str | None,
     limit: int | None,
     force: bool,
     item_ids: Iterable[int] | None,
     dry_run: bool,
     now: Any | None,
-) -> tuple[int | None, list[_ItemContext], list[_TimeFilteredItem], bool, datetime | None]:
+) -> tuple[int, list[_ItemContext], list[_TimeFilteredItem], bool, datetime | None]:
     """Freeze/resolve the item scope and build detached provider envelopes."""
 
     requested_ids = {int(value) for value in item_ids} if item_ids is not None else None
     with session_factory() as session:
         repo = IntelRepository(session)
-        run = None
-        if run_id is None:
-            # The compatibility facade has no explicit fetch run.  Create a
-            # durable run and attach the currently selected pending items.
-            candidates = repo.list_pending_items(
-                limit=None,
-                source_id=source_filter,
-                content_class=content_class,
-                force=force,
-                stage="screen",
-            )
-            if requested_ids is not None:
-                candidates = [item for item in candidates if int(item.id) in requested_ids]
-            reference_time = _as_utc(now) or datetime.now(timezone.utc)
-            if dry_run:
-                eligible, filtered = _filter_recent_items(
-                    candidates,
-                    source_specs=source_specs,
-                    reference_time=reference_time,
-                )
-                truncated_by_limit = limit is not None and len(eligible) > limit
-                return (
-                    None,
-                    [_context_from_item(item, source_specs) for item in eligible],
-                    filtered,
-                    truncated_by_limit,
-                    reference_time,
-                )
-            run = repo.start_run(
-                run_type="ai_review",
-                source_ids=[item.source_id for item in candidates],
-                reference_time=reference_time,
-                scope=recent_window_scope(),
-            )
-            for item in candidates:
-                repo.record_run_item(run.id, item.id, source_id=item.source_id, role="fetched", status="new")
-            repo.freeze_run_scope(
-                run.id,
-                source_ids=[item.source_id for item in candidates],
-                item_ids=[int(item.id) for item in candidates],
-            )
-            session.commit()
-            run_id = int(run.id)
-        else:
-            # Date-addressed daily builds are complete replacement snapshots:
-            # every item fetched into the hidden build is screened again.
-            # Legacy run callers retain the former delta-only compatibility
-            # behavior until they are migrated to a DailyEdition build.
-            run = session.get(IntelRun, int(run_id))
-            daily_build = getattr(run, "edition_id", None) is not None if run is not None else False
-            candidates = repo.list_run_items(
-                run_id,
-                role=None if requested_ids is not None or daily_build else DAILY_DELTA_RUN_ITEM_ROLES,
-            )
-            if source_filter:
-                candidates = [item for item in candidates if item.source_id == source_filter]
-            if content_class:
-                candidates = [item for item in candidates if item.content_class == content_class]
-            if requested_ids is not None:
-                candidates = [item for item in candidates if int(item.id) in requested_ids]
+        run = session.get(IntelRun, int(run_id))
         if run is None:
             raise ValueError(f"intel run {run_id} does not exist")
+        if run.edition_id is None:
+            raise ValueError("Stage A requires the current daily edition build")
+        candidates = repo.list_run_items(run_id, role=None)
+        if requested_ids is not None:
+            candidates = [item for item in candidates if int(item.id) in requested_ids]
         reference_time = _as_utc(run.reference_time) or _as_utc(now) or datetime.now(timezone.utc)
         eligible, filtered = _filter_recent_items(
             candidates,
@@ -770,7 +694,7 @@ def _persist_screen_failure(
                 raise _TaskLeaseLost(f"stage A task {task_id} lease/owner lost before failure persistence")
             # Persist the projection only after the owner/lease check above,
             # in the same transaction as the task failure transition.
-            repo.save_screen(
+            repo.upsert_ai_screen(
                 item_id,
                 screen,
                 run_id=run_id,
@@ -1032,10 +956,5 @@ def _as_utc(value: Any) -> datetime | None:
 
 __all__ = [
     "StageAScreenResult",
-    "StageAResult",
     "run_stage_a_screen_job",
-    "run_stage_a_screen",
-    "run_stage_a",
-    "run_stage_a_job",
-    "run_screen_stage",
 ]

@@ -12,7 +12,7 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.domain.models import SourceSpec
@@ -102,22 +102,7 @@ STAGE_RUNNING_STATUSES = frozenset({"running", "in_progress"})
 TASK_REUSABLE_STATUS = "succeeded"
 DAILY_EDITION_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
-# ``IntelRunItem.role`` describes how a fetched identity contributes to the
-# current daily edition.  Older rows used the single ``fetched`` role, which
-# remains an active compatibility role.  New runs distinguish a first sighting
-# from a material refresh and a no-op re-fetch, so the latter never re-enters
-# the expensive A/B/C path just because a feed returns it again.
-RUN_ITEM_ROLE_NEW = "new"
-RUN_ITEM_ROLE_CHANGED = "changed"
-RUN_ITEM_ROLE_RETRY = "retry"
-RUN_ITEM_ROLE_UNCHANGED = "unchanged"
 RUN_ITEM_ROLE_FETCHED = "fetched"
-DAILY_DELTA_RUN_ITEM_ROLES = (
-    RUN_ITEM_ROLE_NEW,
-    RUN_ITEM_ROLE_CHANGED,
-    RUN_ITEM_ROLE_RETRY,
-    RUN_ITEM_ROLE_FETCHED,
-)
 
 
 class IntelRepository:
@@ -237,75 +222,6 @@ class IntelRepository:
             stmt = stmt.where(Source.id == source_id)
         return list(self.session.scalars(stmt).all())
 
-    def start_run(
-        self,
-        *,
-        filters: Mapping[str, Any] | None = None,
-        scope: Mapping[str, Any] | None = None,
-        run_type: str = "run_once",
-        source_ids: Iterable[str] | None = None,
-        reference_time: datetime | None = None,
-        edition_date: date | str | None = None,
-    ) -> IntelRun:
-        """Create a durable run and its explicit processing scope.
-
-        ``edition_date`` is the public daily identifier.  It may be supplied
-        explicitly when a retry happens after midnight but should still
-        replace the previous day's edition.  ``reference_time`` remains the
-        immutable execution-time anchor used by recency and stage processing.
-        """
-
-        source_values = _unique_strings(source_ids or ())
-        scope_values = dict(scope or {})
-        # ``reference_time`` is run-frozen metadata.  An explicit argument
-        # wins over a caller-supplied scope value; otherwise preserve a valid
-        # value already present in the initial scope, then fall back to now.
-        reference = _as_utc(reference_time) or _as_utc(scope_values.get("reference_time")) or utcnow()
-        scope_values["reference_time"] = reference.isoformat()
-        # ``edition_date`` is the human-facing daily grouping key.  It is not
-        # a primary key: several immutable runs may share a date while the UI
-        # points that date at the most recent Stage-D snapshot.
-        explicit_edition_date = _as_edition_date(edition_date)
-        if edition_date is not None and explicit_edition_date is None:
-            raise ValueError("edition_date must use YYYY-MM-DD")
-        resolved_edition_date = (
-            explicit_edition_date
-            or _as_edition_date(scope_values.get("edition_date"))
-            or reference.astimezone(DAILY_EDITION_TIMEZONE).date()
-        )
-        scope_values["edition_date"] = resolved_edition_date.isoformat()
-        scope_values["edition_timezone"] = "Asia/Shanghai"
-        run = IntelRun(
-            status="running",
-            run_type=_text(run_type) or "run_once",
-            _edition_date=resolved_edition_date,
-            filters_json=_dump_json(dict(filters or {})),
-            scope_json=_dump_json(scope_values),
-            source_ids_json=_dump_json(source_values),
-        )
-        self.session.add(run)
-        self.session.flush()
-        return run
-
-    def latest_run_for_edition(self, edition_date: date | str) -> IntelRun | None:
-        """Return the newest internal attempt for one public daily edition.
-
-        Command-line operators address a report by date, while the returned
-        run ID stays inside the orchestration layer for foreign-key joins and
-        resumable stage state.
-        """
-
-        resolved_edition_date = _as_edition_date(edition_date)
-        if resolved_edition_date is None:
-            raise ValueError("edition_date must use YYYY-MM-DD")
-        statement = (
-            select(IntelRun)
-            .where(IntelRun._edition_date == resolved_edition_date)
-            .order_by(IntelRun.started_at.desc(), IntelRun.id.desc())
-            .limit(1)
-        )
-        return self.session.scalars(statement).first()
-
     # ------------------------------------------------------------------
     # Date-addressed public editions and hidden draft builds
     # ------------------------------------------------------------------
@@ -341,7 +257,6 @@ class IntelRepository:
         edition_date: date | str,
         filters: Mapping[str, Any] | None = None,
         scope: Mapping[str, Any] | None = None,
-        run_type: str = "daily_build",
         source_ids: Iterable[str] | None = None,
         reference_time: datetime | None = None,
     ) -> tuple[DailyEdition, IntelRun]:
@@ -360,15 +275,20 @@ class IntelRepository:
         for stale_build_id in stale_build_ids:
             self.delete_build(stale_build_id)
 
-        run = self.start_run(
-            filters=filters,
-            scope=scope,
-            run_type=run_type,
-            source_ids=source_ids,
-            reference_time=reference_time,
-            edition_date=edition.edition_date,
+        source_values = _unique_strings(source_ids or ())
+        scope_values = dict(scope or {})
+        reference = _as_utc(reference_time) or _as_utc(scope_values.get("reference_time")) or utcnow()
+        scope_values["reference_time"] = reference.isoformat()
+        run = IntelRun(
+            edition_id=int(edition.id),
+            status="running",
+            filters_json=_dump_json(dict(filters or {})),
+            scope_json=_dump_json(scope_values),
+            source_ids_json=_dump_json(source_values),
         )
-        run.edition_id = int(edition.id)
+        run.edition = edition
+        self.session.add(run)
+        self.session.flush()
         edition.draft_run_id = int(run.id)
         # A previously published report remains readable while this draft is
         # rebuilt.  The explicit state still tells operators whether the
@@ -428,7 +348,9 @@ class IntelRepository:
             ):
                 if key in record and key not in metadata:
                     metadata[key] = record[key]
-            event_key = _text(record.get("event_key")) or _text(record.get("canonical_key")) or f"build-{run_id}-entry-{order}"
+            event_key = _text(record.get("event_key"))
+            if event_key is None:
+                raise ValueError("published daily report record is missing event_key")
             self.session.add(
                 DailyEditionReportEntry(
                     edition_id=int(edition.id),
@@ -538,26 +460,11 @@ class IntelRepository:
                 select(IntelItem.id).where(IntelItem.build_id == int(run_id))
             ).all()
         ]
-        # Legacy daily drafts created before the workspace migration do not
-        # carry build_id.  Their run scope still provides a safe deletion
-        # boundary while they are being replaced.
-        if not item_ids:
-            item_ids = [
-                int(value)
-                for value in self.session.scalars(
-                    select(IntelRunItem.item_id).where(IntelRunItem.run_id == int(run_id))
-                ).all()
-            ]
         event_ids = [
             int(value)
             for value in self.session.scalars(
                 select(IntelEvent.id).where(
-                    or_(
-                        IntelEvent.build_id == int(run_id),
-                        IntelEvent.first_run_id == int(run_id),
-                        IntelEvent.last_run_id == int(run_id),
-                        IntelEvent.new_in_run_id == int(run_id),
-                    )
+                    IntelEvent.build_id == int(run_id)
                 )
             ).all()
         ]
@@ -612,10 +519,8 @@ class IntelRepository:
     ) -> IntelRun | None:
         """Freeze fetch membership before any resumable processing stage.
 
-        The marker lives in the legacy JSON scope so this operation remains
-        additive: no ALTER/backfill is needed for existing databases.  A
-        frozen run may still update ``IntelRunItem.status`` projections, but
-        cannot gain new source/item membership.
+        A frozen build may still update ``IntelRunItem.status`` projections,
+        but cannot gain new source/item membership.
         """
 
         run = self.session.get(IntelRun, int(run_id))
@@ -653,8 +558,6 @@ class IntelRepository:
         self.session.flush()
         return run
 
-    freeze_scope = freeze_run_scope
-
     def set_run_scope(
         self,
         run_id: int,
@@ -686,7 +589,6 @@ class IntelRepository:
         item_id: int,
         *,
         source_id: str | None = None,
-        role: str = "fetched",
         status: str = "fetched",
     ) -> IntelRunItem:
         """Attach an item to a run scope idempotently.
@@ -711,22 +613,14 @@ class IntelRepository:
                 IntelRunItem.run_id == int(run_id), IntelRunItem.item_id == int(item_id)
             )
         )
-        existing_relation = relation is not None
         if relation is None:
             if run.scope_frozen:
                 raise RuntimeError(f"intel run {run_id} scope is already frozen")
             relation = IntelRunItem(run_id=int(run_id), item_id=int(item_id))
             self.session.add(relation)
         relation.source_id = source_id or relation.source_id or item.source_id
-        requested_role = _text(role) or RUN_ITEM_ROLE_FETCHED
-        if existing_relation and _run_item_role_priority(relation.role) > _run_item_role_priority(requested_role):
-            # A source may return the same identity twice in one fetch run.
-            # Preserve a prior ``new``/``changed`` classification instead of
-            # downgrading it to an unchanged repeat on the second encounter.
-            requested_role = relation.role
-        relation.role = requested_role
+        relation.role = RUN_ITEM_ROLE_FETCHED
         relation.status = _text(status) or "fetched"
-        item.latest_run_id = int(run_id)
         item_ids = _unique_ints([*(_string_values(_load_json(run.item_ids_json, []))), int(item_id)])
         run.item_ids_json = _dump_json(item_ids)
         relation.updated_at = utcnow()
@@ -803,12 +697,13 @@ class IntelRepository:
         *,
         source_id: str,
         request_url: str,
-        run_id: int | None = None,
+        run_id: int,
         manual_override: bool = False,
     ) -> FetchAttempt:
+        self._daily_build_id(run_id)
         attempt = FetchAttempt(
             source_id=source_id,
-            run_id=run_id,
+            run_id=int(run_id),
             request_url=request_url,
             manual_override=manual_override,
             started_at=utcnow(),
@@ -860,21 +755,19 @@ class IntelRepository:
                 attempt.error_code = getattr(error, "error_code", None) or attempt.error_code or type(error).__name__.lower()
             attempt.error_message = message[:4000]
 
-    def _daily_build_id(self, run_id: int | None) -> int | None:
+    def _daily_build_id(self, run_id: int) -> int:
         """Return the private build namespace for a public daily draft."""
 
-        if run_id is None:
-            return None
         run = self.session.get(IntelRun, int(run_id))
-        return int(run.id) if run is not None and run.edition_id is not None else None
+        if run is None or run.edition_id is None:
+            raise ValueError("persistent data requires a current daily edition build")
+        return int(run.id)
 
-    def insert_item(self, item: Any, *, run_id: int | None = None, run_role: str = "fetched") -> IntelInsertResult:
+    def insert_item(self, item: Any, *, run_id: int) -> IntelInsertResult:
         """Insert or refresh one normalized item inside its processing scope.
 
         A date-addressed build gets a private ``build_id`` namespace, so every
-        enabled source response is re-evaluated from scratch.  Direct legacy
-        and diagnostic callers retain their ``NULL`` namespace and existing
-        idempotent behavior.
+        enabled source response is re-evaluated from scratch.
         """
 
         fields = _item_fields(item)
@@ -921,7 +814,6 @@ class IntelRepository:
                 existing,
                 fields,
             )
-            retry_needed = _item_requires_daily_retry(existing)
             content_hash_changed = (
                 not _is_github_repository_fields(fields)
                 and bool(fields["content_hash"])
@@ -942,6 +834,7 @@ class IntelRepository:
             if content_hash_changed and not self.session.scalar(
                 select(IntelItem.id).where(
                     IntelItem.content_hash == fields["content_hash"],
+                    IntelItem.source_id == fields["source_id"],
                     _build_scope(IntelItem.build_id, build_id),
                     IntelItem.id != existing.id,
                 )
@@ -965,23 +858,12 @@ class IntelRepository:
                 existing.selection_score = 0
                 existing.selection_reason = None
             existing.updated_at = utcnow()
-            if run_id is not None:
-                self.record_run_item(
-                    run_id,
-                    existing.id,
-                    source_id=existing.source_id,
-                    role=(
-                        RUN_ITEM_ROLE_FETCHED
-                        if build_id is not None
-                        else _daily_delta_run_role(
-                            run_role,
-                            inserted=False,
-                            material_change=material_change,
-                            retry_needed=retry_needed,
-                        )
-                    ),
-                    status="fetched",
-                )
+            self.record_run_item(
+                run_id,
+                existing.id,
+                source_id=existing.source_id,
+                status="fetched",
+            )
             return IntelInsertResult(inserted=False, item_id=existing.id, reason="duplicate", updated=True)
 
         row_metrics = (
@@ -1011,23 +893,12 @@ class IntelRepository:
         )
         self.session.add(row)
         self.session.flush()
-        if run_id is not None:
-            self.record_run_item(
-                run_id,
-                row.id,
-                source_id=row.source_id,
-                role=(
-                    RUN_ITEM_ROLE_FETCHED
-                    if build_id is not None
-                    else _daily_delta_run_role(
-                        run_role,
-                        inserted=True,
-                        material_change=True,
-                        retry_needed=False,
-                    )
-                ),
-                status="fetched",
-            )
+        self.record_run_item(
+            run_id,
+            row.id,
+            source_id=row.source_id,
+            status="fetched",
+        )
         return IntelInsertResult(inserted=True, item_id=row.id)
 
     def save_github_enrichment(self, item_id: int, enrichment: Mapping[str, Any]) -> IntelItem | None:
@@ -1087,7 +958,7 @@ class IntelRepository:
         self.session.flush()
         return item
 
-    def _find_existing(self, fields: Mapping[str, Any], *, build_id: int | None = None) -> IntelItem | None:
+    def _find_existing(self, fields: Mapping[str, Any], *, build_id: int) -> IntelItem | None:
         external_id = fields.get("external_id")
         if external_id:
             stmt = select(IntelItem).where(
@@ -1098,100 +969,16 @@ class IntelRepository:
             found = self.session.scalar(stmt)
             if found is not None:
                 return found
-            if build_id is None and str(external_id).startswith("github_repo:"):
-                found = self.session.scalar(
-                    select(IntelItem).where(
-                        IntelItem.build_id.is_(None),
-                        IntelItem.external_id == external_id,
-                    )
-                )
-                if found is not None:
-                    return found
-
-        canonical_url = fields.get("canonical_url")
-        if canonical_url and fields.get("content_class") == "project_tool":
-            found = self.session.scalar(
-                select(IntelItem).where(
-                    _build_scope(IntelItem.build_id, build_id),
-                    IntelItem.content_class == "project_tool",
-                    IntelItem.canonical_url == canonical_url,
-                )
-            )
-            if found is not None:
-                return found
-
         content_hash = fields.get("content_hash")
         if content_hash:
             return self.session.scalar(
                 select(IntelItem).where(
                     _build_scope(IntelItem.build_id, build_id),
+                    IntelItem.source_id == fields["source_id"],
                     IntelItem.content_hash == content_hash,
                 )
             )
         return None
-
-    def list_pending_items(
-        self,
-        *,
-        limit: int | None = 100,
-        content_class: str | None = None,
-        source_id: str | None = None,
-        force: bool = False,
-        run_id: int | None = None,
-        stage: str = "screen",
-    ) -> list[IntelItem]:
-        stmt = (
-            select(IntelItem)
-            .options(
-                joinedload(IntelItem.source),
-                joinedload(IntelItem.ai_screen),
-                joinedload(IntelItem.ai_review),
-            )
-            .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
-        )
-        if run_id is not None:
-            stmt = stmt.join(IntelRunItem, IntelRunItem.item_id == IntelItem.id).where(
-                IntelRunItem.run_id == int(run_id)
-            )
-        if stage.casefold() in {"analysis", "analyze", "stage_b", "b"}:
-            # Stage A pass/uncertain items remain ``new`` until Stage B
-            # produces a projection; high-confidence rejects are excluded.
-            stmt = stmt.where(
-                IntelItem.status.in_(["new", "analysis_filtered", "analysis_failed", "candidate"])
-                if force
-                else IntelItem.status == "new",
-                IntelItem.ai_screen.has(
-                    and_(
-                        AIItemScreen.decision.in_(["pass", "uncertain"]),
-                        AIItemScreen.status == "success",
-                    )
-                ),
-            )
-            if not force:
-                stmt = stmt.where(
-                    (~IntelItem.ai_review.has())
-                    | (IntelItem.ai_review.has(AIItemReview.status == "analysis_failed"))
-                )
-        else:
-            stmt = stmt.where(
-                IntelItem.status.in_(
-                    ["new", "screened_out", "screen_failed", "analysis_filtered", "analysis_failed", "candidate"]
-                )
-                if force
-                else IntelItem.status == "new"
-            )
-            if not force:
-                stmt = stmt.where(
-                    (~IntelItem.ai_screen.has())
-                    | (IntelItem.ai_screen.has(AIItemScreen.status == "screen_failed"))
-                )
-        if content_class:
-            stmt = stmt.where(IntelItem.content_class == content_class)
-        if source_id:
-            stmt = stmt.where(IntelItem.source_id == source_id)
-        if limit is not None:
-            stmt = stmt.limit(limit)
-        return list(self.session.scalars(stmt).unique().all())
 
     def list_run_items(
         self,
@@ -1222,28 +1009,12 @@ class IntelRepository:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).unique().all())
 
-    def save_selection(self, item_id: int, *, keep: bool, score: int, reason: str) -> IntelItem | None:
-        item = self.session.get(IntelItem, item_id)
-        if item is None:
-            return None
-        item.selection_score = max(0, min(int(score), 100))
-        item.selection_reason = reason[:4000] if reason else None
-        item.status = "selected" if keep else "filtered"
-        item.updated_at = utcnow()
-        return item
-
-    def save_discovered_links(self, item_id: int, links: list[dict[str, str]]) -> None:
-        item = self.session.get(IntelItem, item_id)
-        if item is not None:
-            item.discovered_links_json = _dump_json(links)
-            item.updated_at = utcnow()
-
     def upsert_ai_screen(
         self,
         item_id: int,
         response: Any,
         *,
-        run_id: int | None = None,
+        run_id: int,
         model: str | None = None,
         status: str | None = None,
         error_message: str | None = None,
@@ -1253,11 +1024,12 @@ class IntelRepository:
         item = self.session.get(IntelItem, int(item_id))
         if item is None:
             raise ValueError(f"intel item {item_id} does not exist")
+        if item.build_id != self._daily_build_id(run_id):
+            raise ValueError(f"intel item {item_id} does not belong to daily build {run_id}")
         screen = self.session.scalar(select(AIItemScreen).where(AIItemScreen.item_id == int(item_id)))
         if screen is None:
             screen = AIItemScreen(item_id=int(item_id))
             self.session.add(screen)
-        screen.run_id = run_id
         screen.model = model
         screen.decision = _normalize_screen_decision(_response_value(response, "decision", "uncertain"))
         screen.reason_code = _text(_response_value(response, "reason_code") or _response_value(response, "code")) or ""
@@ -1275,20 +1047,15 @@ class IntelRepository:
         screen.error_message = (response_error or error_message or "")[:4000] or None
         screen.updated_at = utcnow()
         self.session.flush()
-        if run_id is not None:
-            self.update_run_item_status(run_id, item_id, status=screen.status)
+        self.update_run_item_status(run_id, item_id, status=screen.status)
         return screen
-
-    save_ai_screen = upsert_ai_screen
-    save_screen_result = upsert_ai_screen
-    save_screen = upsert_ai_screen
 
     def upsert_ai_analysis(
         self,
         item_id: int,
         response: Any,
         *,
-        run_id: int | None = None,
+        run_id: int,
         model: str | None = None,
         content_class: str | None = None,
         status: str | None = None,
@@ -1299,6 +1066,8 @@ class IntelRepository:
         item = self.session.get(IntelItem, int(item_id))
         if item is None:
             raise ValueError(f"intel item {item_id} does not exist")
+        if item.build_id != self._daily_build_id(run_id):
+            raise ValueError(f"intel item {item_id} does not belong to daily build {run_id}")
         review = self.session.scalar(select(AIItemReview).where(AIItemReview.item_id == int(item_id)))
         if review is None:
             review = AIItemReview(
@@ -1306,7 +1075,6 @@ class IntelRepository:
                 content_class=content_class or item.content_class or "community_social",
             )
             self.session.add(review)
-        review.run_id = run_id
         review.model = model
         review.content_class = _text(
             _response_value(response, "source_content_class")
@@ -1345,46 +1113,17 @@ class IntelRepository:
         review.error_message = (response_error or error_message or "")[:4000] or None
         review.updated_at = utcnow()
         self.session.flush()
-        if run_id is not None:
-            self.update_run_item_status(run_id, item_id, status=review.status)
+        self.update_run_item_status(run_id, item_id, status=review.status)
         return review
 
-    save_ai_analysis = upsert_ai_analysis
-    save_analysis_result = upsert_ai_analysis
-    save_analysis = upsert_ai_analysis
-
-    def set_item_status(self, item_id: int, status: str, *, run_id: int | None = None) -> None:
+    def set_item_status(self, item_id: int, status: str, *, run_id: int) -> None:
         item = self.session.get(IntelItem, item_id)
         if item is not None:
+            if item.build_id != self._daily_build_id(run_id):
+                raise ValueError(f"intel item {item_id} does not belong to daily build {run_id}")
             item.status = status
             item.updated_at = utcnow()
-            if run_id is not None:
-                self.update_run_item_status(run_id, item_id, status=status)
-
-    def list_export_items(
-        self,
-        *,
-        limit: int | None = 100,
-        content_class: str | None = None,
-        source_id: str | None = None,
-    ) -> list[IntelItem]:
-        stmt = (
-            select(IntelItem)
-            .options(joinedload(IntelItem.source), joinedload(IntelItem.ai_screen), joinedload(IntelItem.ai_review))
-            .outerjoin(AIItemReview, AIItemReview.item_id == IntelItem.id)
-            .where(
-                IntelItem.status == "candidate",
-                AIItemReview.status == "success",
-            )
-            .order_by(IntelItem.selection_score.desc(), IntelItem.published_at.desc(), IntelItem.id.asc())
-        )
-        if content_class:
-            stmt = stmt.where(IntelItem.content_class == content_class)
-        if source_id:
-            stmt = stmt.where(IntelItem.source_id == source_id)
-        if limit is not None:
-            stmt = stmt.limit(limit)
-        return list(self.session.scalars(stmt).unique().all())
+            self.update_run_item_status(run_id, item_id, status=status)
 
     # ------------------------------------------------------------------
     # Event aggregation and Stage-D snapshot persistence
@@ -1392,10 +1131,9 @@ class IntelRepository:
 
     def upsert_event(
         self,
-        event: Any | None = None,
         *,
-        event_key: str | None = None,
-        canonical_key: str | None = None,
+        run_id: int,
+        event_key: str,
         canonical_url: str | None = None,
         external_id: str | None = None,
         normalized_title: str | None = None,
@@ -1418,47 +1156,27 @@ class IntelRepository:
         resolution_raw: Any | None = None,
         risk_flags: Iterable[str] | None = None,
         primary_item_id: int | None = None,
-        run_id: int | None = None,
-        new_in_run_id: int | None = None,
         first_seen_at: datetime | None = None,
         last_seen_at: datetime | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> IntelEvent:
-        """Create or refresh one canonical event without duplicate rows.
+        """Create or refresh one event inside one private daily build.
 
-        ``event_key`` is the deterministic key selected by the clustering job.
-        ``identity_keys`` stores URL/external-id anchors only.  Titles are
-        deliberately not durable identity aliases: a repeated headline can
-        describe a different real-world event and must go through Stage C's
-        semantic/AI resolution instead of being auto-merged here.
+        Event rows never act as cross-edition history.  Repeated items from a
+        prior date are represented by a fresh row in the active build and are
+        matched only against final report entries by Stage C/D.
         """
 
-        values = _object_mapping(event)
-        key = _text(event_key or canonical_key or values.get("event_key") or values.get("canonical_key"))
-        if not key:
-            key = _event_key_from_values(values)
-
-        raw_run_id = run_id if run_id is not None else values.get("run_id")
-        try:
-            build_id = self._daily_build_id(int(raw_run_id)) if raw_run_id is not None else None
-        except (TypeError, ValueError):
-            build_id = None
-
-        canonical = _canonical_url(canonical_url or values.get("canonical_url") or values.get("url"))
-        external = _normalize_event_external_id(external_id or values.get("external_id"))
-        norm_title = _normalize_event_title(normalized_title or values.get("normalized_title") or values.get("title"))
+        build_id = self._daily_build_id(run_id)
+        key = _text(event_key)
+        if key is None:
+            raise ValueError("daily event requires event_key")
+        canonical = _canonical_url(canonical_url)
+        external = _normalize_event_external_id(external_id)
+        norm_title = _normalize_event_title(normalized_title or title)
         aliases = _unique_strings(
             [
-                *(
-                    value
-                    for value in (identity_keys or ())
-                    if not str(value).strip().casefold().startswith("title:")
-                ),
-                *(
-                    value
-                    for value in _string_values(values.get("identity_keys"))
-                    if not str(value).strip().casefold().startswith("title:")
-                ),
+                *(value for value in (identity_keys or ()) if not str(value).strip().casefold().startswith("title:")),
                 _identity_alias_url(canonical),
                 _identity_alias_external(external),
                 key if key.startswith(("url:", "external:")) else None,
@@ -1467,114 +1185,84 @@ class IntelRepository:
 
         row = self.session.scalar(
             select(IntelEvent).where(
-                _build_scope(IntelEvent.build_id, build_id),
+                IntelEvent.build_id == build_id,
                 IntelEvent.event_key == key,
             )
         )
-        if row is None:
-            # Prefer an existing membership, then exact indexed identities,
-            # and finally the persisted alias list.  The latter is intentionally
-            # read in Python because SQLite JSON1 is not required.
-            candidate_item_ids = [
-                int(item_id)
-                for item_id in [primary_item_id, values.get("primary_item_id")]
-                if item_id is not None
-            ]
-            if candidate_item_ids:
-                row = self.session.scalar(
-                    select(IntelEvent)
-                    .join(IntelEventItem, IntelEventItem.event_id == IntelEvent.id)
-                    .where(
-                        _build_scope(IntelEvent.build_id, build_id),
-                        IntelEventItem.item_id.in_(candidate_item_ids),
-                    )
-                    .order_by(IntelEvent.id.asc())
+        if row is None and primary_item_id is not None:
+            row = self.session.scalar(
+                select(IntelEvent)
+                .join(IntelEventItem, IntelEventItem.event_id == IntelEvent.id)
+                .where(
+                    IntelEvent.build_id == build_id,
+                    IntelEventItem.item_id == int(primary_item_id),
                 )
-            if row is None and canonical:
-                row = self.session.scalar(
-                    select(IntelEvent).where(
-                        _build_scope(IntelEvent.build_id, build_id),
-                        IntelEvent.canonical_url == canonical,
-                    )
+                .order_by(IntelEvent.id.asc())
+            )
+        if row is None and canonical:
+            row = self.session.scalar(
+                select(IntelEvent).where(
+                    IntelEvent.build_id == build_id,
+                    IntelEvent.canonical_url == canonical,
                 )
-            if row is None and external:
-                row = self.session.scalar(
-                    select(IntelEvent).where(
-                        _build_scope(IntelEvent.build_id, build_id),
-                        IntelEvent.external_id == external,
-                    )
+            )
+        if row is None and external:
+            row = self.session.scalar(
+                select(IntelEvent).where(
+                    IntelEvent.build_id == build_id,
+                    IntelEvent.external_id == external,
                 )
-            if row is None and aliases:
-                rows = list(
-                    self.session.scalars(
-                        select(IntelEvent)
-                        .where(_build_scope(IntelEvent.build_id, build_id))
-                        .order_by(IntelEvent.id.asc())
-                    ).all()
-                )
-                alias_set = {alias for alias in aliases if alias.startswith(("url:", "external:"))}
-                for candidate in rows:
-                    existing_aliases = {
-                        alias
-                        for alias in _load_json(candidate.identity_keys_json, [])
-                        if isinstance(alias, str) and alias.startswith(("url:", "external:"))
-                    }
-                    if existing_aliases & alias_set:
-                        row = candidate
-                        break
-
+            )
+        if row is None and aliases:
+            alias_set = {alias for alias in aliases if alias.startswith(("url:", "external:"))}
+            for candidate in self.session.scalars(
+                select(IntelEvent)
+                .where(IntelEvent.build_id == build_id)
+                .order_by(IntelEvent.id.asc())
+            ).all():
+                existing_aliases = {
+                    alias
+                    for alias in _load_json(candidate.identity_keys_json, [])
+                    if isinstance(alias, str) and alias.startswith(("url:", "external:"))
+                }
+                if existing_aliases & alias_set:
+                    row = candidate
+                    break
         if row is None:
             row = IntelEvent(event_key=key, build_id=build_id)
             self.session.add(row)
-
-        values_topics = _unique_strings([*(topics or ()), *(_string_values(values.get("topics"))), values.get("topic")])
-        values_sources = _unique_strings([*(source_ids or ()), *(_string_values(values.get("source_ids"))), values.get("source_id")])
-        values_source_groups = _unique_strings(
-            [*(source_groups or ()), *(_string_values(values.get("source_groups"))), source_group, values.get("source_group")]
-        )
-        previous_topics = _load_json(row.topics_json, [])
-        previous_keywords = _load_json(row.keywords_json, [])
-        previous_entities = _load_json(row.entities_json, [])
-        previous_sources = _load_json(row.source_ids_json, [])
-        previous_source_groups = _load_json(row.source_groups_json, [])
-        previous_aliases = [
-            alias
-            for alias in _load_json(row.identity_keys_json, [])
-            if isinstance(alias, str) and alias.startswith(("url:", "external:"))
-        ]
-        merged_topics = _unique_strings([*(_string_values(previous_topics)), *values_topics])
-        values_keywords = _unique_strings(
-            [*(keywords or ()), *(_string_values(values.get("keywords"))), values.get("keyword")]
-        )
-        merged_keywords = _unique_strings([*(_string_values(previous_keywords)), *values_keywords])
-        values_entities = [
-            _structured_json(entity)
-            for entity in (entities or ())
-            if isinstance(_structured_json(entity), Mapping)
-        ]
-        if isinstance(values.get("entities"), (list, tuple, set)):
-            values_entities.extend(
-                _structured_json(entity)
-                for entity in values.get("entities", ())
-                if isinstance(_structured_json(entity), Mapping)
-            )
-        merged_entities = _unique_json_objects([*(_load_json(row.entities_json, [])), *values_entities])
-        merged_sources = _unique_strings([*(_string_values(previous_sources)), *values_sources])
-        merged_source_groups = _unique_strings([*(_string_values(previous_source_groups)), *values_source_groups])
-        merged_aliases = _unique_strings([*(_string_values(previous_aliases)), *aliases])
 
         def _assign(name: str, value: Any, *, allow_empty: bool = False) -> None:
             if value is not None and (allow_empty or value != ""):
                 setattr(row, name, value)
 
+        merged_topics = _unique_strings([*_string_values(_load_json(row.topics_json, [])), *(topics or ()), topic])
+        merged_keywords = _unique_strings([*_string_values(_load_json(row.keywords_json, [])), *(keywords or ())])
+        incoming_entities = [
+            _structured_json(entity)
+            for entity in (entities or ())
+            if isinstance(_structured_json(entity), Mapping)
+        ]
+        merged_entities = _unique_json_objects([*_load_json(row.entities_json, []), *incoming_entities])
+        merged_sources = _unique_strings([*_string_values(_load_json(row.source_ids_json, [])), *(source_ids or ())])
+        merged_source_groups = _unique_strings(
+            [*_string_values(_load_json(row.source_groups_json, [])), *(source_groups or ()), source_group]
+        )
+        previous_aliases = [
+            alias
+            for alias in _load_json(row.identity_keys_json, [])
+            if isinstance(alias, str) and alias.startswith(("url:", "external:"))
+        ]
+        merged_aliases = _unique_strings([*previous_aliases, *aliases])
+
         _assign("canonical_url", canonical)
         _assign("external_id", external)
         _assign("normalized_title", norm_title, allow_empty=True)
-        _assign("title", _text(title or values.get("title")))
-        _assign("summary_cn", _text(summary_cn or values.get("summary_cn") or values.get("summary")))
-        _assign("topic", _text(topic or values.get("topic")))
-        _assign("content_class", _text(content_class or values.get("content_class")))
-        _assign("source_group", _text(source_group or values.get("source_group")))
+        _assign("title", _text(title))
+        _assign("summary_cn", _text(summary_cn))
+        _assign("topic", _text(topic))
+        _assign("content_class", _text(content_class))
+        _assign("source_group", _text(source_group))
         if merged_topics:
             row.topics_json = _dump_json(merged_topics)
             if not row.topic or row.topic == "opinion":
@@ -1589,45 +1277,30 @@ class IntelRepository:
             row.source_groups_json = _dump_json(merged_source_groups)
         if merged_aliases:
             row.identity_keys_json = _dump_json(merged_aliases)
-        if display_score is not None or "display_score" in values:
-            score = display_score if display_score is not None else values.get("display_score")
+        if display_score is not None:
             try:
-                row.display_score = max(float(row.display_score or 0.0), max(0.0, min(100.0, float(score))))
+                row.display_score = max(float(row.display_score or 0.0), max(0.0, min(100.0, float(display_score))))
             except (TypeError, ValueError, OverflowError):
                 pass
-        novelty = _normalize_novelty_status(novelty_status or values.get("novelty_status") or values.get("novelty"))
-        if novelty is not None:
-            # ``unknown`` is the safe first-run value, but never erase a known
-            # history result during an idempotent refresh.
-            if row.novelty_status in {None, "unknown"} or novelty != "unknown":
-                row.novelty_status = novelty
-        _assign("state", _text(state or values.get("state")))
-        _assign("resolution_method", _text(resolution_method or values.get("resolution_method")))
-        if resolution_confidence is not None or values.get("resolution_confidence") is not None:
+        novelty = _normalize_novelty_status(novelty_status)
+        if novelty is not None and (row.novelty_status in {None, "unknown"} or novelty != "unknown"):
+            row.novelty_status = novelty
+        _assign("state", _text(state))
+        _assign("resolution_method", _text(resolution_method))
+        if resolution_confidence is not None:
             try:
-                row.resolution_confidence = max(
-                    0,
-                    min(100, int(resolution_confidence if resolution_confidence is not None else values.get("resolution_confidence"))),
-                )
+                row.resolution_confidence = max(0, min(100, int(resolution_confidence)))
             except (TypeError, ValueError, OverflowError):
                 row.resolution_confidence = 0
-        if resolution_raw is not None or "resolution_raw" in values:
-            row.resolution_raw_json = _dump_json(resolution_raw if resolution_raw is not None else values.get("resolution_raw"))
-        flags = _unique_strings([*(_string_values(_load_json(row.risk_flags_json, []))), *(risk_flags or ()), *(_string_values(values.get("risk_flags")))])
-        row.risk_flags_json = _dump_json(flags)
-        if primary_item_id is not None or values.get("primary_item_id") is not None:
-            candidate_primary = int(primary_item_id if primary_item_id is not None else values.get("primary_item_id"))
-            if row.primary_item_id is None:
-                row.primary_item_id = candidate_primary
-        if run_id is not None or values.get("run_id") is not None:
-            current_run_id = int(run_id if run_id is not None else values.get("run_id"))
-            if row.first_run_id is None:
-                row.first_run_id = current_run_id
-            row.last_run_id = current_run_id
-        if new_in_run_id is not None or values.get("new_in_run_id") is not None:
-            row.new_in_run_id = int(new_in_run_id if new_in_run_id is not None else values.get("new_in_run_id"))
-        first_seen = _as_utc(first_seen_at or values.get("first_seen_at"))
-        last_seen = _as_utc(last_seen_at or values.get("last_seen_at"))
+        if resolution_raw is not None:
+            row.resolution_raw_json = _dump_json(resolution_raw)
+        row.risk_flags_json = _dump_json(
+            _unique_strings([*_string_values(_load_json(row.risk_flags_json, [])), *(risk_flags or ())])
+        )
+        if primary_item_id is not None and row.primary_item_id is None:
+            row.primary_item_id = int(primary_item_id)
+        first_seen = _as_utc(first_seen_at)
+        last_seen = _as_utc(last_seen_at)
         existing_first_seen = _as_utc(row.first_seen_at)
         existing_last_seen = _as_utc(row.last_seen_at)
         if first_seen is not None and (existing_first_seen is None or first_seen < existing_first_seen):
@@ -1642,30 +1315,8 @@ class IntelRepository:
         self.session.flush()
         return row
 
-    save_event = upsert_event
-
     def get_event(self, event_id: int) -> IntelEvent | None:
         return self.session.get(IntelEvent, event_id)
-
-    def get_event_by_key(self, event_key: str) -> IntelEvent | None:
-        return self.session.scalar(select(IntelEvent).where(IntelEvent.event_key == event_key))
-
-    def get_event_by_identity(self, identity_key: str) -> IntelEvent | None:
-        """Find an event by one persisted exact identity alias."""
-
-        identity = _text(identity_key)
-        if not identity or not identity.startswith(("url:", "external:")):
-            return None
-        rows = list(self.session.scalars(select(IntelEvent).order_by(IntelEvent.id.asc())).all())
-        for row in rows:
-            aliases = {
-                alias
-                for alias in _load_json(row.identity_keys_json, [])
-                if isinstance(alias, str) and alias.startswith(("url:", "external:"))
-            }
-            if identity in aliases:
-                return row
-        return None
 
     def find_event_for_item(self, item_id: int) -> IntelEvent | None:
         return self.session.scalar(
@@ -1729,11 +1380,6 @@ class IntelRepository:
         self.session.flush()
         return EventItemUpsertResult(relation, created)
 
-    add_event_item = upsert_event_item
-    attach_event_item = upsert_event_item
-    upsert_event_member = upsert_event_item
-    add_event_member = upsert_event_item
-
     def list_event_items(self, event_id: int) -> list[IntelEventItem]:
         stmt = (
             select(IntelEventItem)
@@ -1743,36 +1389,11 @@ class IntelRepository:
         )
         return list(self.session.scalars(stmt).unique().all())
 
-    list_event_members = list_event_items
-
-    def list_events(
-        self,
-        *,
-        topic: str | None = None,
-        state: str | None = None,
-        snapshot_key: str | None = None,
-        limit: int | None = None,
-    ) -> list[IntelEvent]:
-        stmt = select(IntelEvent).order_by(IntelEvent.display_score.desc(), IntelEvent.id.asc())
-        if topic:
-            stmt = stmt.where(IntelEvent.topic == topic)
-        if state:
-            stmt = stmt.where(IntelEvent.state == state)
-        if snapshot_key:
-            stmt = stmt.join(IntelEventStageDSnapshot, IntelEventStageDSnapshot.event_id == IntelEvent.id).where(
-                IntelEventStageDSnapshot.snapshot_key == snapshot_key,
-                IntelEventStageDSnapshot.selected.is_(True),
-            )
-        if limit is not None:
-            stmt = stmt.limit(limit)
-        return list(self.session.scalars(stmt).unique().all())
-
     def upsert_event_stage_d_snapshot(
         self,
         event_id: int,
         *,
-        snapshot_key: str = "latest",
-        run_id: int | None = None,
+        run_id: int,
         display_order: int = 0,
         display_score: float = 0.0,
         selected: bool = False,
@@ -1784,15 +1405,15 @@ class IntelRepository:
     ) -> EventStageDSnapshotUpsertResult:
         row = self.session.scalar(
             select(IntelEventStageDSnapshot).where(
-                IntelEventStageDSnapshot.snapshot_key == snapshot_key,
+                IntelEventStageDSnapshot.run_id == int(run_id),
                 IntelEventStageDSnapshot.event_id == int(event_id),
             )
         )
         created = row is None
         if row is None:
-            row = IntelEventStageDSnapshot(snapshot_key=snapshot_key, event_id=int(event_id))
+            row = IntelEventStageDSnapshot(event_id=int(event_id), run_id=int(run_id))
             self.session.add(row)
-        row.run_id = run_id
+        row.run_id = int(run_id)
         row.display_order = max(0, int(display_order))
         try:
             row.display_score = max(0.0, min(100.0, float(display_score)))
@@ -1808,43 +1429,14 @@ class IntelRepository:
         self.session.flush()
         return EventStageDSnapshotUpsertResult(row, created)
 
-    def get_event_stage_d_snapshot(
-        self,
-        event_id: int,
-        *,
-        snapshot_key: str = "latest",
-    ) -> IntelEventStageDSnapshot | None:
-        return self.session.scalar(
-            select(IntelEventStageDSnapshot).where(
-                IntelEventStageDSnapshot.event_id == int(event_id),
-                IntelEventStageDSnapshot.snapshot_key == snapshot_key,
-            )
-        )
-
-    def list_event_stage_d_snapshots(
-        self,
-        *,
-        snapshot_key: str = "latest",
-        selected_only: bool = False,
-        limit: int | None = None,
-    ) -> list[IntelEventStageDSnapshot]:
-        stmt = (
-            select(IntelEventStageDSnapshot)
-            .where(IntelEventStageDSnapshot.snapshot_key == snapshot_key)
-            .order_by(IntelEventStageDSnapshot.display_order.asc(), IntelEventStageDSnapshot.event_id.asc())
-        )
-        if selected_only:
-            stmt = stmt.where(IntelEventStageDSnapshot.selected.is_(True))
-        if limit is not None:
-            stmt = stmt.limit(limit)
-        return list(self.session.scalars(stmt).all())
-
-    def clear_event_stage_d_snapshot(self, *, snapshot_key: str = "latest") -> int:
-        """Remove stale rows for a snapshot key before rebuilding it."""
+    def clear_event_stage_d_snapshot(self, *, run_id: int) -> int:
+        """Remove stale Stage-D rows for one private daily build."""
 
         rows = list(
             self.session.scalars(
-                select(IntelEventStageDSnapshot).where(IntelEventStageDSnapshot.snapshot_key == snapshot_key)
+                select(IntelEventStageDSnapshot).where(
+                    IntelEventStageDSnapshot.run_id == int(run_id),
+                )
             ).all()
         )
         for row in rows:
@@ -1859,9 +1451,8 @@ class IntelRepository:
     def ensure_stage(
         self,
         run_id: int,
-        stage_name: str | None = None,
+        stage_name: str,
         *,
-        stage: str | None = None,
         status: str = "pending",
         input_fingerprint: str | None = None,
         config_fingerprint: str | None = None,
@@ -1879,7 +1470,7 @@ class IntelRepository:
         run = self.session.get(IntelRun, int(run_id))
         if run is None:
             raise ValueError(f"intel run {run_id} does not exist")
-        name = _text(stage_name or stage)
+        name = _text(stage_name)
         if not name:
             raise ValueError("stage_name is required")
         row = self.session.scalar(
@@ -1930,18 +1521,12 @@ class IntelRepository:
         self.session.flush()
         return row
 
-    create_stage = ensure_stage
-    upsert_stage = ensure_stage
-    get_or_create_stage = ensure_stage
-
     def get_stage(self, run_id: int, stage_name: str) -> IntelRunStage | None:
         return self.session.scalar(
             select(IntelRunStage).where(
                 IntelRunStage.run_id == int(run_id), IntelRunStage.stage_name == str(stage_name)
             )
         )
-
-    get_run_stage = get_stage
 
     def get_stage_by_id(self, stage_id: int) -> IntelRunStage | None:
         return self.session.get(IntelRunStage, int(stage_id))
@@ -1952,14 +1537,11 @@ class IntelRepository:
             stmt = stmt.where(IntelRunStage.status.in_(list(statuses)))
         return list(self.session.scalars(stmt).all())
 
-    list_run_stages = list_stages
-
     def start_stage(
         self,
         run_id: int,
-        stage_name: str | None = None,
+        stage_name: str,
         *,
-        stage: str | None = None,
         owner: str | None = None,
         lease_owner: str | None = None,
         lease_seconds: int = 300,
@@ -1968,7 +1550,7 @@ class IntelRepository:
     ) -> IntelRunStage | None:
         """Start a stage and acquire its single-stage execution lease."""
 
-        stage_row = self.ensure_stage(run_id, stage_name, stage=stage, **kwargs)
+        stage_row = self.ensure_stage(run_id, stage_name, **kwargs)
         return self.acquire_stage_lease(
             stage_row,
             owner=owner or lease_owner,
@@ -2012,8 +1594,6 @@ class IntelRepository:
         row.updated_at = current
         self.session.flush()
         return row
-
-    claim_stage_lease = acquire_stage_lease
 
     def heartbeat_stage(
         self,
@@ -2096,8 +1676,6 @@ class IntelRepository:
         row.updated_at = utcnow()
         self.session.flush()
         return row
-
-    complete_stage = finish_stage
 
     def ensure_stage_task(
         self,
@@ -2198,12 +1776,6 @@ class IntelRepository:
         self.session.flush()
         return task
 
-    create_stage_task = ensure_stage_task
-    upsert_stage_task = ensure_stage_task
-    create_task = ensure_stage_task
-    upsert_task = ensure_stage_task
-    get_or_create_stage_task = ensure_stage_task
-
     def get_stage_task(self, task_id: int | IntelRunStageTask) -> IntelRunStageTask | None:
         if isinstance(task_id, IntelRunStageTask):
             return task_id
@@ -2271,10 +1843,6 @@ class IntelRepository:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).all())
 
-    list_pending_tasks = list_stage_tasks
-    list_tasks = list_stage_tasks
-    list_recoverable_tasks = list_stage_tasks
-
     def task_is_reusable(
         self,
         task: IntelRunStageTask | int,
@@ -2290,8 +1858,6 @@ class IntelRepository:
         if config_fingerprint is not None and row.config_fingerprint != str(config_fingerprint):
             return False
         return True
-
-    is_task_reusable = task_is_reusable
 
     def claim_stage_task(
         self,
@@ -2399,9 +1965,6 @@ class IntelRepository:
         self.session.flush()
         return task
 
-    claim_task = claim_stage_task
-    claim_recoverable_task = claim_stage_task
-
     def claim_stage_tasks(
         self,
         stage: IntelRunStage | int | None = None,
@@ -2450,9 +2013,6 @@ class IntelRepository:
                 claimed.append(row)
         return claimed
 
-    claim_tasks = claim_stage_tasks
-    claim_recoverable_tasks = claim_stage_tasks
-
     def heartbeat_stage_task(
         self,
         task: IntelRunStageTask | int,
@@ -2480,9 +2040,6 @@ class IntelRepository:
         row.updated_at = current
         self.session.flush()
         return row
-
-    heartbeat_task = heartbeat_stage_task
-    touch_task_lease = heartbeat_stage_task
 
     def complete_stage_task(
         self,
@@ -2541,10 +2098,6 @@ class IntelRepository:
         self.session.flush()
         self.refresh_stage_status(row.stage_id, now=current)
         return row
-
-    finish_stage_task = complete_stage_task
-    complete_task = complete_stage_task
-    record_task_success = complete_stage_task
 
     def fail_stage_task(
         self,
@@ -2612,10 +2165,6 @@ class IntelRepository:
         self.refresh_stage_status(row.stage_id, now=current)
         return row
 
-    mark_task_failed = fail_stage_task
-    fail_task = fail_stage_task
-    record_task_failure = fail_stage_task
-
     def start_stage_attempt(
         self,
         task: IntelRunStageTask | int,
@@ -2651,8 +2200,6 @@ class IntelRepository:
         self.session.flush()
         return attempt
 
-    create_stage_attempt = start_stage_attempt
-
     def finish_stage_attempt(
         self,
         attempt: IntelRunStageAttempt | int,
@@ -2686,8 +2233,6 @@ class IntelRepository:
         )
         self.session.flush()
         return row
-
-    complete_stage_attempt = finish_stage_attempt
 
     def list_stage_attempts(self, task: IntelRunStageTask | int, *, limit: int | None = None) -> list[IntelRunStageAttempt]:
         task_id = int(task.id if isinstance(task, IntelRunStageTask) else task)
@@ -2742,8 +2287,6 @@ class IntelRepository:
             for touched_stage_id in touched_stage_ids:
                 self.refresh_stage_status(touched_stage_id, now=current)
         return rows
-
-    recover_expired_tasks = recover_expired_stage_tasks
 
     def retry_failed(
         self,
@@ -2800,10 +2343,6 @@ class IntelRepository:
             self.session.flush()
             self.refresh_stage_status(stage_row, now=current)
         return selected
-
-    retry_stage = retry_failed
-    reset_failed = retry_failed
-    retry_stage_tasks = retry_failed
 
     def reset_stage(
         self,
@@ -2908,9 +2447,6 @@ class IntelRepository:
         self.session.flush()
         return row
 
-    update_stage_status = refresh_stage_status
-
-    get_stage_summary = stage_summary
 
     def run_stage_summary(self, run_id: int) -> list[StageStateSummary]:
         return [summary for stage in self.list_stages(run_id) if (summary := self.stage_summary(stage)) is not None]
@@ -2926,65 +2462,6 @@ class IntelRepository:
             "retry_waiting_tasks": sum(summary.retry_waiting for summary in summaries),
             "blocked_tasks": sum(summary.blocked for summary in summaries),
         }
-
-    def adopt_existing_stage_tasks(
-        self,
-        run_id: int,
-        stage_name: str,
-        *,
-        config_fingerprint: str | None = None,
-    ) -> list[IntelRunStageTask]:
-        """Reconstruct only trustworthy projection-backed tasks, without AI calls."""
-
-        stage = self.ensure_stage(run_id, stage_name, config_fingerprint=config_fingerprint)
-        name = stage.stage_name.casefold()
-        rows = list(
-            self.session.scalars(
-                select(IntelRunItem)
-                .where(IntelRunItem.run_id == int(run_id))
-                .order_by(IntelRunItem.id.asc())
-            ).all()
-        )
-        adopted: list[IntelRunStageTask] = []
-        for relation in rows:
-            item = self.session.get(IntelItem, relation.item_id)
-            if item is None:
-                continue
-            projection: AIItemScreen | AIItemReview | None
-            if name in {"screen", "stage_a", "a", "stage-a"}:
-                projection = self.session.scalar(select(AIItemScreen).where(AIItemScreen.item_id == item.id))
-            elif name in {"analyze", "analysis", "stage_b", "b", "stage-b"}:
-                projection = self.session.scalar(select(AIItemReview).where(AIItemReview.item_id == item.id))
-            else:
-                projection = None
-            if projection is None or projection.run_id != int(run_id):
-                continue
-            projection_status = _text(getattr(projection, "status", None)) or "success"
-            if name in {"screen", "stage_a", "a", "stage-a"}:
-                decision = _text(getattr(projection, "decision", None)) or "uncertain"
-                task_status = "succeeded" if projection_status == "success" else "blocked"
-                if decision == "pass":
-                    task_status = "succeeded"
-            else:
-                task_status = "succeeded" if projection_status == "success" else "retry_waiting"
-            task = self.ensure_stage_task(
-                stage,
-                subject_type="item",
-                subject_id=item.id,
-                item_id=item.id,
-                input_fingerprint=item.content_hash,
-                config_fingerprint=config_fingerprint or _projection_fingerprint(projection),
-                status=task_status,
-            )
-            task.status = task_status
-            task.result_ref_json = _dump_json({"projection": projection.__class__.__name__, "id": projection.id})
-            task.next_retry_at = None if task_status == "succeeded" else utcnow()
-            task.updated_at = utcnow()
-            self.session.flush()
-            adopted.append(task)
-        return adopted
-
-    adopt_existing = adopt_existing_stage_tasks
 
     def _coerce_stage(self, stage: IntelRunStage | int) -> IntelRunStage | None:
         if isinstance(stage, IntelRunStage):
@@ -3067,25 +2544,6 @@ class IntelRepository:
         return counts
 
 
-def _daily_delta_run_role(
-    requested_role: str | None,
-    *,
-    inserted: bool,
-    material_change: bool,
-    retry_needed: bool,
-) -> str:
-    """Classify one fetched identity without changing custom caller roles."""
-
-    role = _text(requested_role) or RUN_ITEM_ROLE_FETCHED
-    if role != RUN_ITEM_ROLE_FETCHED:
-        return role
-    if inserted:
-        return RUN_ITEM_ROLE_NEW
-    if material_change:
-        return RUN_ITEM_ROLE_CHANGED
-    return RUN_ITEM_ROLE_RETRY if retry_needed else RUN_ITEM_ROLE_UNCHANGED
-
-
 def _run_item_roles(value: str | Iterable[str]) -> list[str]:
     values = [value] if isinstance(value, str) else value
     result: list[str] = []
@@ -3094,17 +2552,6 @@ def _run_item_roles(value: str | Iterable[str]) -> list[str]:
         if role and role not in result:
             result.append(role)
     return result or [RUN_ITEM_ROLE_FETCHED]
-
-
-def _run_item_role_priority(value: Any) -> int:
-    role = _text(value) or RUN_ITEM_ROLE_FETCHED
-    return {
-        RUN_ITEM_ROLE_UNCHANGED: 0,
-        RUN_ITEM_ROLE_FETCHED: 1,
-        RUN_ITEM_ROLE_RETRY: 2,
-        RUN_ITEM_ROLE_CHANGED: 2,
-        RUN_ITEM_ROLE_NEW: 3,
-    }.get(role, 1)
 
 
 def _item_has_material_change(
@@ -3135,12 +2582,6 @@ def _item_has_material_change(
     if not is_github_repository and fields["content_hash"] and existing.content_hash != fields["content_hash"]:
         return True
     return False
-
-
-def _item_requires_daily_retry(existing: IntelItem) -> bool:
-    """Retain recovery for work that never reached a terminal selection."""
-
-    return existing.status in {"new", "ai_failed", "screen_failed", "analysis_failed"}
 
 
 def _item_fields(item: Any) -> dict[str, Any]:
@@ -3371,32 +2812,6 @@ def _identity_alias_url(value: str | None) -> str | None:
 
 def _identity_alias_external(value: str | None) -> str | None:
     return f"external:{value}" if value else None
-
-
-def _event_key_from_values(values: Mapping[str, Any]) -> str:
-    canonical = _canonical_url(values.get("canonical_url") or values.get("url") or values.get("source_url"))
-    if canonical:
-        return _identity_alias_url(canonical) or "item:unknown"
-    external = _normalize_event_external_id(values.get("external_id"))
-    if external:
-        return _identity_alias_external(external) or "item:unknown"
-    for name in ("primary_item_id", "item_id", "id"):
-        try:
-            item_id = int(values.get(name))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if item_id > 0:
-            return f"item:{item_id}"
-    # This branch is only for direct repository callers that did not supply an
-    # event key or a stable anchor.  Incorporating the available provenance
-    # avoids making the headline itself an exact identity.
-    payload = {
-        "title": _normalize_event_title(values.get("normalized_title") or values.get("title")),
-        "source_id": _text(values.get("source_id")),
-        "published_at": str(values.get("published_at") or values.get("captured_at") or ""),
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return "unanchored:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 def _normalize_novelty_status(value: Any) -> str | None:
@@ -3655,10 +3070,10 @@ def _as_edition_date(value: Any) -> date | None:
         return None
 
 
-def _build_scope(column, build_id: int | None):
-    """Return the SQL predicate for one private build/legacy namespace."""
+def _build_scope(column, build_id: int):
+    """Return the SQL predicate for one private build namespace."""
 
-    return column.is_(None) if build_id is None else column == int(build_id)
+    return column == int(build_id)
 
 
 def _identity_hash(external_id: str | None, url: str | None, title: str, content: str | None) -> str:

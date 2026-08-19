@@ -134,22 +134,10 @@ class FeedCollector(Collector):
         )
 
 
-class RSSCollector(FeedCollector):
-    """Compatibility name for native RSS/Atom feeds."""
-
-
-class RSSHubCollector(FeedCollector):
-    """Compatibility name; RSSHub uses the exact same feed implementation."""
-
-
 class ProductHuntCollector(FeedCollector):
     """Map Product Hunt's public Atom feed without API or GraphQL fallback."""
 
     def __init__(self, *args: Any, github_lookup=None, **kwargs: Any) -> None:
-        # Accept and discard removed settings during a rolling job upgrade.
-        # They must never affect routing or trigger an API request.
-        kwargs.pop("api_token", None)
-        kwargs.pop("api_url", None)
         super().__init__(*args, **kwargs)
         self.github_lookup = github_lookup
 
@@ -265,4 +253,4 @@ def _response_header(response: Any, name: str) -> str | None:
     return text or None
 
 
-__all__ = ["FeedCollector", "ProductHuntCollector", "RSSCollector", "RSSHubCollector"]
+__all__ = ["FeedCollector", "ProductHuntCollector"]

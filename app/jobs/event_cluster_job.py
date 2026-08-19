@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.ai.event_resolution import event_resolution_client_from_settings, resolve_event_group
@@ -24,12 +24,10 @@ from app.domain.recency import recent_window_decision
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import (
-    AIItemReview,
     DailyEdition,
     DailyEditionReportEntry,
     IntelEvent,
     IntelEventItem,
-    IntelEventStageDSnapshot,
     IntelItem,
     IntelRun,
     IntelRunItem,
@@ -49,6 +47,7 @@ DAILY_HISTORY_DAYS = 3
 
 @dataclass
 class EventClusterResult:
+    run_id: int
     processed: int = 0
     events: int = 0
     merged: int = 0
@@ -60,20 +59,14 @@ class EventClusterResult:
     failed: int = 0
     errors: list[str] = field(default_factory=list)
     event_ids: list[int] = field(default_factory=list)
-    # ``event_ids`` is kept as the historical new-event projection for API
-    # compatibility.  Stage D needs the complete current Stage-C projection,
-    # including candidates that were matched to an existing event row.
+    # Stage D needs the complete current Stage-C projection, including
+    # candidates that were matched to an event already created in this build.
     current_event_ids: list[int] = field(default_factory=list)
-    snapshot_key: str = "latest"
-    run_id: int | None = None
     reference_time: datetime | None = None
 
     @property
     def new_event_ids(self) -> list[int]:
         return self.event_ids
-
-
-ClusterResult = EventClusterResult
 
 
 @dataclass(frozen=True)
@@ -423,19 +416,16 @@ def run_event_cluster_job(
     history_hook: Callable[..., Any] | None = None,
     history_provider: Callable[..., Any] | None = None,
     item_ids: Iterable[int] | None = None,
-    snapshot_key: str | None = None,
-    run_id: int | None = None,
+    run_id: int,
     **_: Any,
 ) -> EventClusterResult:
     """Aggregate current Stage-B candidates into new or historical events.
 
-    When a run id is supplied, its reference time and candidate membership are
-    durable inputs.  A retry therefore never needs to invoke Stage A/B or
-    consult the mutable ``IntelItem.status`` projection as orchestration state.
+    The build's reference time and Stage-B membership are durable inputs. A
+    retry never invokes Stage A/B or consults a global item projection.
     """
 
-    key = _effective_snapshot_key(snapshot_key, run_id)
-    result = EventClusterResult(snapshot_key=key, run_id=run_id)
+    result = EventClusterResult(run_id=run_id)
     del history_hook, history_provider
     stage = None
     stage_task = None
@@ -443,21 +433,21 @@ def run_event_cluster_job(
     with session_factory() as session:
         try:
             repo = IntelRepository(session)
-            run = session.get(IntelRun, int(run_id)) if run_id is not None else None
-            frozen_reference = _as_utc(reference_time) or _as_utc(run.reference_time if run else None)
+            run = session.get(IntelRun, int(run_id))
+            if run is None or run.edition_id is None:
+                raise ValueError("Stage C requires the current daily edition build")
+            frozen_reference = _as_utc(reference_time) or _as_utc(run.reference_time)
             frozen_reference = frozen_reference or _as_utc(now) or datetime.now(timezone.utc)
-            if run_id is not None and run is not None:
-                stage = repo.ensure_stage(
-                    int(run_id),
-                    "cluster",
-                    reference_time=frozen_reference,
-                    metadata={
-                        "snapshot_key": key,
-                        "history_mode": "prior_selected_daily",
-                        "daily_history_days": DAILY_HISTORY_DAYS,
-                        "freshness_window_hours": RECENT_WINDOW_HOURS,
-                    },
-                )
+            stage = repo.ensure_stage(
+                int(run_id),
+                "cluster",
+                reference_time=frozen_reference,
+                metadata={
+                    "history_mode": "prior_published_daily_reports",
+                    "daily_history_days": DAILY_HISTORY_DAYS,
+                    "freshness_window_hours": RECENT_WINDOW_HOURS,
+                },
+            )
             current = _as_utc(stage.reference_time if stage is not None else frozen_reference) or frozen_reference
             result.reference_time = current
             items = _load_cluster_items(
@@ -470,49 +460,46 @@ def run_event_cluster_job(
             )
             candidates = [_item_candidate(item) for item in items]
             result.processed = len(candidates)
-            if stage is not None:
-                input_fingerprint = _cluster_input_fingerprint(candidates)
-                stage_task = repo.ensure_stage_task(
-                    stage,
-                    subject_type="run",
-                    subject_id=int(run_id),
-                    target_run_id=int(run_id),
+            input_fingerprint = _cluster_input_fingerprint(candidates)
+            stage_task = repo.ensure_stage_task(
+                stage,
+                subject_type="run",
+                subject_id=int(run_id),
+                target_run_id=int(run_id),
+                input_fingerprint=input_fingerprint,
+                config_fingerprint="cluster-v2",
+            )
+            claimed = repo.claim_stage_task(
+                stage,
+                task_id=stage_task.id,
+                owner=owner,
+                force=force,
+                input_fingerprint=input_fingerprint,
+                config_fingerprint="cluster-v2",
+            )
+            if claimed is None:
+                if repo.task_is_reusable(
+                    stage_task,
                     input_fingerprint=input_fingerprint,
                     config_fingerprint="cluster-v2",
-                )
-                claimed = repo.claim_stage_task(
-                    stage,
-                    task_id=stage_task.id,
-                    owner=owner,
-                    force=force,
-                    input_fingerprint=input_fingerprint,
-                    config_fingerprint="cluster-v2",
-                )
-                if claimed is None:
-                    if repo.task_is_reusable(
-                        stage_task,
-                        input_fingerprint=input_fingerprint,
-                        config_fingerprint="cluster-v2",
-                    ):
-                        stored = _mapping(stage_task.result)
-                        result.event_ids = _event_id_list(stored.get("event_ids"))
-                        result.current_event_ids = _event_id_list(
-                            stored.get("current_event_ids"),
-                            fallback=result.event_ids,
-                        )
-                        result.processed = 0
-                        return result
-                    result.failed = 1
-                    result.errors.append("cluster stage is already running")
+                ):
+                    stored = _mapping(stage_task.result)
+                    result.event_ids = _event_id_list(stored.get("event_ids"))
+                    result.current_event_ids = _event_id_list(
+                        stored.get("current_event_ids"),
+                        fallback=result.event_ids,
+                    )
+                    result.processed = 0
                     return result
-                stage_task = claimed
-                # Keep the lease/task claim durable independently from event
-                # writes.  A failed group must not roll it back.
-                session.commit()
+                result.failed = 1
+                result.errors.append("cluster stage is already running")
+                return result
+            stage_task = claimed
+            # Keep the lease/task claim durable independently from event
+            # writes. A failed group must not roll it back.
+            session.commit()
             history_events = _load_history_events(
                 session,
-                current=current,
-                snapshot_key=key,
                 run=run,
             )
             in_run_events: dict[int, IntelEvent] = {}
@@ -539,9 +526,8 @@ def run_event_cluster_job(
                             )
                             if is_new:
                                 result.events += 1
-                                if run_id is None or event.new_in_run_id == run_id:
-                                    if event.id not in result.event_ids:
-                                        result.event_ids.append(event.id)
+                                if event.id not in result.event_ids:
+                                    result.event_ids.append(event.id)
                             else:
                                 result.repeats += 1
                             if event.id not in result.current_event_ids:
@@ -549,8 +535,7 @@ def run_event_cluster_job(
                             result.merged += max(0, len(subgroup) - 1)
                             if event.id not in {row.id for row in history_events}:
                                 history_events.append(event)
-                            if run_id is not None and event.new_in_run_id == run_id:
-                                in_run_events[event.id] = event
+                            in_run_events[event.id] = event
                 except Exception as exc:
                     result.failed += 1
                     result.errors.append(f"event_group={values[0].get('id')}: {exc}")
@@ -558,55 +543,49 @@ def run_event_cluster_job(
                     # The nested transaction above isolates one bad group;
                     # already persisted events and the stage lease survive.
             session.commit()
-            if stage_task is not None:
-                if result.failed:
-                    repo.fail_stage_task(
-                        stage_task,
-                        error_category="stage",
-                        error_code="cluster_group_failed",
-                        error_message="; ".join(result.errors)[-4000:],
-                        retryable=True,
-                        owner=owner,
-                    )
-                else:
-                    repo.complete_stage_task(
-                        stage_task,
-                        owner=owner,
-                        result={
-                            "event_ids": result.event_ids,
-                            "current_event_ids": result.current_event_ids,
-                            "processed": result.processed,
-                        },
-                    )
-                session.commit()
+            if result.failed:
+                repo.fail_stage_task(
+                    stage_task,
+                    error_category="stage",
+                    error_code="cluster_group_failed",
+                    error_message="; ".join(result.errors)[-4000:],
+                    retryable=True,
+                    owner=owner,
+                )
+            else:
+                repo.complete_stage_task(
+                    stage_task,
+                    owner=owner,
+                    result={
+                        "event_ids": result.event_ids,
+                        "current_event_ids": result.current_event_ids,
+                        "processed": result.processed,
+                    },
+                )
+            session.commit()
         except Exception as exc:
             session.rollback()
             result.failed += 1
             result.errors.append(str(exc))
             LOGGER.exception("Event cluster job failed")
-            if run_id is not None:
-                try:
-                    with session_factory() as state_session:
-                        state_repo = IntelRepository(state_session)
-                        state_stage = state_repo.get_stage(int(run_id), "cluster")
-                        state_task = state_repo.get_task(state_stage, subject_type="run", subject_id=int(run_id)) if state_stage else None
-                        if state_task is not None and state_task.status == "running":
-                            state_repo.fail_stage_task(
-                                state_task,
-                                error_category="stage",
-                                error_code="cluster_failed",
-                                error_message=str(exc),
-                                retryable=True,
-                                owner=owner,
-                            )
-                        state_session.commit()
-                except Exception:
-                    LOGGER.exception("Unable to persist cluster stage failure")
+            try:
+                with session_factory() as state_session:
+                    state_repo = IntelRepository(state_session)
+                    state_stage = state_repo.get_stage(int(run_id), "cluster")
+                    state_task = state_repo.get_task(state_stage, subject_type="run", subject_id=int(run_id)) if state_stage else None
+                    if state_task is not None and state_task.status == "running":
+                        state_repo.fail_stage_task(
+                            state_task,
+                            error_category="stage",
+                            error_code="cluster_failed",
+                            error_message=str(exc),
+                            retryable=True,
+                            owner=owner,
+                        )
+                    state_session.commit()
+            except Exception:
+                LOGGER.exception("Unable to persist cluster stage failure")
     return result
-
-
-def run_cluster_job(**kwargs: Any) -> EventClusterResult:
-    return run_event_cluster_job(**kwargs)
 
 
 def run_event_cluster_from_settings(*, settings: Settings, ai_client: Any | None = None, **kwargs: Any) -> EventClusterResult:
@@ -616,12 +595,6 @@ def run_event_cluster_from_settings(*, settings: Settings, ai_client: Any | None
     if resolver is None:
         resolver = event_resolution_client_from_settings(settings)
     return run_event_cluster_job(session_factory=create_session_factory(engine), ai_client=resolver, **kwargs)
-
-
-def _effective_snapshot_key(snapshot_key: str | None, run_id: int | None) -> str:
-    if snapshot_key:
-        return str(snapshot_key)
-    return f"run-{int(run_id)}" if run_id is not None else "latest"
 
 
 def _cluster_input_fingerprint(candidates: Sequence[Mapping[str, Any]]) -> str:
@@ -663,7 +636,7 @@ def _event_id_list(value: Any, *, fallback: Iterable[int] = ()) -> list[int]:
 def _load_cluster_items(
     session: Session,
     *,
-    run_id: int | None,
+    run_id: int,
     item_ids: Iterable[int] | None,
     limit: int | None,
     stage: Any | None = None,
@@ -673,38 +646,17 @@ def _load_cluster_items(
     if item_ids is not None:
         ids = [int(item_id) for item_id in item_ids]
         stmt = stmt.where(IntelItem.id.in_(ids or [-1]))
-    elif run_id is not None:
-        stmt = stmt.join(IntelRunItem, IntelRunItem.item_id == IntelItem.id).where(IntelRunItem.run_id == int(run_id))
-        # Prefer durable Stage-B task state.  The mutable item status remains
-        # only a compatibility fallback for old runs with no task table row.
-        task_ids = _successful_analysis_item_ids(session, int(run_id)) if stage is not None else []
-        if task_ids:
-            stmt = stmt.where(IntelItem.id.in_(task_ids))
-        else:
-            # Older runs may not have durable Stage-B tasks yet.  A successful
-            # candidate review tied to this run is still trustworthy and
-            # avoids falling back to the mutable global item status.
-            review_ids: list[int] = []
-            for review in session.scalars(
-                select(AIItemReview)
-                .join(IntelItem, AIItemReview.item_id == IntelItem.id)
-                .where(
-                    AIItemReview.run_id == int(run_id),
-                    AIItemReview.status == "success",
-                )
-            ).all():
-                # ``status=success`` describes a completed provider call.  It
-                # does not mean that Stage B kept the item as a candidate:
-                # filtered analyses are intentionally persisted as successful
-                # projections for auditability.  Keep the compatibility path
-                # aligned with the durable-task path below.
-                if not _analysis_result_is_filtered({"reason": review.reason}):
-                    review_ids.append(int(review.item_id))
-            stmt = stmt.where(IntelItem.id.in_(review_ids or [-1]))
     else:
-        stmt = stmt.where(IntelItem.status == "candidate")
+        task_ids = _successful_analysis_item_ids(session, int(run_id)) if stage is not None else []
+        stmt = (
+            stmt.join(IntelRunItem, IntelRunItem.item_id == IntelItem.id)
+            .where(
+                IntelRunItem.run_id == int(run_id),
+                IntelItem.id.in_(task_ids or [-1]),
+            )
+        )
     items = list(session.scalars(stmt).unique().all())
-    if run_id is not None and reference_time is not None:
+    if reference_time is not None:
         items = [
             item
             for item in items
@@ -720,13 +672,10 @@ def _load_cluster_items(
 
 
 def _successful_analysis_item_ids(session: Session, run_id: int) -> list[int]:
-    """Read successful Stage-B *candidate* tasks for ``run_id``.
+    """Read successful Stage-B analysis tasks for ``run_id``.
 
-    Stage B records both retained candidates and ``analysis_filtered`` items
-    with task status ``succeeded`` because the provider call itself completed
-    successfully.  Stage C must therefore inspect the task result (and the
-    run-scoped review as a compatibility fallback), rather than treating task
-    success as candidate eligibility.
+    Stage B's value score is a signal rather than a gate. Every succeeded
+    analysis task in the current build is therefore a Stage-C input.
     """
 
     from app.storage.models import IntelRunStage, IntelRunStageTask
@@ -734,19 +683,11 @@ def _successful_analysis_item_ids(session: Session, run_id: int) -> list[int]:
     stage = session.scalar(
         select(IntelRunStage).where(
             IntelRunStage.run_id == int(run_id),
-            IntelRunStage.stage_name.in_(("analyze", "analysis", "stage_b", "stage-b")),
+            IntelRunStage.stage_name == "analyze",
         )
     )
     if stage is None:
         return []
-    review_reasons = {
-        int(item_id): reason
-        for item_id, reason in session.execute(
-            select(AIItemReview.item_id, AIItemReview.reason).where(
-                AIItemReview.run_id == int(run_id),
-            )
-        ).all()
-    }
     values: list[int] = []
     for task in session.scalars(
         select(IntelRunStageTask).where(
@@ -763,61 +704,23 @@ def _successful_analysis_item_ids(session: Session, run_id: int) -> list[int]:
         if item_id is None:
             continue
 
-        # Current Stage B tasks persist the normalized AnalysisResult, whose
-        # reason is prefixed with ``analysis_filtered:`` for rejected output.
-        # Older rows may only have the run-scoped AIItemReview projection, so
-        # consult that projection when the task result has no marker.
-        if _analysis_result_is_filtered(task.result):
-            continue
-        if _analysis_result_is_filtered({"reason": review_reasons.get(item_id)}):
-            continue
         values.append(item_id)
     return values
-
-
-def _analysis_result_is_filtered(value: Any) -> bool:
-    """Return whether a Stage-B result is an analysis-filtered projection."""
-
-    data = _mapping(value)
-    reason = _text(data.get("reason"))
-    if reason is not None and reason.casefold().startswith("analysis_filtered"):
-        return True
-    if data.get("filtered") is True:
-        return True
-    metadata = _mapping(data.get("metadata"))
-    return metadata.get("filtered") is True
 
 
 def _load_history_events(
     session: Session,
     *,
-    current: datetime,
-    snapshot_key: str,
-    run: IntelRun | None = None,
+    run: IntelRun,
     daily_history_days: int = DAILY_HISTORY_DAYS,
 ) -> list[IntelEvent]:
-    """Load only previous public daily selections for a run-scoped edition.
+    """Load previous published daily reports plus this build's current events."""
 
-    The database remains the audit store, but the current daily event pool is
-    not deduplicated against every recent event row.  For normal pipeline
-    runs, historical matching is deliberately limited to the latest public
-    edition for each recent date.  The run-less branch preserves the legacy
-    compatibility facade used by older direct callers.
-    """
-
-    if run is not None:
-        return _load_selected_daily_history_events(
-            session,
-            run=run,
-            days=daily_history_days,
-        )
-
-    # Legacy direct calls have no public edition boundary. Keep their former
-    # bounded behaviour instead of inventing a date-addressed daily scope.
-    since = current - timedelta(hours=72)
-    snapshot_ids = select(IntelEventStageDSnapshot.event_id).where(IntelEventStageDSnapshot.snapshot_key == snapshot_key, IntelEventStageDSnapshot.selected.is_(True))
-    stmt = select(IntelEvent).options(joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_review), joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.source), joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source)).where(or_(IntelEvent.last_seen_at >= since, IntelEvent.first_seen_at >= since, IntelEvent.id.in_(snapshot_ids))).order_by(IntelEvent.id.asc())
-    return list(session.scalars(stmt).unique().all())
+    return _load_selected_daily_history_events(
+        session,
+        run=run,
+        days=daily_history_days,
+    )
 
 
 def _load_selected_daily_history_events(
@@ -826,13 +729,8 @@ def _load_selected_daily_history_events(
     run: IntelRun,
     days: int,
 ) -> list[IntelEvent]:
-    if days <= 0 or not run.edition_date:
+    if days <= 0 or run.edition_id is None or not run.edition_date:
         return []
-    # Direct/legacy callers still create a bare IntelRun rather than a daily
-    # build.  Keep their historical snapshot lookup isolated here so the
-    # public daily path can rely exclusively on published report entries.
-    if run.edition_id is None:
-        return _load_legacy_selected_daily_history_events(session, run=run, days=days)
     try:
         current_edition = date.fromisoformat(run.edition_date)
     except ValueError:
@@ -869,96 +767,11 @@ def _load_selected_daily_history_events(
                 joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.source),
                 joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source),
             )
-            .where(
-                or_(
-                    IntelEvent.build_id == int(run.id),
-                    IntelEvent.first_run_id == int(run.id),
-                    IntelEvent.last_run_id == int(run.id),
-                    IntelEvent.new_in_run_id == int(run.id),
-                )
-            )
+            .where(IntelEvent.build_id == int(run.id))
             .order_by(IntelEvent.id.asc())
         ).unique().all()
     )
     return [*history, *current_events]
-
-
-def _load_legacy_selected_daily_history_events(
-    session: Session,
-    *,
-    run: IntelRun,
-    days: int,
-) -> list[IntelEvent]:
-    """Compatibility lookup for non-daily direct job callers only."""
-
-    if days <= 0 or not run.edition_date:
-        return []
-    try:
-        current_edition = date.fromisoformat(run.edition_date)
-    except ValueError:
-        return []
-    earliest = current_edition - timedelta(days=days)
-    previous_runs = list(
-        session.scalars(
-            select(IntelRun)
-            .where(
-                IntelRun.status.in_(("completed", "completed_with_errors", "partial")),
-                IntelRun._edition_date >= earliest,
-                IntelRun._edition_date < current_edition,
-            )
-            .order_by(IntelRun._edition_date.desc(), IntelRun.id.desc())
-        ).all()
-    )
-    latest_by_edition: dict[str, IntelRun] = {}
-    for previous_run in previous_runs:
-        if previous_run.edition_date:
-            latest_by_edition.setdefault(previous_run.edition_date, previous_run)
-    conditions = [
-        and_(
-            IntelEventStageDSnapshot.run_id == int(previous_run.id),
-            IntelEventStageDSnapshot.snapshot_key == previous_run.daily_snapshot_key,
-        )
-        for previous_run in latest_by_edition.values()
-    ]
-    event_ids: list[int] = []
-    if conditions:
-        event_ids.extend(
-            int(event_id)
-            for event_id in session.scalars(
-                select(IntelEventStageDSnapshot.event_id).where(
-                    IntelEventStageDSnapshot.selected.is_(True),
-                    or_(*conditions),
-                )
-            ).all()
-        )
-    event_ids.extend(
-        int(event_id)
-        for event_id in session.scalars(
-            select(IntelEvent.id).where(
-                or_(
-                    IntelEvent.first_run_id == int(run.id),
-                    IntelEvent.last_run_id == int(run.id),
-                    IntelEvent.new_in_run_id == int(run.id),
-                )
-            )
-        ).all()
-    )
-    event_ids = list(dict.fromkeys(event_ids))
-    if not event_ids:
-        return []
-    stmt = (
-        select(IntelEvent)
-        .options(
-            joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_review),
-            joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.source),
-            joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source),
-        )
-        .where(IntelEvent.id.in_(event_ids))
-        .order_by(IntelEvent.id.asc())
-    )
-    return list(session.scalars(stmt).unique().all())
-
-
 def _history_event_from_report(
     entry: DailyEditionReportEntry,
     *,
@@ -1111,7 +924,7 @@ def _find_resolver(client: Any) -> Callable[..., Any] | None:
     return client if callable(client) else None
 
 
-def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, current: datetime, run_id: int | None, history_events: Sequence[IntelEvent], in_run_events: Mapping[int, IntelEvent], resolver: _GroupResolution, ai_client: Any | None) -> tuple[IntelEvent, bool, str]:
+def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, current: datetime, run_id: int, history_events: Sequence[IntelEvent], in_run_events: Mapping[int, IntelEvent], resolver: _GroupResolution, ai_client: Any | None) -> tuple[IntelEvent, bool, str]:
     projection = _event_projection(values, current=current)
     group_resolution_method = resolver.method
     match, match_kind = _match_history_event(values, history_events, current=current, run_id=run_id, in_run_events=in_run_events)
@@ -1138,7 +951,6 @@ def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, cur
         projection.update(
             event_key=match.event_key,
             run_id=run_id,
-            new_in_run_id=match.new_in_run_id,
             novelty_status="repeat" if not current_match else match.novelty_status,
             resolution_method=match_kind,
             resolution_confidence=100 if match_kind == "repeat_exact" else 85,
@@ -1146,7 +958,6 @@ def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, cur
     else:
         projection.update(
             run_id=run_id,
-            new_in_run_id=run_id,
             novelty_status="new",
             resolution_method=resolver.method,
             resolution_confidence=resolver.confidence,
@@ -1280,7 +1091,7 @@ def _history_github_repo_compatible(candidate_repos: frozenset[str], event_repos
     return True
 
 
-def _match_history_event(values: Sequence[Mapping[str, Any]], history_events: Sequence[IntelEvent], *, current: datetime, run_id: int | None, in_run_events: Mapping[int, IntelEvent]) -> tuple[IntelEvent | None, str]:
+def _match_history_event(values: Sequence[Mapping[str, Any]], history_events: Sequence[IntelEvent], *, current: datetime, run_id: int, in_run_events: Mapping[int, IntelEvent]) -> tuple[IntelEvent | None, str]:
     candidate_ids = {identity for value in values for identity in _strong_identity_keys(value)}
     item_ids = {int(value["id"]) for value in values if value.get("id") is not None}
     candidate_repos = frozenset(
@@ -1296,7 +1107,7 @@ def _match_history_event(values: Sequence[Mapping[str, Any]], history_events: Se
         seen.add(event.id)
         event_identity = _event_strong_identity_keys(event)
         if any(int(relation.item_id) in item_ids for relation in event.event_items) or candidate_ids & event_identity:
-            return event, "repeat_exact" if (run_id is None or event.new_in_run_id != run_id) else "same_run"
+            return event, "same_run" if int(event.id) in in_run_events else "repeat_exact"
     primary = max(values, key=lambda value: (_number(value.get("selection_score")), _as_utc(value.get("published_at")) or datetime.min.replace(tzinfo=timezone.utc)))
     candidates: list[tuple[float, IntelEvent]] = []
     for event in [*in_run_events.values(), *history_events]:
@@ -1420,4 +1231,4 @@ def _iso_datetime(value: Any) -> str | None:
     return current.isoformat() if current is not None else None
 
 
-__all__ = ["ClusterResult", "EventClusterResult", "build_candidate_clusters", "canonical_event_key", "canonical_event_url", "cluster_candidates", "exact_identity_keys", "github_repo_identity", "normalize_event_title", "resolve_ambiguous_group", "run_cluster_job", "run_event_cluster_from_settings", "run_event_cluster_job"]
+__all__ = ["EventClusterResult", "build_candidate_clusters", "canonical_event_key", "canonical_event_url", "cluster_candidates", "exact_identity_keys", "github_repo_identity", "normalize_event_title", "resolve_ambiguous_group", "run_event_cluster_from_settings", "run_event_cluster_job"]

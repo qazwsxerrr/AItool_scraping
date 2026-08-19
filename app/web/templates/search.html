@@ -12,9 +12,9 @@
 
 <form class="search-hero" action="/search" method="get">
   <label class="sr-only" for="search-query">搜索情报</label>
-  <select name="run_date" aria-label="日报">
+  <select name="edition_date" aria-label="日报">
     {% for option in edition_options %}
-      <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}{% if option.partial %} · partial{% endif %}</option>
+      <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}</option>
     {% endfor %}
   </select>
   <input id="search-query" name="q" type="search" placeholder="例如：Claude Code、MCP、Agent、GitHub..." value="{{ query }}" autofocus>
@@ -29,7 +29,7 @@
 {% elif total_count == 0 %}
   <div class="empty-state">
     <h3>没有找到相关内容</h3>
-    <p>可以换一个关键词，或先运行 fetch 与 ai-review 生成更多数据。</p>
+    <p>可以换一个关键词，或先运行 pipeline run 生成当天日报。</p>
   </div>
 {% else %}
   <section class="search-summary">

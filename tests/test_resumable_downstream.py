@@ -1,25 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import json
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
-from app.jobs.stage_d_job import StageDProfile, run_stage_d_job
+from app.domain.models import FetchItem
 from app.jobs.event_cluster_job import run_event_cluster_job
 from app.jobs.export_job import run_intel_export_job
+from app.jobs.stage_d_job import StageDProfile, run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import (
-    AIItemReview,
-    IntelEvent,
-    IntelEventItem,
-    IntelEventStageDSnapshot,
-    IntelItem,
-    IntelRun,
-    IntelRunStage,
-    IntelRunStageTask,
-    Source,
-)
+from app.storage.models import AIItemReview, IntelEventItem, IntelRunStage, IntelRunStageTask, Source
 from app.storage.repository import IntelRepository
 
 
@@ -59,7 +50,7 @@ class _PhasedClient:
                     "editorial_score": 90,
                     "story_family_id": f"family-{event['event_id']}",
                     "family_position": 1,
-                    "display_title_zh": "运行范围更新事件",
+                    "display_title_zh": "本期日报运行范围更新事件",
                     "title_supporting_fields": ["title", "summary_cn"],
                     "reason_codes": ["material_change"],
                     "editorial_reason": "测试事件适合进入日报。",
@@ -76,87 +67,101 @@ def _db():
     return create_session_factory(engine)
 
 
-def _run_with_item(
+def _build_with_stage_b_items(
     session_factory,
     *,
     reference_time: datetime,
-    title: str,
-    score: int = 80,
-    run_id: int | None = None,
-):
+    rows: list[tuple[str, int, str]],
+) -> tuple[int, dict[str, int]]:
+    """Seed one immutable daily build with completed Stage-B tasks."""
+
     with session_factory() as session:
         repo = IntelRepository(session)
-        run = session.get(IntelRun, run_id) if run_id is not None else repo.start_run(reference_time=reference_time)
-        assert run is not None
-        source_id = f"source-{run.id}"
-        source = session.get(Source, source_id)
-        if source is None:
-            source = Source(
-                id=source_id,
+        session.add(
+            Source(
+                id="downstream-source",
                 name="Source",
                 transport="feed",
-                url="https://source.example/feed",
+                url="https://source.example/feed.xml",
+                source_group="official_blog",
                 content_class="official_model_company",
             )
-            session.add(source)
-            session.flush()
-        item = IntelItem(
-            source_id=source.id,
-            title=title,
-            content_class="official_model_company",
-            content_hash=(f"{run.id}-{title}" * 8)[:64],
-            selection_score=score,
-            status="analysis_failed",  # deliberately not the orchestration input
-            published_at=reference_time,
-            captured_at=reference_time,
         )
-        session.add(item)
         session.flush()
-        repo.record_run_item(run.id, item.id)
-        session.add(
-            AIItemReview(
-                item_id=item.id,
-                run_id=run.id,
-                content_class="official_model_company",
-                topic="model",
-                topics_json='["model"]',
-                keywords_json='["gpt-5", "release"]',
-                entities_json=json.dumps([{"type": "company", "name": "OpenAI"}]),
-                selection_score=score,
-                status="success",
-            )
+        _, build = repo.start_daily_build(
+            edition_date="2026-08-15",
+            reference_time=reference_time,
         )
+        analyze = repo.ensure_stage(build.id, "analyze")
+        item_ids: dict[str, int] = {}
+        for index, (title, score, status) in enumerate(rows, start=1):
+            inserted = repo.insert_item(
+                FetchItem(
+                    source_id="downstream-source",
+                    external_id=f"downstream-{index}",
+                    title=title,
+                    url=f"https://source.example/{index}",
+                    summary=f"{title} summary",
+                    content_class="official_model_company",
+                    published_at=reference_time,
+                    captured_at=reference_time,
+                ),
+                run_id=build.id,
+            )
+            assert inserted.item_id is not None
+            item_id = int(inserted.item_id)
+            item_ids[title] = item_id
+            session.add(
+                AIItemReview(
+                    item_id=item_id,
+                    content_class="official_model_company",
+                    topic="model",
+                    topics_json='["model"]',
+                    keywords_json='["gpt-5", "release"]',
+                    entities_json=json.dumps([{"type": "company", "name": "OpenAI"}]),
+                    summary_cn=f"{title} summary",
+                    selection_score=score,
+                    reason=status,
+                    status="success",
+                )
+            )
+            task = repo.ensure_stage_task(
+                analyze,
+                subject_type="item",
+                subject_id=item_id,
+                item_id=item_id,
+            )
+            repo.complete_stage_task(
+                task,
+                result={"item_id": item_id, "status": "success", "selection_score": score},
+            )
+        repo.finish_stage(analyze, status="succeeded")
+        repo.freeze_run_scope(build.id)
         session.commit()
-        return run.id, item.id
+        return int(build.id), item_ids
 
 
-def test_cluster_uses_frozen_reference_time_and_run_projection_on_retry():
+def test_cluster_retry_keeps_the_frozen_reference_time_and_current_build_projection():
     session_factory = _db()
     reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
-    run_id, _ = _run_with_item(session_factory, reference_time=reference, title="Orchid Systems processor")
-
-    first = run_event_cluster_job(session_factory=session_factory, run_id=run_id, reference_time=reference)
-    assert first.events == 1
-    assert first.reference_time == reference
-
-    # A later retry sees a new Stage-B projection in the same run, while the
-    # global item status intentionally still says analysis_failed.
-    _, second_item_id = _run_with_item(
+    run_id, _ = _build_with_stage_b_items(
         session_factory,
         reference_time=reference,
-        title="Orchid Systems accelerator",
-        run_id=run_id,
+        rows=[("Orchid Systems processor", 80, "candidate")],
     )
-    assert second_item_id > 0
 
+    first = run_event_cluster_job(session_factory=session_factory, run_id=run_id, reference_time=reference)
     second = run_event_cluster_job(
         session_factory=session_factory,
         run_id=run_id,
+        force=True,
         now=reference + timedelta(hours=100),
     )
+
+    assert first.events == 1
+    assert first.reference_time == reference
     assert second.reference_time == reference
     assert second.repeats == 1
-
     with session_factory() as session:
         stage = session.scalar(
             select(IntelRunStage).where(
@@ -164,196 +169,64 @@ def test_cluster_uses_frozen_reference_time_and_run_projection_on_retry():
                 IntelRunStage.stage_name == "cluster",
             )
         )
-        task = session.scalar(
-            select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id)
-        )
-        assert task.status == "succeeded"
+        task = session.scalar(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id))
+        assert task is not None and task.status == "succeeded"
 
 
-def test_cluster_excludes_analysis_filtered_stage_b_tasks():
+def test_cluster_includes_low_signal_analysis_stage_b_tasks():
+    """A successful Stage-B task remains Stage-C input even at a low score."""
+
     session_factory = _db()
     reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        run = repo.start_run(reference_time=reference)
-        source = Source(
-            id=f"source-{run.id}",
-            name="Source",
-            transport="feed",
-            url="https://source.example/feed",
-            content_class="official_model_company",
-        )
-        session.add(source)
-        session.flush()
-        analyze_stage = repo.ensure_stage(run.id, "analyze")
-        item_ids: dict[str, int] = {}
-        for label, score, reason, status in (
-            ("candidate", 85, "analysis candidate", "candidate"),
-            ("filtered", 42, "analysis_filtered:score_below_threshold", "analysis_filtered"),
-        ):
-            item = IntelItem(
-                source_id=source.id,
-                title=f"Orchid Systems {label}",
-                content_class="official_model_company",
-                content_hash=(f"{run.id}-{label}" * 8)[:64],
-                selection_score=score,
-                selection_reason=reason,
-                status=status,
-                published_at=reference,
-                captured_at=reference,
-            )
-            session.add(item)
-            session.flush()
-            item_ids[label] = int(item.id)
-            repo.record_run_item(run.id, item.id)
-            session.add(
-                AIItemReview(
-                    item_id=item.id,
-                    run_id=run.id,
-                    content_class="official_model_company",
-                    topic="model",
-                    topics_json='["model"]',
-                    keywords_json='["release"]',
-                    entities_json=json.dumps([{"type": "company", "name": "OpenAI"}]),
-                    summary_cn=f"{label} summary",
-                    selection_score=score,
-                    reason=reason,
-                    status="success",
-                )
-            )
-            task = repo.ensure_stage_task(
-                analyze_stage,
-                subject_type="item",
-                subject_id=item.id,
-                item_id=item.id,
-            )
-            task.status = "succeeded"
-            task.result = {
-                "item_id": item.id,
-                "status": "success",
-                "selection_score": score,
-                "reason": reason,
-            }
-        session.commit()
+    run_id, item_ids = _build_with_stage_b_items(
+        session_factory,
+        reference_time=reference,
+        rows=[
+            ("Orchid Systems candidate", 85, "candidate"),
+            ("Orchid Systems low signal", 42, "analysis_filtered:score_below_threshold"),
+        ],
+    )
 
     result = run_event_cluster_job(
         session_factory=session_factory,
-        run_id=run.id,
+        run_id=run_id,
         reference_time=reference,
     )
-    assert result.processed == 1
-    assert result.events == 1
 
+    assert result.processed == 2
+    assert result.events == 2
     with session_factory() as session:
         relations = session.scalars(select(IntelEventItem)).all()
-        assert len(relations) == 1
-        assert relations[0].item_id == item_ids["candidate"]
+        assert {relation.item_id for relation in relations} == set(item_ids.values())
 
 
-def test_stage_d_and_export_are_run_scoped_and_partial_export_preserves_digest(tmp_path):
+def test_stage_d_and_export_use_only_the_current_daily_build(tmp_path):
     session_factory = _db()
     reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        run_one = repo.start_run(reference_time=reference)
-        run_two = repo.start_run(reference_time=reference)
-        first = IntelEvent(
-            event_key="title:one",
-            title="Run one update",
-            summary_cn="Run one event summary",
-            topic="model",
-            display_score=90,
-            source_group="official_blog",
-            new_in_run_id=run_one.id,
-            first_run_id=run_one.id,
-        )
-        second = IntelEvent(
-            event_key="title:two",
-            title="Run two update",
-            summary_cn="Run two event summary",
-            topic="model",
-            display_score=80,
-            new_in_run_id=run_two.id,
-            first_run_id=run_two.id,
-        )
-        session.add_all([first, second])
-        session.flush()
-        # Stage D consumes the durable current Stage-C projection rather
-        # than historical ``new_in_run_id`` provenance.  Persist the one
-        # event that this test's simulated Stage C emitted for run one.
-        cluster_stage = repo.ensure_stage(run_one.id, "cluster")
-        cluster_task = repo.ensure_stage_task(
-            cluster_stage,
-            subject_type="run",
-            subject_id=run_one.id,
-            target_run_id=run_one.id,
-        )
-        cluster_task.status = "succeeded"
-        cluster_task.result = {
-            "event_ids": [first.id],
-            "current_event_ids": [first.id],
-            "processed": 1,
-        }
-        repo.refresh_stage_status(cluster_stage)
-        session.add_all(
-            [
-                IntelEventStageDSnapshot(
-                    snapshot_key="daily-2026-08-15",
-                    run_id=run_one.id,
-                    event_id=first.id,
-                    display_order=1,
-                    display_score=90,
-                    selected=True,
-                    source_group="official_blog",
-                ),
-                IntelEventStageDSnapshot(
-                    snapshot_key="daily-2026-08-15-secondary",
-                    run_id=run_two.id,
-                    event_id=second.id,
-                    display_order=1,
-                    display_score=80,
-                    selected=True,
-                ),
-            ]
-        )
-        session.commit()
-        run_one_id, run_two_id = run_one.id, run_two.id
+    run_id, _ = _build_with_stage_b_items(
+        session_factory,
+        reference_time=reference,
+        rows=[("Current build update", 90, "candidate")],
+    )
+    cluster = run_event_cluster_job(session_factory=session_factory, run_id=run_id, reference_time=reference)
+    assert cluster.current_event_ids
 
     stage_d = run_stage_d_job(
         session_factory=session_factory,
-        run_id=run_one_id,
+        run_id=run_id,
         profile=StageDProfile(total_max=1),
         ai_client=_PhasedClient(),
     )
-    assert stage_d.snapshot_key == "daily-2026-08-15"
     assert stage_d.selected == 1
 
-    final_dir = tmp_path / "intel"
-    final_dir.mkdir()
-    (final_dir / "intel_digest.md").write_text("previous-success", encoding="utf-8")
-    partial = run_intel_export_job(
+    artifact_dir = tmp_path / "draft"
+    exported = run_intel_export_job(
         session_factory=session_factory,
-        output_dir=final_dir,
-        run_id=run_one_id,
-        partial=True,
-        partial_reason="upstream_failed",
+        output_dir=tmp_path / "public-intel",
+        artifact_dir=artifact_dir,
+        run_id=run_id,
     )
-    assert (final_dir / "intel_digest.md").read_text(encoding="utf-8") == "previous-success"
-    daily_dir = tmp_path / "daily" / "2026-08-15"
-    assert (daily_dir / "intel_digest.md").exists()
-    manifest = json.loads((daily_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["edition_date"] == "2026-08-15"
-    assert "run_id" not in manifest
-    assert "snapshot_key" not in manifest
-    assert manifest["artifact_status"] == "partial"
-    assert not (tmp_path / "runs").exists()
 
-    successful = run_intel_export_job(
-        session_factory=session_factory,
-        output_dir=final_dir,
-        run_id=run_one_id,
-    )
-    assert successful.exported == 1
-    assert (final_dir / "intel_digest.md").read_text(encoding="utf-8") != "previous-success"
-    assert "来源组：`official_blog` | 状态：`selected`" in (final_dir / "intel_digest.md").read_text(encoding="utf-8")
-    assert run_two_id != run_one_id
+    assert exported.exported == 1
+    assert "本期日报运行范围更新事件" in (artifact_dir / "intel_digest.md").read_text(encoding="utf-8")
+    assert not (tmp_path / "public-intel" / "daily" / "2026-08-15").exists()

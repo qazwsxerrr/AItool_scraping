@@ -34,7 +34,7 @@ def test_old_schema_fails_fast_without_alter_or_backfill(tmp_path):
         connection.execute("create table ai_item_reviews (id integer primary key, item_id integer not null)")
         connection.commit()
     engine = create_engine_from_url(f"sqlite:///{database}")
-    with pytest.raises(RuntimeError, match="incompatible.*no migrations/backfill"):
+    with pytest.raises(RuntimeError, match="unsupported.*no conversion"):
         init_db(engine)
 
 
@@ -52,7 +52,11 @@ def test_stage_a_b_raw_payloads_and_run_scope_are_serially_persisted(tmp_path):
         )
         session.commit()
         repository = IntelRepository(session)
-        run = repository.start_run(scope={"source_limit": 30}, source_ids=["source-1"])
+        _, run = repository.start_daily_build(
+            edition_date="2026-08-19",
+            scope={"source_limit": 30},
+            source_ids=["source-1"],
+        )
         inserted = repository.insert_item(
             {
                 "source_id": "source-1",

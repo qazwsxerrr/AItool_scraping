@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.collectors.feed import FeedCollector, ProductHuntCollector, RSSCollector
+from app.collectors.feed import FeedCollector, ProductHuntCollector
 from app.collectors.github import GitHubCollector, GitHubTrendingCollector
 from app.collectors.router import CollectorRouter
 from app.domain.models import SourceSpec
@@ -64,7 +64,7 @@ def test_rss_collector_returns_fetch_batch_and_uses_shared_client():
     client = _Client([_response(url, body)])
     source = _feed_source(url=url)
 
-    batch = RSSCollector(client, sleeper=lambda _: None).collect(source, 10)
+    batch = FeedCollector(client, sleeper=lambda _: None).collect(source, 10)
 
     assert batch.status == "success"
     assert batch.items_fetched == 1
@@ -94,7 +94,7 @@ def test_reddit_feed_uses_standard_registry_url_without_query_rewrite():
     body = b"<feed xmlns='http://www.w3.org/2005/Atom'><entry><title>Reddit item</title></entry></feed>"
     client = _Client([_response(url, body)])
 
-    batch = RSSCollector(client, retries=0, sleeper=lambda _: None).collect(source, 10)
+    batch = FeedCollector(client, retries=0, sleeper=lambda _: None).collect(source, 10)
 
     assert batch.status == "success"
     assert client.calls[0][1] == url
@@ -106,7 +106,7 @@ def test_rss_503_retries_once_and_records_retry_count():
     body = b"<rss version='2.0'><channel><item><title>retry</title></item></channel></rss>"
     client = _Client([_response(url, b"down", status=503), _response(url, body)])
 
-    batch = RSSCollector(client, retries=3, sleeper=lambda _: None).collect(_feed_source(url=url), 10)
+    batch = FeedCollector(client, retries=3, sleeper=lambda _: None).collect(_feed_source(url=url), 10)
 
     assert batch.status == "success"
     assert batch.retry_count == 1
@@ -124,7 +124,7 @@ def test_rss_rate_limit_reset_header_controls_retry_sleep():
     )
     sleeps = []
 
-    batch = RSSCollector(client, retries=1, sleeper=sleeps.append).collect(
+    batch = FeedCollector(client, retries=1, sleeper=sleeps.append).collect(
         _feed_source(url=url), 10
     )
 
@@ -251,7 +251,7 @@ def test_producthunt_atom_maps_engagement_and_github_link_without_post():
         source_group="producthunt",
     )
 
-    batch = ProductHuntCollector(client, api_token="ignored", sleeper=lambda _: None).collect(source, 10)
+    batch = ProductHuntCollector(client, sleeper=lambda _: None).collect(source, 10)
 
     assert batch.status == "success"
     assert batch.items[0].metrics["github_url"] == "https://github.com/Owner/Repo"

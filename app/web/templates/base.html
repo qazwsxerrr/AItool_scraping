@@ -10,7 +10,7 @@
   <body>
     <header class="topbar">
       <div class="brand-block">
-        <a class="brand" href="/{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}" aria-label="返回首页"><span class="brand-mark">AI</span><span>热点内容台</span></a>
+        <a class="brand" href="/{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}" aria-label="返回首页"><span class="brand-mark">AI</span><span>热点内容台</span></a>
         <p class="subtitle">抓取 · AI 筛选 · 主题归类 · 来源追溯</p>
       </div>
       <div class="topbar-actions">
@@ -18,7 +18,7 @@
         <form class="top-search" action="/search" method="get">
         <label class="sr-only" for="top-search-input">搜索情报</label>
           <span class="search-icon" aria-hidden="true">⌕</span>
-          {% if active_edition_date %}<input type="hidden" name="run_date" value="{{ active_edition_date }}">{% endif %}
+          {% if active_edition_date %}<input type="hidden" name="edition_date" value="{{ active_edition_date }}">{% endif %}
           <input id="top-search-input" name="q" type="search" placeholder="搜索模型、工具、论文…" value="{{ request.query_params.get('q', '') }}">
         </form>
       </div>
@@ -26,14 +26,14 @@
     <div class="shell">
       <nav class="sidebar" aria-label="主导航">
         <div class="nav-caption">内容</div>
-        <a class="nav-item {{ 'active' if active_nav == 'home' else '' }}" href="/{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">✦</span><span>今日精选</span></a>
-        <a class="nav-item {{ 'active' if active_nav == 'all' else '' }}" href="/all{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">▤</span><span>本期精选</span></a>
-        <a class="nav-item {{ 'active' if active_nav == 'search' else '' }}" href="/search{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">⌕</span><span>热点搜索</span></a>
+        <a class="nav-item {{ 'active' if active_nav == 'home' else '' }}" href="/{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">✦</span><span>今日精选</span></a>
+        <a class="nav-item {{ 'active' if active_nav == 'all' else '' }}" href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">▤</span><span>本期精选</span></a>
+        <a class="nav-item {{ 'active' if active_nav == 'search' else '' }}" href="/search{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">⌕</span><span>热点搜索</span></a>
         <div class="nav-caption">专题</div>
         <a class="nav-item {{ 'active' if active_nav == 'github' else '' }}" href="/github"><span class="nav-icon">◈</span><span>GitHub 项目</span></a>
         <a class="nav-item {{ 'active' if active_nav == 'sources' else '' }}" href="/sources"><span class="nav-icon">◎</span><span>来源目录</span></a>
         <div class="nav-caption">运行</div>
-        <a class="nav-item {{ 'active' if active_nav == 'runs' else '' }}" href="/{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">!</span><span>运行状态</span></a>
+        <a class="nav-item {{ 'active' if active_nav == 'runs' else '' }}" href="/{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">!</span><span>运行状态</span></a>
         <div class="sidebar-note">
           <span class="sidebar-note-dot"></span>
           <div><strong>本地数据优先</strong><small>页面只读数据库与导出结果</small></div>

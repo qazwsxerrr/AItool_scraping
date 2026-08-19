@@ -12,7 +12,7 @@
     </div>
     <h3>
       {% if result.result_type == 'event' %}
-        <a href="/events/{{ result.id }}?{% if active_edition_date %}run_date={{ active_edition_date }}&amp;{% endif %}origin=search{% if query %}&amp;return_q={{ query | urlencode }}{% endif %}">{{ result.title }}</a>
+        <a href="/events/{{ result.id }}?{% if active_edition_date %}edition_date={{ active_edition_date }}&amp;{% endif %}origin=search{% if query %}&amp;return_q={{ query | urlencode }}{% endif %}">{{ result.title }}</a>
       {% elif result.url %}
         <a href="{{ result.url }}" target="_blank" rel="noopener noreferrer">{{ result.title }}</a>
       {% else %}{{ result.title }}{% endif %}

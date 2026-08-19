@@ -5,16 +5,7 @@ from datetime import datetime, timezone
 
 from app.domain.models import FetchBatch, FetchItem, SourceSpec
 from app.jobs.fetch_job import run_intel_fetch_job
-from app.jobs.fetch_only_job import run_fetch_only_export_job, run_fetch_only_job
-from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelItem
-from sqlalchemy import select
-
-
-def _db(tmp_path):
-    engine = create_engine_from_url(f"sqlite:///{tmp_path / 'fetch-only.db'}")
-    init_db(engine)
-    return create_session_factory(engine)
+from app.jobs.fetch_only_job import run_fetch_only_job
 
 
 def _source(source_id: str, *, group: str = "official_blog") -> SourceSpec:
@@ -45,8 +36,7 @@ class _Router:
         return self.batches[source.id]
 
 
-def test_fetch_only_exports_new_rows_with_governance_and_x_marker(tmp_path):
-    sf = _db(tmp_path)
+def test_fetch_only_exports_diagnostic_rows_without_database_writes(tmp_path):
     official = _source("openai_news")
     x_official = _source("x_account_openai", group="x_official")
     x_social = _source("x_account_sam_altman", group="x_social")
@@ -68,45 +58,28 @@ def test_fetch_only_exports_new_rows_with_governance_and_x_marker(tmp_path):
             transport="httpx",
         )
 
-    router = _Router(
-        {
-            official.id: batch(official, "Official item"),
-            x_official.id: batch(x_official, "Official X item"),
-            x_social.id: batch(x_social, "Social X item"),
-        }
-    )
     result = run_fetch_only_job(
-        session_factory=sf,
         sources=[official, x_official, x_social],
-        router=router,
+        router=_Router(
+            {
+                official.id: batch(official, "Official item"),
+                x_official.id: batch(x_official, "Official X item"),
+                x_social.id: batch(x_social, "Social X item"),
+            }
+        ),
         output_dir=tmp_path / "out",
         force=True,
     )
+
     assert result.fetch.total_inserted == 3
-    assert result.export is not None
+    assert result.export.exported == 3
     records = [json.loads(line) for line in (tmp_path / "out" / "fetch_items.jsonl").read_text().splitlines()]
     assert {record["source_id"] for record in records} == {official.id, x_official.id, x_social.id}
-    official_record = next(record for record in records if record["source_id"] == x_official.id)
-    social_record = next(record for record in records if record["source_id"] == x_social.id)
-    for key in ("source_id", "source_name", "transport", "source_group", "source_subtype", "tier", "role"):
-        assert key in official_record
-        assert key in official_record["source"]
-    assert official_record["x_official"] is True
-    assert social_record["x_official"] is False
-    assert official_record["status"] == "new"
-    with sf() as session:
-        assert len(session.scalars(select(IntelItem)).all()) == 3
-
-
-def test_fetch_only_export_dry_run_does_not_write_files(tmp_path):
-    sf = _db(tmp_path)
-    result = run_fetch_only_export_job(session_factory=sf, output_dir=tmp_path / "none", dry_run=True)
-    assert result.exported == 0
-    assert not (tmp_path / "none").exists()
+    assert all("item_id" not in record for record in records)
+    assert all("run_id" not in json.dumps(record) for record in records)
 
 
 def test_fetch_only_isolates_one_failed_source_from_successful_sources(tmp_path):
-    sf = _db(tmp_path)
     good = _source("good_source")
     bad = _source("bad_source")
     good_batch = FetchBatch(
@@ -123,22 +96,21 @@ def test_fetch_only_isolates_one_failed_source_from_successful_sources(tmp_path)
         http_status=503,
         transport="httpx",
     )
+
     result = run_fetch_only_job(
-        session_factory=sf,
         sources=[good, bad],
         router=_Router({good.id: good_batch, bad.id: bad_batch}),
         output_dir=tmp_path / "out",
         force=True,
     )
+
     assert result.fetch.stats[good.id].inserted == 1
     assert result.fetch.stats[bad.id].failed == 1
     assert result.fetch.total_failed == 1
-    assert result.export is not None
     assert result.export.exported == 1
 
 
-def test_force_fetch_omits_conditional_headers_and_retrieves_current_window(tmp_path):
-    session_factory = _db(tmp_path)
+def test_diagnostic_fetch_uses_unconditional_requests(tmp_path):
     source = _source("conditional_source")
     batch = FetchBatch(
         source=source,
@@ -156,18 +128,20 @@ def test_force_fetch_omits_conditional_headers_and_retrieves_current_window(tmp_
     )
     router = _Router({source.id: batch})
 
-    run_intel_fetch_job(
-        session_factory=session_factory,
+    first = run_intel_fetch_job(
+        session_factory=None,
         sources=[source],
         router=router,
         force=True,
+        dry_run=True,
     )
-    result = run_intel_fetch_job(
-        session_factory=session_factory,
+    second = run_intel_fetch_job(
+        session_factory=None,
         sources=[source],
         router=router,
         force=True,
+        dry_run=True,
     )
 
-    assert result.stats[source.id].fetched == 1
+    assert first.total_fetched == second.total_fetched == 1
     assert router.request_headers == [{}, {}]

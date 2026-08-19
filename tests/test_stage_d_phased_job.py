@@ -5,18 +5,16 @@ import threading
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import select
 
+from app.domain.models import FetchItem
 from app.jobs.stage_d_job import StageDExecutionError, StageDProfile, run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import (
-    AIItemReview,
-    IntelEvent,
-    IntelEventStageDSnapshot,
-    IntelItem,
-    IntelRun,
-    Source,
-)
+from app.storage.models import AIItemReview, IntelEventStageDSnapshot, IntelItem, Source
 from app.storage.repository import IntelRepository
+
+
+REFERENCE = datetime(2026, 8, 19, 8, tzinfo=timezone.utc)
 
 
 def _db():
@@ -28,65 +26,84 @@ def _db():
 def _run_with_events(session_factory, count: int = 3) -> tuple[int, list[int]]:
     with session_factory() as session:
         repo = IntelRepository(session)
-        run = repo.start_run(reference_time=datetime(2026, 8, 19, 8, tzinfo=timezone.utc))
-        event_ids: list[int] = []
-        for index in range(count):
-            source = Source(
-                id=f"stage-d-source-{run.id}-{index}",
+        session.add(
+            Source(
+                id="stage-d-source",
                 name="Stage D test source",
                 transport="feed",
-                url=f"https://example.test/feed/{run.id}/{index}",
+                url="https://example.test/feed.xml",
                 source_group="official_blog",
                 content_class="official_model_company",
             )
-            item = IntelItem(
-                source=source,
-                title=f"模型更新 {index}",
-                summary=f"模型发布第 {index} 项明确更新，包含开发者可用的新能力。",
-                canonical_url=f"https://example.test/event/{run.id}/{index}",
-                content_class="official_model_company",
-                content_hash=(f"{run.id}-{index}" * 20)[:64],
-                status="candidate",
-                selection_score=90 - index,
-                captured_at=run.reference_time,
+        )
+        session.flush()
+        _, build = repo.start_daily_build(edition_date="2026-08-19", reference_time=REFERENCE)
+        event_ids: list[int] = []
+        for index in range(count):
+            inserted = repo.insert_item(
+                FetchItem(
+                    source_id="stage-d-source",
+                    external_id=f"stage-d-{index}",
+                    title=f"模型更新 {index}",
+                    url=f"https://example.test/event/{index}",
+                    summary=f"模型发布第 {index} 项明确更新，包含开发者可用的新能力。",
+                    content_class="official_model_company",
+                    published_at=REFERENCE,
+                    captured_at=REFERENCE,
+                ),
+                run_id=build.id,
             )
-            review = AIItemReview(
-                item=item,
-                content_class="official_model_company",
-                topic="model" if index < 2 else "product",
-                topics_json=json.dumps(["model" if index < 2 else "product"]),
-                summary_cn=item.summary,
-                selection_score=90 - index,
-                status="success",
+            assert inserted.item_id is not None
+            item = session.get(IntelItem, inserted.item_id)
+            assert item is not None
+            item.status = "candidate"
+            item.selection_score = 90 - index
+            topic = "model" if index < 2 else "product"
+            session.add(
+                AIItemReview(
+                    item_id=item.id,
+                    content_class="official_model_company",
+                    topic=topic,
+                    topics_json=json.dumps([topic]),
+                    summary_cn=item.summary,
+                    selection_score=90 - index,
+                    status="success",
+                )
             )
-            session.add_all([source, item, review])
-            session.flush()
             event = repo.upsert_event(
+                run_id=build.id,
                 event_key=f"url:{item.canonical_url}",
                 canonical_url=item.canonical_url,
                 title=item.title,
                 summary_cn=item.summary,
-                topic=review.topic,
-                topics=[review.topic],
+                topic=topic,
+                topics=[topic],
                 entities=[],
                 content_class=item.content_class,
-                source_group=source.source_group,
-                source_ids=[source.id],
-                source_groups=[source.source_group],
+                source_group="official_blog",
+                source_ids=[item.source_id],
+                source_groups=["official_blog"],
                 display_score=90 - index,
+                novelty_status="new",
                 primary_item_id=item.id,
-                first_seen_at=run.reference_time,
-                last_seen_at=run.reference_time,
+                first_seen_at=REFERENCE,
+                last_seen_at=REFERENCE,
             )
-            repo.upsert_event_item(event.id, item.id, source_id=source.id, source_group=source.source_group, is_primary=True)
+            repo.upsert_event_item(
+                event.id,
+                item.id,
+                source_id=item.source_id,
+                source_group="official_blog",
+                is_primary=True,
+            )
             event_ids.append(int(event.id))
-        cluster = repo.ensure_stage(run.id, "cluster")
-        task = repo.ensure_stage_task(cluster, subject_type="run", subject_id=run.id, target_run_id=run.id)
-        claimed = repo.claim_stage_task(cluster, task_id=task.id, owner="cluster-test")
-        assert claimed is not None
-        repo.complete_stage_task(claimed, owner="cluster-test", result={"current_event_ids": event_ids})
+        cluster = repo.ensure_stage(build.id, "cluster")
+        task = repo.ensure_stage_task(cluster, subject_type="run", subject_id=build.id, target_run_id=build.id)
+        repo.complete_stage_task(task, result={"current_event_ids": event_ids})
+        repo.finish_stage(cluster, status="succeeded")
+        repo.freeze_run_scope(build.id)
         session.commit()
-        return int(run.id), event_ids
+        return int(build.id), event_ids
 
 
 def _assessment(event_id: int, *, score: int = 80, must: bool = False) -> dict:
@@ -154,10 +171,7 @@ class _PhasedClient:
         self.assessment_calls.append(ids)
         return {
             "schema_version": "stage_d_assessment_v1",
-            "assessments": [
-                _assessment(event_id, **self.assessment_scores.get(event_id, {}))
-                for event_id in ids
-            ],
+            "assessments": [_assessment(event_id, **self.assessment_scores.get(event_id, {})) for event_id in ids],
         }
 
     def compose_events(self, events, *, edition, total_max, watchlist_max):
@@ -197,7 +211,6 @@ def test_d1_batch_reuse_skips_provider_on_second_run():
     assert len(client.assessment_calls) == 1
     assert len(client.composition_calls) == 1
     with session_factory() as session:
-        tasks = session.query(type(IntelRepository(session).ensure_stage_task)).all() if False else []
         stage = IntelRepository(session).get_stage(run_id, "stage_d")
         assert stage is not None and stage.status == "succeeded"
         assert len([task for task in stage.tasks if task.subject_type == "batch"]) == 1
@@ -221,14 +234,12 @@ def test_d1_runs_two_assessment_batches_concurrently():
     assert len(client.assessment_threads) == 2
 
 
-def test_d1_failure_blocks_d3_and_preserves_old_snapshot():
+def test_d1_failure_blocks_d3_and_keeps_current_draft_snapshot():
     session_factory = _db()
     run_id, event_ids = _run_with_events(session_factory, count=2)
-    key = f"daily-2026-08-19"
     with session_factory() as session:
         session.add(
             IntelEventStageDSnapshot(
-                snapshot_key=key,
                 run_id=run_id,
                 event_id=event_ids[0],
                 display_order=1,
@@ -245,19 +256,17 @@ def test_d1_failure_blocks_d3_and_preserves_old_snapshot():
 
     assert client.composition_calls == []
     with session_factory() as session:
-        rows = session.query(IntelEventStageDSnapshot).filter_by(snapshot_key=key).all()
+        rows = list(session.scalars(select(IntelEventStageDSnapshot).where(IntelEventStageDSnapshot.run_id == run_id)))
         assert [row.event_id for row in rows] == [event_ids[0]]
         assert IntelRepository(session).get_stage(run_id, "stage_d").status == "failed"
 
 
-def test_d3_failure_preserves_old_snapshot():
+def test_d3_failure_keeps_current_draft_snapshot():
     session_factory = _db()
     run_id, event_ids = _run_with_events(session_factory, count=1)
-    key = "daily-2026-08-19"
     with session_factory() as session:
         session.add(
             IntelEventStageDSnapshot(
-                snapshot_key=key,
                 run_id=run_id,
                 event_id=event_ids[0],
                 display_order=1,
@@ -273,8 +282,8 @@ def test_d3_failure_preserves_old_snapshot():
         run_stage_d_job(session_factory=session_factory, run_id=run_id, ai_client=client)
 
     with session_factory() as session:
-        row = session.query(IntelEventStageDSnapshot).filter_by(snapshot_key=key).one()
-        assert json.loads(row.metadata_json)["old"] is True
+        row = session.scalar(select(IntelEventStageDSnapshot).where(IntelEventStageDSnapshot.run_id == run_id))
+        assert row is not None and json.loads(row.metadata_json)["old"] is True
         assert IntelRepository(session).get_stage(run_id, "stage_d").status == "failed"
 
 
@@ -311,7 +320,7 @@ def test_success_persists_selected_watchlist_and_omitted_rows():
     assert result.watchlist == 1
     assert result.omitted == 1
     with session_factory() as session:
-        rows = session.query(IntelEventStageDSnapshot).filter_by(snapshot_key="daily-2026-08-19").all()
+        rows = list(session.scalars(select(IntelEventStageDSnapshot).where(IntelEventStageDSnapshot.run_id == run_id)))
         tiers = {row.event_id: json.loads(row.metadata_json)["editorial_tier"] for row in rows}
         assert tiers == {event_ids[0]: "selected", event_ids[1]: "watchlist", event_ids[2]: "omitted"}
         assert IntelRepository(session).get_stage(run_id, "stage_d").status == "succeeded"

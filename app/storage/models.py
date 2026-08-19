@@ -1,9 +1,7 @@
-"""SQLAlchemy models for the compact AI-only intelligence pipeline.
+"""SQLAlchemy models for the date-addressed intelligence pipeline.
 
-The data layer contains sources, fetch telemetry, runs, normalized items,
-structured AI reviews, and the Stage-C event/member plus Stage-D snapshot tables.
-The only startup-time compatibility upgrade is the additive indexed
-``intel_runs.edition_date`` column.
+Transient build data belongs to one hidden build, while published reports are
+stored only as date-addressed daily editions.
 """
 
 from __future__ import annotations
@@ -75,9 +73,7 @@ class Source(Base):
     source_group: Mapped[str] = mapped_column(String(64), nullable=False, default="general")
     source_subtype: Mapped[str] = mapped_column(String(64), nullable=False, default="fixed")
     account_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # V3 governance metadata.  These columns deliberately have safe defaults
-    # so existing callers that construct ``Source`` rows directly remain
-    # compatible with a freshly-created database.
+    # Governance metadata has safe defaults for incomplete source specs.
     tier: Mapped[str] = mapped_column(String(8), nullable=False, default="p4")
     topic_scopes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     primary_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -127,7 +123,7 @@ class FetchAttempt(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False)
-    run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id"), nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
@@ -254,25 +250,16 @@ class IntelRun(Base):
     __table_args__ = (
         Index("ix_intel_runs_status", "status"),
         Index("ix_intel_runs_started_at", "started_at"),
-        # The logical daily edition is queried independently from an
-        # immutable execution attempt.  Keep the latter as ``id`` and index
-        # this real column instead of repeatedly decoding ``scope_json``.
-        Index("ix_intel_runs_edition_date", "edition_date"),
         Index("ix_intel_runs_edition_id", "edition_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     # ``edition_id`` is an opaque build-owner pointer.  The public daily key
     # lives in ``daily_editions.edition_date`` and is intentionally unique.
-    edition_id: Mapped[int | None] = mapped_column(ForeignKey("daily_editions.id"), nullable=True)
+    edition_id: Mapped[int] = mapped_column(ForeignKey("daily_editions.id"), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    run_type: Mapped[str] = mapped_column(String(32), nullable=False, default="run_once")
-    # ``edition_date`` used to live only in ``scope_json``.  The private
-    # attribute preserves the public string-returning property below, which
-    # keeps report/UI callers and legacy rows backward compatible.
-    _edition_date: Mapped[date | None] = mapped_column("edition_date", Date, nullable=True)
     scope_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     source_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     item_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -287,9 +274,7 @@ class IntelRun(Base):
     candidate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     partial: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     partial_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # ``selected`` remains a generic count for callers that still report a
-    # legacy aggregate; it is not an AI keep/triage decision and is not used
-    # by the new persistence APIs.
+    # ``selected`` is a build-local aggregate maintained for stage summaries.
     selected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     filters_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
@@ -301,6 +286,7 @@ class IntelRun(Base):
     run_stages: Mapped[list["IntelRunStage"]] = relationship(
         back_populates="run", cascade="all, delete-orphan", order_by="IntelRunStage.id"
     )
+    edition: Mapped[DailyEdition] = relationship(foreign_keys=[edition_id], lazy="joined")
 
     @property
     def scope(self) -> dict[str, object]:
@@ -342,31 +328,12 @@ class IntelRun(Base):
                     continue
         return result
 
-    # Descriptive aliases used by stage orchestration/reporting code.
-    @property
-    def screen_count(self) -> int:
-        return int(self.screened or 0)
-
-    @property
-    def analyze_count(self) -> int:
-        return int(self.analyzed or 0)
-
-    @property
-    def filtered_count(self) -> int:
-        return int((self.screened_out or 0) + (self.analysis_filtered or 0))
-
-    @property
-    def failure_count(self) -> int:
-        return int((self.screen_failed or 0) + (self.analysis_failed or 0) + (self.failed or 0))
-
     @property
     def reference_time(self) -> datetime | None:
         """Fixed run reference time used by resumable downstream stages.
 
-        The legacy ``intel_runs`` table is deliberately not altered by the
-        resumable-state migration.  Persisting the value in ``scope_json``
-        keeps existing databases migration-safe while exposing the natural
-        attribute expected by stage orchestration code.
+        Persisting the value in ``scope_json`` keeps build retries stable
+        without exposing the hidden build ID to daily callers.
         """
 
         value = self.scope.get("reference_time")
@@ -392,48 +359,14 @@ class IntelRun(Base):
 
     @property
     def edition_date(self) -> str | None:
-        """Stable daily label for UI/report grouping, without replacing ``id``.
+        """Date of the build's owning daily edition."""
 
-        ``id`` remains the immutable relational key used by stage and item
-        foreign keys.  New runs persist a real indexed ``edition_date``
-        column and retain the JSON copy for compatibility; old rows fall back
-        to JSON/reference-time derivation while an additive migration catches
-        them up.
-        """
-
-        if self._edition_date is not None:
-            return self._edition_date.isoformat()
-        value = self.scope.get("edition_date")
-        if value:
-            try:
-                return date.fromisoformat(str(value)).isoformat()
-            except (TypeError, ValueError):
-                pass
-        reference = self.reference_time or self.started_at
-        if reference is None:
-            return None
-        current = reference if reference.tzinfo is not None else reference.replace(tzinfo=timezone.utc)
-        return current.astimezone(DAILY_EDITION_TIMEZONE).date().isoformat()
-
-    @property
-    def daily_snapshot_key(self) -> str | None:
-        """Stable public Stage D key for this run's daily edition.
-
-        ``id`` remains an internal execution/audit key.  A date-addressed
-        snapshot intentionally lets a same-day rerun replace the public
-        editorial projection without exposing that implementation detail.
-        """
-
-        edition_date = self.edition_date
-        return f"daily-{edition_date}" if edition_date else None
-
+        return self.edition.edition_date.isoformat() if self.edition is not None else None
 
 class IntelRunStage(Base):
     """Durable state for one named stage within an :class:`IntelRun`.
 
-    Stage rows are intentionally additive.  They are the coordinator's
-    source of truth; the historical ``IntelRunItem.status`` and latest AI
-    projections remain compatibility/UI views only.
+    Stage rows are the coordinator's source of truth for one hidden build.
     """
 
     __tablename__ = "intel_run_stages"
@@ -474,32 +407,12 @@ class IntelRunStage(Base):
     )
 
     @property
-    def stage(self) -> str:
-        """Compatibility alias for code that calls the name simply ``stage``."""
-
-        return self.stage_name
-
-    @stage.setter
-    def stage(self, value: str) -> None:
-        self.stage_name = str(value)
-
-    @property
     def result_ref(self) -> object:
         return _decode_json(self.result_ref_json, {})
 
     @result_ref.setter
     def result_ref(self, value: object) -> None:
         self.result_ref_json = _dump_json(value if value is not None else {})
-
-    @property
-    def result_reference(self) -> object:
-        """Alias used by stage callers that spell the reference in full."""
-
-        return self.result_ref
-
-    @result_reference.setter
-    def result_reference(self, value: object) -> None:
-        self.result_ref = value
 
     @property
     def metadata_dict(self) -> dict[str, object]:
@@ -514,31 +427,6 @@ class IntelRunStage(Base):
     def lease_active(self) -> bool:
         current = utcnow()
         return bool(self.lease_owner and self.lease_expires_at and self.lease_expires_at > current)
-
-    @property
-    def retry_at(self) -> datetime | None:
-        return self.next_retry_at
-
-    @retry_at.setter
-    def retry_at(self, value: datetime | None) -> None:
-        self.next_retry_at = value
-
-    @property
-    def input_hash(self) -> str | None:
-        return self.input_fingerprint
-
-    @input_hash.setter
-    def input_hash(self, value: str | None) -> None:
-        self.input_fingerprint = value
-
-    @property
-    def config_hash(self) -> str | None:
-        return self.config_fingerprint
-
-    @config_hash.setter
-    def config_hash(self, value: str | None) -> None:
-        self.config_fingerprint = value
-
 
 class IntelRunStageTask(Base):
     """One independently resumable stage unit.
@@ -597,28 +485,12 @@ class IntelRunStageTask(Base):
     )
 
     @property
-    def subject(self) -> str:
-        return self.subject_id
-
-    @subject.setter
-    def subject(self, value: object) -> None:
-        self.subject_id = str(value)
-
-    @property
     def result_ref(self) -> object:
         return _decode_json(self.result_ref_json, {})
 
     @result_ref.setter
     def result_ref(self, value: object) -> None:
         self.result_ref_json = _dump_json(value if value is not None else {})
-
-    @property
-    def result_reference(self) -> object:
-        return self.result_ref
-
-    @result_reference.setter
-    def result_reference(self, value: object) -> None:
-        self.result_ref = value
 
     @property
     def result(self) -> object:
@@ -636,31 +508,6 @@ class IntelRunStageTask(Base):
     @property
     def reusable(self) -> bool:
         return self.status == "succeeded"
-
-    @property
-    def retry_at(self) -> datetime | None:
-        return self.next_retry_at
-
-    @retry_at.setter
-    def retry_at(self, value: datetime | None) -> None:
-        self.next_retry_at = value
-
-    @property
-    def input_hash(self) -> str | None:
-        return self.input_fingerprint
-
-    @input_hash.setter
-    def input_hash(self, value: str | None) -> None:
-        self.input_fingerprint = value
-
-    @property
-    def config_hash(self) -> str | None:
-        return self.config_fingerprint
-
-    @config_hash.setter
-    def config_hash(self, value: str | None) -> None:
-        self.config_fingerprint = value
-
 
 class IntelRunStageAttempt(Base):
     """Immutable-attempt audit row for one provider/local execution."""
@@ -707,14 +554,6 @@ class IntelRunStageAttempt(Base):
     @result_ref.setter
     def result_ref(self, value: object) -> None:
         self.result_ref_json = _dump_json(value if value is not None else {})
-
-    @property
-    def result_reference(self) -> object:
-        return self.result_ref
-
-    @result_reference.setter
-    def result_reference(self, value: object) -> None:
-        self.result_ref = value
 
     @property
     def raw_response(self) -> object:
@@ -767,22 +606,18 @@ class IntelItem(Base):
         # may legitimately be fetched and re-evaluated on two edition dates,
         # so identities are unique only inside one hidden build.
         UniqueConstraint("build_id", "source_id", "external_id", name="uq_intel_items_build_source_external_id"),
-        UniqueConstraint("build_id", "content_hash", name="uq_intel_items_build_content_hash"),
+        UniqueConstraint("build_id", "source_id", "content_hash", name="uq_intel_items_build_source_content_hash"),
         Index("ix_intel_items_status", "status"),
         Index("ix_intel_items_build", "build_id"),
         Index("ix_intel_items_content_class", "content_class"),
         Index("ix_intel_items_published_at", "published_at"),
         Index("ix_intel_items_selection_score", "selection_score"),
-        Index("ix_intel_items_latest_run", "latest_run_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    # ``build_id`` is populated only for date-addressed DailyEdition drafts.
-    # Legacy diagnostic callers retain ``NULL`` and their compatibility
-    # behavior remains in the repository layer.
-    build_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
+    # Every persisted raw item belongs to one hidden daily build.
+    build_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id"), nullable=False)
     source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False)
-    latest_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     external_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     canonical_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     title: Mapped[str] = mapped_column(Text, nullable=False)
@@ -808,7 +643,6 @@ class IntelItem(Base):
     )
 
     source: Mapped[Source] = relationship(back_populates="intel_items")
-    latest_run: Mapped[IntelRun | None] = relationship(foreign_keys=[latest_run_id])
     run_items: Mapped[list[IntelRunItem]] = relationship(
         back_populates="item", cascade="all, delete-orphan"
     )
@@ -828,12 +662,10 @@ class AIItemScreen(Base):
         UniqueConstraint("item_id", name="uq_ai_item_screens_item_id"),
         Index("ix_ai_item_screens_status", "status"),
         Index("ix_ai_item_screens_decision", "decision"),
-        Index("ix_ai_item_screens_run", "run_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     item_id: Mapped[int] = mapped_column(ForeignKey("intel_items.id"), nullable=False)
-    run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="intel_screen_v1")
     decision: Mapped[str] = mapped_column(String(16), nullable=False, default="uncertain")
@@ -875,12 +707,10 @@ class AIItemReview(Base):
         Index("ix_ai_item_reviews_status", "status"),
         Index("ix_ai_item_reviews_topic", "topic"),
         Index("ix_ai_item_reviews_score", "selection_score"),
-        Index("ix_ai_item_reviews_run", "run_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     item_id: Mapped[int] = mapped_column(ForeignKey("intel_items.id"), nullable=False)
-    run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     prompt_version: Mapped[str] = mapped_column(String(64), nullable=False, default="intel_analysis_v1")
     content_class: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -982,7 +812,7 @@ class IntelEvent(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    build_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
+    build_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id"), nullable=False)
     event_key: Mapped[str] = mapped_column(String(512), nullable=False)
     canonical_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     external_id: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -1005,9 +835,6 @@ class IntelEvent(Base):
     resolution_confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     resolution_raw_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
-    first_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
-    last_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
-    new_in_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     primary_item_id: Mapped[int | None] = mapped_column(ForeignKey("intel_items.id"), nullable=True)
     first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1026,16 +853,6 @@ class IntelEvent(Base):
         cascade="all, delete-orphan",
         order_by="IntelEventStageDSnapshot.display_order",
     )
-
-    @property
-    def canonical_key(self) -> str:
-        """Compatibility alias used by earlier event pipeline callers."""
-
-        return self.event_key
-
-    @canonical_key.setter
-    def canonical_key(self, value: str) -> None:
-        self.event_key = value
 
     @property
     def novelty(self) -> str:
@@ -1086,20 +903,18 @@ class IntelEventItem(Base):
 
 
 class IntelEventStageDSnapshot(Base):
-    """Idempotent Stage-D editorial output consumed by export and the UI."""
+    """Private Stage-D output for one hidden daily build."""
 
     __tablename__ = "intel_event_stage_d_snapshots"
     __table_args__ = (
-        UniqueConstraint("snapshot_key", "event_id", name="uq_intel_event_stage_d_snapshot_event"),
-        Index("ix_intel_event_stage_d_snapshot_key", "snapshot_key"),
-        Index("ix_intel_event_stage_d_snapshot_order", "snapshot_key", "display_order"),
-        Index("ix_intel_event_stage_d_snapshot_selected", "snapshot_key", "selected"),
+        UniqueConstraint("run_id", "event_id", name="uq_intel_event_stage_d_snapshot_run_event"),
+        Index("ix_intel_event_stage_d_snapshot_run_order", "run_id", "display_order"),
+        Index("ix_intel_event_stage_d_snapshot_run_selected", "run_id", "selected"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    snapshot_key: Mapped[str] = mapped_column(String(128), nullable=False, default="latest")
     event_id: Mapped[int] = mapped_column(ForeignKey("intel_events.id"), nullable=False)
-    run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id"), nullable=False)
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     display_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -1114,7 +929,3 @@ class IntelEventStageDSnapshot(Base):
     )
 
     event: Mapped[IntelEvent] = relationship(back_populates="stage_d_snapshots")
-
-
-# Friendly alias for callers that use the shorter Stage-D name.
-EventStageDSnapshot = IntelEventStageDSnapshot

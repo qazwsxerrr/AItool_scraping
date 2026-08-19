@@ -1,6 +1,6 @@
 """Collector public API."""
 
-from .feed import FeedCollector, ProductHuntCollector, RSSCollector, RSSHubCollector
+from .feed import FeedCollector, ProductHuntCollector
 from .github import GitHubCollector, GitHubTrendingCollector
 from .router import CollectorRouter
 
@@ -10,6 +10,4 @@ __all__ = [
     "GitHubCollector",
     "GitHubTrendingCollector",
     "ProductHuntCollector",
-    "RSSCollector",
-    "RSSHubCollector",
 ]

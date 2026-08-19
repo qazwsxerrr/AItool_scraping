@@ -12,9 +12,9 @@
 </section>
 
 <form class="filters" action="/all" method="get">
-  <select name="run_date" aria-label="日报">
+  <select name="edition_date" aria-label="日报">
     {% for option in edition_options %}
-      <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}{% if option.partial %} · partial{% endif %}</option>
+      <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}</option>
     {% endfor %}
   </select>
   <label class="sr-only" for="all-query">搜索动态</label>
@@ -39,7 +39,7 @@
   </select>
   <button type="submit">应用筛选</button>
   {% if filters.query or filters.source_group or filters.content_class or filters.topic_category %}
-    <a class="button secondary" href="/all{% if active_edition_date %}?run_date={{ active_edition_date }}{% endif %}">清除</a>
+    <a class="button secondary" href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">清除</a>
   {% endif %}
 </form>
 

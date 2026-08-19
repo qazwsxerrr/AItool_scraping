@@ -1,4 +1,4 @@
-"""Deterministic run-scoped freshness policy for daily intelligence.
+"""Deterministic build-scoped freshness policy for daily intelligence.
 
 The AI provider must never decide whether an item is recent. Every run uses
 its frozen ``reference_time`` and this module's 72-hour news rule, with an

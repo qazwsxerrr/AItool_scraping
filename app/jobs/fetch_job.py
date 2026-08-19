@@ -13,16 +13,16 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.collectors.feed import FeedCollector, ProductHuntCollector, RSSHubCollector
+from app.collectors.feed import FeedCollector, ProductHuntCollector
 from app.collectors.github import GitHubCollector, GitHubTrendingCollector
 from app.collectors.router import CollectorRouter
 from app.config.limits import DEFAULT_FETCH_LIMIT_PER_SOURCE
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
-from app.domain.models import FetchBatch, SourceSpec
+from app.domain.models import FetchBatch, FetchItem, SourceSpec
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.repository import IntelCounts, IntelRepository
-from app.storage.models import FetchAttempt, Source
+from app.storage.repository import IntelRepository
+from app.storage.models import FetchAttempt, IntelRun, Source
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +50,14 @@ class IntelSourceStats:
     backoff_until: datetime | None = None
 
 
+@dataclass(frozen=True)
+class DiagnosticFetchedItem:
+    """Normalized item retained only in memory for diagnostic commands."""
+
+    source: SourceSpec
+    item: FetchItem
+
+
 @dataclass
 class IntelFetchResult:
     stats: dict[str, IntelSourceStats] = field(default_factory=dict)
@@ -57,6 +65,7 @@ class IntelFetchResult:
     not_due_sources: list[str] = field(default_factory=list)
     run_id: int | None = None
     dry_run: bool = False
+    diagnostic_items: list[DiagnosticFetchedItem] = field(default_factory=list, repr=False)
 
     @property
     def total_fetched(self) -> int:
@@ -87,7 +96,7 @@ def run_intel_fetch_job(
     dry_run: bool = False,
     run_id: int | None = None,
 ) -> IntelFetchResult:
-    """Fetch due sources with one shared client and source-level isolation."""
+    """Fetch a daily build or collect in-memory diagnostic data."""
 
     specs = list(sources)
     selected = [
@@ -97,15 +106,13 @@ def run_intel_fetch_job(
         and (content_class is None or spec.content_class == content_class)
     ]
     result = IntelFetchResult(run_id=run_id, dry_run=dry_run)
-    own_run = run_id is None and not dry_run
-
-    if own_run:
+    if not dry_run and run_id is None:
+        raise ValueError("persisted fetch requires the current daily edition build")
+    if not dry_run:
         with session_factory() as session:
-            run = IntelRepository(session).start_run(
-                filters={"source": source_filter, "content_class": content_class, "stage": "fetch"}
-            )
-            session.commit()
-            result.run_id = run.id
+            run = session.get(IntelRun, int(run_id))
+            if run is None or run.edition_id is None:
+                raise ValueError("persisted fetch requires the current daily edition build")
 
     source_state: dict[str, tuple[Source, FetchAttempt | None]] = {}
     if not dry_run:
@@ -192,6 +199,14 @@ def run_intel_fetch_job(
                 continue
             stats.status = batch.status
             stats.fetched = len(batch.items)
+            if dry_run:
+                result.diagnostic_items.extend(
+                    DiagnosticFetchedItem(
+                        source=spec,
+                        item=raw_item.model_copy(update={"content_class": spec.content_class}),
+                    )
+                    for raw_item in batch.items
+                )
             if not dry_run:
                 with session_factory() as session:
                     repo = IntelRepository(session)
@@ -208,7 +223,6 @@ def run_intel_fetch_job(
                                 insert = repo.insert_item(
                                     item,
                                     run_id=result.run_id,
-                                    run_role="fetched",
                                 )
                             if insert.inserted:
                                 stats.inserted += 1
@@ -246,17 +260,6 @@ def run_intel_fetch_job(
         finally:
             stats.duration_seconds = time.monotonic() - started
 
-    if not dry_run and result.run_id is not None and own_run:
-        with session_factory() as session:
-            counts = IntelCounts(
-                fetched=result.total_fetched,
-                inserted=result.total_inserted,
-                skipped=result.total_skipped,
-                failed=result.total_failed,
-            )
-            run_status = "completed_with_errors" if result.total_failed else "completed"
-            IntelRepository(session).finish_run(result.run_id, status=run_status, counts=counts)
-            session.commit()
     return result
 
 
@@ -287,7 +290,7 @@ def run_intel_fetch_from_settings(
     try:
         feed = FeedCollector(external_client, retries=settings.request_retries, user_agent=settings.user_agent)
         direct_feed = FeedCollector(direct_client, retries=settings.request_retries, user_agent=settings.user_agent)
-        rsshub = RSSHubCollector(rsshub_client, retries=settings.request_retries, user_agent=settings.user_agent)
+        rsshub = FeedCollector(rsshub_client, retries=settings.request_retries, user_agent=settings.user_agent)
         github = GitHubCollector(
             external_client,
             base_url=settings.github_api_base_url,

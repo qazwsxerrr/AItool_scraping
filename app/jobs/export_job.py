@@ -14,7 +14,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
@@ -24,7 +24,7 @@ from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
 from app.storage.models import IntelEvent, IntelEventItem, IntelEventStageDSnapshot, IntelItem, IntelRun, IntelRunItem
-from app.storage.run_snapshot_summary import build_run_snapshot_summary
+from app.storage.daily_build_summary import build_daily_build_summary
 
 
 _STAGE_D_BLOCKING_TASK_STATUSES = frozenset(
@@ -45,7 +45,6 @@ class IntelExportResult:
     partial: bool = False
     partial_reason: str | None = None
     run_id: int | None = None
-    snapshot_key: str = "latest"
     # Internal hand-off to the daily publisher.  This is never serialized to
     # the public manifest/CLI, but avoids re-reading a build after its files
     # have been staged.
@@ -66,114 +65,83 @@ def run_intel_export_job(
     session_factory: sessionmaker[Session],
     output_dir: str | Path = "output/intel",
     limit: int | None = DEFAULT_DAILY_REPORT_LIMIT,
-    source_filter: str | None = None,
-    content_class: str | None = None,
     dry_run: bool = False,
     github_report_dir: str | Path | None = None,
-    snapshot_key: str | None = None,
-    run_id: int | None = None,
-    partial: bool = False,
-    partial_reason: str | None = None,
+    run_id: int,
     artifact_dir: str | Path | None = None,
-    publish_root_mirror: bool = True,
 ) -> IntelExportResult:
     final_output = Path(output_dir)
-    key = str(snapshot_key or "latest")
     effective_limit = _normalise_export_limit(limit)
     stage = None
     stage_task = None
-    run: IntelRun | None = None
-    run_snapshot_summary: dict[str, Any] | None = None
+    run: IntelRun
+    build_summary: dict[str, Any] | None = None
     watchlist_records: list[dict[str, Any]] = []
     owner = "intel-export"
     with session_factory() as session:
         try:
             repo = IntelRepository(session)
-            run = session.get(IntelRun, int(run_id)) if run_id is not None else None
-            # Public daily exports use the date-based Stage-D key.  The run
-            # ID stays attached to database rows and stage tasks only.
-            key = str(snapshot_key or (run.daily_snapshot_key if run is not None else None) or "latest")
-            if run is not None and run_id is not None:
-                _ensure_stage_d_ready(repo, int(run_id))
-            if run is not None and not dry_run:
-                artifact_output = Path(artifact_dir) if artifact_dir is not None else _daily_output_dir(final_output, run)
-                stage = repo.ensure_stage(
-                    int(run_id),
-                    "export",
-                    metadata={"snapshot_key": key, "artifact_dir": str(artifact_output)},
-                )
+            run = session.get(IntelRun, int(run_id))
+            if run is None or run.edition_id is None:
+                raise ValueError("export requires the current daily edition build")
+            _ensure_stage_d_ready(repo, int(run_id))
+            artifact_output = Path(artifact_dir) if artifact_dir is not None else _daily_output_dir(final_output, run)
+            stage = repo.ensure_stage(
+                int(run_id),
+                "export",
+                metadata={"artifact_dir": str(artifact_output)},
+            )
             snapshot_rows = _list_export_events(
                 session,
-                snapshot_key=key,
                 limit=effective_limit,
-                source_filter=source_filter,
-                content_class=content_class,
                 run_id=run_id,
-                reference_time=run.reference_time if run is not None else None,
+                reference_time=run.reference_time,
             )
             records = snapshot_rows
-            if run is not None:
-                watchlist_records = _list_watchlist_events(
-                    session,
-                    snapshot_key=key,
-                    source_filter=source_filter,
-                    content_class=content_class,
-                    run_id=run_id,
-                    reference_time=run.reference_time,
-                )
-            if run is not None and (run.partial or str(run.status).casefold() in {"failed", "partial"}):
-                partial = True
-                partial_reason = partial_reason or run.partial_reason or f"run_status:{run.status}"
-            if stage is not None:
-                input_fingerprint = _export_input_fingerprint(records, key)
-                stage_task = repo.ensure_stage_task(
-                    stage,
-                    subject_type="run",
-                    subject_id=int(run_id),
-                    target_run_id=int(run_id),
-                    input_fingerprint=input_fingerprint,
-                    config_fingerprint="export-v1",
-                )
-                claimed = repo.claim_stage_task(
-                    stage,
-                    task_id=stage_task.id,
-                    owner=owner,
-                    force=True,
-                    input_fingerprint=input_fingerprint,
-                    config_fingerprint="export-v1",
-                )
-                if claimed is None:
-                    raise RuntimeError("export stage is already running")
-                stage_task = claimed
-                # Make the export lease visible before filesystem work starts.
-                session.commit()
-            if run is not None:
-                # The task is still running while files are written.  The
-                # manifest describes the terminal artifact state that this
-                # export invocation is about to commit, rather than exposing
-                # that transient lease to static readers.
-                run_snapshot_summary = build_run_snapshot_summary(
-                    session,
-                    run=run,
-                    snapshot_key=key,
-                    export_status="partial" if partial else "succeeded",
-                    export_error=partial_reason if partial else None,
-                )
+            watchlist_records = _list_watchlist_events(
+                session,
+                run_id=run_id,
+                reference_time=run.reference_time,
+            )
+            if run.partial or str(run.status).casefold() in {"failed", "partial"}:
+                raise RuntimeError(f"daily build is not publishable: {run.partial_reason or run.status}")
+            input_fingerprint = _export_input_fingerprint(records, int(run_id))
+            stage_task = repo.ensure_stage_task(
+                stage,
+                subject_type="run",
+                subject_id=int(run_id),
+                target_run_id=int(run_id),
+                input_fingerprint=input_fingerprint,
+                config_fingerprint="export-v2",
+            )
+            claimed = repo.claim_stage_task(
+                stage,
+                task_id=stage_task.id,
+                owner=owner,
+                force=True,
+                input_fingerprint=input_fingerprint,
+                config_fingerprint="export-v2",
+            )
+            if claimed is None:
+                raise RuntimeError("export stage is already running")
+            stage_task = claimed
+            # Make the export lease visible before filesystem work starts.
+            session.commit()
+            # The task is still running while files are written. The manifest
+            # describes the terminal artifact state about to be published.
+            build_summary = build_daily_build_summary(
+                session,
+                run=run,
+                export_status="succeeded",
+            )
         except Exception:
             session.rollback()
             raise
 
-    artifact_output = (
-        Path(artifact_dir)
-        if artifact_dir is not None
-        else _daily_output_dir(final_output, run)
-        if run is not None
-        else final_output
-    )
+    artifact_output = Path(artifact_dir) if artifact_dir is not None else _daily_output_dir(final_output, run)
     jsonl_path = artifact_output / "intel_items.jsonl"
     markdown_path = artifact_output / "intel_digest.md"
     manifest_path = artifact_output / "manifest.json"
-    legacy_pending_path = artifact_output / "intel_pending.jsonl"
     report_root = Path(github_report_dir) if github_report_dir else artifact_output / "github-trending"
 
     status_counts = dict(Counter(str(record.get("status") or "unknown") for record in records))
@@ -185,75 +153,54 @@ def run_intel_export_job(
 
     github_report_path: Path | None = None
     try:
-        if not dry_run and (run_id is not None or not partial):
+        if not dry_run:
             jsonl_payload = "".join(json.dumps(record, ensure_ascii=False, default=str) + "\n" for record in records)
             markdown_payload = _markdown(
                 records,
-                edition_date=run.edition_date if run is not None else None,
+                edition_date=run.edition_date,
                 status_counts=status_counts,
                 failure_counts=failure_counts,
                 watchlist_records=watchlist_records,
-                partial=partial,
-                partial_reason=partial_reason,
+                partial=False,
+                partial_reason=None,
             )
             payloads = {
                 jsonl_path: jsonl_payload,
                 markdown_path: markdown_payload,
             }
-            if run is not None:
-                payloads[manifest_path] = _manifest(
-                    run=run,
-                    records=records,
-                    jsonl_payload=jsonl_payload,
-                    watchlist_count=len(watchlist_records),
-                    partial=partial,
-                    partial_reason=partial_reason,
-                    run_snapshot_summary=run_snapshot_summary,
-                )
+            payloads[manifest_path] = _manifest(
+                run=run,
+                records=records,
+                jsonl_payload=jsonl_payload,
+                watchlist_count=len(watchlist_records),
+                partial=False,
+                partial_reason=None,
+                build_summary=build_summary,
+            )
             _atomic_write_bundle(payloads)
-            _remove_legacy_pending_artifacts(legacy_pending_path)
             github_report_path = write_github_trending_report(
                 records,
                 output_root=report_root,
                 report_date=_edition_report_date(run),
             )
-            # A partial/failed upstream run is auditable in its per-run
-            # directory but must never replace the last successful digest.
-            if run_id is not None and not partial and publish_root_mirror:
-                final_payloads = {
-                    final_output / "intel_items.jsonl": jsonl_payload,
-                    final_output / "intel_digest.md": markdown_payload,
-                }
-                _atomic_write_bundle(final_payloads)
-                _remove_legacy_pending_artifacts(final_output / "intel_pending.jsonl")
         if stage_task is not None:
             with session_factory() as session:
                 repo = IntelRepository(session)
-                state_stage = repo.get_stage(int(run_id), "export") if run_id is not None else None
+                state_stage = repo.get_stage(int(run_id), "export")
                 state_task = repo.get_task(state_stage, subject_type="run", subject_id=int(run_id)) if state_stage else None
                 if state_task is not None:
-                    if partial:
-                        repo.fail_stage_task(
-                            state_task,
-                            error_category="upstream",
-                            error_code="partial_upstream",
-                            error_message=partial_reason or "upstream stage is partial",
-                            retryable=True,
-                            owner=owner,
-                        )
-                    else:
-                        repo.complete_stage_task(
-                            state_task,
-                            owner=owner,
-                            result={"exported": len(records), "artifact_dir": str(artifact_output)},
-                        )
+                    repo.complete_stage_task(
+                        state_task,
+                        owner=owner,
+                        result={"exported": len(records), "artifact_dir": str(artifact_output)},
+                    )
                 session.commit()
     except Exception as exc:
         if stage_task is not None:
             try:
                 with session_factory() as session:
                     repo = IntelRepository(session)
-                    state_stage = repo.get_stage(int(run_id), "export") if run_id is not None else None
+                    state_stage = repo.get_stage(int(run_id), "export")
                     state_task = repo.get_task(state_stage, subject_type="run", subject_id=int(run_id)) if state_stage else None
                     if state_task is not None and state_task.status == "running":
                         repo.fail_stage_task(
@@ -273,15 +220,14 @@ def run_intel_export_job(
         exported=len(records),
         jsonl_path=str(jsonl_path),
         markdown_path=str(markdown_path),
-        manifest_path=str(manifest_path) if run is not None else None,
+        manifest_path=str(manifest_path),
         dry_run=dry_run,
         github_report_path=str(github_report_path) if github_report_path else None,
         status_counts=status_counts,
         failure_counts=failure_counts,
-        partial=bool(partial),
-        partial_reason=partial_reason,
+        partial=False,
+        partial_reason=None,
         run_id=run_id,
-        snapshot_key=key,
         records=tuple(records),
     )
 
@@ -291,16 +237,10 @@ def run_intel_export_from_settings(
     settings: Settings,
     output_dir: str | Path = "output/intel",
     limit: int | None = DEFAULT_DAILY_REPORT_LIMIT,
-    source_filter: str | None = None,
-    content_class: str | None = None,
     dry_run: bool = False,
     github_report_dir: str | Path | None = None,
-    snapshot_key: str | None = None,
-    run_id: int | None = None,
-    partial: bool = False,
-    partial_reason: str | None = None,
+    run_id: int,
     artifact_dir: str | Path | None = None,
-    publish_root_mirror: bool = True,
 ) -> IntelExportResult:
     database_url = _readable_database_url(settings.database_url, dry_run=dry_run)
     engine = create_engine_from_url(database_url)
@@ -310,16 +250,10 @@ def run_intel_export_from_settings(
         session_factory=create_session_factory(engine),
         output_dir=output_dir,
         limit=_normalise_export_limit(limit),
-        source_filter=source_filter,
-        content_class=content_class,
         dry_run=dry_run,
         github_report_dir=github_report_dir,
-        snapshot_key=snapshot_key,
         run_id=run_id,
-        partial=partial,
-        partial_reason=partial_reason,
         artifact_dir=artifact_dir,
-        publish_root_mirror=publish_root_mirror,
     )
 
 
@@ -376,27 +310,11 @@ def finalize_daily_bundle(promotion: DailyBundlePromotion) -> None:
         shutil.rmtree(promotion.backup_dir)
 
 
-def refresh_daily_export_mirror(*, output_dir: str | Path, daily_dir: str | Path) -> None:
-    """Refresh compatibility files at ``output/intel`` after publication only."""
-
-    root = Path(output_dir)
-    bundle = Path(daily_dir)
-    payloads: dict[Path, str] = {}
-    for name in ("intel_items.jsonl", "intel_digest.md", "manifest.json"):
-        source = bundle / name
-        if source.exists():
-            payloads[root / name] = source.read_text(encoding="utf-8")
-    if payloads:
-        _atomic_write_bundle(payloads)
-
-
 def _daily_output_dir(final_output: Path, run: IntelRun) -> Path:
     """Return the mutable public bundle for one Asia/Shanghai daily edition.
 
-    Run IDs remain immutable database/audit keys.  File artifacts intentionally
-    group by the human-facing edition date so a same-day rerun atomically
-    replaces the daily bundle rather than creating another ``runs/run-<id>``
-    directory.
+    File artifacts group only by their public edition date, so a same-day
+    rebuild atomically replaces the existing daily directory.
     """
 
     base = final_output.parent if final_output.name.casefold() == "intel" else final_output
@@ -406,28 +324,23 @@ def _daily_output_dir(final_output: Path, run: IntelRun) -> Path:
     return base / "daily" / edition_date
 
 
-def _edition_report_date(run: IntelRun | None) -> date | None:
+def _edition_report_date(run: IntelRun) -> date:
     """Keep the optional GitHub report aligned with its daily bundle."""
 
-    if run is None or not run.edition_date:
-        return None
+    if not run.edition_date:
+        raise ValueError("daily build is missing its edition date")
     try:
         return date.fromisoformat(run.edition_date)
-    except ValueError:
-        return None
+    except ValueError as exc:
+        raise ValueError("daily build has an invalid edition date") from exc
 
 
 def _ensure_stage_d_ready(repo: IntelRepository, run_id: int) -> None:
-    """Block run-scoped export until Stage D has a complete terminal result.
-
-    Legacy direct exports may not have a ``stage_d`` row at all; those remain
-    compatible.  Once the row exists, however, a missing/failed/in-flight
-    assessment or composition task must never create or replace artifacts.
-    """
+    """Block publication until this daily build has a complete Stage D result."""
 
     stage = repo.get_stage(int(run_id), "stage_d")
     if stage is None:
-        return
+        raise RuntimeError("stage_d_incomplete: Stage D has not run")
     tasks = repo.list_stage_tasks(stage, include_expired=True)
     blocking = [task for task in tasks if str(task.status) in _STAGE_D_BLOCKING_TASK_STATUSES]
     if str(stage.status) != "succeeded" or blocking:
@@ -446,17 +359,14 @@ def _manifest(
     watchlist_count: int,
     partial: bool,
     partial_reason: str | None,
-    run_snapshot_summary: dict[str, Any] | None,
+    build_summary: dict[str, Any] | None,
 ) -> str:
     """Build the machine-readable metadata for a date-addressed export."""
 
     payload = {
         "schema_version": 5,
         "edition_date": run.edition_date,
-        # Older runs did not persist a daily timezone.  Preserve their former
-        # UTC interpretation; all newly-created runs explicitly store
-        # Asia/Shanghai in ``scope_json``.
-        "edition_timezone": str(run.scope.get("edition_timezone") or "UTC"),
+        "edition_timezone": "Asia/Shanghai",
         "artifact_status": "partial" if partial else "ready",
         "edition_status": "partial" if partial else "ready",
         "partial": bool(partial),
@@ -464,11 +374,11 @@ def _manifest(
         "reference_time": _date(run.reference_time),
         "selected_count": len(records),
         "watchlist_count": max(0, int(watchlist_count)),
-        "stage_d_count": int((run_snapshot_summary or {}).get("funnel", {}).get("stage_d_total", 0)),
-        "stage_d_shortlisted": int((run_snapshot_summary or {}).get("funnel", {}).get("stage_d_shortlisted", 0)),
-        "funnel": (run_snapshot_summary or {}).get("funnel", {}),
-        "stages": (run_snapshot_summary or {}).get("stages", {}),
-        "failure_reasons": (run_snapshot_summary or {}).get("failure_reasons", []),
+        "stage_d_count": int((build_summary or {}).get("funnel", {}).get("stage_d_total", 0)),
+        "stage_d_shortlisted": int((build_summary or {}).get("funnel", {}).get("stage_d_shortlisted", 0)),
+        "funnel": (build_summary or {}).get("funnel", {}),
+        "stages": (build_summary or {}).get("stages", {}),
+        "failure_reasons": (build_summary or {}).get("failure_reasons", []),
         "artifacts": {
             "items_jsonl": "intel_items.jsonl",
             "digest_markdown": "intel_digest.md",
@@ -482,10 +392,10 @@ def _manifest(
 
 def _export_input_fingerprint(
     records: list[dict[str, Any]],
-    snapshot_key: str,
+    run_id: int,
 ) -> str:
     payload = {
-        "snapshot_key": snapshot_key,
+        "build_id": int(run_id),
         "events": [int(record.get("event_id")) for record in records if record.get("event_id") is not None],
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
@@ -515,33 +425,15 @@ def _atomic_write_bundle(payloads: dict[Path, str]) -> None:
                 pass
 
 
-def _remove_legacy_pending_artifacts(*paths: Path) -> None:
-    """Remove the retired audit artifact only after a new export succeeds."""
-
-    for path in paths:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            continue
-
-
 def _list_export_events(
     session: Session,
     *,
-    snapshot_key: str,
     limit: int | None,
-    source_filter: str | None,
-    content_class: str | None,
-    run_id: int | None = None,
+    run_id: int,
     reference_time: datetime | None = None,
     selected: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return event records from one snapshot tier.
-
-    The default remains selected-only for JSONL and all existing callers.  The
-    export job uses ``selected=False`` only for the private watchlist appendix;
-    it never feeds those rows into the public selected JSONL/API surfaces.
-    """
+    """Return selected or watchlist records from the current daily build."""
     stmt = (
         select(IntelEventStageDSnapshot, IntelEvent)
         .join(IntelEvent, IntelEvent.id == IntelEventStageDSnapshot.event_id)
@@ -552,34 +444,21 @@ def _list_export_events(
             joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source),
         )
         .where(
-            IntelEventStageDSnapshot.snapshot_key == snapshot_key,
+            IntelEventStageDSnapshot.run_id == int(run_id),
             IntelEventStageDSnapshot.selected.is_(bool(selected)),
+            IntelEvent.build_id == int(run_id),
         )
         .order_by(IntelEventStageDSnapshot.display_order.asc(), IntelEvent.id.asc())
     )
-    if run_id is not None:
-        stmt = stmt.where(
-            or_(
-                IntelEventStageDSnapshot.run_id == int(run_id),
-                IntelEventStageDSnapshot.run_id.is_(None),
-            )
-        )
     rows = list(session.execute(stmt).unique().all())
     records: list[dict[str, Any]] = []
     for snapshot, event in rows:
         freshness = _event_freshness(event, reference_time=reference_time)
-        # A well-formed run-scoped event must still pass the frozen item-level
-        # gate at export time.  Legacy events without a primary item retain
-        # their prior compatibility behavior rather than being invented anew.
+        # Stage D is fed by the frozen build scope; repeat the freshness check
+        # only to defend against malformed transient rows.
         if freshness is not None and not freshness.eligible:
             continue
         record = _serialize_event(snapshot, event, freshness=freshness)
-        if content_class and record.get("content_class") != content_class:
-            continue
-        if source_filter:
-            source_ids = record.get("source_ids") if isinstance(record.get("source_ids"), list) else []
-            if source_filter not in source_ids:
-                continue
         records.append(record)
         if limit is not None and len(records) >= limit:
             break
@@ -589,10 +468,7 @@ def _list_export_events(
 def _list_watchlist_events(
     session: Session,
     *,
-    snapshot_key: str,
-    source_filter: str | None,
-    content_class: str | None,
-    run_id: int | None = None,
+    run_id: int,
     reference_time: datetime | None = None,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
@@ -602,10 +478,7 @@ def _list_watchlist_events(
         return []
     rows = _list_export_events(
         session,
-        snapshot_key=snapshot_key,
         limit=None,
-        source_filter=source_filter,
-        content_class=content_class,
         run_id=run_id,
         reference_time=reference_time,
         selected=False,
@@ -690,7 +563,7 @@ def _serialize_event(
         "community_signal_pending_verification": ["社区线索 / 待核实"],
         "multi_community_signal_pending_verification": ["多源社区线索 / 待核实"],
     }.get(str(presentation), [])
-    provenance_kind = "new" if event.new_in_run_id == snapshot.run_id else "repeat"
+    provenance_kind = "new" if event.novelty_status == "new" else "repeat"
     return {
         "record_type": "intel_event",
         "stage": "stage_d",
@@ -863,7 +736,7 @@ def _json_list(value: str | None) -> list[str]:
 
 
 def _public_value(value: Any) -> Any:
-    """Remove internal execution identifiers from exportable nested JSON."""
+    """Remove hidden build identifiers from exportable nested JSON."""
 
     if isinstance(value, dict):
         return {
@@ -883,8 +756,6 @@ def _is_internal_execution_key(key: object) -> bool:
     return (
         normalized == "run_id"
         or normalized.endswith("_run_id")
-        or normalized == "snapshot_key"
-        or normalized.endswith("_snapshot_key")
     )
 
 

@@ -30,7 +30,7 @@ from app.config.limits import DEFAULT_AI_ANALYSIS_MIN_SCORE, DEFAULT_AI_REVIEW_C
 from app.domain.models import SourceSpec
 from app.jobs.provider_retry import ProviderResponseFailure, call_with_provider_retries
 from app.storage.models import IntelItem, IntelRun, IntelRunStageTask
-from app.storage.repository import DAILY_DELTA_RUN_ITEM_ROLES, IntelRepository
+from app.storage.repository import IntelRepository
 
 from .stage_a_screen_job import (
     _classify_provider_failure,
@@ -132,8 +132,11 @@ def run_stage_b_analysis_job(
     # analysis provider request and never causes Stage A to run.
     preflight_intel_triage_schemas()
 
+    # ``structured_v2`` deliberately invalidates the old value-gated Stage-B
+    # tasks.  Reusing those tasks would preserve ``analysis_filtered`` rows
+    # and defeat the new contract even when the provider output is unchanged.
     config_fingerprint = _config_fingerprint(
-        stage="analyze",
+        stage="analyze_structured_v2",
         model=getattr(ai_client, "model", None),
         reject_threshold=min_score,
     )
@@ -141,6 +144,9 @@ def run_stage_b_analysis_job(
     task_ids_by_item: dict[int, int] = {}
     with session_factory() as session:
         repo = IntelRepository(session)
+        run = session.get(IntelRun, int(run_id))
+        if run is None or run.edition_id is None:
+            raise ValueError("Stage B requires the current daily edition build")
         existing_stage = repo.get_stage(run_id, "analyze")
         # Reset a whole stage only for a genuinely unfiltered rerun.  A
         # source/class/task filter is an operator-scoped retry and must not
@@ -179,14 +185,9 @@ def run_stage_b_analysis_job(
             for task in screen_tasks
             if task.item_id is not None or str(task.subject_id).isdigit()
         }
-        run = session.get(IntelRun, int(run_id))
-        daily_build = getattr(run, "edition_id", None) is not None if run is not None else False
         scope_items = {
             int(item.id): item
-            for item in repo.list_run_items(
-                run_id,
-                role=None if requested_ids is not None or daily_build else DAILY_DELTA_RUN_ITEM_ROLES,
-            )
+            for item in repo.list_run_items(run_id, role=None)
         }
         eligible_contexts: list[_AnalysisContext] = []
         for screen_task in screen_tasks:
@@ -197,9 +198,8 @@ def run_stage_b_analysis_job(
                 continue
             existing_b = repo.get_task(stage, subject_type="item", subject_id=item_id)
             if requested_task_ids is not None:
-                # ``task_ids`` names Stage-B tasks.  For a first invocation,
-                # accepting a matching Stage-A ID is a small compatibility
-                # affordance; otherwise keep the selection strictly scoped.
+                # ``task_ids`` names Stage-B tasks.  A first invocation may
+                # use the matching Stage-A task ID to keep a retry scoped.
                 if existing_b is not None and existing_b.id not in requested_task_ids:
                     continue
                 if existing_b is None and screen_task.id not in requested_task_ids:
@@ -353,6 +353,11 @@ def run_stage_b_analysis_job(
         try:
             guard_reason = analysis_guard_failure(analysis)
             score = int(analysis.selection_score or 0)
+            analysis_tier = "low_signal" if score < min_score else "enriched"
+            flags = list(analysis.risk_flags)
+            if analysis_tier == "low_signal" and "analysis:low_signal" not in flags:
+                flags.append("analysis:low_signal")
+            enriched = analysis.model_copy(update={"risk_flags": flags}) if flags != analysis.risk_flags else analysis
             with session_factory() as session:
                 repo = IntelRepository(session)
                 task = session.get(IntelRunStageTask, task_id)
@@ -361,15 +366,26 @@ def run_stage_b_analysis_job(
                 heartbeated = repo.heartbeat_stage_task(task, owner=owner)
                 if heartbeated is None:
                     raise _TaskLeaseLost(f"stage B task {task_id} lease/owner lost before persistence")
-                filtered = bool(guard_reason or score < min_score)
-                persisted = analysis.model_copy(update={"reason": f"analysis_filtered:{guard_reason or 'score_below_threshold'}"}) if filtered else analysis
+                # Value is no longer a Stage-B gate.  Only a genuinely
+                # malformed success (for example, no summary after the
+                # envelope fallback) remains a structural filter.
+                filtered = bool(guard_reason)
+                persisted = (
+                    enriched.model_copy(update={"reason": f"analysis_filtered:{guard_reason}"})
+                    if filtered
+                    else enriched
+                )
                 completed = repo.complete_stage_task(
                     task,
                     owner=owner,
                     result_ref={"projection": "AIItemReview", "item_id": context.item_id},
                     result=persisted.model_dump(mode="json"),
                     raw_response=persisted.raw_response,
-                    metadata={"selection_score": score, "filtered": filtered},
+                    metadata={
+                        "selection_score": score,
+                        "filtered": filtered,
+                        "analysis_tier": "structural_invalid" if filtered else analysis_tier,
+                    },
                 )
                 if completed is None:
                     raise _TaskLeaseLost(f"stage B task {task_id} lease/owner lost before completion")
@@ -378,7 +394,7 @@ def run_stage_b_analysis_job(
                 # stale worker cannot publish a result for a task it no
                 # longer owns.
                 if filtered:
-                    repo.save_analysis(
+                    repo.upsert_ai_analysis(
                         context.item_id,
                         persisted,
                         run_id=run_id,
@@ -389,12 +405,12 @@ def run_stage_b_analysis_job(
                     item = session.get(IntelItem, context.item_id)
                     if item is not None:
                         item.selection_score = score
-                        item.selection_reason = f"analysis_filtered:{guard_reason or 'score_below_threshold'}"
+                        item.selection_reason = f"analysis_filtered:{guard_reason}"
                     repo.set_item_status(context.item_id, "analysis_filtered", run_id=run_id)
                 else:
-                    repo.save_analysis(
+                    repo.upsert_ai_analysis(
                         context.item_id,
-                        analysis,
+                        persisted,
                         run_id=run_id,
                         model=getattr(ai_client, "model", None),
                         content_class=context.content_class,
@@ -403,7 +419,7 @@ def run_stage_b_analysis_job(
                     item = session.get(IntelItem, context.item_id)
                     if item is not None:
                         item.selection_score = score
-                        item.selection_reason = analysis.reason[:4000] if analysis.reason else "analysis_candidate"
+                        item.selection_reason = persisted.reason[:4000] if persisted.reason else "analysis_candidate"
                     repo.set_item_status(context.item_id, "candidate", run_id=run_id)
                 session.commit()
             result.analyzed += 1
@@ -484,24 +500,11 @@ def run_stage_b_analysis_job(
     return result
 
 
-run_stage_b = run_stage_b_analysis_job
-run_analysis_stage = run_stage_b_analysis_job
-run_stage_b_job = run_stage_b_analysis_job
-run_stage_b_analysis = run_stage_b_analysis_job
-run_stage_b_analyze = run_stage_b_analysis_job
-StageBResult = StageBAnalysisResult
-
-
 def _screen_task_is_eligible(task: IntelRunStageTask, *, run_id: int, session: Session) -> bool:
+    del run_id, session
     data = task.result
     decision = str(data.get("decision", "")).casefold() if isinstance(data, Mapping) else ""
-    if decision in {"pass", "uncertain"}:
-        return True
-    # Adopted tasks may only have a projection reference.  The projection is a
-    # compatibility fallback and must still belong to this run.
-    item = session.get(IntelItem, int(task.item_id or task.subject_id))
-    screen = getattr(item, "ai_screen", None) if item is not None else None
-    return bool(screen is not None and screen.run_id == int(run_id) and screen.status == "success" and screen.decision in {"pass", "uncertain"})
+    return decision in {"pass", "uncertain"}
 
 
 def _screen_task_is_terminally_ineligible(
@@ -686,7 +689,7 @@ def _persist_analysis_failure(
                 raise _TaskLeaseLost(f"stage B task {task_id} lease/owner lost before failure persistence")
             # Persist the projection only after the owner/lease check above,
             # in the same transaction as the task failure transition.
-            repo.save_analysis(
+            repo.upsert_ai_analysis(
                 item_id,
                 analysis,
                 run_id=run_id,
@@ -770,11 +773,5 @@ def _bounded_concurrency(value: Any) -> int:
 
 __all__ = [
     "StageBAnalysisResult",
-    "StageBResult",
     "run_stage_b_analysis_job",
-    "run_stage_b_analysis",
-    "run_stage_b_analyze",
-    "run_stage_b",
-    "run_stage_b_job",
-    "run_analysis_stage",
 ]

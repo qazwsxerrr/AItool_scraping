@@ -15,7 +15,7 @@
       {% if card.published_at %}<time datetime="{{ card.published_at }}">{{ card.published_at | relative_time }}</time>{% endif %}
     </div>
     <h3>
-      <a href="/events/{{ card.id }}?{% if active_edition_date %}run_date={{ active_edition_date }}&amp;{% endif %}origin={{ active_nav or 'home' }}">{{ card.title }}</a>
+      <a href="/events/{{ card.id }}?{% if active_edition_date %}edition_date={{ active_edition_date }}&amp;{% endif %}origin={{ active_nav or 'home' }}">{{ card.title }}</a>
     </h3>
     {% if card.summary %}<p class="summary-clamp" title="{{ card.summary }}">{{ card.summary }}</p>{% endif %}
     {% if card.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ card.selection_reason }}</p>{% endif %}

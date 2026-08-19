@@ -154,8 +154,6 @@ button, input, select { font: inherit; }
 .section-heading h2 { margin: 3px 0 0; color: var(--ink); font-size: 20px; letter-spacing: -.03em; }
 .section-count { color: var(--muted); font-size: 11px; }
 .section-intro { margin: -3px 0 12px; color: var(--muted); font-size: 12px; }
-.legacy-anchor { margin-top: 44px; }
-.legacy-anchor h2 { color: transparent; font-size: 1px; }
 
 /* Cards and provenance */
 .card { display: flex; gap: 16px; margin-bottom: 12px; padding: 18px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 3px 12px rgba(16,24,39,.035); transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease; }

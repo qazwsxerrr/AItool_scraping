@@ -6,7 +6,7 @@ DEFAULT_FETCH_LIMIT_PER_SOURCE = 30
 DEFAULT_AI_REVIEW_LIMIT: int | None = None
 """Default AI item cap. ``None`` means no global cap."""
 
-DEFAULT_AI_SCREEN_REJECT_THRESHOLD = 85
+DEFAULT_AI_SCREEN_REJECT_THRESHOLD = 90
 """Minimum Stage A confidence required for a hard rejection."""
 
 DEFAULT_AI_ANALYSIS_MIN_SCORE = 60

@@ -11,15 +11,12 @@ from app.config.limits import (
     DEFAULT_FETCH_LIMIT_PER_SOURCE,
 )
 from app.config.settings import Settings
-from app.jobs.ai_review_job import run_ai_review_from_settings
-from app.jobs.stage_d_job import run_stage_d_from_settings
-from app.jobs.export_job import run_intel_export_from_settings
 from app.jobs.fetch_job import run_intel_fetch_from_settings
 from app.jobs.fetch_only_job import run_fetch_only_from_settings
 from app.jobs.pipeline_orchestrator import (
     normalize_stage,
     pipeline_edition_status_from_settings,
-    resolve_pipeline_run_id_from_settings,
+    resolve_pending_daily_build_id_from_settings,
     resume_pipeline_from_settings,
     retry_pipeline_stage_from_settings,
     run_pipeline_export_from_settings,
@@ -30,7 +27,6 @@ from app.jobs.pipeline_orchestrator import (
     run_pipeline_stage_c_from_settings,
     start_pipeline_run_from_settings,
 )
-from app.jobs.run_job import run_intel_once_from_settings
 from app.jobs.source_health_job import run_source_health_from_settings
 from app.logging_config import configure_logging
 
@@ -53,7 +49,6 @@ def fetch(
     source: str | None = typer.Option(None, help="Only fetch one source id."),
     content_class: str | None = typer.Option(None, "--class", help="Only fetch one content class."),
     force: bool = typer.Option(False, "--force", help="Ignore fetch_interval cooldown."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Fetch without database writes."),
 ) -> None:
     configure_logging()
     _validate_content_class(content_class)
@@ -63,7 +58,7 @@ def fetch(
         source_filter=source,
         content_class=content_class,
         force=force,
-        dry_run=dry_run,
+        dry_run=True,
     )
     if result.not_due_sources:
         typer.echo(f"Not due (use --force to retry): {', '.join(result.not_due_sources)}")
@@ -95,7 +90,6 @@ def fetch_only(
     source: str | None = typer.Option(None, help="Only fetch one source id."),
     content_class: str | None = typer.Option(None, "--class", help="Only fetch one content class."),
     force: bool = typer.Option(False, "--force", help="Ignore fetch_interval cooldown."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Fetch without database or export writes."),
     output_dir: str = typer.Option("output/fetch", help="Raw/normalized JSON and Markdown output directory."),
 ) -> None:
     """Run only fetch and export raw/normalized items with source attribution."""
@@ -108,7 +102,6 @@ def fetch_only(
         source_filter=source,
         content_class=content_class,
         force=force,
-        dry_run=dry_run,
         output_dir=output_dir,
     )
     if result.fetch.not_due_sources:
@@ -124,104 +117,10 @@ def fetch_only(
     )
     if result.fetch.skipped_sources:
         typer.echo(f"Registry skipped: {len(result.fetch.skipped_sources)}")
-    if result.export is not None:
-        typer.echo(f"exported={result.export.exported} dry_run={result.export.dry_run}")
-        typer.echo(f"json={result.export.json_path}")
-        typer.echo(f"jsonl={result.export.jsonl_path}")
-        typer.echo(f"markdown={result.export.markdown_path}")
-
-
-@app.command("ai-review")
-def ai_review(
-    source: str | None = typer.Option(None, "--source", help="Only review one source id."),
-    content_class: str | None = typer.Option(None, "--class", help="Only review one content class."),
-    limit: int = typer.Option(
-        DEFAULT_AI_REVIEW_LIMIT,
-        min=1,
-        help=f"Maximum existing items to review (default: {DEFAULT_AI_REVIEW_LIMIT}).",
-    ),
-    force: bool = typer.Option(False, "--force", help="Re-review previously handled items."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Run selection without AI/database/output writes."),
-    output_dir: str = typer.Option("output/ai-review", help="Candidate and audit output directory."),
-) -> None:
-    """Run AI-only classification and Chinese summary."""
-
-    configure_logging()
-    _validate_content_class(content_class)
-    result = run_ai_review_from_settings(
-        settings=Settings.from_env(),
-        source_filter=source,
-        content_class=content_class,
-        limit=limit,
-        force=force,
-        dry_run=dry_run,
-        output_dir=output_dir,
-    )
-    typer.echo(
-        f"processed={result.processed} selected={result.selected} filtered={result.filtered} "
-        f"analyzed={result.analyzed} ai_failed={result.ai_failed} failed={result.failed} "
-        f"exported={result.exported} audit={result.audit_exported} dry_run={result.dry_run}"
-    )
-    typer.echo(f"candidates={result.candidate_path}")
-    typer.echo(f"audit={result.audit_path}")
-    typer.echo(f"markdown={result.markdown_path}")
-
-
-@app.command("export")
-def export(
-    source: str | None = typer.Option(None, help="Only export one source id."),
-    content_class: str | None = typer.Option(None, "--class", help="Only export one content class."),
-    limit: int = typer.Option(
-        DEFAULT_DAILY_REPORT_LIMIT,
-        min=1,
-        help=f"Maximum retained items to export (default: {DEFAULT_DAILY_REPORT_LIMIT}; explicit values override).",
-    ),
-    output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Build records without writing files."),
-    snapshot_key: str = typer.Option("latest", "--snapshot", help="Stage D snapshot key."),
-) -> None:
-    configure_logging()
-    _validate_content_class(content_class)
-    result = run_intel_export_from_settings(
-        settings=Settings.from_env(),
-        source_filter=source,
-        content_class=content_class,
-        limit=limit,
-        output_dir=output_dir,
-        dry_run=dry_run,
-        snapshot_key=snapshot_key,
-    )
-    typer.echo(f"exported={result.exported} dry_run={result.dry_run}")
-    typer.echo(f"jsonl={result.jsonl_path}")
-    typer.echo(f"markdown={result.markdown_path}")
-    if result.manifest_path:
-        typer.echo(f"manifest={result.manifest_path}")
-    if result.github_report_path:
-        typer.echo(f"github_report={result.github_report_path}")
-
-
-@app.command("stage-d")
-def stage_d(
-    force: bool = typer.Option(False, "--force", help="Rebuild this Stage-D editorial snapshot."),
-    snapshot_key: str = typer.Option("latest", "--snapshot", help="Stage-D snapshot key."),
-    profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
-) -> None:
-    """Select a final daily edition from Stage-C canonical events."""
-
-    configure_logging()
-    result = run_stage_d_from_settings(
-        settings=Settings.from_env(),
-        profile_path=profile,
-        force=force,
-        snapshot_key=snapshot_key,
-    )
-    typer.echo(
-        f"processed={result.processed} eligible={result.eligible} selected={result.selected} omitted={result.omitted} "
-        f"paper_gated={result.paper_gated} snapshots={result.snapshots} ai_failed={result.ai_failed} "
-        f"fallback={result.used_fallback}"
-    )
-    for error in result.errors:
-        typer.echo(f"error={error}")
+    typer.echo(f"exported={result.export.exported}")
+    typer.echo(f"json={result.export.json_path}")
+    typer.echo(f"jsonl={result.export.jsonl_path}")
+    typer.echo(f"markdown={result.export.markdown_path}")
 
 
 @app.command("run-once")
@@ -233,7 +132,6 @@ def run_once(
         min=1,
         help=f"Maximum items to fetch per source (default: {DEFAULT_FETCH_LIMIT_PER_SOURCE}).",
     ),
-    force: bool = typer.Option(False, "--force", help="Ignore cooldown and re-review items."),
     edition_date: str | None = typer.Option(
         None,
         "--edition-date",
@@ -244,43 +142,25 @@ def run_once(
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
 ) -> None:
     configure_logging()
-    result = run_intel_once_from_settings(
+    result = run_pipeline_from_settings(
         settings=Settings.from_env(),
         limit=limit,
-        force=force,
         edition_date=_optional_edition_date(edition_date),
         output_dir=output_dir,
         profile_path=profile,
     )
     typer.echo(
-        f"fetch: fetched={result.fetch.total_fetched} inserted={result.fetch.total_inserted} "
-        f"skipped={result.fetch.total_skipped} failed={result.fetch.total_failed}"
+        f"fetch: fetched={result.start.fetch.total_fetched} inserted={result.start.fetch.total_inserted} "
+        f"skipped={result.start.fetch.total_skipped} failed={result.start.fetch.total_failed}"
     )
-    typer.echo(
-        f"ai-review: processed={result.ai_review.processed} screened={result.ai_review.screened} "
-        f"screened_out={result.ai_review.screened_out} analyzed={result.ai_review.analyzed} "
-        f"candidate={result.ai_review.candidate} failed={result.ai_review.failed} partial={result.ai_review.partial}"
-    )
-    typer.echo(
-        f"export: exported={result.export.exported} partial={result.export.partial}"
-    )
-    if result.event_cluster is not None:
-        typer.echo(
-            f"event-cluster: processed={result.event_cluster.processed} events={result.event_cluster.events} "
-            f"failed={result.event_cluster.failed}"
-        )
-    if result.stage_d is not None:
-        typer.echo(
-            f"stage-d: selected={result.stage_d.selected} omitted={result.stage_d.omitted} "
-            f"ai_failed={result.stage_d.ai_failed}"
-        )
-    if result.export.github_report_path:
-        typer.echo(f"github_report={result.export.github_report_path}")
-    _echo_daily_edition(result.export.markdown_path)
+    exported = result.resume.results.get("export")
+    if exported is not None:
+        typer.echo(f"export: exported={exported.exported}")
+        _echo_daily_edition(exported.markdown_path)
     typer.echo(f"status={result.status}")
-    if result.error:
-        typer.echo(f"error={result.error}")
     if result.status != "published":
+        for error in result.resume.errors:
+            typer.echo(f"error={error}")
         raise typer.Exit(code=1)
 
 
@@ -292,7 +172,6 @@ def pipeline_start(
         min=1,
         help="Maximum items fetched per source for this run.",
     ),
-    force: bool = typer.Option(False, "--force", help="Ignore source cooldown for this fetch stage only."),
     edition_date: str | None = typer.Option(
         None,
         "--edition-date",
@@ -306,7 +185,6 @@ def pipeline_start(
     result = start_pipeline_run_from_settings(
         settings=Settings.from_env(),
         limit=limit,
-        force=force,
         edition_date=_optional_edition_date(edition_date),
     )
     if result.edition_date:
@@ -328,7 +206,6 @@ def pipeline_run(
         min=1,
         help="Maximum items fetched per source for this run.",
     ),
-    force: bool = typer.Option(False, "--force", help="Ignore source cooldown for this fetch stage only."),
     output_dir: str = typer.Option("output/intel", "--output-dir"),
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
     edition_date: str | None = typer.Option(
@@ -350,7 +227,6 @@ def pipeline_run(
     result = run_pipeline_from_settings(
         settings=Settings.from_env(),
         limit=limit,
-        force=force,
         edition_date=_optional_edition_date(edition_date),
         output_dir=output_dir,
         profile_path=profile,
@@ -387,7 +263,7 @@ def pipeline_stage_a(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_run_id(settings, edition_date)
+    run_id = _resolve_pending_build_id(settings, edition_date)
     result = run_pipeline_stage_a_from_settings(
         settings=settings,
         run_id=run_id,
@@ -414,7 +290,7 @@ def pipeline_stage_b(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_run_id(settings, edition_date)
+    run_id = _resolve_pending_build_id(settings, edition_date)
     result = run_pipeline_stage_b_from_settings(
         settings=settings,
         run_id=run_id,
@@ -440,7 +316,7 @@ def pipeline_stage_c(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_run_id(settings, edition_date)
+    run_id = _resolve_pending_build_id(settings, edition_date)
     result = run_pipeline_stage_c_from_settings(
         settings=settings,
         run_id=run_id,
@@ -463,7 +339,7 @@ def pipeline_stage_d(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_run_id(settings, edition_date)
+    run_id = _resolve_pending_build_id(settings, edition_date)
     result = run_pipeline_stage_d_from_settings(
         settings=settings,
         run_id=run_id,
@@ -481,19 +357,17 @@ def pipeline_export(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to export."),
     limit: int = typer.Option(DEFAULT_DAILY_REPORT_LIMIT, "--limit", min=1),
     output_dir: str = typer.Option("output/intel", "--output-dir"),
-    dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     """Publish the current daily draft's selected Stage-D events."""
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_run_id(settings, edition_date)
+    run_id = _resolve_pending_build_id(settings, edition_date)
     result = run_pipeline_export_from_settings(
         settings=settings,
         run_id=run_id,
         limit=limit,
         output_dir=output_dir,
-        dry_run=dry_run,
     )
     typer.echo(
         f"export: exported={result.exported} partial={result.partial}"
@@ -546,7 +420,7 @@ def pipeline_retry(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_run_id(settings, edition_date)
+    run_id = _resolve_pending_build_id(settings, edition_date)
     try:
         canonical = normalize_stage(stage)
         result = retry_pipeline_stage_from_settings(
@@ -581,7 +455,7 @@ def pipeline_resume(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_run_id(settings, edition_date)
+    run_id = _resolve_pending_build_id(settings, edition_date)
     result = resume_pipeline_from_settings(
         settings=settings,
         run_id=run_id,
@@ -625,10 +499,10 @@ def _required_edition_date(value: str) -> str:
         raise typer.BadParameter("must use YYYY-MM-DD", param_hint="--edition-date") from exc
 
 
-def _resolve_run_id(settings: Settings, edition_date: str) -> int:
+def _resolve_pending_build_id(settings: Settings, edition_date: str) -> int:
     normalized = _required_edition_date(edition_date)
     try:
-        return resolve_pipeline_run_id_from_settings(settings=settings, edition_date=normalized)
+        return resolve_pending_daily_build_id_from_settings(settings=settings, edition_date=normalized)
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--edition-date") from exc
 

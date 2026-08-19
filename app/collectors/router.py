@@ -7,7 +7,6 @@ from typing import Mapping
 from app.domain.models import FetchBatch, SourceSpec
 
 from .base import Collector
-from .feed import FeedCollector, ProductHuntCollector, RSSHubCollector
 from .github import GitHubCollector, GitHubTrendingCollector
 
 
@@ -22,8 +21,8 @@ class CollectorRouter:
         self,
         *,
         feed: Collector,
-        direct_feed: Collector | None = None,
-        rsshub: Collector | None = None,
+        direct_feed: Collector,
+        rsshub: Collector,
         github: Collector,
         github_trending: Collector,
         producthunt: Collector,
@@ -32,11 +31,8 @@ class CollectorRouter:
         # Some public feeds are reachable only without the user's outbound
         # proxy. The registry makes that exception explicit per source instead
         # of relying on process-wide NO_PROXY mutations.
-        self.direct_feed = direct_feed if direct_feed is not None else feed
-        # RSSHub documents are parsed exactly like native feeds.  Keep the
-        # optional name for callers migrating from the old constructor while
-        # honoring a separately configured local RSSHub client when provided.
-        self.rsshub = rsshub if rsshub is not None else feed
+        self.direct_feed = direct_feed
+        self.rsshub = rsshub
         self.github = github
         self.github_trending = github_trending
         self.producthunt = producthunt
@@ -72,15 +68,7 @@ class CollectorRouter:
         request_headers: Mapping[str, str] | None = None,
     ) -> FetchBatch:
         collector = self.collector_for(source)
-        try:
-            return collector.collect(source, limit, request_headers=request_headers)
-        except TypeError as exc:
-            # Existing fake/third-party collectors often expose the original
-            # two-argument contract. Retry only when the optional keyword is
-            # rejected; genuine collector errors are re-raised.
-            if "request_headers" not in str(exc):
-                raise
-            return collector.collect(source, limit)
+        return collector.collect(source, limit, request_headers=request_headers)
 
 
 __all__ = ["CollectorRouter"]

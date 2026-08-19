@@ -1,10 +1,4 @@
-"""Strict provider-neutral contracts for the two Stage D AI phases.
-
-Stage D v2 deliberately separates the inexpensive per-event assessment from
-the bounded global composition call.  The legacy v1 models are kept private
-so old snapshots and callers can still be parsed during a rolling upgrade;
-new public aliases refer to the v2 composition contract.
-"""
+"""Strict provider-neutral contracts for the two Stage D AI phases."""
 
 from __future__ import annotations
 
@@ -206,13 +200,6 @@ class StageDCompositionResponse(BaseModel):
         return self
 
 
-# Public compatibility names used by the jobs and by downstream consumers.
-# They intentionally point to the v2 composition types.  Legacy v1 parsing is
-# implemented privately in parser.py and does not leak into the new contract.
-StageDDecision = StageDEditorialDecision
-StageDEditorialResponse = StageDCompositionResponse
-
-
 __all__ = [
     "STAGE_D_REASON_CODES",
     "STAGE_D_REASON_CODE_SET",
@@ -221,7 +208,5 @@ __all__ = [
     "StageDAssessment",
     "StageDAssessmentResponse",
     "StageDCompositionResponse",
-    "StageDDecision",
     "StageDEditorialDecision",
-    "StageDEditorialResponse",
 ]
