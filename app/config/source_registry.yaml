@@ -317,6 +317,134 @@ sources:
   - model_product
   - industry_infrastructure
   primary_eligible: true
+- id: langchain_blog
+  name: LangChain Blog
+  transport: feed
+  url: https://www.langchain.com/blog/rss.xml
+  enabled: true
+  priority: 42
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: developer_blog
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  content_class: official_model_company
+  selection_policy:
+    mode: first_party_recent
+    max_age_days: 30
+  default_limit: 12
+  tier: p1
+  topic_scopes:
+  - model_product
+  - open_source_tool
+  primary_eligible: true
+- id: google_developers_blog
+  name: Google Developers Blog
+  transport: feed
+  url: https://developers.googleblog.com/feeds/posts/default/?alt=rss
+  enabled: true
+  priority: 43
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: developer_blog
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  content_class: official_model_company
+  selection_policy:
+    mode: first_party_recent
+    max_age_days: 7
+  default_limit: 15
+  tier: p1
+  topic_scopes:
+  - model_product
+  - industry_infrastructure
+  - open_source_tool
+  primary_eligible: true
+- id: cursor_changelog
+  name: Cursor Changelog
+  transport: feed
+  url: https://cursor.com/changelog/rss.xml
+  enabled: true
+  priority: 44
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: product_changelog
+  quality_weight: 0.95
+  source_role: official
+  spam_risk: low
+  content_class: official_model_company
+  selection_policy:
+    mode: first_party_recent
+    max_age_days: 30
+  default_limit: 12
+  tier: p1
+  topic_scopes:
+  - model_product
+  - open_source_tool
+  primary_eligible: true
+- id: gary_marcus_blog
+  name: Gary Marcus Blog
+  transport: feed
+  url: https://garymarcus.substack.com/feed
+  enabled: true
+  priority: 63
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  source_subtype: analysis_blog
+  quality_weight: 0.8
+  source_role: analysis
+  spam_risk: low
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 7
+    keywords: []
+  default_limit: 15
+  tier: p2
+  topic_scopes:
+  - research
+  - practice_opinion
+  primary_eligible: true
+- id: tomer_tunguz_blog
+  name: Tomer Tunguz Blog
+  transport: feed
+  url: https://www.tomtunguz.com/index.xml
+  enabled: true
+  priority: 64
+  fetch_interval: 7200
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  source_subtype: analysis_blog
+  quality_weight: 0.8
+  source_role: analysis
+  spam_risk: low
+  content_class: news_media
+  selection_policy:
+    mode: media_recent
+    max_age_days: 7
+    keywords: []
+  default_limit: 15
+  tier: p2
+  topic_scopes:
+  - industry_infrastructure
+  - practice_opinion
+  primary_eligible: true
 - id: ithome_ai_news
   name: IT之家 AI 资讯
   transport: feed
@@ -2062,6 +2190,162 @@ sources:
   topic_scopes:
   - model_product
   primary_eligible: false
+- id: x_account_claude_devs
+  name: X Claude Developers official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/ClaudeDevs
+  enabled: true
+  priority: 134
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  account_url: https://x.com/ClaudeDevs
+  content_class: official_model_company
+  selection_policy:
+    mode: first_party_recent
+    max_age_days: 7
+  default_limit: 10
+  tier: p1
+  topic_scopes:
+  - model_product
+  - open_source_tool
+  primary_eligible: true
+- id: x_account_pvncher
+  name: X pvncher official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/pvncher
+  enabled: true
+  priority: 135
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  account_url: https://x.com/pvncher
+  content_class: official_model_company
+  selection_policy:
+    mode: first_party_recent
+    max_age_days: 7
+  default_limit: 10
+  tier: p1
+  topic_scopes:
+  - model_product
+  - open_source_tool
+  primary_eligible: true
+- id: x_account_thdxr
+  name: X thdxr official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/thdxr
+  enabled: true
+  priority: 136
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  account_url: https://x.com/thdxr
+  content_class: official_model_company
+  selection_policy:
+    mode: first_party_recent
+    max_age_days: 7
+  default_limit: 10
+  tier: p1
+  topic_scopes:
+  - model_product
+  - open_source_tool
+  primary_eligible: true
+- id: x_account_xhyctf
+  name: X xhyctf official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/xhyctf
+  enabled: true
+  priority: 137
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  account_url: https://x.com/xhyctf
+  content_class: official_model_company
+  selection_policy:
+    mode: first_party_recent
+    max_age_days: 7
+  default_limit: 10
+  tier: p1
+  topic_scopes:
+  - model_product
+  - open_source_tool
+  primary_eligible: true
+- id: x_account_devin_desktop
+  name: X Devin Desktop official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/devindesktop
+  enabled: true
+  priority: 138
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  account_url: https://x.com/devindesktop
+  content_class: official_model_company
+  selection_policy:
+    mode: first_party_recent
+    max_age_days: 7
+  default_limit: 10
+  tier: p1
+  topic_scopes:
+  - model_product
+  - open_source_tool
+  primary_eligible: true
+- id: x_account_cursor_ai
+  name: X Cursor official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/cursor_ai
+  enabled: true
+  priority: 139
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  source_subtype: account
+  quality_weight: 0.9
+  source_role: official
+  spam_risk: low
+  account_url: https://x.com/cursor_ai
+  content_class: official_model_company
+  selection_policy:
+    mode: first_party_recent
+    max_age_days: 7
+  default_limit: 10
+  tier: p1
+  topic_scopes:
+  - model_product
+  - open_source_tool
+  primary_eligible: true
 - id: x_account_sam_altman
   name: X Sam Altman via RSSHub
   transport: rsshub
@@ -2274,6 +2558,31 @@ sources:
   topic_scopes:
   - practice_opinion
   primary_eligible: false
+- id: deepseek_api_news_rsshub
+  name: DeepSeek API News via RSSHub
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/deepseek/news
+  enabled: true
+  priority: 109
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: official_blog
+  source_subtype: api_news
+  quality_weight: 0.95
+  source_role: official
+  spam_risk: low
+  content_class: official_model_company
+  selection_policy:
+    mode: first_party_recent
+    max_age_days: 30
+  default_limit: 12
+  tier: p1
+  topic_scopes:
+  - model_product
+  - industry_infrastructure
+  primary_eligible: true
 - id: anthropic_news_rsshub
   name: Anthropic News via RSSHub
   transport: rsshub

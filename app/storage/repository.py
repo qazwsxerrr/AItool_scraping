@@ -7,7 +7,7 @@ import json
 import re
 from uuid import uuid4
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -99,6 +99,23 @@ STAGE_RETRYABLE_STATUSES = frozenset({"pending", "retry_waiting", "failed"})
 STAGE_RUNNING_STATUSES = frozenset({"running", "in_progress"})
 TASK_REUSABLE_STATUS = "succeeded"
 DAILY_EDITION_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+# ``IntelRunItem.role`` describes how a fetched identity contributes to the
+# current daily edition.  Older rows used the single ``fetched`` role, which
+# remains an active compatibility role.  New runs distinguish a first sighting
+# from a material refresh and a no-op re-fetch, so the latter never re-enters
+# the expensive A/B/C path just because a feed returns it again.
+RUN_ITEM_ROLE_NEW = "new"
+RUN_ITEM_ROLE_CHANGED = "changed"
+RUN_ITEM_ROLE_RETRY = "retry"
+RUN_ITEM_ROLE_UNCHANGED = "unchanged"
+RUN_ITEM_ROLE_FETCHED = "fetched"
+DAILY_DELTA_RUN_ITEM_ROLES = (
+    RUN_ITEM_ROLE_NEW,
+    RUN_ITEM_ROLE_CHANGED,
+    RUN_ITEM_ROLE_RETRY,
+    RUN_ITEM_ROLE_FETCHED,
+)
 
 
 class IntelRepository:
@@ -226,8 +243,15 @@ class IntelRepository:
         run_type: str = "run_once",
         source_ids: Iterable[str] | None = None,
         reference_time: datetime | None = None,
+        edition_date: date | str | None = None,
     ) -> IntelRun:
-        """Create a durable run and its explicit processing scope."""
+        """Create a durable run and its explicit processing scope.
+
+        ``edition_date`` is the public daily identifier.  It may be supplied
+        explicitly when a retry happens after midnight but should still
+        replace the previous day's edition.  ``reference_time`` remains the
+        immutable execution-time anchor used by recency and stage processing.
+        """
 
         source_values = _unique_strings(source_ids or ())
         scope_values = dict(scope or {})
@@ -238,14 +262,21 @@ class IntelRepository:
         scope_values["reference_time"] = reference.isoformat()
         # ``edition_date`` is the human-facing daily grouping key.  It is not
         # a primary key: several immutable runs may share a date while the UI
-        # points that date at the most recent ranked snapshot.
-        edition_date = reference.astimezone(DAILY_EDITION_TIMEZONE).date()
-        scope_values["edition_date"] = edition_date.isoformat()
+        # points that date at the most recent Stage-D snapshot.
+        explicit_edition_date = _as_edition_date(edition_date)
+        if edition_date is not None and explicit_edition_date is None:
+            raise ValueError("edition_date must use YYYY-MM-DD")
+        resolved_edition_date = (
+            explicit_edition_date
+            or _as_edition_date(scope_values.get("edition_date"))
+            or reference.astimezone(DAILY_EDITION_TIMEZONE).date()
+        )
+        scope_values["edition_date"] = resolved_edition_date.isoformat()
         scope_values["edition_timezone"] = "Asia/Shanghai"
         run = IntelRun(
             status="running",
             run_type=_text(run_type) or "run_once",
-            _edition_date=edition_date,
+            _edition_date=resolved_edition_date,
             filters_json=_dump_json(dict(filters or {})),
             scope_json=_dump_json(scope_values),
             source_ids_json=_dump_json(source_values),
@@ -253,6 +284,25 @@ class IntelRepository:
         self.session.add(run)
         self.session.flush()
         return run
+
+    def latest_run_for_edition(self, edition_date: date | str) -> IntelRun | None:
+        """Return the newest internal attempt for one public daily edition.
+
+        Command-line operators address a report by date, while the returned
+        run ID stays inside the orchestration layer for foreign-key joins and
+        resumable stage state.
+        """
+
+        resolved_edition_date = _as_edition_date(edition_date)
+        if resolved_edition_date is None:
+            raise ValueError("edition_date must use YYYY-MM-DD")
+        statement = (
+            select(IntelRun)
+            .where(IntelRun._edition_date == resolved_edition_date)
+            .order_by(IntelRun.started_at.desc(), IntelRun.id.desc())
+            .limit(1)
+        )
+        return self.session.scalars(statement).first()
 
     def freeze_run_scope(
         self,
@@ -359,13 +409,20 @@ class IntelRepository:
                 IntelRunItem.run_id == int(run_id), IntelRunItem.item_id == int(item_id)
             )
         )
+        existing_relation = relation is not None
         if relation is None:
             if run.scope_frozen:
                 raise RuntimeError(f"intel run {run_id} scope is already frozen")
             relation = IntelRunItem(run_id=int(run_id), item_id=int(item_id))
             self.session.add(relation)
         relation.source_id = source_id or relation.source_id or item.source_id
-        relation.role = _text(role) or "fetched"
+        requested_role = _text(role) or RUN_ITEM_ROLE_FETCHED
+        if existing_relation and _run_item_role_priority(relation.role) > _run_item_role_priority(requested_role):
+            # A source may return the same identity twice in one fetch run.
+            # Preserve a prior ``new``/``changed`` classification instead of
+            # downgrading it to an unchanged repeat on the second encounter.
+            requested_role = relation.role
+        relation.role = requested_role
         relation.status = _text(status) or "fetched"
         item.latest_run_id = int(run_id)
         item_ids = _unique_ints([*(_string_values(_load_json(run.item_ids_json, []))), int(item_id)])
@@ -391,12 +448,12 @@ class IntelRepository:
         self,
         run_id: int,
         *,
-        role: str | None = None,
+        role: str | Iterable[str] | None = None,
         status: str | Iterable[str] | None = None,
     ) -> list[int]:
         stmt = select(IntelRunItem.item_id).where(IntelRunItem.run_id == int(run_id)).order_by(IntelRunItem.id.asc())
         if role:
-            stmt = stmt.where(IntelRunItem.role == role)
+            stmt = stmt.where(IntelRunItem.role.in_(_run_item_roles(role)))
         if status:
             statuses = [status] if isinstance(status, str) else list(status)
             stmt = stmt.where(IntelRunItem.status.in_(statuses))
@@ -528,8 +585,9 @@ class IntelRepository:
                 fields["canonical_url"] = github_url
         existing = self._find_existing(fields)
         if existing is not None:
-            # Refresh volatile metrics/payload while preserving a completed
-            # selection status. This lets a later fetch update star counts.
+            # Refresh volatile metrics/payload for audit. Only a material
+            # content change creates daily A/B/C work; metric/payload churn
+            # alone must not make an old feed entry a fresh daily candidate.
             old_metrics = existing.metrics_json
             old_payload = existing.raw_payload_json
             merged_metrics = (
@@ -547,7 +605,16 @@ class IntelRepository:
                 if _is_github_repository_fields(fields)
                 else fields["raw_payload"]
             )
-            class_changed = existing.content_class != fields["content_class"]
+            material_change = _item_has_material_change(
+                existing,
+                fields,
+            )
+            retry_needed = _item_requires_daily_retry(existing)
+            content_hash_changed = (
+                not _is_github_repository_fields(fields)
+                and bool(fields["content_hash"])
+                and existing.content_hash != fields["content_hash"]
+            )
             existing.title = fields["title"] or existing.title
             existing.summary = fields["summary"] or existing.summary
             existing.content_text = fields["content_text"] or existing.content_text
@@ -560,7 +627,14 @@ class IntelRepository:
             existing.content_class = fields["content_class"]
             existing.metrics_json = new_metrics
             existing.raw_payload_json = new_payload
-            if (class_changed or old_metrics != new_metrics or old_payload != new_payload) and existing.status in {
+            if content_hash_changed and not self.session.scalar(
+                select(IntelItem.id).where(
+                    IntelItem.content_hash == fields["content_hash"],
+                    IntelItem.id != existing.id,
+                )
+            ):
+                existing.content_hash = fields["content_hash"]
+            if material_change and existing.status in {
                 "hotspot",
                 "rejected",
                 "filtered",
@@ -583,7 +657,12 @@ class IntelRepository:
                     run_id,
                     existing.id,
                     source_id=existing.source_id,
-                    role=run_role,
+                    role=_daily_delta_run_role(
+                        run_role,
+                        inserted=False,
+                        material_change=material_change,
+                        retry_needed=retry_needed,
+                    ),
                     status="fetched",
                 )
             return IntelInsertResult(inserted=False, item_id=existing.id, reason="duplicate", updated=True)
@@ -619,7 +698,12 @@ class IntelRepository:
                 run_id,
                 row.id,
                 source_id=row.source_id,
-                role=run_role,
+                role=_daily_delta_run_role(
+                    run_role,
+                    inserted=True,
+                    material_change=True,
+                    retry_needed=False,
+                ),
                 status="fetched",
             )
         return IntelInsertResult(inserted=True, item_id=row.id)
@@ -780,7 +864,7 @@ class IntelRepository:
         run_id: int,
         *,
         statuses: Iterable[str] | None = None,
-        role: str | None = None,
+        role: str | Iterable[str] | None = None,
         limit: int | None = None,
     ) -> list[IntelItem]:
         """Read only the items attached to one run scope."""
@@ -799,7 +883,7 @@ class IntelRepository:
         if statuses:
             stmt = stmt.where(IntelItem.status.in_(list(statuses)))
         if role:
-            stmt = stmt.where(IntelRunItem.role == role)
+            stmt = stmt.where(IntelRunItem.role.in_(_run_item_roles(role)))
         if limit is not None:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).unique().all())
@@ -969,7 +1053,7 @@ class IntelRepository:
         return list(self.session.scalars(stmt).unique().all())
 
     # ------------------------------------------------------------------
-    # Event aggregation and ranking snapshot persistence
+    # Event aggregation and Stage-D snapshot persistence
     # ------------------------------------------------------------------
 
     def upsert_event(
@@ -2619,6 +2703,82 @@ class IntelRepository:
         return counts
 
 
+def _daily_delta_run_role(
+    requested_role: str | None,
+    *,
+    inserted: bool,
+    material_change: bool,
+    retry_needed: bool,
+) -> str:
+    """Classify one fetched identity without changing custom caller roles."""
+
+    role = _text(requested_role) or RUN_ITEM_ROLE_FETCHED
+    if role != RUN_ITEM_ROLE_FETCHED:
+        return role
+    if inserted:
+        return RUN_ITEM_ROLE_NEW
+    if material_change:
+        return RUN_ITEM_ROLE_CHANGED
+    return RUN_ITEM_ROLE_RETRY if retry_needed else RUN_ITEM_ROLE_UNCHANGED
+
+
+def _run_item_roles(value: str | Iterable[str]) -> list[str]:
+    values = [value] if isinstance(value, str) else value
+    result: list[str] = []
+    for item in values:
+        role = _text(item)
+        if role and role not in result:
+            result.append(role)
+    return result or [RUN_ITEM_ROLE_FETCHED]
+
+
+def _run_item_role_priority(value: Any) -> int:
+    role = _text(value) or RUN_ITEM_ROLE_FETCHED
+    return {
+        RUN_ITEM_ROLE_UNCHANGED: 0,
+        RUN_ITEM_ROLE_FETCHED: 1,
+        RUN_ITEM_ROLE_RETRY: 2,
+        RUN_ITEM_ROLE_CHANGED: 2,
+        RUN_ITEM_ROLE_NEW: 3,
+    }.get(role, 1)
+
+
+def _item_has_material_change(
+    existing: IntelItem,
+    fields: Mapping[str, Any],
+) -> bool:
+    """Whether the inbound record contains a new editorial signal.
+
+    Fetch payloads often update mutable counters, crawl metadata and raw JSON
+    on every invocation. Those changes remain persisted for audit but do not
+    qualify an old story for another daily edition. GitHub repository hashes
+    are deliberately identity-stable, so their metric-only refreshes are also
+    intentionally excluded here.
+    """
+
+    is_github_repository = _is_github_repository_fields(fields)
+    next_title = fields["title"] or existing.title
+    next_summary = fields["summary"] or existing.summary
+    next_url = fields["canonical_url"] or existing.canonical_url
+    next_published_at = fields["published_at"] or existing.published_at
+
+    if existing.content_class != fields["content_class"]:
+        return True
+    if existing.title != next_title or existing.summary != next_summary or existing.canonical_url != next_url:
+        return True
+    if _as_utc(existing.published_at) != _as_utc(next_published_at):
+        return True
+    if not is_github_repository and fields["content_hash"] and existing.content_hash != fields["content_hash"]:
+        return True
+    return False
+
+
+def _item_requires_daily_retry(existing: IntelItem) -> bool:
+    """Retain recovery for work that never reached a terminal selection."""
+
+    return existing.status in {"new", "ai_failed", "screen_failed", "analysis_failed"}
+
+
 def _item_fields(item: Any) -> dict[str, Any]:
     values = _object_mapping(item)
     source_id = _text(values.get("source_id")) or "unknown"
@@ -3114,6 +3274,21 @@ def _as_utc(value: Any) -> datetime | None:
     if not isinstance(value, datetime):
         return None
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _as_edition_date(value: Any) -> date | None:
+    """Parse a public daily identifier without coupling it to run IDs."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _identity_hash(external_id: str | None, url: str | None, title: str, content: str | None) -> str:

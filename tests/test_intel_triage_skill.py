@@ -105,6 +105,14 @@ def test_stage_b_strict_parser_has_entities_and_no_legacy_decision_fields():
     assert result.raw_response == payload
 
 
+def test_stage_b_parser_normalizes_null_paper_source_type():
+    result = parse_analysis_result(
+        analysis_payload(paper_support={"is_paper": False, "source_type": None}),
+        envelope=envelope(),
+    )
+    assert result.paper_support.source_type == "unknown"
+
+
 def test_first_party_x_accounts_are_not_marked_social_only_and_prompt_preserves_limits():
     item = envelope(
         source_content_class="official_model_company",

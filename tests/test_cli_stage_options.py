@@ -63,8 +63,9 @@ def test_cli_accepts_news_media_content_class(monkeypatch):
     assert captured["content_class"] == "news_media"
 
 
-def test_pipeline_export_prints_the_public_edition_not_the_internal_run_id(monkeypatch, tmp_path):
+def test_pipeline_export_uses_the_public_edition_not_the_internal_run_id(monkeypatch, tmp_path):
     monkeypatch.setattr(main.Settings, "from_env", lambda: object())
+    captured: dict[str, object] = {}
 
     class Result:
         exported = 1
@@ -73,11 +74,27 @@ def test_pipeline_export_prints_the_public_edition_not_the_internal_run_id(monke
         jsonl_path = str(tmp_path / "daily" / "2026-08-16" / "intel_items.jsonl")
         manifest_path = str(tmp_path / "daily" / "2026-08-16" / "manifest.json")
 
-    monkeypatch.setattr(main, "run_pipeline_export_from_settings", lambda **kwargs: Result())
+    def resolve_run(**kwargs):
+        captured["resolved_edition_date"] = kwargs["edition_date"]
+        return 77
 
-    result = runner.invoke(main.app, ["pipeline", "export", "--run-id", "77", "--output-dir", str(tmp_path)])
+    def export_run(**kwargs):
+        captured["run_id"] = kwargs["run_id"]
+        return Result()
+
+    monkeypatch.setattr(main, "resolve_pipeline_run_id_from_settings", resolve_run)
+    monkeypatch.setattr(main, "run_pipeline_export_from_settings", export_run)
+
+    result = runner.invoke(main.app, ["pipeline", "export", "--edition-date", "2026-08-16", "--output-dir", str(tmp_path)])
 
     assert result.exit_code == 0
+    assert captured == {"resolved_edition_date": "2026-08-16", "run_id": 77}
     assert "edition_date=2026-08-16" in result.stdout
     assert "run_id=77" not in result.stdout
     assert "snapshot=" not in result.stdout
+
+
+def test_pipeline_commands_no_longer_accept_run_id_as_a_public_option():
+    result = runner.invoke(main.app, ["pipeline", "status", "--run-id", "77"])
+
+    assert result.exit_code != 0

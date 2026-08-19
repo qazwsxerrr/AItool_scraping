@@ -4,6 +4,7 @@ import sqlite3
 
 import pytest
 
+from app.ai.skills.stage_d_editorial.client import StageDEditorialClient
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, init_db
 
@@ -63,6 +64,20 @@ def test_settings_stage_d_has_own_overrides_and_review_fallback(monkeypatch):
     assert dedicated.ai_stage_d_api_key == "editor-secret"
     assert dedicated.ai_stage_d_model == "editor-model"
     assert dedicated.ai_stage_d_retries == 3
+    client = StageDEditorialClient.from_settings(dedicated)
+    assert client.max_retries == 3
+
+
+def test_settings_stage_d_timeout_is_independent_and_defaults_to_120(monkeypatch):
+    for name in ("AI_REVIEW_TIMEOUT_SECONDS", "AI_STAGE_D_TIMEOUT_SECONDS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AI_REVIEW_TIMEOUT_SECONDS", "7")
+    settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
+    assert settings.ai_stage_d_timeout_seconds == 120.0
+
+    monkeypatch.setenv("AI_STAGE_D_TIMEOUT_SECONDS", "31")
+    overridden = Settings.from_env(dotenv_path="/path/that/does/not/exist")
+    assert overridden.ai_stage_d_timeout_seconds == 31.0
 
 
 def test_settings_read_category_taxonomy(monkeypatch):

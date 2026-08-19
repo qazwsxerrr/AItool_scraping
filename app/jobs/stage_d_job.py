@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.ai.skills.stage_d_editorial import StageDEditorialClient, StageDEditorialResponse, strict_parse_stage_d
@@ -40,6 +40,20 @@ from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
 STAGE_D_NAME = "stage_d"
+
+
+class StageDProviderCallError(RuntimeError):
+    """Carry provider-attempt and sanitized response data through fallback."""
+
+    def __init__(self, cause: BaseException, attempts: int) -> None:
+        self.cause = cause
+        self.provider_attempts = int(attempts)
+        self.status_code = getattr(cause, "status_code", None)
+        self.error_code = getattr(cause, "error_code", None)
+        self.error_message = getattr(cause, "error_message", None) or str(cause)
+        self.raw_response = getattr(cause, "raw_response", None)
+        self.request_metadata = dict(getattr(cause, "request_metadata", None) or {})
+        super().__init__(str(cause))
 
 
 @dataclass(frozen=True)
@@ -174,7 +188,9 @@ def run_stage_d_job(
             stage_d_source = "ai"
             response_hash: str | None = None
             fallback_reason: str | None = None
+            provider_audit: dict[str, Any] = {}
             if payload:
+                _clear_provider_audit(ai_client)
                 try:
                     response, attempts = _call_editorial_provider(
                         ai_client,
@@ -185,7 +201,11 @@ def run_stage_d_job(
                             "max_selected_per_story_family": 2,
                         },
                         total_max=policy.total_max,
-                        retries=getattr(getattr(ai_client, "settings", None), "ai_stage_d_retries", None),
+                        retries=getattr(
+                            ai_client,
+                            "max_retries",
+                            getattr(getattr(ai_client, "settings", None), "ai_stage_d_retries", None),
+                        ),
                     )
                     result.provider_attempts = attempts
                     decisions = {decision.event_id: decision.model_dump(mode="json") for decision in response.decisions}
@@ -198,12 +218,27 @@ def run_stage_d_job(
                     fallback_reason = str(exc)
                     result.errors.append(fallback_reason)
                     stage_d_source = "deterministic_fallback"
+                    provider_audit = _provider_audit(exc, ai_client)
+                    result.provider_attempts = max(result.provider_attempts, int(provider_audit.get("provider_attempts") or 0))
+                    raw_response = provider_audit.get("raw_response")
+                    if raw_response is not None:
+                        response_hash = _response_hash(raw_response)
                     LOGGER.warning("Stage D provider failed; using deterministic fallback: %s", exc)
                     decisions = _fallback_decisions(eligible, total_max=policy.total_max)
             else:
                 # An empty eligible pool is an auditable empty edition, not a
                 # provider failure and not an invitation to fill with gated papers.
                 stage_d_source = "no_eligible_events"
+            if not provider_audit:
+                request_metadata = getattr(ai_client, "last_request_metadata", None)
+                provider_audit = {
+                    "provider_attempts": result.provider_attempts,
+                    "status_code": None,
+                    "error_code": None,
+                    "error_message": None,
+                    "raw_response": getattr(ai_client, "last_raw_response", None),
+                    "request_metadata": dict(request_metadata) if isinstance(request_metadata, Mapping) else {},
+                }
 
             repo.clear_event_stage_d_snapshot(snapshot_key=key)
             for candidate in candidates:
@@ -240,10 +275,15 @@ def run_stage_d_job(
                     "reason_codes": decision.get("reason_codes", []),
                     "editorial_reason": decision.get("editorial_reason"),
                     "confidence": decision.get("confidence"),
+                    "fallback_rank": decision.get("fallback_rank"),
+                    "fallback_score_components": decision.get("fallback_score_components"),
                     "recent_daily_history": candidate["recent_daily_history"],
                     "provider_attempts": result.provider_attempts,
                     "response_hash": response_hash,
                     "fallback_reason": fallback_reason,
+                    "provider_status_code": provider_audit.get("status_code"),
+                    "provider_error_code": provider_audit.get("error_code"),
+                    "provider_error_message": provider_audit.get("error_message"),
                 }
                 snapshot = repo.upsert_event_stage_d_snapshot(
                     event_id,
@@ -261,6 +301,16 @@ def run_stage_d_job(
                 result.snapshots += int(snapshot.created)
             session.commit()
             if stage_task is not None:
+                stage_metadata = {
+                    "stage_d_source": stage_d_source,
+                    "provider_attempts": result.provider_attempts,
+                    "fallback_reason": fallback_reason,
+                    "response_hash": response_hash,
+                    "provider_status_code": provider_audit.get("status_code"),
+                    "provider_error_code": provider_audit.get("error_code"),
+                    "provider_error_message": provider_audit.get("error_message"),
+                    "request_metadata": provider_audit.get("request_metadata") or {},
+                }
                 repo.complete_stage_task(
                     stage_task,
                     owner=owner,
@@ -273,14 +323,17 @@ def run_stage_d_job(
                         "stage_d_source": stage_d_source,
                         "response_hash": response_hash,
                         "fallback_reason": fallback_reason,
-                    },
-                    raw_response=getattr(ai_client, "last_raw_response", None),
-                    metadata={
-                        "stage_d_source": stage_d_source,
                         "provider_attempts": result.provider_attempts,
-                        "fallback_reason": fallback_reason,
+                        "provider_error": {
+                            key: provider_audit.get(key)
+                            for key in ("status_code", "error_code", "error_message")
+                            if provider_audit.get(key) is not None
+                        },
                     },
+                    raw_response=provider_audit.get("raw_response") or getattr(ai_client, "last_raw_response", None),
+                    metadata=stage_metadata,
                 )
+                repo.finish_stage(stage, status="succeeded", metadata=stage_metadata, owner=owner)
                 session.commit()
         except Exception as exc:
             session.rollback()
@@ -459,15 +512,39 @@ def _recent_daily_history(
     if not event_ids:
         return {}
     earliest = current - timedelta(days=days)
+    previous_runs = list(
+        session.scalars(
+            select(IntelRun)
+            .where(
+                IntelRun.status.in_(("completed", "completed_with_errors", "partial")),
+                IntelRun._edition_date >= earliest,
+                IntelRun._edition_date < current,
+            )
+            .order_by(IntelRun._edition_date.desc(), IntelRun.id.desc())
+        ).all()
+    )
+    # A date can have multiple internal runs. Compare only against the newest
+    # date-addressed edition, because that is the prior day's final output.
+    latest_by_edition: dict[str, IntelRun] = {}
+    for previous_run in previous_runs:
+        if previous_run.edition_date:
+            latest_by_edition.setdefault(previous_run.edition_date, previous_run)
+    conditions = [
+        and_(
+            IntelEventStageDSnapshot.run_id == int(previous_run.id),
+            IntelEventStageDSnapshot.snapshot_key == previous_run.daily_snapshot_key,
+        )
+        for previous_run in latest_by_edition.values()
+    ]
+    if not conditions:
+        return {}
     rows = session.execute(
         select(IntelEventStageDSnapshot, IntelRun)
         .join(IntelRun, IntelRun.id == IntelEventStageDSnapshot.run_id)
         .where(
             IntelEventStageDSnapshot.event_id.in_(event_ids),
             IntelEventStageDSnapshot.selected.is_(True),
-            IntelRun.status == "completed",
-            IntelRun._edition_date >= earliest,
-            IntelRun._edition_date < current,
+            or_(*conditions),
         )
         .order_by(IntelRun._edition_date.desc(), IntelEventStageDSnapshot.updated_at.desc())
     ).all()
@@ -523,7 +600,8 @@ def _call_editorial_provider(
         max_retries=_bounded_int(retries, 2, lower=0, upper=5),
     )
     if failure is not None or value is None:
-        raise failure if failure is not None else RuntimeError("Stage D provider returned no result")
+        cause = failure if failure is not None else RuntimeError("Stage D provider returned no result")
+        raise StageDProviderCallError(cause, attempts) from cause
     return value, attempts
 
 
@@ -538,36 +616,250 @@ def _provider_failure_is_retryable(exc: BaseException) -> bool:
     return any(token in name for token in ("timeout", "connect", "network", "transport"))
 
 
-def _fallback_decisions(candidates: Sequence[Mapping[str, Any]], *, total_max: int) -> dict[int, dict[str, Any]]:
-    """A visible last resort: score order only, with no old quota logic."""
+def _clear_provider_audit(ai_client: Any | None) -> None:
+    if ai_client is None:
+        return
+    for name in ("last_raw_response", "last_request_metadata", "last_error_metadata"):
+        if hasattr(ai_client, name):
+            try:
+                setattr(ai_client, name, None)
+            except (AttributeError, TypeError):
+                continue
 
-    rows = sorted(candidates, key=lambda value: (-_number(value["event"].display_score), int(value["event"].id)))
+
+def _provider_audit(exc: BaseException, ai_client: Any | None) -> dict[str, Any]:
+    raw_response = getattr(exc, "raw_response", None)
+    if raw_response is None:
+        raw_response = getattr(ai_client, "last_raw_response", None)
+    request_metadata = getattr(exc, "request_metadata", None)
+    if not isinstance(request_metadata, Mapping):
+        request_metadata = getattr(ai_client, "last_request_metadata", None)
+    return {
+        "provider_attempts": int(getattr(exc, "provider_attempts", 0) or 0),
+        "status_code": getattr(exc, "status_code", None),
+        "error_code": getattr(exc, "error_code", None),
+        "error_message": getattr(exc, "error_message", None),
+        "raw_response": raw_response,
+        "request_metadata": dict(request_metadata or {}) if isinstance(request_metadata, Mapping) else {},
+    }
+
+
+_FALLBACK_SOURCE_PENALTY_STEP = 6
+_FALLBACK_SOURCE_PENALTY_MAX = 12
+_FALLBACK_CONTENT_PENALTY_STEP = 4
+_FALLBACK_CONTENT_PENALTY_MAX = 8
+_FALLBACK_TOPIC_PENALTY_STEP = 3
+_FALLBACK_TOPIC_PENALTY_MAX = 6
+_FALLBACK_ENTITY_PENALTY_STEP = 4
+_FALLBACK_ENTITY_PENALTY_MAX = 8
+_FALLBACK_STORY_PENALTY_STEP = 4
+_FALLBACK_STORY_PENALTY_MAX = 8
+_FALLBACK_TRUSTED_BONUS = 3
+
+
+def _fallback_decisions(candidates: Sequence[Mapping[str, Any]], *, total_max: int) -> dict[int, dict[str, Any]]:
+    """Choose a deterministic fallback edition with bounded soft diversity signals."""
+
+    remaining = list(candidates)
+    selected_context: list[dict[str, str | None]] = []
     decisions: dict[int, dict[str, Any]] = {}
     selected_count = 0
-    for candidate in rows:
+    rank = 0
+    limit = max(0, int(total_max))
+    while remaining:
+        scored: list[tuple[dict[str, Any], Mapping[str, Any], str | None, int]] = []
+        for index, candidate in enumerate(remaining):
+            event = candidate["event"]
+            components = _fallback_score_components(candidate, selected_context)
+            title = _fallback_title(event, community_signal=_source_presentation(candidate) is not None)
+            scored.append((components, candidate, title, index))
+        scored.sort(
+            key=lambda row: (
+                -float(row[0]["adjusted"]),
+                -float(row[0]["base"]),
+                int(row[1]["event"].id),
+            )
+        )
+        components, candidate, title, index = scored[0]
+        remaining.pop(index)
         event = candidate["event"]
         event_id = int(event.id)
-        title = _fallback_title(event, community_signal=_source_presentation(candidate) is not None)
-        can_select = selected_count < total_max and title is not None
-        if can_select:
+        rank += 1
+        reason_codes = _fallback_reason_codes(components)
+        if title is not None and selected_count < limit:
             selected_count += 1
+            selected_context.append(_fallback_signal_keys(candidate))
             decisions[event_id] = {
                 "event_id": event_id,
                 "decision": "selected",
                 "display_order": selected_count,
-                "editorial_score": round(_number(event.display_score)),
+                "editorial_score": round(float(components["base"])),
                 "story_family_id": f"fallback_{event_id}",
                 "family_position": 1,
                 "display_title_zh": title,
                 "title_supporting_fields": ["summary_cn", "title"],
-                "reason_codes": ["deterministic_fallback"],
-                "editorial_reason": "编辑服务不可用，按前序展示分数回退排序。",
+                "reason_codes": reason_codes,
+                "editorial_reason": "编辑服务不可用，按 display_score 主导的确定性软多样性回退排序。",
                 "confidence": 0,
+                "fallback_rank": rank,
+                "fallback_score_components": components,
             }
+            continue
+
+        if title is None:
+            reason_codes.append("title_unavailable")
+            reason = "编辑服务不可用，候选标题不可用，未进入回退展示列表。"
         else:
-            reason = "title_unavailable" if title is None else "fallback_limit"
-            decisions[event_id] = _omitted_decision(reason, "未进入本次回退展示列表。", event_id=event_id)
+            reason_codes.append("fallback_limit")
+            reason = "编辑服务不可用，已达到回退展示上限。"
+        decisions[event_id] = {
+            **_omitted_decision(reason_codes[-1], reason, event_id=event_id),
+            "editorial_score": round(float(components["base"])),
+            "reason_codes": reason_codes,
+            "fallback_rank": rank,
+            "fallback_score_components": components,
+        }
     return decisions
+
+
+def _fallback_score_components(
+    candidate: Mapping[str, Any],
+    selected_context: Sequence[Mapping[str, str | None]],
+) -> dict[str, float | int]:
+    keys = _fallback_signal_keys(candidate)
+    counts = {
+        "source_group": _fallback_repeat_count(keys.get("source_group"), selected_context, "source_group"),
+        "content_class": _fallback_repeat_count(keys.get("content_class"), selected_context, "content_class"),
+        "topic": _fallback_repeat_count(keys.get("topic"), selected_context, "topic"),
+        "primary_entity": _fallback_repeat_count(keys.get("primary_entity"), selected_context, "primary_entity"),
+        "story": _fallback_repeat_count(keys.get("story"), selected_context, "story"),
+    }
+    source_penalty = min(_FALLBACK_SOURCE_PENALTY_MAX, counts["source_group"] * _FALLBACK_SOURCE_PENALTY_STEP)
+    content_penalty = min(_FALLBACK_CONTENT_PENALTY_MAX, counts["content_class"] * _FALLBACK_CONTENT_PENALTY_STEP)
+    topic_penalty = min(_FALLBACK_TOPIC_PENALTY_MAX, counts["topic"] * _FALLBACK_TOPIC_PENALTY_STEP)
+    entity_penalty = min(_FALLBACK_ENTITY_PENALTY_MAX, counts["primary_entity"] * _FALLBACK_ENTITY_PENALTY_STEP)
+    story_penalty = min(_FALLBACK_STORY_PENALTY_MAX, counts["story"] * _FALLBACK_STORY_PENALTY_STEP)
+    bonus = _fallback_trusted_bonus(candidate)
+    base = _number(candidate["event"].display_score)
+    adjusted = base + bonus - source_penalty - content_penalty - topic_penalty - entity_penalty - story_penalty
+    return {
+        "base": round(base, 4),
+        "bonus": bonus,
+        "same_source_group_penalty": source_penalty,
+        "same_content_class_penalty": content_penalty,
+        "same_topic_penalty": topic_penalty,
+        "same_primary_entity_penalty": entity_penalty,
+        "same_story_penalty": story_penalty,
+        "adjusted": round(adjusted, 4),
+    }
+
+
+def _fallback_reason_codes(components: Mapping[str, Any]) -> list[str]:
+    codes = ["deterministic_fallback"]
+    for key, code in (
+        ("same_source_group_penalty", "fallback_repeat_source_group"),
+        ("same_content_class_penalty", "fallback_repeat_content_class"),
+        ("same_topic_penalty", "fallback_repeat_topic"),
+        ("same_primary_entity_penalty", "fallback_repeat_primary_entity"),
+        ("same_story_penalty", "fallback_repeat_story"),
+    ):
+        if _number(components.get(key)) > 0:
+            codes.append(code)
+    if _number(components.get("bonus")) > 0:
+        codes.append("fallback_trusted_evidence_bonus")
+    return codes
+
+
+def _fallback_repeat_count(
+    value: str | None,
+    selected_context: Sequence[Mapping[str, str | None]],
+    key: str,
+) -> int:
+    if not value:
+        return 0
+    return sum(1 for selected in selected_context if selected.get(key) == value)
+
+
+def _fallback_signal_keys(candidate: Mapping[str, Any]) -> dict[str, str | None]:
+    event = candidate["event"]
+    source_groups = candidate.get("source_groups")
+    if not source_groups:
+        source_groups = _json_strings(getattr(event, "source_groups_json", None))
+    if isinstance(source_groups, str):
+        source_groups = [source_groups]
+    source_group = candidate.get("source_group") or next((str(value) for value in source_groups or [] if value), None)
+    content_class = candidate.get("content_class") or getattr(event, "content_class", None)
+    topic = candidate.get("topic") or getattr(event, "topic", None)
+    return {
+        "source_group": _fallback_token(source_group),
+        "content_class": _fallback_token(content_class),
+        "topic": _fallback_token(topic),
+        "primary_entity": _fallback_primary_entity(candidate),
+        "story": _fallback_story_key(candidate),
+    }
+
+
+def _fallback_primary_entity(candidate: Mapping[str, Any]) -> str | None:
+    explicit = candidate.get("primary_entity") or candidate.get("primary_entity_name")
+    if explicit:
+        return _fallback_token(explicit)
+    event = candidate["event"]
+    entities = candidate.get("entities")
+    if not entities:
+        entities = getattr(event, "entities", None)
+    if not entities:
+        entities = _json_value(getattr(event, "entities_json", None), [])
+    if not isinstance(entities, (list, tuple)):
+        return None
+    for entity in entities:
+        if isinstance(entity, Mapping):
+            value = entity.get("name") or entity.get("text") or entity.get("value") or entity.get("entity")
+        else:
+            value = entity
+        token = _fallback_token(value)
+        if token:
+            return token
+    return None
+
+
+def _fallback_story_key(candidate: Mapping[str, Any]) -> str | None:
+    event = candidate["event"]
+    for value in (
+        candidate.get("story_family_id"),
+        candidate.get("story_key"),
+        getattr(event, "story_family_id", None),
+        getattr(event, "story_key", None),
+    ):
+        token = _fallback_token(value)
+        if token:
+            return token
+    return None
+
+
+def _fallback_trusted_bonus(candidate: Mapping[str, Any]) -> int:
+    evidence = _fallback_token(candidate.get("source_evidence_level"))
+    if evidence != "trusted_or_first_party_supported":
+        return 0
+    event = candidate["event"]
+    groups = candidate.get("source_groups") or _json_strings(getattr(event, "source_groups_json", None))
+    if not groups and candidate.get("source_group"):
+        groups = (candidate.get("source_group"),)
+    if isinstance(groups, str):
+        groups = (groups,)
+    content_class = _fallback_token(candidate.get("content_class") or getattr(candidate["event"], "content_class", None)) or ""
+    trusted_group = any(
+        (token := _fallback_token(group))
+        and (token.startswith("official_") or token.endswith("_official") or token in {"official", "vendor_docs", "research"})
+        for group in groups
+    )
+    if trusted_group or content_class.startswith("official_") or content_class in {"news_media", "academic_paper"}:
+        return _FALLBACK_TRUSTED_BONUS
+    return 0
+
+
+def _fallback_token(value: Any) -> str | None:
+    text = " ".join(str(value or "").strip().casefold().split())
+    return text or None
 
 
 def _fallback_title(event: IntelEvent, *, community_signal: bool = False) -> str | None:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Iterable
@@ -38,7 +38,7 @@ from app.jobs.stage_b_analysis_job import StageBAnalysisResult, run_stage_b_anal
 from app.jobs.stage_d_job import StageDResult, run_stage_d_from_settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import IntelRun
-from app.storage.repository import IntelCounts, IntelRepository, StageStateSummary
+from app.storage.repository import DAILY_DELTA_RUN_ITEM_ROLES, IntelCounts, IntelRepository, StageStateSummary
 
 
 STAGE_ALIASES: dict[str, str] = {
@@ -83,6 +83,7 @@ class PipelineStartResult:
     fetch: IntelFetchResult
     reference_time: datetime | None = None
     scope_frozen: bool = True
+    edition_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,7 @@ class PipelineStatus:
     run_status: str
     reference_time: datetime | None
     scope_frozen: bool
+    edition_date: str | None = None
     stages: tuple[dict[str, Any], ...] = ()
     total_failures: int = 0
     total_blocked: int = 0
@@ -378,7 +380,9 @@ def _freeze_after_fetch(
         run = session.get(IntelRun, int(run_id))
         if run is None:
             raise ValueError(f"intel run {run_id} disappeared during fetch")
-        item_ids = repo.list_run_item_ids(run_id, role="fetched")
+        # Freeze all fetched source lineage for audit, including unchanged
+        # re-fetches. Stage A/B will separately consume only the daily delta.
+        item_ids = repo.list_run_item_ids(run_id)
         source_ids = [source_id for source_id in (run.source_ids or []) if source_id]
         if not source_ids:
             stats = getattr(fetch, "stats", {}) or {}
@@ -425,6 +429,7 @@ def start_pipeline_run_from_settings(
     limit: int | None = DEFAULT_FETCH_LIMIT_PER_SOURCE,
     force: bool = False,
     dry_run: bool = False,
+    edition_date: date | str | None = None,
     registry_path=DEFAULT_REGISTRY_PATH,
     fetch_runner: Callable[..., IntelFetchResult] | None = None,
 ) -> PipelineStartResult:
@@ -449,7 +454,13 @@ def start_pipeline_run_from_settings(
             force=force,
             dry_run=True,
         )
-        return PipelineStartResult(run_id=int(fetch.run_id or 0), fetch=fetch, reference_time=None, scope_frozen=False)
+        return PipelineStartResult(
+            run_id=int(fetch.run_id or 0),
+            fetch=fetch,
+            reference_time=None,
+            scope_frozen=False,
+            edition_date=_normalize_edition_date(edition_date),
+        )
 
     _, session_factory = _engine_and_factory(settings)
     with session_factory() as session:
@@ -464,6 +475,7 @@ def start_pipeline_run_from_settings(
                 "reference_time": datetime.now(timezone.utc).isoformat(),
                 **recent_window_scope(),
             },
+            edition_date=edition_date,
         )
         session.commit()
         run_id = int(run.id)
@@ -491,7 +503,13 @@ def start_pipeline_run_from_settings(
         limit=limit,
         fetch=fetch,
     )
-    return PipelineStartResult(run_id=run_id, fetch=fetch, reference_time=frozen_reference, scope_frozen=True)
+    return PipelineStartResult(
+        run_id=run_id,
+        fetch=fetch,
+        reference_time=frozen_reference,
+        scope_frozen=True,
+        edition_date=run.edition_date,
+    )
 
 
 def run_pipeline_stage_a_from_settings(
@@ -684,6 +702,20 @@ def run_pipeline_export_from_settings(
     return result
 
 
+def resolve_pipeline_run_id_from_settings(*, settings: Settings, edition_date: date | str) -> int:
+    """Resolve a public daily date to its newest internal execution attempt."""
+
+    normalized = _normalize_edition_date(edition_date)
+    if normalized is None:
+        raise ValueError("edition_date must use YYYY-MM-DD")
+    _, session_factory = _engine_and_factory(settings)
+    with session_factory() as session:
+        run = IntelRepository(session).latest_run_for_edition(normalized)
+        if run is None:
+            raise ValueError(f"no pipeline run found for edition_date={normalized}")
+        return int(run.id)
+
+
 def pipeline_status_from_settings(*, settings: Settings, run_id: int) -> PipelineStatus:
     _, session_factory = _engine_and_factory(settings)
     with session_factory() as session:
@@ -719,6 +751,7 @@ def pipeline_status_from_settings(*, settings: Settings, run_id: int) -> Pipelin
             run_status=str(run.status),
             reference_time=run.reference_time,
             scope_frozen=bool(run.scope_frozen),
+            edition_date=run.edition_date,
             stages=tuple(rows),
             total_failures=sum(int(row.get("failed", 0)) for row in rows),
             total_blocked=sum(int(row.get("blocked", 0)) for row in rows),
@@ -745,7 +778,10 @@ def adopt_existing_pipeline_from_settings(*, settings: Settings, run_id: int) ->
             previous = len(repo.list_stage_tasks(before)) if before is not None else 0
             rows = repo.adopt_existing_stage_tasks(run_id, stage_name)
             adopted[stage_name] = len(rows)
-            skipped[stage_name] = max(0, previous + len(repo.list_run_item_ids(run_id, role="fetched")) - len(rows))
+            skipped[stage_name] = max(
+                0,
+                previous + len(repo.list_run_item_ids(run_id, role=DAILY_DELTA_RUN_ITEM_ROLES)) - len(rows),
+            )
         session.commit()
     return PipelineAdoptResult(run_id=int(run_id), adopted=adopted, skipped=skipped)
 
@@ -867,7 +903,7 @@ def _stage_needs_resume(session_factory, run_id: int, stage_name: str) -> bool:
                 return bool(expires <= datetime.now(timezone.utc))
             return False
         if stage_name == "screen":
-            return bool(repo.list_run_item_ids(run_id, role="fetched"))
+            return bool(repo.list_run_item_ids(run_id, role=DAILY_DELTA_RUN_ITEM_ROLES))
         previous = {name: repo.get_stage(run_id, name) for name in PIPELINE_STAGES}
         dependency = {"analyze": "screen", "cluster": "analyze", "stage_d": "cluster", "export": "stage_d"}[stage_name]
         dependency_stage = previous[dependency]
@@ -990,6 +1026,7 @@ def run_pipeline_from_settings(
     content_class: str | None = None,
     limit: int | None = DEFAULT_FETCH_LIMIT_PER_SOURCE,
     force: bool = False,
+    edition_date: date | str | None = None,
     output_dir: str | Path = "output/intel",
     snapshot_key: str | None = None,
     profile_path: str | Path | None = None,
@@ -1013,6 +1050,7 @@ def run_pipeline_from_settings(
         content_class=content_class,
         limit=limit,
         force=force,
+        edition_date=edition_date,
         registry_path=registry_path,
     )
     if not start.scope_frozen or not start.run_id:
@@ -1051,6 +1089,7 @@ def run_pipeline_once_from_settings(
     ai_limit: int | None = None,
     force: bool = False,
     dry_run: bool = False,
+    edition_date: date | str | None = None,
     output_dir: str | Path = "output/intel",
     profile_path: str | Path | None = None,
     snapshot_key: str | None = None,
@@ -1133,6 +1172,7 @@ def run_pipeline_once_from_settings(
                 "fetch_limit": limit,
                 **recent_window_scope(),
             },
+            edition_date=edition_date,
         )
         session.commit()
         run_id = int(run.id)
@@ -1260,6 +1300,19 @@ def _summary_dict(summary: StageStateSummary) -> dict[str, Any]:
     }
 
 
+def _normalize_edition_date(value: date | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        raise ValueError("edition_date must use YYYY-MM-DD")
+    if isinstance(value, date):
+        return value.isoformat()
+    try:
+        return date.fromisoformat(str(value)).isoformat()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("edition_date must use YYYY-MM-DD") from exc
+
+
 # Short aliases make the orchestration layer convenient for non-CLI callers
 # while the explicit ``*_from_settings`` names remain the dependency-injection
 # seam used by the command handlers and tests.
@@ -1290,6 +1343,7 @@ __all__ = [
     "normalize_stage",
     "pipeline_status_from_settings",
     "pipeline_status",
+    "resolve_pipeline_run_id_from_settings",
     "resume_pipeline_from_settings",
     "resume_pipeline",
     "run_pipeline_from_settings",

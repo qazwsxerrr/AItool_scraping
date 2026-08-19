@@ -1,8 +1,10 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from app.config.source_registry import load_source_registry
+from app.domain import FetchItem, selection_decision
 from app.domain.models import SourceSpec
 
 
@@ -166,6 +168,61 @@ def test_default_registry_includes_official_feed_expansion():
         assert source.selection_policy.keywords
 
 
+def test_default_registry_includes_gap_p0_p1_sources():
+    result = load_source_registry(env={"RSSHUB_BASE_URL": "https://rsshub.example"})
+    source_by_id = {source.id: source for source in result.sources}
+
+    official_sources = {
+        "langchain_blog": (
+            "feed",
+            "https://www.langchain.com/blog/rss.xml",
+            "developer_blog",
+        ),
+        "google_developers_blog": (
+            "feed",
+            "https://developers.googleblog.com/feeds/posts/default/?alt=rss",
+            "developer_blog",
+        ),
+        "cursor_changelog": (
+            "feed",
+            "https://cursor.com/changelog/rss.xml",
+            "product_changelog",
+        ),
+        "deepseek_api_news_rsshub": (
+            "rsshub",
+            "https://rsshub.example/deepseek/news",
+            "api_news",
+        ),
+    }
+    for source_id, (transport, url, subtype) in official_sources.items():
+        source = source_by_id[source_id]
+        assert source.transport == transport
+        assert source.url == url
+        assert source.source_group == "official_blog"
+        assert source.source_subtype == subtype
+        assert source.source_role == "official"
+        assert source.content_class == "official_model_company"
+        assert source.tier == "p1"
+        assert source.primary_eligible is True
+        assert source.selection_policy.mode == "first_party_recent"
+
+    gary_marcus = source_by_id["gary_marcus_blog"]
+    assert gary_marcus.url == "https://garymarcus.substack.com/feed"
+    assert gary_marcus.source_group == "tech_media"
+    assert gary_marcus.source_role == "analysis"
+    assert gary_marcus.content_class == "news_media"
+    assert gary_marcus.selection_policy.mode == "media_recent"
+    assert gary_marcus.selection_policy.keywords == ()
+
+    tomer_tunguz = source_by_id["tomer_tunguz_blog"]
+    assert tomer_tunguz.url == "https://www.tomtunguz.com/index.xml"
+    assert tomer_tunguz.source_group == "tech_media"
+    assert tomer_tunguz.source_role == "analysis"
+    assert tomer_tunguz.content_class == "news_media"
+    assert tomer_tunguz.selection_policy.mode == "media_recent"
+    assert tomer_tunguz.selection_policy.keywords == ()
+
+
 def test_default_registry_includes_verified_aihot_feed_expansion():
     result = load_source_registry(env={})
     source_by_id = {source.id: source for source in result.sources}
@@ -217,6 +274,46 @@ def test_default_registry_includes_aihot_official_x_accounts():
         assert source.selection_policy.max_age_days == 7
         assert source.url.endswith(f"/twitter/user/{handle}")
         assert source.account_url == f"https://x.com/{handle}"
+
+
+def test_default_registry_treats_gap_x_accounts_as_first_party_sources():
+    result = load_source_registry(env={"RSSHUB_BASE_URL": "https://rsshub.example"})
+    source_by_id = {source.id: source for source in result.sources}
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
+
+    expected_handles = {
+        "x_account_claude_devs": "ClaudeDevs",
+        "x_account_pvncher": "pvncher",
+        "x_account_thdxr": "thdxr",
+        "x_account_xhyctf": "xhyctf",
+        "x_account_devin_desktop": "devindesktop",
+        "x_account_cursor_ai": "cursor_ai",
+    }
+    for source_id, handle in expected_handles.items():
+        source = source_by_id[source_id]
+        assert source.transport == "rsshub"
+        assert source.source_group == "x_official"
+        assert source.source_subtype == "account"
+        assert source.source_role == "official"
+        assert source.content_class == "official_model_company"
+        assert source.tier == "p1"
+        assert source.primary_eligible is True
+        assert source.selection_policy.mode == "first_party_recent"
+        assert source.selection_policy.max_age_days == 7
+        assert source.url == f"https://rsshub.example/twitter/user/{handle}"
+        assert source.account_url == f"https://x.com/{handle}"
+        decision = selection_decision(
+            FetchItem(
+                source_id=source_id,
+                title="A first-party product update without generic AI keywords",
+                url=f"https://x.com/{handle}/status/1",
+                published_at=now,
+            ),
+            source,
+            now=now,
+        )
+        assert decision.selected is True
+        assert decision.reason == "selected:first_party_recent"
 
 
 def test_legacy_routing_fields_are_rejected(tmp_path):

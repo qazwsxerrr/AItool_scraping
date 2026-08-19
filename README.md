@@ -90,7 +90,7 @@ AI_STAGE_D_API_URL=
 AI_STAGE_D_API_KEY=
 AI_STAGE_D_MODEL=
 AI_STAGE_D_API_STYLE=generic_json
-AI_STAGE_D_TIMEOUT_SECONDS=45
+AI_STAGE_D_TIMEOUT_SECONDS=120
 AI_STAGE_D_RETRIES=2
 ```
 
@@ -107,18 +107,18 @@ python -m app.main fetch [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N
 python -m app.main fetch-only [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
 python -m app.main ai-review [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
 python -m app.main export [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N]
-python -m app.main run-once [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--ai-limit N] [--force]
+python -m app.main run-once [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--ai-limit N] [--force] [--edition-date YYYY-MM-DD]
 python -m app.main source-health [--source SOURCE_ID]
 
 # 正式的可恢复链路
-python -m app.main pipeline run [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force] [--output-dir DIR]
-python -m app.main pipeline start [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N]
-python -m app.main pipeline stage-a --run-id RUN_ID
-python -m app.main pipeline stage-b --run-id RUN_ID
-python -m app.main pipeline stage-c --run-id RUN_ID
-python -m app.main pipeline stage-d --run-id RUN_ID
-python -m app.main pipeline export --run-id RUN_ID
-python -m app.main pipeline status --run-id RUN_ID
+python -m app.main pipeline run [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force] [--output-dir DIR] [--edition-date YYYY-MM-DD]
+python -m app.main pipeline start [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--edition-date YYYY-MM-DD]
+python -m app.main pipeline stage-a --edition-date YYYY-MM-DD
+python -m app.main pipeline stage-b --edition-date YYYY-MM-DD
+python -m app.main pipeline stage-c --edition-date YYYY-MM-DD
+python -m app.main pipeline stage-d --edition-date YYYY-MM-DD
+python -m app.main pipeline export --edition-date YYYY-MM-DD
+python -m app.main pipeline status --edition-date YYYY-MM-DD
 ```
 
 ## 完整执行指令
@@ -131,11 +131,6 @@ PYTHON=.venv/bin/python
 
 # 首次安装后，或明确删除旧库后，按当前 ORM 创建新数据库
 $PYTHON scripts/init_db.py
-
-# 如已有旧 Rank 快照数据库，先查看迁移计划，再显式执行一次迁移。
-# 该迁移会将 rank stage、快照表与 display order 转为 Stage D。
-$PYTHON scripts/migrate_rank_to_stage_d.py
-$PYTHON scripts/migrate_rank_to_stage_d.py --apply
 
 # 使用 X/RSSHub 来源时先启动本地 RSSHub；不使用 RSSHub 可跳过
 bash scripts/start_rsshub.sh
@@ -156,14 +151,14 @@ $PYTHON -m app.main pipeline run \
   --force \
   --output-dir output/intel
 
-# 诊断或运维恢复时，才使用下面的内部命令：start 只抓取并冻结 membership，后续阶段不会重复抓取。
-# RUN_ID 是数据库审计/恢复键，正常日报运行不会在终端或产物中展示它。
-$PYTHON -m app.main pipeline start --limit 20
-$PYTHON -m app.main pipeline stage-a --run-id RUN_ID
-$PYTHON -m app.main pipeline stage-b --run-id RUN_ID
-$PYTHON -m app.main pipeline stage-c --run-id RUN_ID
-$PYTHON -m app.main pipeline stage-d --run-id RUN_ID
-$PYTHON -m app.main pipeline export --run-id RUN_ID
+# 诊断或运维恢复时，仍用日报日期定位；start 只抓取并冻结 membership，后续阶段不会重复抓取。
+# 同一天多次重跑会更新同一份日报；内部尝试记录只用于审计和恢复。
+$PYTHON -m app.main pipeline start --limit 20 --edition-date 2026-08-18
+$PYTHON -m app.main pipeline stage-a --edition-date 2026-08-18
+$PYTHON -m app.main pipeline stage-b --edition-date 2026-08-18
+$PYTHON -m app.main pipeline stage-c --edition-date 2026-08-18
+$PYTHON -m app.main pipeline stage-d --edition-date 2026-08-18
+$PYTHON -m app.main pipeline export --edition-date 2026-08-18
 
 # 只抓取并检查原始/标准化结果，不调用 AI；这是诊断命令，不会创建正式 pipeline run
 $PYTHON -m app.main fetch-only \
@@ -173,9 +168,9 @@ $PYTHON -m app.main fetch-only \
   --output-dir output/fetch
 
 # Stage B 失败后的安全恢复：只重试 Stage B，不会重新调用 Stage A
-$PYTHON -m app.main pipeline retry --run-id RUN_ID --stage stage-b
+$PYTHON -m app.main pipeline retry --edition-date 2026-08-18 --stage stage-b
 # 或按依赖顺序恢复所有当前可执行的下游阶段（默认不 fetch）
-$PYTHON -m app.main pipeline resume --run-id RUN_ID
+$PYTHON -m app.main pipeline resume --edition-date 2026-08-18
 ```
 
 单个来源或来源类别可以用同样的参数缩小范围：

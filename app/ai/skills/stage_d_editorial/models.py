@@ -10,6 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 _MARKDOWN_OR_URL_RE = re.compile(r"(?:https?://|www\.|\[[^\]]+\]\([^)]*\)|`|<[^>]+>)", re.IGNORECASE)
 _MARKETING_WORDS = ("重磅", "颠覆", "史上最强", "最强", "革命性")
+STAGE_D_TITLE_MIN_CHARS = 8
+STAGE_D_TITLE_MAX_CHARS = 60
 
 
 class StageDDecision(BaseModel):
@@ -23,7 +25,11 @@ class StageDDecision(BaseModel):
     editorial_score: int = Field(ge=0, le=100)
     story_family_id: str = Field(min_length=1, max_length=80)
     family_position: int | None = Field(default=None, ge=1, le=2)
-    display_title_zh: str | None = None
+    display_title_zh: str | None = Field(
+        default=None,
+        min_length=STAGE_D_TITLE_MIN_CHARS,
+        max_length=STAGE_D_TITLE_MAX_CHARS,
+    )
     title_supporting_fields: list[Literal["title", "summary_cn"]] = Field(default_factory=list)
     reason_codes: list[str] = Field(default_factory=list, max_length=12)
     editorial_reason: str = Field(min_length=1, max_length=240)
@@ -50,8 +56,10 @@ class StageDDecision(BaseModel):
             return None
         if "\n" in title or "\r" in title:
             raise ValueError("display_title_zh must not contain line breaks")
-        if not 8 <= len(title) <= 36:
-            raise ValueError("display_title_zh must be 8 to 36 characters")
+        if not STAGE_D_TITLE_MIN_CHARS <= len(title) <= STAGE_D_TITLE_MAX_CHARS:
+            raise ValueError(
+                f"display_title_zh must be {STAGE_D_TITLE_MIN_CHARS} to {STAGE_D_TITLE_MAX_CHARS} characters"
+            )
         if _MARKDOWN_OR_URL_RE.search(title):
             raise ValueError("display_title_zh must not contain Markdown or URLs")
         if any(word in title for word in _MARKETING_WORDS):

@@ -7,6 +7,7 @@ tests, then delegates the actual run to that orchestrator.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 from app.config.limits import (
@@ -32,6 +33,7 @@ def run_intel_once_from_settings(
     ai_limit: int | None = None,
     force: bool = False,
     dry_run: bool = False,
+    edition_date: date | str | None = None,
     output_dir: str = "output/intel",
     profile_path: str | Path | None = None,
     snapshot_key: str | None = None,
@@ -52,6 +54,7 @@ def run_intel_once_from_settings(
         ai_limit=ai_limit,
         force=force,
         dry_run=dry_run,
+        edition_date=edition_date,
         output_dir=output_dir,
         profile_path=profile_path,
         snapshot_key=snapshot_key,

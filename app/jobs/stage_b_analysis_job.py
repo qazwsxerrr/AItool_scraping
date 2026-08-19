@@ -30,7 +30,7 @@ from app.config.limits import DEFAULT_AI_ANALYSIS_MIN_SCORE, DEFAULT_AI_REVIEW_C
 from app.domain.models import SourceSpec
 from app.jobs.provider_retry import ProviderResponseFailure, call_with_provider_retries
 from app.storage.models import IntelItem, IntelRunStageTask
-from app.storage.repository import IntelRepository
+from app.storage.repository import DAILY_DELTA_RUN_ITEM_ROLES, IntelRepository
 
 from .stage_a_screen_job import (
     _classify_provider_failure,
@@ -179,7 +179,13 @@ def run_stage_b_analysis_job(
             for task in screen_tasks
             if task.item_id is not None or str(task.subject_id).isdigit()
         }
-        scope_items = {int(item.id): item for item in repo.list_run_items(run_id, role="fetched")}
+        scope_items = {
+            int(item.id): item
+            for item in repo.list_run_items(
+                run_id,
+                role=None if requested_ids is not None else DAILY_DELTA_RUN_ITEM_ROLES,
+            )
+        }
         eligible_contexts: list[_AnalysisContext] = []
         for screen_task in screen_tasks:
             if screen_task.status != "succeeded":

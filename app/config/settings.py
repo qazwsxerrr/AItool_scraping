@@ -61,7 +61,7 @@ class Settings:
     ai_stage_d_api_key: str | None = field(default=None, repr=False)
     ai_stage_d_model: str | None = None
     ai_stage_d_api_style: str = "generic_json"
-    ai_stage_d_timeout_seconds: float = 45.0
+    ai_stage_d_timeout_seconds: float = 120.0
     ai_stage_d_retries: int = 2
 
     @classmethod
@@ -107,7 +107,7 @@ class Settings:
             ai_stage_d_api_key=ai_stage_d_api_key,
             ai_stage_d_model=ai_stage_d_model,
             ai_stage_d_api_style=os.getenv("AI_STAGE_D_API_STYLE") or os.getenv("AI_REVIEW_API_STYLE", "generic_json"),
-            ai_stage_d_timeout_seconds=float(os.getenv("AI_STAGE_D_TIMEOUT_SECONDS", os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "45"))),
+            ai_stage_d_timeout_seconds=float(os.getenv("AI_STAGE_D_TIMEOUT_SECONDS", "120")),
             ai_stage_d_retries=max(0, _bounded_int(os.getenv("AI_STAGE_D_RETRIES"), 2)),
         )
 

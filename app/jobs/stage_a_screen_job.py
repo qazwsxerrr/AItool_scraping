@@ -42,7 +42,7 @@ from app.domain.recency import (
 )
 from app.jobs.provider_retry import ProviderResponseFailure, ProviderRetryExhausted, call_with_provider_retries
 from app.storage.models import IntelItem, IntelRun, IntelRunStageTask
-from app.storage.repository import IntelRepository
+from app.storage.repository import DAILY_DELTA_RUN_ITEM_ROLES, IntelRepository
 
 LOGGER = logging.getLogger(__name__)
 
@@ -539,16 +539,13 @@ def _prepare_scope(
             session.commit()
             run_id = int(run.id)
         else:
-            candidates = repo.list_run_items(run_id, role="fetched")
-            if not candidates:
-                candidates = repo.list_pending_items(
-                    limit=None,
-                    source_id=source_filter,
-                    content_class=content_class,
-                    force=force,
-                    run_id=run_id,
-                    stage="screen",
-                )
+            # A daily run only screens this fetch's editorial delta.  An
+            # explicitly targeted item remains an operator override, while a
+            # normal invocation never falls back to unchanged run members.
+            candidates = repo.list_run_items(
+                run_id,
+                role=None if requested_ids is not None else DAILY_DELTA_RUN_ITEM_ROLES,
+            )
             if source_filter:
                 candidates = [item for item in candidates if item.source_id == source_filter]
             if content_class:

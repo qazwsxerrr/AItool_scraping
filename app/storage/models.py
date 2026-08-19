@@ -2,8 +2,7 @@
 
 The data layer contains sources, fetch telemetry, runs, normalized items,
 structured AI reviews, and the Stage-C event/member plus Stage-D snapshot tables.
-Historical Rank snapshots have one explicit operator-run migration to Stage D;
-the only startup-time compatibility upgrade remains the additive indexed
+The only startup-time compatibility upgrade is the additive indexed
 ``intel_runs.edition_date`` column.
 """
 

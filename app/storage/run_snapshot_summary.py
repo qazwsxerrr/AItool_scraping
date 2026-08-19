@@ -22,6 +22,7 @@ from app.storage.models import (
     IntelRunStage,
     IntelRunStageTask,
 )
+from app.storage.repository import DAILY_DELTA_RUN_ITEM_ROLES
 
 
 CANONICAL_STAGE_NAMES = ("fetch", "screen", "analyze", "cluster", "stage_d", "export")
@@ -66,7 +67,14 @@ def build_run_snapshot_summary(
         session.execute(
             select(func.count(IntelRunItem.id)).where(
                 IntelRunItem.run_id == run_id,
-                IntelRunItem.role == "fetched",
+            )
+        ).scalar_one()
+    )
+    daily_delta = int(
+        session.execute(
+            select(func.count(IntelRunItem.id)).where(
+                IntelRunItem.run_id == run_id,
+                IntelRunItem.role.in_(DAILY_DELTA_RUN_ITEM_ROLES),
             )
         ).scalar_one()
     )
@@ -137,13 +145,14 @@ def build_run_snapshot_summary(
         1 for task in screen_tasks if task.status == "skipped"
     )
     if not screen_task_count:
-        within_72h = max(0, frozen - time_excluded)
+        within_72h = max(0, daily_delta - time_excluded)
 
     return {
         "funnel": {
             "fetched": fetched,
             "inserted": inserted,
             "frozen": frozen,
+            "daily_delta": daily_delta,
             "within_72h": max(0, within_72h),
             "time_excluded": time_excluded,
             "time_excluded_by_reason": time_excluded_by_reason,
@@ -240,7 +249,41 @@ def _stage_details(
                 for key, value in freshness_counts.items()
             }
         return details
-    if stage_name in {"cluster", "stage_d", "export"}:
+    if stage_name == "stage_d":
+        details: dict[str, Any] = {}
+        for key in (
+            "stage_d_source",
+            "provider_attempts",
+            "fallback_reason",
+            "response_hash",
+            "provider_status_code",
+            "provider_error_code",
+            "provider_error_message",
+        ):
+            value = metadata.get(key)
+            if value is not None:
+                details[key] = value
+        request_metadata = metadata.get("request_metadata")
+        if isinstance(request_metadata, dict):
+            # Request metadata is intentionally limited to non-secret
+            # fingerprints and transport facts; raw bodies stay in attempts.
+            details["request_metadata"] = {
+                key: request_metadata[key]
+                for key in (
+                    "endpoint",
+                    "api_style",
+                    "model",
+                    "event_count",
+                    "total_max",
+                    "prompt_version",
+                    "schema_version",
+                    "request_bytes",
+                    "request_sha256",
+                )
+                if key in request_metadata
+            }
+        return details
+    if stage_name in {"cluster", "export"}:
         # Snapshot keys are execution plumbing.  Public daily status is
         # addressed by ``edition_date`` at the caller boundary instead.
         return {}

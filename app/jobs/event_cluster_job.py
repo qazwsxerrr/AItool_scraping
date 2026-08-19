@@ -8,11 +8,11 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.ai.event_resolution import event_resolution_client_from_settings, resolve_event_group
@@ -34,6 +34,7 @@ _STOPWORDS = {"a", "an", "and", "for", "from", "new", "the", "to", "of", "in", "
 # implicit transitive merge.
 SEMANTIC_REPEAT_THRESHOLD = 0.80
 SEMANTIC_AMBIGUITY_THRESHOLD = 0.55
+DAILY_HISTORY_DAYS = 3
 
 
 @dataclass
@@ -50,7 +51,7 @@ class EventClusterResult:
     errors: list[str] = field(default_factory=list)
     event_ids: list[int] = field(default_factory=list)
     # ``event_ids`` is kept as the historical new-event projection for API
-    # compatibility.  Ranking needs the complete current Stage-C projection,
+    # compatibility.  Stage D needs the complete current Stage-C projection,
     # including candidates that were matched to an existing event row.
     current_event_ids: list[int] = field(default_factory=list)
     snapshot_key: str = "latest"
@@ -119,6 +120,54 @@ def _normalize_external_id(value: Any) -> str | None:
         return None
     text = re.sub(r"\s+", "", str(value).strip()).casefold()
     return text or None
+
+
+def github_repo_identity(value: Any) -> str | None:
+    """Return a stable ``owner/repo`` identity for GitHub repository items.
+
+    The collector's ``github_repo:owner/repo`` external id is authoritative.
+    URL parsing is only a fallback, and deliberately uses the first two
+    GitHub path components so issue, commit and other repository sub-pages
+    remain attached to the same repository identity.
+    """
+
+    values = _mapping(value)
+    if not values and isinstance(value, str):
+        values = {"canonical_url": value}
+
+    external_id = _normalize_external_id(values.get("external_id") or values.get("guid"))
+    if external_id and external_id.startswith("github_repo:"):
+        parts = [part for part in external_id.split(":", 1)[1].split("/") if part]
+        if len(parts) >= 2:
+            owner = parts[0].strip()
+            repo = parts[1].removesuffix(".git").strip()
+            if owner and repo:
+                return f"{owner}/{repo}".casefold()
+
+    for name in ("canonical_url", "url", "source_url"):
+        raw = values.get(name)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        if "://" not in text and text.casefold().startswith(("github.com/", "www.github.com/")):
+            text = f"https://{text}"
+        try:
+            parsed = urlsplit(text)
+        except ValueError:
+            continue
+        host = (parsed.hostname or "").casefold()
+        if host not in {"github.com", "www.github.com"}:
+            continue
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) < 2:
+            continue
+        owner = parts[0].strip()
+        repo = re.sub(r"\.git$", "", parts[1], flags=re.IGNORECASE).strip()
+        if owner and repo:
+            return f"{owner}/{repo}".casefold()
+    return None
 
 
 def exact_identity_keys(value: Any) -> tuple[str, ...]:
@@ -281,13 +330,16 @@ def build_candidate_clusters(candidates: Iterable[Any], **kwargs: Any) -> list[l
 def _candidate(value: Any) -> dict[str, Any]:
     values = _mapping(value)
     title = values.get("title") or values.get("original_title") or ""
-    return {"item": value, "identity_keys": exact_identity_keys(values), "title": str(title), "summary_cn": values.get("summary_cn") or values.get("summary"), "title_tokens": _title_tokens(title), "topic": _text(values.get("topic")), "content_class": _text(values.get("content_class")), "keywords": values.get("keywords", []), "entities": values.get("entities", [])}
+    return {"item": value, "identity_keys": exact_identity_keys(values), "github_repo_identity": github_repo_identity(values), "title": str(title), "summary_cn": values.get("summary_cn") or values.get("summary"), "title_tokens": _title_tokens(title), "topic": _text(values.get("topic")), "content_class": _text(values.get("content_class")), "keywords": values.get("keywords", []), "entities": values.get("entities", [])}
 
 
 def _compatible_candidate(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     # Topic/content class describe presentation, not real-world identity.
     # They must not force two reports about one announcement apart.
-    del left, right
+    left_repo = left.get("github_repo_identity") or github_repo_identity(left)
+    right_repo = right.get("github_repo_identity") or github_repo_identity(right)
+    if left_repo and right_repo and left_repo != right_repo:
+        return False
     return True
 
 
@@ -309,7 +361,9 @@ def _safe_groups(
         exact_indexes = [
             index
             for index, group in enumerate(groups)
-            if anchors and any(anchors & set(member.get("identity_keys", ())) for member in group)
+            if anchors
+            and all(_compatible_candidate(row, member) for member in group)
+            and any(anchors & set(member.get("identity_keys", ())) for member in group)
         ]
         if exact_indexes:
             first = exact_indexes[0]
@@ -389,7 +443,8 @@ def run_event_cluster_job(
                     reference_time=frozen_reference,
                     metadata={
                         "snapshot_key": key,
-                        "history_window_hours": 72,
+                        "history_mode": "prior_selected_daily",
+                        "daily_history_days": DAILY_HISTORY_DAYS,
                         "freshness_window_hours": RECENT_WINDOW_HOURS,
                     },
                 )
@@ -444,7 +499,12 @@ def run_event_cluster_job(
                 # Keep the lease/task claim durable independently from event
                 # writes.  A failed group must not roll it back.
                 session.commit()
-            history_events = _load_history_events(session, current=current, snapshot_key=key)
+            history_events = _load_history_events(
+                session,
+                current=current,
+                snapshot_key=key,
+                run=run,
+            )
             in_run_events: dict[int, IntelEvent] = {}
             for values, fuzzy_group in _cluster_rows(candidates):
                 try:
@@ -718,10 +778,115 @@ def _analysis_result_is_filtered(value: Any) -> bool:
     return metadata.get("filtered") is True
 
 
-def _load_history_events(session: Session, *, current: datetime, snapshot_key: str) -> list[IntelEvent]:
+def _load_history_events(
+    session: Session,
+    *,
+    current: datetime,
+    snapshot_key: str,
+    run: IntelRun | None = None,
+    daily_history_days: int = DAILY_HISTORY_DAYS,
+) -> list[IntelEvent]:
+    """Load only previous public daily selections for a run-scoped edition.
+
+    The database remains the audit store, but the current daily event pool is
+    not deduplicated against every recent event row.  For normal pipeline
+    runs, historical matching is deliberately limited to the latest public
+    edition for each recent date.  The run-less branch preserves the legacy
+    compatibility facade used by older direct callers.
+    """
+
+    if run is not None:
+        return _load_selected_daily_history_events(
+            session,
+            run=run,
+            days=daily_history_days,
+        )
+
+    # Legacy direct calls have no public edition boundary. Keep their former
+    # bounded behaviour instead of inventing a date-addressed daily scope.
     since = current - timedelta(hours=72)
     snapshot_ids = select(IntelEventStageDSnapshot.event_id).where(IntelEventStageDSnapshot.snapshot_key == snapshot_key, IntelEventStageDSnapshot.selected.is_(True))
     stmt = select(IntelEvent).options(joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_review), joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.source), joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source)).where(or_(IntelEvent.last_seen_at >= since, IntelEvent.first_seen_at >= since, IntelEvent.id.in_(snapshot_ids))).order_by(IntelEvent.id.asc())
+    return list(session.scalars(stmt).unique().all())
+
+
+def _load_selected_daily_history_events(
+    session: Session,
+    *,
+    run: IntelRun,
+    days: int,
+) -> list[IntelEvent]:
+    if days <= 0 or not run.edition_date:
+        return []
+    try:
+        current_edition = date.fromisoformat(run.edition_date)
+    except ValueError:
+        return []
+
+    earliest = current_edition - timedelta(days=days)
+    previous_runs = list(
+        session.scalars(
+            select(IntelRun)
+            .where(
+                IntelRun.status.in_(("completed", "completed_with_errors", "partial")),
+                IntelRun._edition_date >= earliest,
+                IntelRun._edition_date < current_edition,
+            )
+            .order_by(IntelRun._edition_date.desc(), IntelRun.id.desc())
+        ).all()
+    )
+    # A public date can have several internal attempts. Only its newest run
+    # represents the final daily output that subsequent editions compare to.
+    latest_by_edition: dict[str, IntelRun] = {}
+    for previous_run in previous_runs:
+        if previous_run.edition_date:
+            latest_by_edition.setdefault(previous_run.edition_date, previous_run)
+    conditions = [
+        and_(
+            IntelEventStageDSnapshot.run_id == int(previous_run.id),
+            IntelEventStageDSnapshot.snapshot_key == previous_run.daily_snapshot_key,
+        )
+        for previous_run in latest_by_edition.values()
+    ]
+    event_ids: list[int] = []
+    if conditions:
+        event_ids.extend(
+            int(event_id)
+            for event_id in session.scalars(
+                select(IntelEventStageDSnapshot.event_id).where(
+                    IntelEventStageDSnapshot.selected.is_(True),
+                    or_(*conditions),
+                )
+            ).all()
+        )
+    # A Stage-C retry must also see events already materialized by this same
+    # run. This is execution-local idempotency, not cross-day historical
+    # recall, and prevents a retry from creating a second canonical event.
+    event_ids.extend(
+        int(event_id)
+        for event_id in session.scalars(
+            select(IntelEvent.id).where(
+                or_(
+                    IntelEvent.first_run_id == int(run.id),
+                    IntelEvent.last_run_id == int(run.id),
+                    IntelEvent.new_in_run_id == int(run.id),
+                )
+            )
+        ).all()
+    )
+    event_ids = list(dict.fromkeys(event_ids))
+    if not event_ids:
+        return []
+    stmt = (
+        select(IntelEvent)
+        .options(
+            joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_review),
+            joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.source),
+            joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source),
+        )
+        .where(IntelEvent.id.in_(event_ids))
+        .order_by(IntelEvent.id.asc())
+    )
     return list(session.scalars(stmt).unique().all())
 
 
@@ -734,6 +899,7 @@ def _item_candidate(item: IntelItem) -> dict[str, Any]:
     return {
         "id": item.id, "source_id": item.source_id, "source_group": source.source_group if source else None, "source_priority": source.priority if source else 100,
         "content_class": (review.content_class if review else None) or item.content_class, "canonical_url": canonical_event_url(item.canonical_url), "external_id": _normalize_external_id(item.external_id),
+        "github_repo_identity": github_repo_identity(item),
         "title": item.title, "normalized_title": normalize_event_title(item.title), "summary_cn": (review.summary_cn if review else None) or item.summary,
         "topic": (review.topic if review else None) or (topics[0] if topics else None), "topics": _clean_strings(topics), "keywords": list(review.keywords) if review is not None else [], "entities": list(review.entities) if review is not None else [], "risk_flags": list(review.risk_flags) if review is not None else [],
         "selection_score": _number(review.selection_score if review else item.selection_score), "published_at": _as_utc(item.published_at or item.discovered_at or item.captured_at), "captured_at": _as_utc(item.captured_at),
@@ -746,6 +912,22 @@ def _cluster_rows(candidates: Sequence[dict[str, Any]]) -> list[tuple[list[dict[
 
 
 def _resolve_ambiguous_group(values: list[dict[str, Any]], *, ai_client: Any | None, ambiguous: bool) -> _GroupResolution:
+    github_repos = {
+        repo
+        for value in values
+        for repo in [value.get("github_repo_identity") or github_repo_identity(value)]
+        if repo
+    }
+    if len(github_repos) > 1:
+        # A provider must never be allowed to merge two known repository
+        # identities, even if the semantic group was ambiguous and the model
+        # claims ``merge``.  Keep each item auditable as a guarded singleton.
+        return _GroupResolution(
+            tuple((value,) for value in values),
+            "deterministic_fallback",
+            0,
+            risk_flags=("github_repo_mismatch",),
+        )
     if not ambiguous:
         return _GroupResolution((tuple(values),), "deterministic", 100)
     if ai_client is None:
@@ -909,15 +1091,66 @@ def _event_resolution_value(event: IntelEvent) -> dict[str, Any]:
     }
 
 
+def _event_github_repo_identities(event: IntelEvent) -> frozenset[str]:
+    identities: set[str] = set()
+    direct = github_repo_identity(event)
+    if direct:
+        identities.add(direct)
+    for relation in getattr(event, "event_items", ()) or ():
+        relation_identity = getattr(relation, "identity_key", None)
+        if isinstance(relation_identity, str):
+            if relation_identity.startswith("external:"):
+                relation_repo = github_repo_identity({"external_id": relation_identity[9:]})
+            elif relation_identity.startswith("url:"):
+                relation_repo = github_repo_identity({"canonical_url": relation_identity[4:]})
+            else:
+                relation_repo = None
+            if relation_repo:
+                identities.add(relation_repo)
+        item = getattr(relation, "item", None)
+        identity = github_repo_identity(item) if item is not None else None
+        if identity:
+            identities.add(identity)
+    return frozenset(identities)
+
+
+def _event_strong_identity_keys(event: IntelEvent) -> frozenset[str]:
+    identities = set(_strong_identity_keys(event))
+    for relation in getattr(event, "event_items", ()) or ():
+        relation_identity = getattr(relation, "identity_key", None)
+        if isinstance(relation_identity, str) and relation_identity.startswith(("url:", "external:")):
+            identities.add(relation_identity)
+        item = getattr(relation, "item", None)
+        if item is not None:
+            identities.update(_strong_identity_keys(item))
+    return frozenset(identities)
+
+
+def _history_github_repo_compatible(candidate_repos: frozenset[str], event_repos: frozenset[str]) -> bool:
+    """Allow semantic history only for a single compatible repo identity."""
+
+    if len(candidate_repos) > 1 or len(event_repos) > 1:
+        return False
+    if candidate_repos and event_repos and candidate_repos != event_repos:
+        return False
+    return True
+
+
 def _match_history_event(values: Sequence[Mapping[str, Any]], history_events: Sequence[IntelEvent], *, current: datetime, run_id: int | None, in_run_events: Mapping[int, IntelEvent]) -> tuple[IntelEvent | None, str]:
     candidate_ids = {identity for value in values for identity in _strong_identity_keys(value)}
     item_ids = {int(value["id"]) for value in values if value.get("id") is not None}
+    candidate_repos = frozenset(
+        repo
+        for value in values
+        for repo in [value.get("github_repo_identity") or github_repo_identity(value)]
+        if repo
+    )
     seen: set[int] = set()
     for event in [*in_run_events.values(), *history_events]:
         if event.id in seen:
             continue
         seen.add(event.id)
-        event_identity = _strong_identity_keys({"canonical_url": event.canonical_url, "external_id": event.external_id})
+        event_identity = _event_strong_identity_keys(event)
         if any(int(relation.item_id) in item_ids for relation in event.event_items) or candidate_ids & event_identity:
             return event, "repeat_exact" if (run_id is None or event.new_in_run_id != run_id) else "same_run"
     primary = max(values, key=lambda value: (_number(value.get("selection_score")), _as_utc(value.get("published_at")) or datetime.min.replace(tzinfo=timezone.utc)))
@@ -925,6 +1158,8 @@ def _match_history_event(values: Sequence[Mapping[str, Any]], history_events: Se
     for event in [*in_run_events.values(), *history_events]:
         event_time = _as_utc(event.last_seen_at or event.first_seen_at)
         if event_time is None or event_time < current - timedelta(hours=72):
+            continue
+        if not _history_github_repo_compatible(candidate_repos, _event_github_repo_identities(event)):
             continue
         similarity = _semantic_match_score(primary, event)
         if similarity >= SEMANTIC_AMBIGUITY_THRESHOLD:
@@ -1041,4 +1276,4 @@ def _iso_datetime(value: Any) -> str | None:
     return current.isoformat() if current is not None else None
 
 
-__all__ = ["ClusterResult", "EventClusterResult", "build_candidate_clusters", "canonical_event_key", "canonical_event_url", "cluster_candidates", "exact_identity_keys", "normalize_event_title", "resolve_ambiguous_group", "run_cluster_job", "run_event_cluster_from_settings", "run_event_cluster_job"]
+__all__ = ["ClusterResult", "EventClusterResult", "build_candidate_clusters", "canonical_event_key", "canonical_event_url", "cluster_candidates", "exact_identity_keys", "github_repo_identity", "normalize_event_title", "resolve_ambiguous_group", "run_cluster_job", "run_event_cluster_from_settings", "run_event_cluster_job"]

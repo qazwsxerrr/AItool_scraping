@@ -38,7 +38,7 @@ from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_regist
 from app.domain.models import SourceSpec
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import IntelItem, IntelRun
-from app.storage.repository import IntelRepository
+from app.storage.repository import DAILY_DELTA_RUN_ITEM_ROLES, IntelRepository
 from app.jobs.stage_a_screen_job import run_stage_a_screen_job
 from app.jobs.stage_b_analysis_job import run_stage_b_analysis_job
 
@@ -434,7 +434,7 @@ def _load_stage_exports(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     repo = IntelRepository(session)
     if run_id is not None:
-        items = repo.list_run_items(run_id, role="fetched")
+        items = repo.list_run_items(run_id, role=DAILY_DELTA_RUN_ITEM_ROLES)
     else:
         items = repo.list_pending_items(limit=None, force=True, stage="screen")
     if source_filter:

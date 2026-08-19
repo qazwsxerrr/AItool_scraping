@@ -200,6 +200,8 @@ def resolve_event_group(values: Iterable[Mapping[str, Any]], resolver: Callable[
 
 
 def parse_event_resolution(raw: Any) -> EventResolution:
+    if isinstance(raw, EventResolution):
+        return raw
     raw = _unwrap_provider_response(raw)
     data = dict(raw) if isinstance(raw, Mapping) else {}
     if isinstance(raw, str):

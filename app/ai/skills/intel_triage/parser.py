@@ -99,6 +99,16 @@ def strict_parse_analysis(
         if normalized_source is None:
             raise ValueError("source_content_class is not supported")
         result_data["source_content_class"] = normalized_source
+    # Some providers emit explicit null for the required paper provenance
+    # token on non-paper items.  Keep the strict public contract while
+    # normalizing that harmless null to the model's neutral value instead of
+    # blocking the whole Stage-B run.
+    paper_support = result_data.get("paper_support")
+    if isinstance(paper_support, Mapping):
+        paper_support = dict(paper_support)
+        if paper_support.get("source_type") is None:
+            paper_support["source_type"] = "unknown"
+        result_data["paper_support"] = paper_support
     result_data["raw_response"] = dict(raw_mapping)
     parsed = AnalysisResult.model_validate(result_data)
     return apply_analysis_guards(parsed, item)

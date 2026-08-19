@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-from app.ai.event_resolution import event_resolution_client_from_settings
+from app.ai.event_resolution import EventResolution, event_resolution_client_from_settings, resolve_event_group
 from app.config.settings import Settings
 from app.jobs import event_cluster_job as event_cluster_module
-from app.jobs.event_cluster_job import _semantic_match_components, canonical_event_key, cluster_candidates, normalize_event_title, run_event_cluster_from_settings, run_event_cluster_job
+from app.jobs.event_cluster_job import _semantic_match_components, canonical_event_key, cluster_candidates, github_repo_identity, normalize_event_title, run_event_cluster_from_settings, run_event_cluster_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import AIItemReview, IntelEvent, IntelEventItem, IntelItem, Source
 from app.storage.repository import IntelRepository
@@ -54,6 +54,104 @@ def test_identity_helpers_and_candidate_clusters_are_stable():
     assert len(groups) == 1 and len(groups[0]) == 2
 
 
+def test_github_repo_identity_prefers_external_id_and_normalizes_url_fallback():
+    assert github_repo_identity(
+        {
+            "external_id": " github_repo:Owner/Repo.GIT ",
+            "canonical_url": "https://github.com/other/project",
+        }
+    ) == "owner/repo"
+    assert github_repo_identity("https://WWW.GITHUB.COM/Owner/Repo.GIT/issues/7") == "owner/repo"
+
+
+def test_different_github_repositories_do_not_fuzzy_merge_identical_text():
+    rows = [
+        {
+            "id": 1,
+            "title": "AI platform release",
+            "summary": "The project announces a new AI platform release for developers.",
+            "url": "https://github.com/acme/platform-a",
+            "external_id": "github_repo:acme/platform-a",
+            "keywords": ["ai", "platform", "release"],
+            "entities": [{"type": "project", "name": "AI platform"}],
+        },
+        {
+            "id": 2,
+            "title": "AI platform release",
+            "summary": "The project announces a new AI platform release for developers.",
+            "url": "https://github.com/acme/platform-b",
+            "external_id": "github_repo:acme/platform-b",
+            "keywords": ["ai", "platform", "release"],
+            "entities": [{"type": "project", "name": "AI platform"}],
+        },
+    ]
+
+    groups = cluster_candidates(rows)
+
+    assert [len(group) for group in groups] == [1, 1]
+
+
+def test_ambiguous_ai_cannot_merge_different_github_repositories():
+    class Resolver:
+        def __init__(self):
+            self.calls = 0
+
+        def resolve_event(self, _values):
+            self.calls += 1
+            return {"decision": "merge", "confidence": 99}
+
+    resolver = Resolver()
+    groups = event_cluster_module.resolve_ambiguous_group(
+        [
+            {
+                "id": 1,
+                "title": "AI platform release",
+                "summary": "The project announces a new AI platform release for developers.",
+                "url": "https://github.com/acme/platform-a",
+                "external_id": "github_repo:acme/platform-a",
+                "keywords": ["ai", "platform", "release"],
+            },
+            {
+                "id": 2,
+                "title": "AI platform release",
+                "summary": "The project announces a new AI platform release for developers.",
+                "url": "https://github.com/acme/platform-b",
+                "external_id": "github_repo:acme/platform-b",
+                "keywords": ["ai", "platform", "release"],
+            },
+        ],
+        ai_client=resolver,
+    )
+
+    assert [len(group) for group in groups] == [1, 1]
+    assert resolver.calls == 0
+
+
+def test_same_github_repository_can_merge_across_sources():
+    groups = cluster_candidates(
+        [
+            {
+                "id": 1,
+                "title": "AI platform release",
+                "summary": "The project announces a new AI platform release for developers.",
+                "url": "https://github.com/acme/platform",
+                "external_id": "github_repo:acme/platform",
+                "keywords": ["ai", "platform", "release"],
+            },
+            {
+                "id": 2,
+                "title": "AI platform release",
+                "summary": "The project announces a new AI platform release for developers.",
+                "url": "https://www.github.com/Acme/Platform.git?utm_source=feed",
+                "external_id": "github_repo:ACME/PLATFORM",
+                "keywords": ["ai", "platform", "release"],
+            },
+        ]
+    )
+
+    assert len(groups) == 1 and len(groups[0]) == 2
+
+
 def test_exact_repeat_attaches_lineage_without_new_event():
     session_factory = _db()
     _seed(session_factory, [{"source_id": "a", "title": "Foo Release", "url": "https://example.test/foo"}])
@@ -65,6 +163,125 @@ def test_exact_repeat_attaches_lineage_without_new_event():
     with session_factory() as session:
         assert session.query(IntelEvent).count() == 1
         assert session.query(IntelEventItem).count() == 2
+
+
+def test_different_github_repository_does_not_reuse_semantic_history():
+    session_factory = _db()
+    shared = {
+        "title": "AI platform release",
+        "summary": "The project announces a new AI platform release for developers.",
+        "keywords": ["ai", "platform", "release"],
+        "entities": [{"type": "project", "name": "AI platform"}],
+    }
+    _seed(
+        session_factory,
+        [
+            {
+                **shared,
+                "source_id": "repo-a",
+                "url": "https://github.com/acme/platform-a",
+                "external_id": "github_repo:acme/platform-a",
+            }
+        ],
+    )
+    first = run_event_cluster_job(session_factory=session_factory)
+    assert first.events == 1
+
+    _seed(
+        session_factory,
+        [
+            {
+                **shared,
+                "source_id": "repo-b",
+                "url": "https://github.com/acme/platform-b",
+                "external_id": "github_repo:acme/platform-b",
+            }
+        ],
+    )
+    second = run_event_cluster_job(
+        session_factory=session_factory,
+        item_ids=[2],
+        now=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    assert second.events == 1 and second.repeats == 0
+    with session_factory() as session:
+        assert session.query(IntelEvent).count() == 2
+        assert {relation.event_id for relation in session.query(IntelEventItem).all()} == {1, 2}
+
+
+def test_contaminated_multi_repo_history_is_not_semantically_reused():
+    session_factory = _db()
+    shared = {
+        "title": "AI platform release",
+        "summary": "The project announces a new AI platform release for developers.",
+        "keywords": ["ai", "platform", "release"],
+        "entities": [{"type": "project", "name": "AI platform"}],
+    }
+    _seed(
+        session_factory,
+        [
+            {
+                **shared,
+                "source_id": "repo-a",
+                "url": "https://github.com/acme/platform-a",
+                "external_id": "github_repo:acme/platform-a",
+            },
+            {
+                **shared,
+                "source_id": "repo-b",
+                "url": "https://github.com/acme/platform-b",
+                "external_id": "github_repo:acme/platform-b",
+            },
+        ],
+    )
+    with session_factory() as session:
+        event = IntelEvent(
+            event_key="url:https://github.com/acme/platform-a",
+            canonical_url="https://github.com/acme/platform-a",
+            external_id="github_repo:acme/platform-a",
+            title="AI platform release",
+            summary_cn=shared["summary"],
+            topic="model",
+            display_score=80,
+            first_seen_at=datetime.now(timezone.utc),
+            last_seen_at=datetime.now(timezone.utc),
+        )
+        session.add(event)
+        session.flush()
+        repo = IntelRepository(session)
+        for item_id in (1, 2):
+            item = session.get(IntelItem, item_id)
+            repo.upsert_event_item(
+                event.id,
+                item_id,
+                source_id=item.source_id,
+                source_group=item.source.source_group,
+                identity_key=f"external:{item.external_id}",
+            )
+        session.commit()
+
+    _seed(
+        session_factory,
+        [
+            {
+                **shared,
+                "source_id": "repo-c",
+                "url": "https://github.com/acme/platform-c",
+                "external_id": "github_repo:acme/platform-c",
+            }
+        ],
+    )
+    result = run_event_cluster_job(
+        session_factory=session_factory,
+        item_ids=[3],
+        now=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    assert result.events == 1 and result.repeats == 0
+    with session_factory() as session:
+        relation = session.query(IntelEventItem).filter_by(item_id=3).one()
+        assert relation.event_id != 1
 
 
 def test_same_title_with_different_urls_is_a_weak_candidate_not_exact_identity():
@@ -421,3 +638,17 @@ def test_event_resolution_factory_and_injected_run_path(monkeypatch):
     monkeypatch.setattr(event_cluster_module, "event_resolution_client_from_settings", lambda value: (_ for _ in ()).throw(AssertionError("factory should not run")))
     run_event_cluster_from_settings(settings=Settings(database_url="sqlite:///:memory:"), ai_client=injected)
     assert captured["kwargs"]["ai_client"] is injected
+
+
+def test_event_resolution_instance_passthrough_does_not_trigger_pairwise_fallback():
+    calls = []
+
+    def resolver(*args):
+        calls.append(args)
+        return EventResolution("separate", 95, "different repositories")
+
+    evidence = resolve_event_group([{"id": 1}, {"id": 2}], resolver)
+
+    assert evidence.decision == "separate"
+    assert evidence.confidence == 95
+    assert len(calls) == 1 and len(calls[0]) == 1
