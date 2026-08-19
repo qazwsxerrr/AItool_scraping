@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -20,7 +21,16 @@ import yaml
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
-from app.ai.skills.stage_d_editorial import StageDEditorialClient, StageDEditorialResponse, strict_parse_stage_d
+from app.ai.skills.stage_d_editorial import (
+    StageDAssessmentResponse,
+    StageDCompositionResponse,
+    StageDProviderCallResult,
+    StageDEditorialClient,
+    StageDEditorialResponse,
+    strict_parse_stage_d,
+    strict_parse_stage_d_assessment,
+    strict_parse_stage_d_composition,
+)
 from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
 from app.config.settings import Settings
 from app.domain.policies import is_first_party_x_source
@@ -34,12 +44,30 @@ from app.storage.models import (
     IntelRun,
     IntelRunStage,
     IntelRunStageTask,
+    utcnow,
 )
 from app.storage.repository import IntelRepository
 
 
 LOGGER = logging.getLogger(__name__)
 STAGE_D_NAME = "stage_d"
+STAGE_D_VERSION = "stage-d-v2"
+STAGE_D_ASSESSMENT_PROMPT_VERSION = "stage_d_assessment_v1"
+STAGE_D_COMPOSITION_PROMPT_VERSION = "stage_d_editorial_v2"
+DEFAULT_STAGE_D_BATCH_SIZE = 24
+DEFAULT_STAGE_D_CONCURRENCY = 2
+DEFAULT_STAGE_D_SHORTLIST_MAX = 60
+DEFAULT_STAGE_D_WATCHLIST_MAX = 10
+DEFAULT_STAGE_D_ASSESSMENT_RETRIES = 5
+
+
+class StageDExecutionError(RuntimeError):
+    """Terminal Stage-D execution failure that must block downstream export."""
+
+    def __init__(self, phase: str, message: str, *, cause: BaseException | None = None) -> None:
+        self.phase = str(phase)
+        self.cause = cause
+        super().__init__(f"stage_d {self.phase} failed: {message}")
 
 
 class StageDProviderCallError(RuntimeError):
@@ -58,13 +86,18 @@ class StageDProviderCallError(RuntimeError):
 
 @dataclass(frozen=True)
 class StageDProfile:
-    """Small policy surface deliberately free of editorial quotas."""
+    """Durable Stage-D v2 policy shared by D1, D2 and D3."""
 
     snapshot_key: str = "latest"
     total_max: int = DEFAULT_DAILY_REPORT_LIMIT
     paper_hard_gate: bool = True
     recent_history_days: int = 3
-    version: str = "stage-d-v1"
+    version: str = STAGE_D_VERSION
+    assessment_batch_size: int = DEFAULT_STAGE_D_BATCH_SIZE
+    assessment_concurrency: int = DEFAULT_STAGE_D_CONCURRENCY
+    shortlist_max: int = DEFAULT_STAGE_D_SHORTLIST_MAX
+    watchlist_max: int = DEFAULT_STAGE_D_WATCHLIST_MAX
+    assessment_retries: int = DEFAULT_STAGE_D_ASSESSMENT_RETRIES
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "StageDProfile":
@@ -75,7 +108,37 @@ class StageDProfile:
             total_max=_bounded_int(data.get("total_max"), DEFAULT_DAILY_REPORT_LIMIT, lower=0, upper=30),
             paper_hard_gate=_coerce_bool(data.get("paper_hard_gate", paper.get("hard_gate", True)), True),
             recent_history_days=_bounded_int(data.get("recent_history_days"), 3, lower=0, upper=30),
-            version=str(data.get("version") or "stage-d-v1"),
+            version=str(data.get("version") or STAGE_D_VERSION),
+            assessment_batch_size=_bounded_int(
+                data.get("assessment_batch_size"),
+                DEFAULT_STAGE_D_BATCH_SIZE,
+                lower=1,
+                upper=24,
+            ),
+            assessment_concurrency=_bounded_int(
+                data.get("assessment_concurrency"),
+                DEFAULT_STAGE_D_CONCURRENCY,
+                lower=1,
+                upper=2,
+            ),
+            shortlist_max=_bounded_int(
+                data.get("shortlist_max"),
+                DEFAULT_STAGE_D_SHORTLIST_MAX,
+                lower=0,
+                upper=60,
+            ),
+            watchlist_max=_bounded_int(
+                data.get("watchlist_max"),
+                DEFAULT_STAGE_D_WATCHLIST_MAX,
+                lower=0,
+                upper=30,
+            ),
+            assessment_retries=_bounded_int(
+                data.get("assessment_retries"),
+                DEFAULT_STAGE_D_ASSESSMENT_RETRIES,
+                lower=0,
+                upper=5,
+            ),
         )
 
 
@@ -87,11 +150,18 @@ class StageDResult:
     eligible: int = 0
     selected: int = 0
     omitted: int = 0
+    assessed: int = 0
+    assessment_batches: int = 0
+    shortlist_count: int = 0
+    watchlist: int = 0
     paper_gated: int = 0
     snapshots: int = 0
     ai_selected: int = 0
     ai_failed: int = 0
     provider_attempts: int = 0
+    assessment_provider_attempts: int = 0
+    composition_provider_attempts: int = 0
+    failed_phase: str | None = None
     used_fallback: bool = False
     errors: list[str] = field(default_factory=list)
 
@@ -119,15 +189,14 @@ def run_stage_d_job(
     run_id: int | None = None,
     event_ids: Iterable[int] | None = None,
 ) -> StageDResult:
-    """Select a final daily edition from this run's Stage-C projection."""
+    """Run Stage D v2: assess batches, build a local shortlist, then compose."""
 
     policy = _coerce_profile(profile if profile is not None else profile_path)
     result = StageDResult(run_id=run_id, snapshot_key=str(snapshot_key or policy.snapshot_key))
     owner = "stage-d-editorial"
-    stage = None
-    stage_task = None
-    with session_factory() as session:
-        try:
+    stage: IntelRunStage | None = None
+    try:
+        with session_factory() as session:
             repo = IntelRepository(session)
             if run_id is None and event_ids is None:
                 latest_run_id = session.scalar(select(func.max(IntelRun.id)))
@@ -141,7 +210,7 @@ def run_stage_d_job(
                 stage = repo.ensure_stage(
                     int(run_id),
                     STAGE_D_NAME,
-                    metadata={"snapshot_key": key, "profile_version": policy.version, "prompt_version": "stage_d_editorial_v1"},
+                    metadata=_stage_d_stage_metadata(policy, key, ai_client),
                 )
             if run_id is not None and event_ids is None:
                 event_ids = _load_current_cluster_event_ids(session, int(run_id))
@@ -150,212 +219,332 @@ def run_stage_d_job(
             candidates = [_candidate(event) for event in events]
             history = _recent_daily_history(session, candidates=candidates, run=run, days=policy.recent_history_days)
             for candidate in candidates:
-                candidate["recent_daily_history"] = history.get(int(candidate["event"].id), {"appeared_recently": False, "prior_editions": []})
+                candidate["recent_daily_history"] = history.get(
+                    int(candidate["event"].id), {"appeared_recently": False, "prior_editions": []}
+                )
 
             eligible = [candidate for candidate in candidates if candidate["paper_gate_pass"] or not policy.paper_hard_gate]
             gated = [candidate for candidate in candidates if not (candidate["paper_gate_pass"] or not policy.paper_hard_gate)]
-            gated_event_ids = {int(candidate["event"].id) for candidate in gated}
             result.eligible = len(eligible)
             result.paper_gated = len(gated)
 
-            input_fingerprint = _stage_d_input_fingerprint(candidates, policy, key)
-            config_fingerprint = f"stage-d-v1:{policy.version}:stage_d_editorial_v1:{getattr(ai_client, 'model', None) or 'unconfigured'}"
+            d1_config = _stage_d_phase_config(policy, ai_client, phase="assessment")
+            d3_config = _stage_d_phase_config(policy, ai_client, phase="composition")
+            batches = _stage_d_batch_specs(
+                eligible,
+                policy.assessment_batch_size,
+                d1_config,
+                seed=str(run_id or key),
+            )
+            result.assessment_batches = len(batches)
+            assessments: dict[int, dict[str, Any]] = {}
             if stage is not None:
-                stage_task = repo.ensure_stage_task(
+                _mark_stale_stage_d_batches(repo, stage, {batch["subject_id"] for batch in batches})
+                session.flush()
+
+            pending_batches: list[dict[str, Any]] = []
+            for batch in batches:
+                batch_id = str(batch["subject_id"])
+                task = None
+                if stage is not None:
+                    task = repo.ensure_stage_task(
+                        stage,
+                        subject_type="batch",
+                        subject_id=batch_id,
+                        input_fingerprint=str(batch["input_fingerprint"]),
+                        config_fingerprint=d1_config,
+                        metadata={"phase": "assessment", "batch_id": batch_id, "event_ids": batch["event_ids"]},
+                    )
+                    stored = _stored_assessments(task, batch["event_ids"], batch["input_fingerprint"], d1_config)
+                    if stored is not None:
+                        assessments.update(stored)
+                        result.assessed += len(stored)
+                        continue
+                pending_batches.append({"batch": batch, "task": task})
+
+            concurrency = max(1, min(policy.assessment_concurrency, len(pending_batches) or 1))
+            for start in range(0, len(pending_batches), concurrency):
+                wave = pending_batches[start : start + concurrency]
+                provider_work: list[dict[str, Any]] = []
+                for work in wave:
+                    batch = work["batch"]
+                    task = work["task"]
+                    if stage is not None and task is not None:
+                        claimed = repo.claim_stage_task(
+                            stage,
+                            task_id=task.id,
+                            owner=owner,
+                            input_fingerprint=str(batch["input_fingerprint"]),
+                            config_fingerprint=d1_config,
+                            acquire_stage=True,
+                        )
+                        if claimed is None:
+                            if repo.task_is_reusable(
+                                task,
+                                input_fingerprint=batch["input_fingerprint"],
+                                config_fingerprint=d1_config,
+                            ):
+                                stored = _stored_assessments(
+                                    task,
+                                    batch["event_ids"],
+                                    batch["input_fingerprint"],
+                                    d1_config,
+                                )
+                                if stored is not None:
+                                    assessments.update(stored)
+                                    result.assessed += len(stored)
+                                    continue
+                            raise StageDExecutionError(
+                                "assessment",
+                                f"batch task is already running: {batch['subject_id']}",
+                            )
+                        work["task"] = claimed
+                    provider_work.append(work)
+                if stage is not None and provider_work:
+                    session.commit()
+
+                outcomes: dict[str, tuple[Any, int, dict[str, Any]] | BaseException] = {}
+                with ThreadPoolExecutor(max_workers=max(1, min(concurrency, len(provider_work)))) as executor:
+                    futures = {
+                        executor.submit(
+                            _call_assessment_provider,
+                            ai_client,
+                            [_prompt_event(candidate) for candidate in work["batch"]["candidates"]],
+                            edition={"date": run.edition_date if run is not None else None},
+                            retries=policy.assessment_retries,
+                        ): str(work["batch"]["subject_id"])
+                        for work in provider_work
+                    }
+                    for future in as_completed(futures):
+                        batch_id = futures[future]
+                        try:
+                            outcomes[batch_id] = future.result()
+                        except BaseException as exc:  # persisted below on the coordinator thread
+                            outcomes[batch_id] = exc
+
+                first_failure: BaseException | None = None
+                for work in provider_work:
+                    batch = work["batch"]
+                    task = work["task"]
+                    batch_id = str(batch["subject_id"])
+                    outcome = outcomes[batch_id]
+                    if isinstance(outcome, BaseException):
+                        first_failure = first_failure or outcome
+                        result.ai_failed += 1
+                        result.failed_phase = "assessment"
+                        result.errors.append(str(outcome))
+                        if task is not None:
+                            failure_audit = _provider_audit(outcome, None)
+                            task.result_json = json.dumps(
+                                {
+                                    "phase": "assessment",
+                                    "batch_id": batch_id,
+                                    "event_ids": batch["event_ids"],
+                                    "provider_attempts": int(failure_audit.get("provider_attempts") or 0),
+                                    "request_metadata": failure_audit.get("request_metadata") or {},
+                                    "response_hash": _response_hash(failure_audit.get("raw_response")) if failure_audit.get("raw_response") is not None else None,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                            repo.fail_stage_task(
+                                task,
+                                owner=owner,
+                                error_category="provider",
+                                error_code=getattr(outcome, "error_code", None) or "assessment_failed",
+                                error_message=str(outcome),
+                                retryable=False,
+                                raw_response=getattr(outcome, "raw_response", None),
+                            )
+                        continue
+
+                    parsed, attempts, audit = outcome
+                    rows = _assessment_rows(parsed)
+                    batch_assessments = {int(row["event_id"]): row for row in rows}
+                    if set(batch_assessments) != set(batch["event_ids"]):
+                        coverage_error = ValueError(f"batch coverage mismatch: {batch_id}")
+                        first_failure = first_failure or coverage_error
+                        result.ai_failed += 1
+                        result.failed_phase = "assessment"
+                        result.errors.append(str(coverage_error))
+                        if task is not None:
+                            repo.fail_stage_task(
+                                task,
+                                owner=owner,
+                                error_category="schema",
+                                error_code="assessment_coverage_mismatch",
+                                error_message=str(coverage_error),
+                                retryable=False,
+                            )
+                        continue
+                    assessments.update(batch_assessments)
+                    result.assessed += len(batch_assessments)
+                    result.assessment_provider_attempts += attempts
+                    result.provider_attempts += attempts
+                    if task is not None:
+                        repo.complete_stage_task(
+                            task,
+                            owner=owner,
+                            result_ref={"phase": "assessment", "batch_id": batch_id},
+                            result={
+                                "phase": "assessment",
+                                "batch_id": batch_id,
+                                "event_ids": batch["event_ids"],
+                                "input_fingerprint": batch["input_fingerprint"],
+                                "config_fingerprint": d1_config,
+                                "assessments": rows,
+                                "provider_attempts": attempts,
+                                "request_metadata": audit.get("request_metadata") or {},
+                                "response_hash": _response_hash(audit.get("raw_response") or rows),
+                            },
+                            raw_response=audit.get("raw_response"),
+                            metadata=audit,
+                        )
+                if stage is not None and provider_work:
+                    session.commit()
+                if first_failure is not None:
+                    raise StageDExecutionError("assessment", str(first_failure), cause=first_failure) from first_failure
+
+            shortlist = _build_stage_d_shortlist(eligible, assessments, shortlist_max=policy.shortlist_max)
+            result.shortlist_count = len(shortlist)
+            shortlist_by_id = {int(row["event_id"]): row for row in shortlist}
+            shortlist_rank = {event_id: index for index, event_id in enumerate(shortlist_by_id, start=1)}
+            d3_payload = [_prompt_shortlist_event(row["candidate"], row["assessment"], shortlist_rank[event_id]) for event_id, row in shortlist_by_id.items()]
+            shortlist_fingerprint = _response_hash(
+                {"events": d3_payload, "max_selected": policy.total_max, "max_watchlist": policy.watchlist_max}
+            )
+            decisions: dict[int, dict[str, Any]] = {}
+            d3_task = None
+            if stage is not None:
+                d3_task = repo.ensure_stage_task(
                     stage,
                     subject_type="run",
                     subject_id=int(run_id),
                     target_run_id=int(run_id),
-                    input_fingerprint=input_fingerprint,
-                    config_fingerprint=config_fingerprint,
+                    input_fingerprint=shortlist_fingerprint,
+                    config_fingerprint=d3_config,
+                    metadata={"phase": "composition", "shortlist_count": len(d3_payload)},
                 )
-                claimed = repo.claim_stage_task(
-                    stage,
-                    task_id=stage_task.id,
-                    owner=owner,
-                    force=True if force or stage_task.status == "succeeded" else False,
-                    input_fingerprint=input_fingerprint,
-                    config_fingerprint=config_fingerprint,
-                )
-                if claimed is None:
-                    result.errors.append("stage_d is already running")
-                    return result
-                stage_task = claimed
-                session.commit()
-
-            payload = [_prompt_event(candidate) for candidate in eligible]
-            decisions: dict[int, dict[str, Any]] = {}
-            stage_d_source = "ai"
-            response_hash: str | None = None
-            fallback_reason: str | None = None
-            provider_audit: dict[str, Any] = {}
-            if payload:
-                _clear_provider_audit(ai_client)
-                try:
-                    response, attempts = _call_editorial_provider(
-                        ai_client,
-                        payload,
-                        edition={
-                            "date": run.edition_date if run is not None else None,
-                            "max_selected": policy.total_max,
-                            "max_selected_per_story_family": 2,
-                        },
-                        total_max=policy.total_max,
-                        retries=getattr(
-                            ai_client,
-                            "max_retries",
-                            getattr(getattr(ai_client, "settings", None), "ai_stage_d_retries", None),
-                        ),
-                    )
-                    result.provider_attempts = attempts
-                    decisions = {decision.event_id: decision.model_dump(mode="json") for decision in response.decisions}
-                    raw_response = getattr(ai_client, "last_raw_response", None)
-                    response_hash = _response_hash(raw_response if raw_response is not None else response.model_dump(mode="json"))
-                    result.ai_selected = sum(1 for value in decisions.values() if value["decision"] == "selected")
-                except Exception as exc:
-                    result.ai_failed = 1
-                    result.used_fallback = True
-                    fallback_reason = str(exc)
-                    result.errors.append(fallback_reason)
-                    stage_d_source = "deterministic_fallback"
-                    provider_audit = _provider_audit(exc, ai_client)
-                    result.provider_attempts = max(result.provider_attempts, int(provider_audit.get("provider_attempts") or 0))
-                    raw_response = provider_audit.get("raw_response")
-                    if raw_response is not None:
-                        response_hash = _response_hash(raw_response)
-                    LOGGER.warning("Stage D provider failed; using deterministic fallback: %s", exc)
-                    decisions = _fallback_decisions(eligible, total_max=policy.total_max)
-            else:
-                # An empty eligible pool is an auditable empty edition, not a
-                # provider failure and not an invitation to fill with gated papers.
-                stage_d_source = "no_eligible_events"
-            if not provider_audit:
-                request_metadata = getattr(ai_client, "last_request_metadata", None)
-                provider_audit = {
-                    "provider_attempts": result.provider_attempts,
-                    "status_code": None,
-                    "error_code": None,
-                    "error_message": None,
-                    "raw_response": getattr(ai_client, "last_raw_response", None),
-                    "request_metadata": dict(request_metadata) if isinstance(request_metadata, Mapping) else {},
-                }
-
-            repo.clear_event_stage_d_snapshot(snapshot_key=key)
-            for candidate in candidates:
-                event = candidate["event"]
-                event_id = int(event.id)
-                decision = decisions.get(event_id)
-                if event_id in gated_event_ids:
-                    decision = _gated_decision(candidate)
-                elif decision is None:
-                    # This can only occur after a provider defect.  Do not
-                    # fill an AI edition locally; make the omission visible.
-                    decision = _omitted_decision("provider_missing_decision", "未获得可展示的编辑决策。")
-                selected = decision["decision"] == "selected"
-                if selected:
-                    result.selected += 1
+                stored_decisions = _stored_composition(d3_task, shortlist_by_id, shortlist_fingerprint, d3_config)
+                if stored_decisions is not None and not force:
+                    decisions = stored_decisions
                 else:
-                    result.omitted += 1
-                metadata = {
-                    "stage": STAGE_D_NAME,
-                    "stage_d_source": stage_d_source,
-                    "profile_version": policy.version,
-                    "prompt_version": "stage_d_editorial_v1",
-                    "paper_gate_pass": bool(candidate["paper_gate_pass"]),
-                    "paper_gate_reason": candidate["paper_gate_reason"],
-                    "source_evidence_level": candidate["source_evidence_level"],
-                    "community_source_group_count": candidate["community_source_group_count"],
-                    "source_presentation": _source_presentation(candidate),
-                    "decision": decision["decision"],
-                    "editorial_score": decision.get("editorial_score"),
-                    "story_family_id": decision.get("story_family_id"),
-                    "family_position": decision.get("family_position"),
-                    "display_title_zh": decision.get("display_title_zh"),
-                    "title_supporting_fields": decision.get("title_supporting_fields", []),
-                    "reason_codes": decision.get("reason_codes", []),
-                    "editorial_reason": decision.get("editorial_reason"),
-                    "confidence": decision.get("confidence"),
-                    "fallback_rank": decision.get("fallback_rank"),
-                    "fallback_score_components": decision.get("fallback_score_components"),
-                    "recent_daily_history": candidate["recent_daily_history"],
-                    "provider_attempts": result.provider_attempts,
-                    "response_hash": response_hash,
-                    "fallback_reason": fallback_reason,
-                    "provider_status_code": provider_audit.get("status_code"),
-                    "provider_error_code": provider_audit.get("error_code"),
-                    "provider_error_message": provider_audit.get("error_message"),
-                }
-                snapshot = repo.upsert_event_stage_d_snapshot(
-                    event_id,
-                    snapshot_key=key,
-                    run_id=run_id,
-                    display_order=int(decision.get("display_order") or 0),
-                    display_score=float(event.display_score or 0.0),
-                    selected=selected,
-                    topic=candidate["topic"],
-                    source_group=candidate["source_group"],
-                    content_class=candidate["content_class"],
-                    reason=(decision.get("reason_codes") or [candidate.get("paper_gate_reason") or "omitted"])[0],
-                    metadata=metadata,
-                )
-                result.snapshots += int(snapshot.created)
-            session.commit()
-            if stage_task is not None:
-                stage_metadata = {
-                    "stage_d_source": stage_d_source,
-                    "provider_attempts": result.provider_attempts,
-                    "fallback_reason": fallback_reason,
-                    "response_hash": response_hash,
-                    "provider_status_code": provider_audit.get("status_code"),
-                    "provider_error_code": provider_audit.get("error_code"),
-                    "provider_error_message": provider_audit.get("error_message"),
-                    "request_metadata": provider_audit.get("request_metadata") or {},
-                }
-                repo.complete_stage_task(
-                    stage_task,
-                    owner=owner,
-                    result_ref={"projection": "IntelEventStageDSnapshot", "snapshot_key": key},
-                    result={
-                        "processed": result.processed,
-                        "eligible": result.eligible,
-                        "selected": result.selected,
-                        "paper_gated": result.paper_gated,
-                        "stage_d_source": stage_d_source,
-                        "response_hash": response_hash,
-                        "fallback_reason": fallback_reason,
-                        "provider_attempts": result.provider_attempts,
-                        "provider_error": {
-                            key: provider_audit.get(key)
-                            for key in ("status_code", "error_code", "error_message")
-                            if provider_audit.get(key) is not None
+                    claimed = repo.claim_stage_task(
+                        stage,
+                        task_id=d3_task.id,
+                        owner=owner,
+                        force=bool(force),
+                        input_fingerprint=shortlist_fingerprint,
+                        config_fingerprint=d3_config,
+                        acquire_stage=True,
+                    )
+                    if claimed is None:
+                        raise StageDExecutionError("composition", "run task is already running")
+                    d3_task = claimed
+                    session.commit()
+            if d3_task is None or not decisions:
+                if d3_payload:
+                    try:
+                        parsed, attempts, audit = _call_composition_provider(
+                            ai_client,
+                            d3_payload,
+                            edition={
+                                "date": run.edition_date if run is not None else None,
+                                "max_selected": policy.total_max,
+                                "max_watchlist": policy.watchlist_max,
+                                "max_selected_per_story_family": 2,
+                            },
+                            total_max=policy.total_max,
+                            watchlist_max=policy.watchlist_max,
+                            retries=_stage_d_composition_retries(ai_client),
+                        )
+                        decisions = _decision_rows(parsed)
+                        result.composition_provider_attempts = attempts
+                        result.provider_attempts += attempts
+                        composition_audit = audit
+                    except Exception as exc:
+                        result.ai_failed += 1
+                        result.failed_phase = "composition"
+                        result.errors.append(str(exc))
+                        if d3_task is not None:
+                            repo.fail_stage_task(
+                                d3_task,
+                                owner=owner,
+                                error_category="provider",
+                                error_code=getattr(exc, "error_code", None) or "composition_failed",
+                                error_message=str(exc),
+                                retryable=False,
+                                raw_response=getattr(exc, "raw_response", None),
+                            )
+                            session.commit()
+                        raise StageDExecutionError("composition", str(exc), cause=exc) from exc
+                else:
+                    decisions = {}
+                    result.composition_provider_attempts = 0
+                    composition_audit = {"request_metadata": {}, "raw_response": None}
+                if d3_task is not None:
+                    decision_rows = list(decisions.values())
+                    repo.complete_stage_task(
+                        d3_task,
+                        owner=owner,
+                        result_ref={"phase": "composition", "snapshot_key": key},
+                        result={
+                            "phase": "composition",
+                            "event_ids": list(shortlist_by_id),
+                            "input_fingerprint": shortlist_fingerprint,
+                            "config_fingerprint": d3_config,
+                            "decisions": decision_rows,
+                            "provider_attempts": result.composition_provider_attempts,
+                            "request_metadata": composition_audit.get("request_metadata") or {},
+                            "response_hash": _response_hash(composition_audit.get("raw_response") or decision_rows),
                         },
-                    },
-                    raw_response=provider_audit.get("raw_response") or getattr(ai_client, "last_raw_response", None),
-                    metadata=stage_metadata,
-                )
+                        raw_response=composition_audit.get("raw_response"),
+                        metadata=composition_audit,
+                    )
+                    session.commit()
+
+            # Public snapshot replacement starts only after all provider work
+            # and exact D3 coverage have succeeded. DELETE+INSERT remains one
+            # transaction, so rollback leaves the previous snapshot untouched.
+            _replace_stage_d_snapshot(
+                repo,
+                key=key,
+                run_id=run_id,
+                candidates=candidates,
+                gated_event_ids={int(candidate["event"].id) for candidate in gated},
+                assessments=assessments,
+                shortlist_by_id=shortlist_by_id,
+                shortlist_rank=shortlist_rank,
+                decisions=decisions,
+                policy=policy,
+                result=result,
+            )
+            session.commit()
+            stage_metadata = _stage_d_stage_metadata(
+                policy,
+                key,
+                ai_client,
+                assessment_batch_count=result.assessment_batches,
+                assessed_count=result.assessed,
+                shortlist_count=result.shortlist_count,
+                selected_count=result.selected,
+                watchlist_count=result.watchlist,
+                omitted_count=result.omitted,
+                provider_attempts=result.provider_attempts,
+            )
+            if stage is not None:
                 repo.finish_stage(stage, status="succeeded", metadata=stage_metadata, owner=owner)
                 session.commit()
-        except Exception as exc:
-            session.rollback()
-            result.errors.append(str(exc))
-            LOGGER.exception("Stage D failed")
-            if stage is not None and stage_task is not None:
-                try:
-                    repo = IntelRepository(session)
-                    task = repo.get_task(stage, subject_type="run", subject_id=int(run_id))
-                    if task is not None and task.status == "running":
-                        repo.fail_stage_task(
-                            task,
-                            owner=owner,
-                            error_category="stage",
-                            error_code="stage_d_failed",
-                            error_message=str(exc),
-                            retryable=True,
-                        )
-                        session.commit()
-                except Exception:
-                    LOGGER.exception("Unable to persist Stage D failure")
-    return result
+            return result
+    except StageDExecutionError:
+        _persist_stage_d_failure(session_factory, run_id, result)
+        raise
+    except Exception as exc:
+        result.failed_phase = result.failed_phase or "persistence"
+        result.errors.append(str(exc))
+        _persist_stage_d_failure(session_factory, run_id, result)
+        LOGGER.exception("Stage D failed")
+        raise StageDExecutionError(result.failed_phase, str(exc), cause=exc) from exc
 
 
 def run_stage_d_from_settings(
@@ -390,6 +579,414 @@ def _coerce_profile(value: StageDProfile | Mapping[str, Any] | str | Path | None
     if isinstance(value, Mapping):
         return StageDProfile.from_mapping(value)
     return load_stage_d_profile()
+
+
+def _stage_d_stage_metadata(
+    policy: StageDProfile,
+    snapshot_key: str,
+    ai_client: Any | None,
+    **counts: Any,
+) -> dict[str, Any]:
+    metadata = {
+        "snapshot_key": snapshot_key,
+        "profile_version": policy.version,
+        "stage_d_version": STAGE_D_VERSION,
+        "assessment_prompt_version": STAGE_D_ASSESSMENT_PROMPT_VERSION,
+        "composition_prompt_version": STAGE_D_COMPOSITION_PROMPT_VERSION,
+        "assessment_batch_size": policy.assessment_batch_size,
+        "assessment_concurrency": policy.assessment_concurrency,
+        "assessment_retries": policy.assessment_retries,
+        "shortlist_max": policy.shortlist_max,
+        "total_max": policy.total_max,
+        "watchlist_max": policy.watchlist_max,
+        "paper_hard_gate": policy.paper_hard_gate,
+        "model": getattr(ai_client, "model", None),
+    }
+    metadata.update({key: int(value) for key, value in counts.items() if value is not None})
+    return metadata
+
+
+def _stage_d_phase_config(policy: StageDProfile, ai_client: Any | None, *, phase: str) -> str:
+    prompt = STAGE_D_ASSESSMENT_PROMPT_VERSION if phase == "assessment" else STAGE_D_COMPOSITION_PROMPT_VERSION
+    return f"{STAGE_D_VERSION}:{policy.version}:{phase}:{prompt}:{getattr(ai_client, 'model', None) or 'unconfigured'}"
+
+
+def _stage_d_composition_retries(ai_client: Any | None) -> int:
+    value = getattr(ai_client, "max_retries", None)
+    if value is None:
+        value = getattr(getattr(ai_client, "settings", None), "ai_stage_d_retries", 2)
+    return _bounded_int(value, 2, lower=0, upper=5)
+
+
+def _stage_d_batch_specs(
+    candidates: Sequence[Mapping[str, Any]],
+    batch_size: int,
+    config_fingerprint: str,
+    *,
+    seed: str,
+) -> list[dict[str, Any]]:
+    ordered = sorted(
+        candidates,
+        key=lambda row: hashlib.sha256(
+            f"{seed}:{int(row['event'].id)}".encode("utf-8")
+        ).hexdigest(),
+    )
+    size = max(1, min(24, int(batch_size)))
+    batches: list[dict[str, Any]] = []
+    for start in range(0, len(ordered), size):
+        rows = ordered[start : start + size]
+        event_ids = [int(row["event"].id) for row in rows]
+        membership = _response_hash({"event_ids": event_ids})
+        payload = [_prompt_event(row) for row in rows]
+        batches.append(
+            {
+                "subject_id": f"batch-{membership[:24]}",
+                "event_ids": event_ids,
+                "candidates": rows,
+                "input_fingerprint": _response_hash({"config": config_fingerprint, "events": payload}),
+            }
+        )
+    return batches
+
+
+def _mark_stale_stage_d_batches(repo: IntelRepository, stage: IntelRunStage, active_ids: set[str]) -> None:
+    for task in repo.list_stage_tasks(stage, subject_type="batch", include_expired=True):
+        if task.subject_id in active_ids or task.status in {"skipped", "cancelled"}:
+            continue
+        task.status = "skipped"
+        task.error_category = "plan"
+        task.error_code = "stale_batch_plan"
+        task.error_message = "batch 不再属于当前 Stage-C 输入计划。"
+        task.lease_owner = None
+        task.lease_expires_at = None
+        task.heartbeat_at = None
+        task.updated_at = utcnow()
+
+
+def _assessment_rows(value: Any) -> list[dict[str, Any]]:
+    assessments = getattr(value, "assessments", None)
+    if assessments is None and isinstance(value, Mapping):
+        assessments = value.get("assessments")
+    rows: list[dict[str, Any]] = []
+    for assessment in assessments or []:
+        if hasattr(assessment, "model_dump"):
+            rows.append(dict(assessment.model_dump(mode="json")))
+        elif isinstance(assessment, Mapping):
+            rows.append(dict(assessment))
+    return rows
+
+
+def _decision_rows(value: Any) -> dict[int, dict[str, Any]]:
+    decisions = getattr(value, "decisions", None)
+    if decisions is None and isinstance(value, Mapping):
+        decisions = value.get("decisions")
+    result: dict[int, dict[str, Any]] = {}
+    for decision in decisions or []:
+        row = decision.model_dump(mode="json") if hasattr(decision, "model_dump") else dict(decision)
+        result[int(row["event_id"])] = dict(row)
+    return result
+
+
+def _stored_assessments(
+    task: IntelRunStageTask,
+    event_ids: Sequence[int],
+    input_fingerprint: str,
+    config_fingerprint: str,
+) -> dict[int, dict[str, Any]] | None:
+    if not task or not task_is_reusable_compat(task, input_fingerprint, config_fingerprint):
+        return None
+    stored = task.result
+    if not isinstance(stored, Mapping) or stored.get("phase") != "assessment":
+        return None
+    rows = _assessment_rows(stored)
+    values = {int(row["event_id"]): row for row in rows if row.get("event_id") is not None}
+    return values if set(values) == set(int(value) for value in event_ids) else None
+
+
+def _stored_composition(
+    task: IntelRunStageTask,
+    shortlist_by_id: Mapping[int, Mapping[str, Any]],
+    input_fingerprint: str,
+    config_fingerprint: str,
+) -> dict[int, dict[str, Any]] | None:
+    if not task or not task_is_reusable_compat(task, input_fingerprint, config_fingerprint):
+        return None
+    stored = task.result
+    if not isinstance(stored, Mapping) or stored.get("phase") != "composition":
+        return None
+    rows = _decision_rows(stored)
+    return rows if set(rows) == set(int(value) for value in shortlist_by_id) else None
+
+
+def task_is_reusable_compat(task: IntelRunStageTask, input_fingerprint: str, config_fingerprint: str) -> bool:
+    return task.status == "succeeded" and task.input_fingerprint == str(input_fingerprint) and task.config_fingerprint == str(config_fingerprint)
+
+
+def _assessment_score(row: Mapping[str, Any]) -> float:
+    return round(
+        0.25 * _number(row.get("material_change"))
+        + 0.20 * _number(row.get("impact"))
+        + 0.20 * _number(row.get("reader_value"))
+        + 0.15 * _number(row.get("actionability"))
+        + 0.10 * _number(row.get("source_support"))
+        + 0.10 * _number(row.get("freshness")),
+        4,
+    )
+
+
+def _build_stage_d_shortlist(
+    candidates: Sequence[Mapping[str, Any]],
+    assessments: Mapping[int, Mapping[str, Any]],
+    *,
+    shortlist_max: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for candidate in candidates:
+        event_id = int(candidate["event"].id)
+        assessment = assessments.get(event_id)
+        if assessment is None:
+            continue
+        rows.append(
+            {
+                "event_id": event_id,
+                "candidate": candidate,
+                "assessment": dict(assessment),
+                "score": _assessment_score(assessment),
+                "must_consider": bool(assessment.get("must_consider")),
+            }
+        )
+    limit = max(0, int(shortlist_max))
+    ordered = sorted(rows, key=lambda row: (-row["score"], -_number(row["candidate"]["event"].display_score), row["event_id"]))
+    if len(ordered) <= limit:
+        return ordered
+    selected_ids: set[int] = set()
+    must = [row for row in ordered if row["must_consider"]]
+    if len(must) >= limit:
+        return must[:limit]
+    selected: list[dict[str, Any]] = []
+    for row in must:
+        selected.append(row)
+        selected_ids.add(row["event_id"])
+    topics: dict[str, list[dict[str, Any]]] = {}
+    for row in ordered:
+        topic = str(row["candidate"].get("topic") or "opinion")
+        topics.setdefault(topic, []).append(row)
+    for topic_rows in topics.values():
+        for row in topic_rows[:2]:
+            if row["event_id"] in selected_ids or len(selected) >= limit:
+                continue
+            selected.append(row)
+            selected_ids.add(row["event_id"])
+    for row in ordered:
+        if len(selected) >= limit:
+            break
+        if row["event_id"] not in selected_ids:
+            selected.append(row)
+            selected_ids.add(row["event_id"])
+    return selected[:limit]
+
+
+def _prompt_shortlist_event(candidate: Mapping[str, Any], assessment: Mapping[str, Any], rank: int) -> dict[str, Any]:
+    value = _prompt_event(candidate)
+    value["d1_assessment"] = {
+        **dict(assessment),
+        "assessment_score": _assessment_score(assessment),
+        "shortlist_rank": int(rank),
+    }
+    return value
+
+
+def _provider_envelope(value: Any) -> tuple[Any, dict[str, Any]]:
+    if isinstance(value, StageDProviderCallResult):
+        return value.parsed, {
+            "raw_response": value.raw_response,
+            "request_metadata": dict(value.request_metadata or {}),
+        }
+    return value, {
+        "raw_response": None,
+        "request_metadata": {},
+    }
+
+
+def _call_assessment_provider(
+    ai_client: Any | None,
+    events: Sequence[Mapping[str, Any]],
+    *,
+    edition: Mapping[str, Any],
+    retries: int,
+) -> tuple[Any, int, dict[str, Any]]:
+    if ai_client is None or not callable(getattr(ai_client, "assess_events", None)):
+        raise RuntimeError("Stage D assessment client is not configured")
+
+    def operation() -> Any:
+        value = ai_client.assess_events(events, edition=edition)
+        parsed, _audit = _provider_envelope(value)
+        if isinstance(parsed, StageDAssessmentResponse):
+            return value
+        return strict_parse_stage_d_assessment(parsed, event_ids=[int(event["event_id"]) for event in events])
+
+    value, failure, attempts = call_with_provider_retries(
+        operation,
+        is_retryable=_provider_failure_is_retryable,
+        stage="stage_d_assessment",
+        max_retries=_bounded_int(retries, DEFAULT_STAGE_D_ASSESSMENT_RETRIES, lower=0, upper=5),
+    )
+    if failure is not None or value is None:
+        cause = failure if failure is not None else RuntimeError("Stage D assessment returned no result")
+        raise StageDProviderCallError(cause, attempts) from cause
+    parsed, audit = _provider_envelope(value)
+    return parsed, attempts, audit
+
+
+def _call_composition_provider(
+    ai_client: Any | None,
+    events: Sequence[Mapping[str, Any]],
+    *,
+    edition: Mapping[str, Any],
+    total_max: int,
+    watchlist_max: int,
+    retries: int,
+) -> tuple[Any, int, dict[str, Any]]:
+    if ai_client is None:
+        raise RuntimeError("Stage D composition client is not configured")
+
+    def operation() -> Any:
+        method = getattr(ai_client, "compose_events", None)
+        if callable(method):
+            value = method(events, edition=edition, total_max=total_max, watchlist_max=watchlist_max)
+        else:
+            method = getattr(ai_client, "select_events", None)
+            if not callable(method):
+                raise RuntimeError("Stage D composition client is not configured")
+            value = method(events, edition=edition, total_max=total_max)
+        parsed, _audit = _provider_envelope(value)
+        if isinstance(parsed, StageDCompositionResponse):
+            return value
+        if getattr(parsed, "decisions", None) is not None and not isinstance(parsed, Mapping):
+            return value
+        return strict_parse_stage_d_composition(
+            parsed,
+            event_ids=[int(event["event_id"]) for event in events],
+            total_max=total_max,
+            watchlist_max=watchlist_max,
+            events=events,
+        )
+
+    value, failure, attempts = call_with_provider_retries(
+        operation,
+        is_retryable=_provider_failure_is_retryable,
+        stage="stage_d_composition",
+        max_retries=_bounded_int(retries, 2, lower=0, upper=5),
+    )
+    if failure is not None or value is None:
+        cause = failure if failure is not None else RuntimeError("Stage D composition returned no result")
+        raise StageDProviderCallError(cause, attempts) from cause
+    parsed, audit = _provider_envelope(value)
+    return parsed, attempts, audit
+
+
+def _replace_stage_d_snapshot(
+    repo: IntelRepository,
+    *,
+    key: str,
+    run_id: int | None,
+    candidates: Sequence[Mapping[str, Any]],
+    gated_event_ids: set[int],
+    assessments: Mapping[int, Mapping[str, Any]],
+    shortlist_by_id: Mapping[int, Mapping[str, Any]],
+    shortlist_rank: Mapping[int, int],
+    decisions: Mapping[int, Mapping[str, Any]],
+    policy: StageDProfile,
+    result: StageDResult,
+) -> None:
+    repo.clear_event_stage_d_snapshot(snapshot_key=key)
+    selected_order = 0
+    watchlist_order = 0
+    for candidate in candidates:
+        event = candidate["event"]
+        event_id = int(event.id)
+        assessment = assessments.get(event_id)
+        if event_id in gated_event_ids:
+            decision = _gated_decision(candidate)
+            tier = "paper_gated"
+        elif event_id not in shortlist_by_id:
+            decision = _omitted_decision("not_shortlisted", "D1 评估后未进入 Stage D 短名单。", event_id=event_id)
+            decision["editorial_score"] = round(_assessment_score(assessment or {}))
+            tier = "omitted"
+        else:
+            decision = dict(decisions.get(event_id) or _omitted_decision("provider_missing_decision", "未获得可展示的编辑决策。", event_id=event_id))
+            tier = str(decision.get("decision") or "omitted")
+        if tier == "selected":
+            selected_order += 1
+            display_order = int(decision.get("display_order") or selected_order)
+            result.selected += 1
+        elif tier == "watchlist":
+            watchlist_order += 1
+            display_order = policy.total_max + watchlist_order
+            result.watchlist += 1
+        else:
+            display_order = 0
+            result.omitted += 1
+        metadata = {
+            "stage": STAGE_D_NAME,
+            "stage_d_source": "ai" if event_id in decisions else "local",
+            "stage_d_version": STAGE_D_VERSION,
+            "profile_version": policy.version,
+            "assessment": assessment,
+            "assessment_score": _assessment_score(assessment or {}) if assessment is not None else None,
+            "shortlist_rank": shortlist_rank.get(event_id),
+            "editorial_tier": tier,
+            "decision": decision.get("decision"),
+            "paper_gate_pass": bool(candidate["paper_gate_pass"]),
+            "paper_gate_reason": candidate["paper_gate_reason"],
+            "source_evidence_level": candidate["source_evidence_level"],
+            "community_source_group_count": candidate["community_source_group_count"],
+            "source_presentation": _source_presentation(candidate),
+            "editorial_score": decision.get("editorial_score"),
+            "story_family_id": decision.get("story_family_id"),
+            "family_position": decision.get("family_position"),
+            "display_title_zh": decision.get("display_title_zh"),
+            "title_supporting_fields": decision.get("title_supporting_fields", []),
+            "reason_codes": decision.get("reason_codes", []),
+            "editorial_reason": decision.get("editorial_reason"),
+            "confidence": decision.get("confidence"),
+            "watchlist_order": watchlist_order if tier == "watchlist" else None,
+            "recent_daily_history": candidate["recent_daily_history"],
+        }
+        snapshot = repo.upsert_event_stage_d_snapshot(
+            event_id,
+            snapshot_key=key,
+            run_id=run_id,
+            display_order=display_order,
+            display_score=float(event.display_score or 0.0),
+            selected=tier == "selected",
+            topic=candidate["topic"],
+            source_group=candidate["source_group"],
+            content_class=candidate["content_class"],
+            reason=(decision.get("reason_codes") or [candidate.get("paper_gate_reason") or "omitted"])[0],
+            metadata=metadata,
+        )
+        result.snapshots += int(snapshot.created)
+
+
+def _persist_stage_d_failure(session_factory: sessionmaker[Session], run_id: int | None, result: StageDResult) -> None:
+    if run_id is None:
+        return
+    try:
+        with session_factory() as session:
+            repo = IntelRepository(session)
+            stage = repo.get_stage(int(run_id), STAGE_D_NAME)
+            if stage is not None:
+                repo.finish_stage(
+                    stage,
+                    status="failed",
+                    error_category="stage",
+                    error_code=f"stage_d_{result.failed_phase or 'failed'}",
+                    error_message=(result.errors[-1] if result.errors else "Stage D failed")[-4000:],
+                )
+                session.commit()
+    except Exception:
+        LOGGER.exception("Unable to persist Stage D failure")
 
 
 def _load_events(session: Session, *, run_id: int | None, event_ids: Iterable[int] | None) -> list[IntelEvent]:
@@ -1063,4 +1660,12 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     return default
 
 
-__all__ = ["STAGE_D_NAME", "StageDProfile", "StageDResult", "load_stage_d_profile", "run_stage_d_from_settings", "run_stage_d_job"]
+__all__ = [
+    "STAGE_D_NAME",
+    "StageDExecutionError",
+    "StageDProfile",
+    "StageDResult",
+    "load_stage_d_profile",
+    "run_stage_d_from_settings",
+    "run_stage_d_job",
+]

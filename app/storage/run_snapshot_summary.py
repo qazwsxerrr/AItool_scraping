@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
+import json
 from typing import Any
 
 from sqlalchemy import func, select
@@ -137,7 +138,16 @@ def build_run_snapshot_summary(
         _failed_task_count(analyze_tasks),
     )
 
-    stage_d_total, stage_d_selected = _stage_d_counts(session, run_id=run_id, snapshot_key=snapshot_key)
+    stage_d_total, stage_d_selected, stage_d_watchlist, stage_d_shortlisted = _stage_d_counts(
+        session,
+        run_id=run_id,
+        snapshot_key=snapshot_key,
+    )
+    stage_d_metadata = stages_by_name.get("stage_d").metadata_dict if stages_by_name.get("stage_d") else {}
+    stage_d_shortlisted = max(
+        stage_d_shortlisted,
+        _as_nonnegative_int(stage_d_metadata.get("shortlist_count")),
+    )
     fetch_metadata = stages_by_name.get("fetch").metadata_dict if stages_by_name.get("fetch") else {}
     fetched = _as_nonnegative_int(fetch_metadata.get("fetched")) or frozen
     inserted = _as_nonnegative_int(fetch_metadata.get("inserted")) or frozen
@@ -165,6 +175,8 @@ def build_run_snapshot_summary(
             "stage_c_events": _cluster_event_count(cluster_tasks),
             "stage_d_total": stage_d_total,
             "stage_d_selected": stage_d_selected,
+            "stage_d_watchlist": stage_d_watchlist,
+            "stage_d_shortlisted": stage_d_shortlisted,
         },
         "stages": stages_payload,
         "failure_reasons": failure_reasons,
@@ -252,9 +264,30 @@ def _stage_details(
     if stage_name == "stage_d":
         details: dict[str, Any] = {}
         for key in (
+            "stage_d_version",
+            "profile_version",
             "stage_d_source",
+            "assessment_prompt_version",
+            "composition_prompt_version",
+            "assessment_batch_count",
+            "assessed_count",
+            "shortlist_count",
+            "selected_count",
+            "watchlist_count",
+            "omitted_count",
+            "assessment_batch_size",
+            "assessment_concurrency",
+            "assessment_retries",
+            "shortlist_max",
+            "total_max",
+            "watchlist_max",
+            "paper_hard_gate",
+            "model",
             "provider_attempts",
+            "assessment_provider_attempts",
+            "composition_provider_attempts",
             "fallback_reason",
+            "failed_phase",
             "response_hash",
             "provider_status_code",
             "provider_error_code",
@@ -386,18 +419,30 @@ def _cluster_event_count(tasks: list[IntelRunStageTask]) -> int:
     return 0
 
 
-def _stage_d_counts(session: Session, *, run_id: int, snapshot_key: str) -> tuple[int, int]:
-    rows = session.execute(
-        select(IntelEventStageDSnapshot.selected, func.count(IntelEventStageDSnapshot.id))
+def _stage_d_counts(
+    session: Session,
+    *,
+    run_id: int,
+    snapshot_key: str,
+) -> tuple[int, int, int, int]:
+    rows = session.scalars(
+        select(IntelEventStageDSnapshot)
         .where(
             IntelEventStageDSnapshot.run_id == run_id,
             IntelEventStageDSnapshot.snapshot_key == snapshot_key,
         )
-        .group_by(IntelEventStageDSnapshot.selected)
     ).all()
-    total = sum(int(count) for _selected, count in rows)
-    selected = sum(int(count) for is_selected, count in rows if is_selected)
-    return total, selected
+    total = len(rows)
+    selected = sum(1 for row in rows if bool(row.selected))
+    watchlist = 0
+    shortlisted = selected
+    for row in rows:
+        metadata = _json_mapping(row.metadata_json)
+        tier = str(metadata.get("editorial_tier") or "").strip().casefold()
+        if not row.selected and tier == "watchlist":
+            watchlist += 1
+            shortlisted += 1
+    return total, selected, watchlist, shortlisted
 
 
 def _result_mapping(task: IntelRunStageTask) -> dict[str, Any]:
@@ -421,6 +466,18 @@ def _as_nonnegative_int(value: object) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
+
+
+def _json_mapping(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
 
 
 def _is_int_like(value: object) -> bool:

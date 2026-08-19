@@ -95,24 +95,51 @@ def test_run_scoped_export_writes_a_date_bundle_with_manifest(tmp_path):
             display_score=80,
             first_seen_at=reference,
         )
-        session.add(event)
+        watchlist_event = IntelEvent(
+            event_key="title:daily-watchlist",
+            title="Watchlist export event",
+            summary_cn="watchlist summary",
+            topic="product",
+            display_score=70,
+            first_seen_at=reference,
+        )
+        session.add_all([event, watchlist_event])
         session.flush()
-        session.add(
-            IntelEventStageDSnapshot(
-                snapshot_key="daily-2026-08-16",
-                run_id=run.id,
-                event_id=event.id,
-                display_order=1,
-                display_score=80,
-                selected=True,
-                metadata_json=json.dumps(
-                    {
-                        "daily_repeat_prior_run_id": 7,
-                        "daily_repeat_prior_snapshot_key": "run-7",
-                        "material_update": True,
-                    }
+        session.add_all(
+            [
+                IntelEventStageDSnapshot(
+                    snapshot_key="daily-2026-08-16",
+                    run_id=run.id,
+                    event_id=event.id,
+                    display_order=1,
+                    display_score=80,
+                    selected=True,
+                    metadata_json=json.dumps(
+                        {
+                            "daily_repeat_prior_run_id": 7,
+                            "daily_repeat_prior_snapshot_key": "run-7",
+                            "material_update": True,
+                            "editorial_tier": "selected",
+                        }
+                    ),
                 ),
-            )
+                IntelEventStageDSnapshot(
+                    snapshot_key="daily-2026-08-16",
+                    run_id=run.id,
+                    event_id=watchlist_event.id,
+                    display_order=31,
+                    display_score=70,
+                    selected=False,
+                    reason="composition_limit",
+                    metadata_json=json.dumps(
+                        {
+                            "editorial_tier": "watchlist",
+                            "watchlist_order": 1,
+                            "editorial_reason": "值得继续观察",
+                        }
+                    ),
+                ),
+            ]
         )
         session.commit()
         run_id = int(run.id)
@@ -127,21 +154,29 @@ def test_run_scoped_export_writes_a_date_bundle_with_manifest(tmp_path):
     assert result.jsonl_path == str(daily_dir / "intel_items.jsonl")
     assert result.manifest_path == str(daily_dir / "manifest.json")
     manifest = json.loads((daily_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 5
     assert manifest["edition_date"] == "2026-08-16"
     assert manifest["edition_timezone"] == "Asia/Shanghai"
     assert manifest["edition_status"] == "ready"
     assert "run_id" not in manifest
     assert "snapshot_key" not in manifest
     assert manifest["selected_count"] == 1
-    assert manifest["funnel"]["stage_d_total"] == 1
+    assert manifest["watchlist_count"] == 1
+    assert manifest["funnel"]["stage_d_total"] == 2
     assert manifest["funnel"]["stage_d_selected"] == 1
+    assert manifest["funnel"]["stage_d_watchlist"] == 1
+    assert manifest["stage_d_shortlisted"] == 2
     assert manifest["stages"]["export"]["status"] == "succeeded"
     assert manifest["stages"]["export"]["task_counts"]["succeeded"] == 1
     assert manifest["failure_reasons"] == []
     assert (daily_dir / "intel_digest.md").read_text(encoding="utf-8").startswith("# AI 日报 · 2026-08-16\n")
     record = json.loads((daily_dir / "intel_items.jsonl").read_text(encoding="utf-8"))
-    assert record["metadata"] == {"material_update": True}
+    assert record["metadata"] == {"material_update": True, "editorial_tier": "selected"}
     assert "run_id" not in (daily_dir / "intel_items.jsonl").read_text(encoding="utf-8")
     assert "snapshot_key" not in (daily_dir / "intel_items.jsonl").read_text(encoding="utf-8")
+    assert "Watchlist export event" not in (daily_dir / "intel_items.jsonl").read_text(encoding="utf-8")
+    digest = (daily_dir / "intel_digest.md").read_text(encoding="utf-8")
+    assert "## 候选观察" in digest
+    assert "Watchlist export event" in digest
+    assert "值得继续观察" in digest
     assert not (tmp_path / "runs").exists()

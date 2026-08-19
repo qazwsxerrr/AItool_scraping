@@ -43,6 +43,7 @@ def _source(source_id: str = "official_stage_integration") -> SourceSpec:
 
 class _FakeIntelProvider:
     model = "fake-staged-provider"
+    max_retries = 0
 
     def __init__(self, *, paper: bool = False):
         self.paper = paper
@@ -90,6 +91,48 @@ class _FakeIntelProvider:
             raw_response={"fixture": "analysis"},
         )
 
+    def assess_events(self, events, *, edition):
+        return {
+            "schema_version": "stage_d_assessment_v1",
+            "assessments": [
+                {
+                    "event_id": int(event["event_id"]),
+                    "material_change": 90,
+                    "impact": 85,
+                    "reader_value": 90,
+                    "actionability": 85,
+                    "source_support": 90,
+                    "freshness": 90,
+                    "must_consider": False,
+                    "reason_codes": ["material_change"],
+                    "assessment_reason": "模型更新具备明确变化和读者价值。",
+                    "confidence": 94,
+                }
+                for event in events
+            ],
+        }
+
+    def compose_events(self, events, *, edition, total_max, watchlist_max):
+        return {
+            "schema_version": "stage_d_editorial_v2",
+            "decisions": [
+                {
+                    "event_id": int(event["event_id"]),
+                    "decision": "selected",
+                    "display_order": index,
+                    "editorial_score": 93,
+                    "story_family_id": f"model-{event['event_id']}",
+                    "family_position": 1,
+                    "display_title_zh": "模型更新摘要与模型发布",
+                    "title_supporting_fields": ["title", "summary_cn"],
+                    "reason_codes": ["material_change"],
+                    "editorial_reason": "模型更新适合进入日报。",
+                    "confidence": 94,
+                }
+                for index, event in enumerate(events, start=1)
+            ],
+        }
+
 
 def _insert_item(session_factory, source: SourceSpec, *, url: str, title: str) -> None:
     captured_at = datetime.now(timezone.utc)
@@ -126,7 +169,11 @@ def test_stage_a_b_projection_drives_current_event(tmp_path):
         output_dir=tmp_path / "review",
     )
     events = run_event_cluster_job(session_factory=session_factory, item_ids=review.candidate_ids)
-    editorial = run_stage_d_job(session_factory=session_factory, event_ids=events.event_ids)
+    editorial = run_stage_d_job(
+        session_factory=session_factory,
+        event_ids=events.event_ids,
+        ai_client=provider,
+    )
 
     assert review.candidate == 1
     assert provider.screen_calls == [1]

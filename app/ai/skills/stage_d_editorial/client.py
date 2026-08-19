@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -11,9 +12,15 @@ import httpx
 
 from app.config.settings import Settings
 
-from .models import StageDEditorialResponse
-from .parser import strict_parse_stage_d
-from .prompts import build_stage_d_provider_payload, preflight_stage_d_schema
+from .models import StageDAssessmentResponse, StageDCompositionResponse, StageDEditorialResponse
+from .parser import strict_parse_stage_d, strict_parse_stage_d_assessment, strict_parse_stage_d_composition
+from .prompts import (
+    build_stage_d_assessment_payload,
+    build_stage_d_composition_payload,
+    build_stage_d_provider_payload,
+    preflight_stage_d_schema,
+    preflight_stage_d_v2_schemas,
+)
 
 
 class SupportsPost(Protocol):
@@ -49,6 +56,15 @@ class StageDEditorialProviderError(RuntimeError):
             "raw_response": self.raw_response,
             "request_metadata": self.request_metadata,
         }
+
+
+@dataclass(frozen=True)
+class StageDProviderCallResult:
+    """Single-call envelope used by D1/D3 and safe for concurrent callers."""
+
+    parsed: Any
+    raw_response: Any
+    request_metadata: Mapping[str, Any]
 
 
 class StageDEditorialClient:
@@ -92,6 +108,73 @@ class StageDEditorialClient:
     def is_configured(self) -> bool:
         return bool(self.api_url and self.api_key)
 
+    def assess_events(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        *,
+        edition: Mapping[str, Any] | None = None,
+    ) -> StageDProviderCallResult:
+        """Run D1 independent assessments and return an audit envelope."""
+
+        if not self.is_configured:
+            raise RuntimeError("Stage D editorial API is not configured")
+        preflight_stage_d_v2_schemas()
+        event_ids = [int(event["event_id"]) for event in events]
+        payload = build_stage_d_assessment_payload(
+            events,
+            edition=edition or {},
+            model=self.model,
+            api_style=self.api_style,
+        )
+        return self._call_phase(
+            phase="assessment",
+            payload=payload,
+            event_ids=event_ids,
+            events=events,
+            parser=lambda value: strict_parse_stage_d_assessment(value, event_ids=event_ids),
+        )
+
+    def compose_events(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        *,
+        edition: Mapping[str, Any] | None = None,
+        total_max: int = 30,
+        watchlist_max: int = 10,
+    ) -> StageDProviderCallResult:
+        """Run D3 global composition over a bounded shortlist."""
+
+        if not self.is_configured:
+            raise RuntimeError("Stage D editorial API is not configured")
+        preflight_stage_d_v2_schemas()
+        event_ids = [int(event["event_id"]) for event in events]
+        payload = build_stage_d_composition_payload(
+            events,
+            edition=edition or {},
+            model=self.model,
+            api_style=self.api_style,
+            total_max=total_max,
+            watchlist_max=watchlist_max,
+        )
+        return self._call_phase(
+            phase="composition",
+            payload=payload,
+            event_ids=event_ids,
+            events=events,
+            total_max=total_max,
+            watchlist_max=watchlist_max,
+            # The compatibility entry point accepts an old v1 provider reply
+            # during rolling deployment; new compose_events callers still
+            # receive strict v2 because the normal provider schema is v2.
+            parser=lambda value: strict_parse_stage_d(
+                value,
+                event_ids=event_ids,
+                total_max=total_max,
+                watchlist_max=watchlist_max,
+                events=events,
+            ),
+        )
+
     def select_events(
         self,
         events: Sequence[Mapping[str, Any]],
@@ -99,11 +182,30 @@ class StageDEditorialClient:
         edition: Mapping[str, Any],
         total_max: int = 30,
     ) -> StageDEditorialResponse:
-        if not self.is_configured:
-            raise RuntimeError("Stage D editorial API is not configured")
-        preflight_stage_d_schema()
-        event_ids = [int(event["event_id"]) for event in events]
-        payload = build_stage_d_provider_payload(events, edition=edition, model=self.model, api_style=self.api_style)
+        """Compatibility entry point returning only the parsed D3 response."""
+
+        # ``select_events`` intentionally exposes the old return shape while
+        # using the strict v2 composition protocol underneath.
+        parsed = self.compose_events(events, edition=edition, total_max=total_max).parsed
+        # A legacy v1 provider response is returned as a plain mapping so
+        # older jobs can feed it through their existing strict parser.  New
+        # v2 composition responses retain the parsed model envelope payload.
+        if isinstance(parsed, StageDEditorialResponse):
+            return parsed
+        model_dump = getattr(parsed, "model_dump", None)
+        return model_dump(mode="json") if callable(model_dump) else parsed
+
+    def _call_phase(
+        self,
+        *,
+        phase: str,
+        payload: dict[str, Any],
+        event_ids: Sequence[int],
+        events: Sequence[Mapping[str, Any]],
+        parser: Any,
+        total_max: int = 30,
+        watchlist_max: int = 10,
+    ) -> StageDProviderCallResult:
         endpoint = self._endpoint_url()
         request_metadata = _request_metadata(
             endpoint,
@@ -112,6 +214,8 @@ class StageDEditorialClient:
             api_style=self.api_style,
             event_count=len(event_ids),
             total_max=total_max,
+            watchlist_max=watchlist_max,
+            phase=phase,
         )
         self.last_request_metadata = request_metadata
         self.last_raw_response = None
@@ -123,19 +227,35 @@ class StageDEditorialClient:
             self.last_error_metadata = exc.audit_payload()
             raise
         try:
-            payload = response.json()
+            raw_payload = response.json()
         except (TypeError, ValueError) as exc:
-            self.last_raw_response = _safe_response_payload(response)
-            self.last_error_metadata = {
-                "status_code": _response_status(response),
-                "error_code": "invalid_json",
-                "error_message": "Stage D API returned invalid JSON",
-                "raw_response": self.last_raw_response,
-                "request_metadata": request_metadata,
-            }
-            raise ValueError("Stage D API returned invalid JSON") from exc
-        self.last_raw_response = payload
-        return strict_parse_stage_d(payload, event_ids=event_ids, total_max=total_max, events=events)
+            error = StageDEditorialProviderError(
+                "Stage D API returned invalid JSON",
+                status_code=_response_status(response),
+                error_code="invalid_json",
+                raw_response=_safe_response_payload(response),
+                request_metadata=request_metadata,
+                cause=exc,
+            )
+            self.last_raw_response = error.raw_response
+            self.last_error_metadata = error.audit_payload()
+            raise error from exc
+        try:
+            parsed = parser(raw_payload)
+        except (TypeError, ValueError) as exc:
+            error = StageDEditorialProviderError(
+                f"Stage D {phase} response failed schema validation",
+                status_code=_response_status(response),
+                error_code="schema_validation_failed",
+                raw_response=raw_payload,
+                request_metadata=request_metadata,
+                cause=exc,
+            )
+            self.last_raw_response = raw_payload
+            self.last_error_metadata = error.audit_payload()
+            raise error from exc
+        self.last_raw_response = raw_payload
+        return StageDProviderCallResult(parsed=parsed, raw_response=raw_payload, request_metadata=request_metadata)
 
     def _post_once(self, url: str, payload: dict[str, Any], *, request_metadata: Mapping[str, Any] | None = None):
         headers = {
@@ -198,6 +318,8 @@ def _request_metadata(
     api_style: str,
     event_count: int,
     total_max: int,
+    watchlist_max: int = 10,
+    phase: str = "composition",
 ) -> dict[str, Any]:
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return {
@@ -206,10 +328,13 @@ def _request_metadata(
         "model": model,
         "event_count": int(event_count),
         "total_max": int(total_max),
-        "prompt_version": "stage_d_editorial_v1",
-        "schema_version": "stage_d_editorial_v1",
+        "watchlist_max": int(watchlist_max),
+        "phase": str(phase),
+        "prompt_version": "stage_d_assessment_v1" if phase == "assessment" else "stage_d_editorial_v2",
+        "schema_version": "stage_d_assessment_v1" if phase == "assessment" else "stage_d_editorial_v2",
         "request_bytes": len(serialized),
         "request_sha256": hashlib.sha256(serialized).hexdigest(),
+        "request_hash": hashlib.sha256(serialized).hexdigest(),
     }
 
 
@@ -315,4 +440,4 @@ def _safe_url(value: str) -> str:
         return _safe_text(value, 512)
 
 
-__all__ = ["StageDEditorialClient", "StageDEditorialProviderError", "SupportsPost"]
+__all__ = ["StageDProviderCallResult", "StageDEditorialClient", "StageDEditorialProviderError", "SupportsPost"]

@@ -206,15 +206,37 @@ def test_stage_c_history_contains_only_prior_selected_daily_events():
 
 class _EditorialClient:
     model = "daily-delta-editorial"
+    max_retries = 0
 
     def __init__(self) -> None:
         self.calls: list[list[dict[str, object]]] = []
 
-    def select_events(self, events, *, edition, total_max):
+    def assess_events(self, events, *, edition):
+        return {
+            "schema_version": "stage_d_assessment_v1",
+            "assessments": [
+                {
+                    "event_id": int(event["event_id"]),
+                    "material_change": 80,
+                    "impact": 80,
+                    "reader_value": 80,
+                    "actionability": 80,
+                    "source_support": 80,
+                    "freshness": 80,
+                    "must_consider": False,
+                    "reason_codes": ["material_change"],
+                    "assessment_reason": "事件具备明确变化和读者价值。",
+                    "confidence": 90,
+                }
+                for event in events
+            ],
+        }
+
+    def compose_events(self, events, *, edition, total_max, watchlist_max):
         self.calls.append(events)
         event_id = int(events[0]["event_id"])
         return {
-            "schema_version": "stage_d_editorial_v1",
+            "schema_version": "stage_d_editorial_v2",
             "decisions": [
                 {
                     "event_id": event_id,

@@ -119,6 +119,53 @@ def _persist_cluster_projection(session, *, run_id: int, event_ids: list[int]) -
     repo.refresh_stage_status(stage)
 
 
+class _StageDClient:
+    model = "same-run-stage-d-v2"
+    max_retries = 0
+
+    def assess_events(self, events, *, edition):
+        return {
+            "schema_version": "stage_d_assessment_v1",
+            "assessments": [
+                {
+                    "event_id": int(event["event_id"]),
+                    "material_change": 80,
+                    "impact": 80,
+                    "reader_value": 80,
+                    "actionability": 80,
+                    "source_support": 80,
+                    "freshness": 80,
+                    "must_consider": False,
+                    "reason_codes": ["material_change"],
+                    "assessment_reason": "当前事件具备明确更新。",
+                    "confidence": 90,
+                }
+                for event in events
+            ],
+        }
+
+    def compose_events(self, events, *, edition, total_max, watchlist_max):
+        return {
+            "schema_version": "stage_d_editorial_v2",
+            "decisions": [
+                {
+                    "event_id": int(event["event_id"]),
+                    "decision": "selected",
+                    "display_order": index,
+                    "editorial_score": 80,
+                    "story_family_id": f"event-{event['event_id']}",
+                    "family_position": 1,
+                    "display_title_zh": f"{event['title']} 事件更新",
+                    "title_supporting_fields": ["title"],
+                    "reason_codes": ["material_change"],
+                    "editorial_reason": "当前事件进入本次日报。",
+                    "confidence": 90,
+                }
+                for index, event in enumerate(events, start=1)
+            ],
+        }
+
+
 def test_same_run_cluster_keeps_new_ids_compatible_and_persists_current_ids():
     session_factory = _db()
     reference = datetime(2026, 8, 16, 6, tzinfo=timezone.utc)
@@ -200,6 +247,7 @@ def test_stage_d_uses_only_latest_cluster_projection_for_same_run():
         run_id=run_id,
         snapshot_key=snapshot_key,
         profile=StageDProfile(total_max=10),
+        ai_client=_StageDClient(),
     )
     assert result.processed == 1
     assert result.selected == 1

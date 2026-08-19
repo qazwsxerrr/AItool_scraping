@@ -9,7 +9,7 @@ import pytest
 from app.ai.skills.stage_d_editorial.client import StageDEditorialClient
 from app.ai.skills.stage_d_editorial.prompts import STAGE_D_JSON_SCHEMA, build_stage_d_provider_payload
 from app.ai.skills.stage_d_editorial import strict_parse_stage_d
-from app.jobs.stage_d_job import StageDProfile, _call_editorial_provider, _fallback_decisions, run_stage_d_job
+from app.jobs.stage_d_job import StageDExecutionError, StageDProfile, _call_editorial_provider, _fallback_decisions, run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import AIItemReview, IntelEvent, IntelEventStageDSnapshot, IntelItem, IntelRun, IntelRunStage, IntelRunStageTask, Source
 from app.storage.repository import IntelRepository
@@ -105,6 +105,42 @@ class _Client:
     def select_events(self, events, *, edition, total_max):
         self.calls.append((events, edition, total_max))
         return self.payload(events)
+
+    def assess_events(self, events, *, edition):
+        return {
+            "schema_version": "stage_d_assessment_v1",
+            "assessments": [
+                {
+                    "event_id": int(event["event_id"]),
+                    "material_change": 85,
+                    "impact": 85,
+                    "reader_value": 85,
+                    "actionability": 85,
+                    "source_support": 85,
+                    "freshness": 85,
+                    "must_consider": False,
+                    "reason_codes": ["material_change"],
+                    "assessment_reason": "测试事件具有明确变化。",
+                    "confidence": 90,
+                }
+                for event in events
+            ],
+        }
+
+    def compose_events(self, events, *, edition, total_max, watchlist_max):
+        self.calls.append((events, edition, total_max))
+        legacy = self.payload(events)
+        rows = legacy.get("decisions", []) if isinstance(legacy, dict) else []
+        by_id = {int(row["event_id"]): row for row in rows}
+        decisions = []
+        for order, event in enumerate(events, start=1):
+            event_id = int(event["event_id"])
+            row = by_id.get(event_id)
+            if row is None or row.get("decision") != "selected":
+                decisions.append(_omitted(event_id))
+                continue
+            decisions.append({**row, "decision": "selected", "family_position": row.get("family_position") or 1})
+        return {"schema_version": "stage_d_editorial_v2", "decisions": decisions}
 
 
 def _selected(event_id: int, *, order: int = 1, family: str = "story_01", title: str = "测试模型发布新能力", score: int = 90):
@@ -266,18 +302,13 @@ def test_stage_d_fallback_has_no_topic_source_or_repeat_quota():
     first = _event(session_factory, title="First same source model", summary="第一条模型更新摘要足够长。", score=90)
     second = _event(session_factory, title="Second same source model", summary="第二条模型更新摘要同样足够长。", score=80)
 
-    result = run_stage_d_job(
-        session_factory=session_factory,
-        event_ids=[first, second],
-        ai_client=None,
-        profile=StageDProfile(total_max=30),
-    )
-
-    assert result.used_fallback is True
-    assert result.selected == 2
-    with session_factory() as session:
-        snapshots = session.query(IntelEventStageDSnapshot).order_by(IntelEventStageDSnapshot.display_order).all()
-        assert [row.display_order for row in snapshots if row.selected] == [1, 2]
+    with pytest.raises(StageDExecutionError, match="assessment"):
+        run_stage_d_job(
+            session_factory=session_factory,
+            event_ids=[first, second],
+            ai_client=None,
+            profile=StageDProfile(total_max=30),
+        )
 
 
 def test_stage_d_fallback_soft_diversity_does_not_fill_all_github_project_pool():
@@ -334,13 +365,13 @@ def test_stage_d_fallback_ties_are_stable_and_metadata_is_auditable():
         _event(session_factory, title="Alpha fallback", summary="Alpha fallback 摘要足够长。", score=90, source_group="github_search", content_class="project_tool", entities=[{"name": "Alpha"}]),
         _event(session_factory, title="Beta fallback", summary="Beta fallback 摘要足够长。", score=89, source_group="official_blog", content_class="official_model_company", entities=[{"name": "Beta"}]),
     ]
-    run_stage_d_job(session_factory=session_factory, event_ids=event_ids, ai_client=None, profile=StageDProfile(total_max=1))
-    with session_factory() as session:
-        snapshots = session.query(IntelEventStageDSnapshot).order_by(IntelEventStageDSnapshot.event_id).all()
-        for snapshot in snapshots:
-            metadata = json.loads(snapshot.metadata_json)
-            assert metadata["fallback_rank"] >= 1
-            assert set(("base", "bonus", "same_source_group_penalty", "same_content_class_penalty", "same_topic_penalty", "same_primary_entity_penalty", "same_story_penalty", "adjusted")) <= set(metadata["fallback_score_components"])
+    with pytest.raises(StageDExecutionError, match="assessment"):
+        run_stage_d_job(
+            session_factory=session_factory,
+            event_ids=event_ids,
+            ai_client=None,
+            profile=StageDProfile(total_max=1),
+        )
 
 
 def test_stage_d_fallback_handles_missing_content_and_source_metadata():
@@ -666,10 +697,9 @@ def test_stage_d_http_400_is_structured_audited_and_not_retried():
         http_client=http,
     )
 
-    result = run_stage_d_job(session_factory=session_factory, run_id=run_id, event_ids=[event_id], ai_client=client)
+    with pytest.raises(StageDExecutionError, match="assessment"):
+        run_stage_d_job(session_factory=session_factory, run_id=run_id, event_ids=[event_id], ai_client=client)
 
-    assert result.used_fallback is True
-    assert result.provider_attempts == 1
     assert len(http.calls) == 1
     assert client.last_error_metadata["status_code"] == 400
     assert client.last_error_metadata["error_code"] == "invalid_schema"
@@ -677,15 +707,16 @@ def test_stage_d_http_400_is_structured_audited_and_not_retried():
         task = (
             session.query(IntelRunStageTask)
             .join(IntelRunStageTask.stage)
-            .filter(IntelRunStageTask.subject_id == str(run_id), IntelRunStage.stage_name == "stage_d")
+            .filter(IntelRunStageTask.subject_type == "batch", IntelRunStage.stage_name == "stage_d")
             .one()
         )
+        assert task.status == "blocked"
         attempt = task.attempts[0]
         assert json.loads(attempt.raw_response_json)["body"]["error"]["code"] == "invalid_schema"
         assert json.loads(task.result_json)["provider_attempts"] == 1
         summary = build_run_snapshot_summary(session, run=session.get(IntelRun, run_id), snapshot_key="daily-2026-08-18")
-        assert summary["stages"]["stage_d"]["details"]["stage_d_source"] == "deterministic_fallback"
-        assert summary["stages"]["stage_d"]["details"]["provider_status_code"] == 400
+        assert summary["stages"]["stage_d"]["status"] == "failed"
+        assert session.query(IntelEventStageDSnapshot).count() == 0
 
 
 def test_stage_d_transient_provider_error_retries_then_materializes_selected_only():
@@ -747,7 +778,7 @@ def test_stage_d_local_story_family_guard_does_not_trigger_fallback():
         omitted = next(row for row in snapshots if row.event_id == event_ids[2])
         metadata = json.loads(omitted.metadata_json)
         assert metadata["stage_d_source"] == "ai"
-        assert "local_story_family_limit" in metadata["reason_codes"]
+        assert "composition_limit" in metadata["reason_codes"]
 
 
 def test_stage_d_client_max_retries_controls_job_retry_count():

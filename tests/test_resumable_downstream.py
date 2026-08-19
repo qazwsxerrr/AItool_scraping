@@ -23,6 +23,53 @@ from app.storage.models import (
 from app.storage.repository import IntelRepository
 
 
+class _PhasedClient:
+    model = "test-stage-d-v2"
+    max_retries = 0
+
+    def assess_events(self, events, *, edition):
+        return {
+            "schema_version": "stage_d_assessment_v1",
+            "assessments": [
+                {
+                    "event_id": int(event["event_id"]),
+                    "material_change": 90,
+                    "impact": 85,
+                    "reader_value": 85,
+                    "actionability": 80,
+                    "source_support": 90,
+                    "freshness": 90,
+                    "must_consider": True,
+                    "reason_codes": ["material_change"],
+                    "assessment_reason": "测试事件存在明确变化。",
+                    "confidence": 90,
+                }
+                for event in events
+            ],
+        }
+
+    def compose_events(self, events, *, edition, total_max, watchlist_max):
+        return {
+            "schema_version": "stage_d_editorial_v2",
+            "decisions": [
+                {
+                    "event_id": int(event["event_id"]),
+                    "decision": "selected",
+                    "display_order": index,
+                    "editorial_score": 90,
+                    "story_family_id": f"family-{event['event_id']}",
+                    "family_position": 1,
+                    "display_title_zh": "运行范围更新事件",
+                    "title_supporting_fields": ["title", "summary_cn"],
+                    "reason_codes": ["material_change"],
+                    "editorial_reason": "测试事件适合进入日报。",
+                    "confidence": 90,
+                }
+                for index, event in enumerate(events, start=1)
+            ],
+        }
+
+
 def _db():
     engine = create_engine_from_url("sqlite:///:memory:")
     init_db(engine)
@@ -276,6 +323,7 @@ def test_stage_d_and_export_are_run_scoped_and_partial_export_preserves_digest(t
         session_factory=session_factory,
         run_id=run_one_id,
         profile=StageDProfile(total_max=1),
+        ai_client=_PhasedClient(),
     )
     assert stage_d.snapshot_key == "daily-2026-08-15"
     assert stage_d.selected == 1

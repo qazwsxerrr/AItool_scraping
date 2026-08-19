@@ -25,6 +25,11 @@ from app.storage.models import IntelEvent, IntelEventItem, IntelEventStageDSnaps
 from app.storage.run_snapshot_summary import build_run_snapshot_summary
 
 
+_STAGE_D_BLOCKING_TASK_STATUSES = frozenset(
+    {"pending", "running", "failed", "retry_waiting", "blocked"}
+)
+
+
 @dataclass(frozen=True)
 class IntelExportResult:
     exported: int
@@ -62,6 +67,7 @@ def run_intel_export_job(
     stage_task = None
     run: IntelRun | None = None
     run_snapshot_summary: dict[str, Any] | None = None
+    watchlist_records: list[dict[str, Any]] = []
     owner = "intel-export"
     with session_factory() as session:
         try:
@@ -70,6 +76,8 @@ def run_intel_export_job(
             # Public daily exports use the date-based Stage-D key.  The run
             # ID stays attached to database rows and stage tasks only.
             key = str(snapshot_key or (run.daily_snapshot_key if run is not None else None) or "latest")
+            if run is not None and run_id is not None:
+                _ensure_stage_d_ready(repo, int(run_id))
             if run is not None and not dry_run:
                 artifact_output = _daily_output_dir(final_output, run)
                 stage = repo.ensure_stage(
@@ -87,6 +95,15 @@ def run_intel_export_job(
                 reference_time=run.reference_time if run is not None else None,
             )
             records = snapshot_rows
+            if run is not None:
+                watchlist_records = _list_watchlist_events(
+                    session,
+                    snapshot_key=key,
+                    source_filter=source_filter,
+                    content_class=content_class,
+                    run_id=run_id,
+                    reference_time=run.reference_time,
+                )
             if run is not None and (run.partial or str(run.status).casefold() in {"failed", "partial"}):
                 partial = True
                 partial_reason = partial_reason or run.partial_reason or f"run_status:{run.status}"
@@ -152,6 +169,7 @@ def run_intel_export_job(
                 edition_date=run.edition_date if run is not None else None,
                 status_counts=status_counts,
                 failure_counts=failure_counts,
+                watchlist_records=watchlist_records,
                 partial=partial,
                 partial_reason=partial_reason,
             )
@@ -164,6 +182,7 @@ def run_intel_export_job(
                     run=run,
                     records=records,
                     jsonl_payload=jsonl_payload,
+                    watchlist_count=len(watchlist_records),
                     partial=partial,
                     partial_reason=partial_reason,
                     run_snapshot_summary=run_snapshot_summary,
@@ -303,11 +322,33 @@ def _edition_report_date(run: IntelRun | None) -> date | None:
         return None
 
 
+def _ensure_stage_d_ready(repo: IntelRepository, run_id: int) -> None:
+    """Block run-scoped export until Stage D has a complete terminal result.
+
+    Legacy direct exports may not have a ``stage_d`` row at all; those remain
+    compatible.  Once the row exists, however, a missing/failed/in-flight
+    assessment or composition task must never create or replace artifacts.
+    """
+
+    stage = repo.get_stage(int(run_id), "stage_d")
+    if stage is None:
+        return
+    tasks = repo.list_stage_tasks(stage, include_expired=True)
+    blocking = [task for task in tasks if str(task.status) in _STAGE_D_BLOCKING_TASK_STATUSES]
+    if str(stage.status) != "succeeded" or blocking:
+        status = str(stage.status or "unknown")
+        task_statuses = ",".join(str(task.status) for task in blocking) or "none"
+        raise RuntimeError(
+            f"stage_d_incomplete: run {int(run_id)} status={status} blocking_tasks={task_statuses}"
+        )
+
+
 def _manifest(
     *,
     run: IntelRun,
     records: list[dict[str, Any]],
     jsonl_payload: str,
+    watchlist_count: int,
     partial: bool,
     partial_reason: str | None,
     run_snapshot_summary: dict[str, Any] | None,
@@ -315,7 +356,7 @@ def _manifest(
     """Build the machine-readable metadata for a date-addressed export."""
 
     payload = {
-        "schema_version": 4,
+        "schema_version": 5,
         "edition_date": run.edition_date,
         # Older runs did not persist a daily timezone.  Preserve their former
         # UTC interpretation; all newly-created runs explicitly store
@@ -327,7 +368,9 @@ def _manifest(
         "partial_reason": partial_reason,
         "reference_time": _date(run.reference_time),
         "selected_count": len(records),
+        "watchlist_count": max(0, int(watchlist_count)),
         "stage_d_count": int((run_snapshot_summary or {}).get("funnel", {}).get("stage_d_total", 0)),
+        "stage_d_shortlisted": int((run_snapshot_summary or {}).get("funnel", {}).get("stage_d_shortlisted", 0)),
         "funnel": (run_snapshot_summary or {}).get("funnel", {}),
         "stages": (run_snapshot_summary or {}).get("stages", {}),
         "failure_reasons": (run_snapshot_summary or {}).get("failure_reasons", []),
@@ -396,8 +439,14 @@ def _list_export_events(
     content_class: str | None,
     run_id: int | None = None,
     reference_time: datetime | None = None,
+    selected: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return selected event records from the requested snapshot only."""
+    """Return event records from one snapshot tier.
+
+    The default remains selected-only for JSONL and all existing callers.  The
+    export job uses ``selected=False`` only for the private watchlist appendix;
+    it never feeds those rows into the public selected JSONL/API surfaces.
+    """
     stmt = (
         select(IntelEventStageDSnapshot, IntelEvent)
         .join(IntelEvent, IntelEvent.id == IntelEventStageDSnapshot.event_id)
@@ -409,7 +458,7 @@ def _list_export_events(
         )
         .where(
             IntelEventStageDSnapshot.snapshot_key == snapshot_key,
-            IntelEventStageDSnapshot.selected.is_(True),
+            IntelEventStageDSnapshot.selected.is_(bool(selected)),
         )
         .order_by(IntelEventStageDSnapshot.display_order.asc(), IntelEvent.id.asc())
     )
@@ -440,6 +489,50 @@ def _list_export_events(
         if limit is not None and len(records) >= limit:
             break
     return records
+
+
+def _list_watchlist_events(
+    session: Session,
+    *,
+    snapshot_key: str,
+    source_filter: str | None,
+    content_class: str | None,
+    run_id: int | None = None,
+    reference_time: datetime | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Return at most ``limit`` public watchlist rows in display order."""
+
+    if limit <= 0:
+        return []
+    rows = _list_export_events(
+        session,
+        snapshot_key=snapshot_key,
+        limit=None,
+        source_filter=source_filter,
+        content_class=content_class,
+        run_id=run_id,
+        reference_time=reference_time,
+        selected=False,
+    )
+    watchlist: list[dict[str, Any]] = []
+    for record in rows:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        if str(metadata.get("editorial_tier") or "").casefold() != "watchlist":
+            continue
+        watchlist.append(record)
+    watchlist.sort(
+        key=lambda record: (
+            _as_nonnegative_int(
+                (record.get("metadata") or {}).get("watchlist_order")
+                if isinstance(record.get("metadata"), dict)
+                else None
+            )
+            or _as_nonnegative_int(record.get("display_order")),
+            _as_nonnegative_int(record.get("event_id")),
+        )
+    )
+    return watchlist[:limit]
 
 
 def _serialize_event(
@@ -578,6 +671,7 @@ def _markdown(
     edition_date: str | None = None,
     status_counts: dict[str, int] | None = None,
     failure_counts: dict[str, int] | None = None,
+    watchlist_records: list[dict[str, Any]] | None = None,
     partial: bool = False,
     partial_reason: str | None = None,
 ) -> str:
@@ -618,6 +712,24 @@ def _markdown(
                 ]
             )
             continue
+    watchlist = list(watchlist_records or [])[:10]
+    if watchlist:
+        lines.extend(["## 候选观察", "", "以下条目已进入观察池，未计入日报精选。", ""])
+        for index, record in enumerate(watchlist, start=1):
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            reason_codes = metadata.get("reason_codes") if isinstance(metadata.get("reason_codes"), list) else []
+            reason = metadata.get("editorial_reason") or record.get("reason") or "暂无原因"
+            if reason_codes:
+                reason = f"{reason}（{', '.join(str(code) for code in reason_codes)}）"
+            lines.extend(
+                [
+                    f"### {index}. {record.get('title') or '(untitled)' }",
+                    f"- 摘要：{record.get('summary_cn') or record.get('summary') or '暂无摘要'}",
+                    f"- 原因：{reason}",
+                    f"- 链接：{record.get('url') or '无'}",
+                    "",
+                ]
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -687,6 +799,13 @@ def _normalise_export_limit(value: int | None) -> int:
         return max(0, int(value))
     except (TypeError, ValueError, OverflowError):
         return DEFAULT_DAILY_REPORT_LIMIT
+
+
+def _as_nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _date(value: datetime | None) -> str | None:

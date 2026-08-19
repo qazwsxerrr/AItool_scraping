@@ -5,17 +5,61 @@ canonical events into an auditable daily edition without changing factual
 event identity or the Stage-B analysis projection.
 """
 
-from .client import StageDEditorialClient
-from .models import StageDDecision, StageDEditorialResponse
-from .parser import parse_stage_d_response, strict_parse_stage_d
-from .prompts import STAGE_D_PROMPT_VERSION, STAGE_D_SYSTEM_PROMPT
+from .client import StageDProviderCallResult, StageDEditorialClient
+from .models import (
+    STAGE_D_REASON_CODES,
+    StageDAssessment,
+    StageDAssessmentResponse,
+    StageDCompositionResponse,
+    StageDDecision,
+    StageDEditorialDecision,
+    StageDEditorialResponse,
+)
+from .parser import (
+    parse_stage_d_assessment_response,
+    parse_stage_d_composition_response,
+    parse_stage_d_response,
+    strict_parse_stage_d,
+    strict_parse_stage_d_assessment,
+    strict_parse_stage_d_composition,
+)
+from .prompts import (
+    STAGE_D_ASSESSMENT_JSON_SCHEMA,
+    STAGE_D_ASSESSMENT_PROMPT_VERSION,
+    STAGE_D_ASSESSMENT_SYSTEM_PROMPT,
+    STAGE_D_COMPOSITION_JSON_SCHEMA,
+    STAGE_D_COMPOSITION_PROMPT_VERSION,
+    STAGE_D_COMPOSITION_SYSTEM_PROMPT,
+    STAGE_D_PROMPT_VERSION,
+    STAGE_D_SYSTEM_PROMPT,
+    build_stage_d_assessment_payload,
+    build_stage_d_composition_payload,
+)
 
 __all__ = [
     "STAGE_D_PROMPT_VERSION",
     "STAGE_D_SYSTEM_PROMPT",
+    "STAGE_D_ASSESSMENT_JSON_SCHEMA",
+    "STAGE_D_ASSESSMENT_PROMPT_VERSION",
+    "STAGE_D_ASSESSMENT_SYSTEM_PROMPT",
+    "STAGE_D_COMPOSITION_JSON_SCHEMA",
+    "STAGE_D_COMPOSITION_PROMPT_VERSION",
+    "STAGE_D_COMPOSITION_SYSTEM_PROMPT",
+    "STAGE_D_REASON_CODES",
+    "StageDAssessment",
+    "StageDAssessmentResponse",
+    "StageDCompositionResponse",
     "StageDDecision",
+    "StageDEditorialDecision",
     "StageDEditorialClient",
     "StageDEditorialResponse",
+    "StageDProviderCallResult",
+    "build_stage_d_assessment_payload",
+    "build_stage_d_composition_payload",
+    "parse_stage_d_assessment_response",
+    "parse_stage_d_composition_response",
     "parse_stage_d_response",
     "strict_parse_stage_d",
+    "strict_parse_stage_d_assessment",
+    "strict_parse_stage_d_composition",
 ]

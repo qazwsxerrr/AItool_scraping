@@ -363,6 +363,22 @@ def _stage_d_client_or_none(value: Any | None) -> Any | None:
     return value if any(callable(getattr(value, name, None)) for name in ("select_events", "stage_d_editorial", "editorial_select")) else None
 
 
+def _stage_result_errors(stage_name: str, value: Any) -> list[str]:
+    """Normalize explicit stage result errors for downstream safety guards.
+
+    Stage D historically returned a result with ``errors`` after materializing
+    a fallback snapshot.  Keep this compatibility check scoped to Stage D so
+    the existing partial-success semantics of Stage A/B are unchanged.
+    """
+
+    if stage_name != "stage_d":
+        return []
+    errors = getattr(value, "errors", None)
+    if not isinstance(errors, (list, tuple)):
+        return []
+    return [str(error) for error in errors if str(error).strip()]
+
+
 def _freeze_after_fetch(
     settings: Settings,
     *,
@@ -1001,6 +1017,10 @@ def resume_pipeline_from_settings(
                 )
             result.ran_stages.append(stage_name)
             result.results[stage_name] = value
+            stage_errors = _stage_result_errors(stage_name, value)
+            if stage_errors:
+                result.errors.extend(f"{stage_name}: {error}" for error in stage_errors)
+                break
         except Exception as exc:
             result.errors.append(f"{stage_name}: {exc}")
             break
@@ -1147,6 +1167,9 @@ def run_pipeline_once_from_settings(
                 event_ids=_stage_c_current_event_ids(cluster),
                 ai_client=_stage_d_client_or_none(ai_client),
             )
+            stage_d_errors = _stage_result_errors("stage_d", stage_d)
+            if stage_d_errors:
+                raise RuntimeError("; ".join(stage_d_errors))
             exported = export_fn(
                 settings=ephemeral,
                 source_filter=source,
@@ -1224,6 +1247,9 @@ def run_pipeline_once_from_settings(
             event_ids=_stage_c_current_event_ids(cluster),
             ai_client=_stage_d_client_or_none(ai_client),
         )
+        stage_d_errors = _stage_result_errors("stage_d", stage_d)
+        if stage_d_errors:
+            raise RuntimeError("; ".join(stage_d_errors))
         exported = export_fn(
             settings=settings,
             source_filter=source,
