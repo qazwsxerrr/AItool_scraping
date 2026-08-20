@@ -10,6 +10,7 @@ from fastapi import Request
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.ai.skills.intel_triage import INTEL_TOPIC_LABELS
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.github_reader import GitHubProjectReader
@@ -125,6 +126,12 @@ def source_role_label(value: str | None) -> str:
     return _ROLE_LABELS.get(value, value.replace("_", " "))
 
 
+def topic_label(value: str | None) -> str:
+    if not value:
+        return "未分类"
+    return INTEL_TOPIC_LABELS.get(value, value)
+
+
 def current_date() -> str:
     return datetime.now(DISPLAY_TIMEZONE).strftime("%Y.%m.%d")
 
@@ -137,6 +144,7 @@ templates.env.filters["source_group_label"] = source_group_label
 templates.env.filters["transport_label"] = transport_label
 templates.env.filters["tier_label"] = tier_label
 templates.env.filters["source_role_label"] = source_role_label
+templates.env.filters["topic_label"] = topic_label
 templates.env.globals["current_date"] = current_date
 
 

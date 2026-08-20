@@ -39,7 +39,7 @@ def _publish(session_factory, *, edition_date: str, title: str, event_key: str) 
                     "summary_cn": "摘要",
                     "url": "https://ui.example/update",
                     "display_score": 88,
-                    "topic": "model",
+                    "topic": "model_release",
                     "content_class": "official_model_company",
                     "source_group": "official_blog",
                     "source_ids": ["ui-source"],
@@ -56,7 +56,7 @@ def _publish(session_factory, *, edition_date: str, title: str, event_key: str) 
                         }
                     ],
                     "risk_flags": ["needs_review"],
-                    "keywords": ["model"],
+                    "keywords": ["model_release"],
                     "entities": [{"type": "company", "name": "Example"}],
                     "provenance": {"kind": "new"},
                     "metadata": {
@@ -93,7 +93,7 @@ def test_read_repository_maps_final_report_provenance_and_source_refs():
     assert detail is not None
     assert detail.resolution_method == "published_daily_report"
     assert detail.members[0].source_id == "ui-source"
-    assert detail.members[0].review_topic == "model"
+    assert detail.members[0].review_topic == "model_release"
 
 
 def test_read_repository_has_no_raw_item_or_snapshot_fallback():

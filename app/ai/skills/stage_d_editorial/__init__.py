@@ -1,53 +1,37 @@
-"""Stage D editorial selection skill.
+"""Single-call Stage-D editorial selection skill."""
 
-This is a runtime project skill, not a Codex skill.  It turns Stage-C
-canonical events into an auditable daily edition without changing factual
-event identity or the Stage-B analysis projection.
-"""
-
-from .client import StageDProviderCallResult, StageDEditorialClient
+from .client import StageDProviderCallResult, StageDEditorialClient, StageDEditorialProviderError
 from .models import (
     STAGE_D_REASON_CODES,
-    StageDAssessment,
-    StageDAssessmentResponse,
-    StageDCompositionResponse,
+    STAGE_D_REASON_CODE_SET,
+    STAGE_D_SCHEMA_VERSION,
     StageDEditorialDecision,
+    StageDEditorialResponse,
 )
-from .parser import (
-    strict_parse_stage_d_assessment,
-    strict_parse_stage_d_composition,
-)
+from .parser import strict_parse_stage_d_editorial
 from .prompts import (
-    STAGE_D_ASSESSMENT_JSON_SCHEMA,
-    STAGE_D_ASSESSMENT_PROMPT_VERSION,
-    STAGE_D_ASSESSMENT_SYSTEM_PROMPT,
-    STAGE_D_COMPOSITION_JSON_SCHEMA,
-    STAGE_D_COMPOSITION_PROMPT_VERSION,
-    STAGE_D_COMPOSITION_SYSTEM_PROMPT,
+    STAGE_D_JSON_SCHEMA,
     STAGE_D_PROMPT_VERSION,
     STAGE_D_SYSTEM_PROMPT,
-    build_stage_d_assessment_payload,
-    build_stage_d_composition_payload,
+    STAGE_D_TASK,
+    build_stage_d_provider_payload,
+    preflight_stage_d_schema,
 )
 
 __all__ = [
+    "STAGE_D_JSON_SCHEMA",
     "STAGE_D_PROMPT_VERSION",
-    "STAGE_D_SYSTEM_PROMPT",
-    "STAGE_D_ASSESSMENT_JSON_SCHEMA",
-    "STAGE_D_ASSESSMENT_PROMPT_VERSION",
-    "STAGE_D_ASSESSMENT_SYSTEM_PROMPT",
-    "STAGE_D_COMPOSITION_JSON_SCHEMA",
-    "STAGE_D_COMPOSITION_PROMPT_VERSION",
-    "STAGE_D_COMPOSITION_SYSTEM_PROMPT",
     "STAGE_D_REASON_CODES",
-    "StageDAssessment",
-    "StageDAssessmentResponse",
-    "StageDCompositionResponse",
-    "StageDEditorialDecision",
+    "STAGE_D_REASON_CODE_SET",
+    "STAGE_D_SCHEMA_VERSION",
+    "STAGE_D_SYSTEM_PROMPT",
+    "STAGE_D_TASK",
     "StageDEditorialClient",
+    "StageDEditorialDecision",
+    "StageDEditorialProviderError",
+    "StageDEditorialResponse",
     "StageDProviderCallResult",
-    "build_stage_d_assessment_payload",
-    "build_stage_d_composition_payload",
-    "strict_parse_stage_d_assessment",
-    "strict_parse_stage_d_composition",
+    "build_stage_d_provider_payload",
+    "preflight_stage_d_schema",
+    "strict_parse_stage_d_editorial",
 ]

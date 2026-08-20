@@ -5,43 +5,27 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
+from app.ai.skills.stage_c_aggregation import (
+    STAGE_C_SCHEMA_VERSION,
+    StageCAggregationCallResult,
+    StageCAggregationResponse,
+)
 from app.domain.models import FetchItem
 from app.jobs.event_cluster_job import run_event_cluster_job
 from app.jobs.export_job import run_intel_export_job
 from app.jobs.stage_d_job import StageDProfile, run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelEventItem, IntelRunStage, IntelRunStageTask, Source
+from app.storage.models import AIItemReview, IntelEventItem, IntelItem, IntelRunStage, IntelRunStageTask, Source
 from app.storage.repository import IntelRepository
 
 
-class _PhasedClient:
-    model = "test-stage-d-v2"
+class _EditorialClient:
+    model = "test-stage-d-v3"
     max_retries = 0
 
-    def assess_events(self, events, *, edition):
+    def select_events(self, events, *, edition, total_max, watchlist_max):
         return {
-            "schema_version": "stage_d_assessment_v1",
-            "assessments": [
-                {
-                    "event_id": int(event["event_id"]),
-                    "material_change": 90,
-                    "impact": 85,
-                    "reader_value": 85,
-                    "actionability": 80,
-                    "source_support": 90,
-                    "freshness": 90,
-                    "must_consider": True,
-                    "reason_codes": ["material_change"],
-                    "assessment_reason": "测试事件存在明确变化。",
-                    "confidence": 90,
-                }
-                for event in events
-            ],
-        }
-
-    def compose_events(self, events, *, edition, total_max, watchlist_max):
-        return {
-            "schema_version": "stage_d_editorial_v2",
+            "schema_version": "stage_d_editorial_v3",
             "decisions": [
                 {
                     "event_id": int(event["event_id"]),
@@ -59,6 +43,31 @@ class _PhasedClient:
                 for index, event in enumerate(events, start=1)
             ],
         }
+
+
+class _StageCClient:
+    model = "test-stage-c"
+
+    def aggregate(self, current_items, *, recent_history, edition):
+        raw = {
+            "schema_version": STAGE_C_SCHEMA_VERSION,
+            "clusters": [
+                {
+                    "title_zh": str(item["title"]),
+                    "summary_zh": str(item.get("summary_cn") or item["title"]),
+                    "primary_item_id": int(item["id"]),
+                    "members": [{"item_id": int(item["id"]), "relation": "primary"}],
+                    "novelty_status": "new",
+                    "prior_event_key": None,
+                }
+                for item in current_items
+            ],
+        }
+        return StageCAggregationCallResult(
+            parsed=StageCAggregationResponse.model_validate(raw),
+            raw_response=raw,
+            request_metadata={"model": self.model},
+        )
 
 
 def _db():
@@ -115,16 +124,19 @@ def _build_with_stage_b_items(
                 AIItemReview(
                     item_id=item_id,
                     content_class="official_model_company",
-                    topic="model",
-                    topics_json='["model"]',
+                    topic="model_release",
+                    topics_json='["model_release"]',
                     keywords_json='["gpt-5", "release"]',
                     entities_json=json.dumps([{"type": "company", "name": "OpenAI"}]),
                     summary_cn=f"{title} summary",
                     selection_score=score,
-                    reason=status,
                     status="success",
                 )
             )
+            item = session.get(IntelItem, item_id)
+            assert item is not None
+            if status.startswith("analysis_filtered:"):
+                item.status = "analysis_filtered"
             task = repo.ensure_stage_task(
                 analyze,
                 subject_type="item",
@@ -150,18 +162,26 @@ def test_cluster_retry_keeps_the_frozen_reference_time_and_current_build_project
         rows=[("Orchid Systems processor", 80, "candidate")],
     )
 
-    first = run_event_cluster_job(session_factory=session_factory, run_id=run_id, reference_time=reference)
+    client = _StageCClient()
+    first = run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        reference_time=reference,
+        ai_client=client,
+    )
     second = run_event_cluster_job(
         session_factory=session_factory,
         run_id=run_id,
         force=True,
         now=reference + timedelta(hours=100),
+        ai_client=client,
     )
 
     assert first.events == 1
     assert first.reference_time == reference
     assert second.reference_time == reference
-    assert second.repeats == 1
+    assert second.events == 1
+    assert second.current_event_ids == first.current_event_ids
     with session_factory() as session:
         stage = session.scalar(
             select(IntelRunStage).where(
@@ -173,8 +193,7 @@ def test_cluster_retry_keeps_the_frozen_reference_time_and_current_build_project
         assert task is not None and task.status == "succeeded"
 
 
-def test_cluster_includes_low_signal_analysis_stage_b_tasks():
-    """A successful Stage-B task remains Stage-C input even at a low score."""
+def test_cluster_excludes_structurally_filtered_stage_b_items():
 
     session_factory = _db()
     reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
@@ -191,13 +210,14 @@ def test_cluster_includes_low_signal_analysis_stage_b_tasks():
         session_factory=session_factory,
         run_id=run_id,
         reference_time=reference,
+        ai_client=_StageCClient(),
     )
 
-    assert result.processed == 2
-    assert result.events == 2
+    assert result.processed == 1
+    assert result.events == 1
     with session_factory() as session:
         relations = session.scalars(select(IntelEventItem)).all()
-        assert {relation.item_id for relation in relations} == set(item_ids.values())
+        assert {relation.item_id for relation in relations} == {item_ids["Orchid Systems candidate"]}
 
 
 def test_stage_d_and_export_use_only_the_current_daily_build(tmp_path):
@@ -208,14 +228,19 @@ def test_stage_d_and_export_use_only_the_current_daily_build(tmp_path):
         reference_time=reference,
         rows=[("Current build update", 90, "candidate")],
     )
-    cluster = run_event_cluster_job(session_factory=session_factory, run_id=run_id, reference_time=reference)
+    cluster = run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        reference_time=reference,
+        ai_client=_StageCClient(),
+    )
     assert cluster.current_event_ids
 
     stage_d = run_stage_d_job(
         session_factory=session_factory,
         run_id=run_id,
         profile=StageDProfile(total_max=1),
-        ai_client=_PhasedClient(),
+        ai_client=_EditorialClient(),
     )
     assert stage_d.selected == 1
 

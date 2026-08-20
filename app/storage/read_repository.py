@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from app.ai.skills.intel_triage import INTEL_TOPICS, normalize_topic
 from app.config.settings import DEFAULT_AI_REVIEW_CATEGORIES
 from app.storage.models import DailyEdition, DailyEditionReportEntry, Source
 
@@ -228,8 +229,13 @@ class UIReadRepository:
 
     def __init__(self, session: Session, topic_categories: Sequence[str] | None = None) -> None:
         self.session = session
-        configured = tuple(str(item).strip() for item in (topic_categories or DEFAULT_AI_REVIEW_CATEGORIES) if str(item).strip())
-        self.topic_categories = configured or DEFAULT_AI_REVIEW_CATEGORIES
+        configured: list[str] = []
+        for item in (topic_categories or DEFAULT_AI_REVIEW_CATEGORIES):
+            raw = str(item).strip()
+            if not raw:
+                continue
+            configured.append(normalize_topic(raw) or raw)
+        self.topic_categories = tuple(dict.fromkeys(configured)) or INTEL_TOPICS
 
     def list_daily_editions(self) -> tuple[DailyEditionView, ...]:
         rows = self.session.execute(
@@ -447,9 +453,10 @@ class UIReadRepository:
             return []
         stmt = select(DailyEditionReportEntry).where(DailyEditionReportEntry.edition_id == int(daily.id))
         if topic:
-            stmt = stmt.where(DailyEditionReportEntry.topic == topic)
+            stmt = stmt.where(DailyEditionReportEntry.topic == (normalize_topic(topic) or topic))
         if category:
-            stmt = stmt.where(or_(DailyEditionReportEntry.topic == category, DailyEditionReportEntry.content_class == category))
+            normalized_category = normalize_topic(category) or category
+            stmt = stmt.where(or_(DailyEditionReportEntry.topic == normalized_category, DailyEditionReportEntry.content_class == category))
         if source_group:
             stmt = stmt.where(DailyEditionReportEntry.source_group == source_group)
         if content_class:

@@ -90,7 +90,7 @@ def test_default_registry_includes_linux_do_sources():
         assert linux_source.url == url
 
 
-def test_default_registry_uses_canonical_github_modes_and_producthunt_atom():
+def test_default_registry_excludes_disabled_github_arxiv_sources_and_keeps_producthunt_atom():
     result = load_source_registry(env={})
     source_by_id = {source.id: source for source in result.sources}
 
@@ -99,19 +99,10 @@ def test_default_registry_uses_canonical_github_modes_and_producthunt_atom():
     assert producthunt.feed.format == "atom"
     assert producthunt.feed.adapter == "producthunt"
 
-    daily = source_by_id["github_trending_daily_native"]
-    assert daily.transport == "github"
-    assert daily.github.mode == "trending"
-    assert daily.github.period == "daily"
-    assert daily.url == "https://github.com/trending?since=daily"
-    assert daily.selection_policy.mode == "github_trending"
-
-    weekly = source_by_id["github_trending_weekly_native"]
-    assert weekly.github.mode == "trending"
-    assert weekly.github.period == "weekly"
-    assert weekly.source_subtype == "trending_weekly"
-
-    topic_ids = {
+    disabled_ids = {
+        "arxiv_ai_cl_ml_feed",
+        "github_trending_daily_native",
+        "github_trending_weekly_native",
         "github_search_topic_llm",
         "github_search_topic_ai_agent",
         "github_search_topic_rag",
@@ -119,16 +110,7 @@ def test_default_registry_uses_canonical_github_modes_and_producthunt_atom():
         "github_search_topic_large_language_model",
         "github_search_topic_machine_learning",
     }
-    assert topic_ids <= source_by_id.keys()
-    for topic_id in topic_ids:
-        source = source_by_id[topic_id]
-        assert source.transport == "github"
-        assert source.github.mode == "search"
-        assert source.github.sort == "stars"
-        assert source.github.order == "desc"
-        assert source.github.pushed_days == 7
-        assert source.selection_policy.min_stars == 100
-        assert source.github.query.startswith("topic:")
+    assert disabled_ids.isdisjoint(source_by_id)
 
     assert "github_trending_python_daily" not in source_by_id
     assert "github_trending_typescript_daily" not in source_by_id
@@ -206,13 +188,8 @@ def test_default_registry_includes_gap_p0_p1_sources():
         assert source.primary_eligible is True
         assert source.selection_policy.mode == "first_party_recent"
 
-    gary_marcus = source_by_id["gary_marcus_blog"]
-    assert gary_marcus.url == "https://garymarcus.substack.com/feed"
-    assert gary_marcus.source_group == "tech_media"
-    assert gary_marcus.source_role == "analysis"
-    assert gary_marcus.content_class == "news_media"
-    assert gary_marcus.selection_policy.mode == "media_recent"
-    assert gary_marcus.selection_policy.keywords == ()
+    assert "gary_marcus_blog" not in source_by_id
+    assert "reddit_local_llama_new" not in source_by_id
 
     tomer_tunguz = source_by_id["tomer_tunguz_blog"]
     assert tomer_tunguz.url == "https://www.tomtunguz.com/index.xml"

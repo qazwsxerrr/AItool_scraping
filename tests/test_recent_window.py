@@ -5,6 +5,11 @@ from types import SimpleNamespace
 
 from sqlalchemy import select
 
+from app.ai.skills.stage_c_aggregation import (
+    STAGE_C_SCHEMA_VERSION,
+    StageCAggregationCallResult,
+    StageCAggregationResponse,
+)
 from app.ai.skills.intel_triage import ScreenResult
 from app.domain.models import FetchItem, SourceSpec
 from app.domain.recency import recent_window_decision, recent_window_scope
@@ -101,6 +106,31 @@ class _ScreenProvider:
             confidence=95,
             risk_flags=[],
             raw_response={"fixture": "screen"},
+        )
+
+
+class _StageCClient:
+    model = "recent-window-stage-c"
+
+    def aggregate(self, current_items, *, recent_history, edition):
+        raw = {
+            "schema_version": STAGE_C_SCHEMA_VERSION,
+            "clusters": [
+                {
+                    "title_zh": str(item["title"]),
+                    "summary_zh": str(item.get("summary_cn") or item["title"]),
+                    "primary_item_id": int(item["id"]),
+                    "members": [{"item_id": int(item["id"]), "relation": "primary"}],
+                    "novelty_status": "new",
+                    "prior_event_key": None,
+                }
+                for item in current_items
+            ],
+        }
+        return StageCAggregationCallResult(
+            parsed=StageCAggregationResponse.model_validate(raw),
+            raw_response=raw,
+            request_metadata={"model": self.model},
         )
 
 
@@ -231,7 +261,7 @@ def test_stage_a_keeps_only_recent_items_and_records_run_local_audit(tmp_path):
         assert stage.status == "succeeded"
 
 
-def test_stage_c_rechecks_the_frozen_recent_window(tmp_path):
+def test_stage_c_uses_successful_stage_b_items_without_reapplying_recency(tmp_path):
     session_factory = _factory(tmp_path)
     source = _feed_source()
     with session_factory() as session:
@@ -273,11 +303,10 @@ def test_stage_c_rechecks_the_frozen_recent_window(tmp_path):
                 AIItemReview(
                     item_id=item.id,
                     content_class=source.content_class,
-                    topic="model",
-                    topics_json='["model"]',
+                    topic="model_release",
+                    topics_json='["model_release"]',
                     keywords_json='["release"]',
                     selection_score=80,
-                    reason="candidate",
                     status="success",
                 )
             )
@@ -297,13 +326,14 @@ def test_stage_c_rechecks_the_frozen_recent_window(tmp_path):
         session_factory=session_factory,
         run_id=run_id,
         reference_time=REFERENCE,
+        ai_client=_StageCClient(),
     )
 
-    assert result.processed == 1
-    assert result.events == 1
+    assert result.processed == 2
+    assert result.events == 2
     with session_factory() as session:
         relations = session.scalars(select(IntelEventItem)).all()
-        assert [relation.item_id for relation in relations] == [item_ids["recent candidate"]]
+        assert {relation.item_id for relation in relations} == set(item_ids.values())
 
 
 def test_all_time_filtered_items_advance_the_empty_pipeline_path(tmp_path):
@@ -393,7 +423,7 @@ def test_daily_build_export_cannot_leak_a_stale_primary_item(tmp_path):
             canonical_url=stale.canonical_url,
             title="stale selected event",
             summary_cn="stale",
-            topic="model",
+            topic="model_release",
             display_score=90,
             novelty_status="new",
             primary_item_id=stale.id,

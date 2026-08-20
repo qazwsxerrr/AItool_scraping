@@ -1,18 +1,11 @@
-version: stage-d-v2
+version: stage-d-v4
 
-# Default editorial pool size.  There is intentionally no minimum: an empty or
-# fully gated day produces an empty report rather than padded content.
+# Default editorial pool size. There is intentionally no minimum: an empty
+# candidate pool produces an empty report rather than padded content.
 total_max: 30
-assessment_batch_size: 24
-assessment_concurrency: 2
-assessment_retries: 5
-shortlist_max: 60
 watchlist_max: 10
 
-paper:
-  hard_gate: true
-
-# Stage D receives repeat history as context only.  It neither applies a
-# daily-repeat hard rejection nor any topic/source/content quota.  The model
-# may select fewer than total_max entries.
+# Stage C classifies new/updated/repeat before this stage. Repeat rows are
+# omitted locally; non-first-party community rows can only enter watchlist.
+# The model may select fewer than total_max entries.
 recent_history_days: 3

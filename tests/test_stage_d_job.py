@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.ai.skills.stage_d_editorial import strict_parse_stage_d_composition
+from app.ai.skills.stage_d_editorial import strict_parse_stage_d_editorial
 from app.domain.models import FetchItem, SourceSpec
 from app.jobs.stage_d_job import StageDExecutionError, run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
@@ -54,13 +54,11 @@ def _build_with_event(session_factory) -> int:
             AIItemReview(
                 item_id=item.id,
                 content_class=source.content_class,
-                topic="model",
-                topics_json='["model"]',
+                topic="model_release",
+                topics_json='["model_release"]',
                 summary_cn="官方发布企业能力与部署更新。",
                 selection_score=90,
                 score_components_json='{"total":90}',
-                paper_support_json="{}",
-                risk_flags_json="[]",
                 status="success",
             )
         )
@@ -70,8 +68,8 @@ def _build_with_event(session_factory) -> int:
             canonical_url="https://example.test/model-update",
             title="模型发布了新的企业能力",
             summary_cn="官方发布企业能力与部署更新。",
-            topic="model",
-            topics=["model"],
+            topic="model_release",
+            topics=["model_release"],
             content_class=source.content_class,
             source_group=source.source_group,
             source_ids=[source.id],
@@ -94,38 +92,20 @@ def _build_with_event(session_factory) -> int:
 class _Client:
     model = "stage-d-test"
 
-    def __init__(self, *, fail_composition: bool = False):
-        self.fail_composition = fail_composition
+    def __init__(self, *, fail: bool = False):
+        self.fail = fail
+        self.calls: list[list[int]] = []
 
-    def assess_events(self, events, *, edition):
+    def select_events(self, events, *, edition, total_max, watchlist_max):
+        if self.fail:
+            raise RuntimeError("editorial unavailable")
+        ids = [int(event["event_id"]) for event in events]
+        self.calls.append(ids)
         return {
-            "schema_version": "stage_d_assessment_v1",
-            "assessments": [
-                {
-                    "event_id": int(event["event_id"]),
-                    "material_change": 90,
-                    "impact": 90,
-                    "reader_value": 90,
-                    "actionability": 80,
-                    "source_support": 90,
-                    "freshness": 90,
-                    "must_consider": False,
-                    "reason_codes": ["material_change"],
-                    "assessment_reason": "变化明确。",
-                    "confidence": 90,
-                }
-                for event in events
-            ],
-        }
-
-    def compose_events(self, events, *, edition, total_max, watchlist_max):
-        if self.fail_composition:
-            raise RuntimeError("composition unavailable")
-        return {
-            "schema_version": "stage_d_editorial_v2",
+            "schema_version": "stage_d_editorial_v3",
             "decisions": [
                 {
-                    "event_id": int(event["event_id"]),
+                    "event_id": event_id,
                     "decision": "selected",
                     "display_order": index,
                     "editorial_score": 90,
@@ -137,40 +117,72 @@ class _Client:
                     "editorial_reason": "变化明确。",
                     "confidence": 90,
                 }
-                for index, event in enumerate(events, start=1)
+                for index, event_id in enumerate(ids, start=1)
             ],
         }
 
 
-def test_stage_d_uses_only_v2_composition_contract():
-    with pytest.raises(ValueError, match="stage_d_editorial_v2"):
-        strict_parse_stage_d_composition(
-            {"schema_version": "stage_d_editorial_v1", "decisions": []},
-            event_ids=[],
-        )
+def test_stage_d_schema_v3_requires_exact_coverage_and_nonselected_no_order():
+    parsed = strict_parse_stage_d_editorial(
+        {
+            "schema_version": "stage_d_editorial_v3",
+            "decisions": [
+                {
+                    "event_id": 1,
+                    "decision": "watchlist",
+                    "editorial_score": 70,
+                    "story_family_id": "family-1",
+                    "family_position": None,
+                    "reason_codes": ["low_impact"],
+                    "editorial_reason": "保留观察。",
+                    "confidence": 80,
+                },
+                {
+                    "event_id": 2,
+                    "decision": "omitted",
+                    "editorial_score": 20,
+                    "story_family_id": "family-2",
+                    "family_position": None,
+                    "reason_codes": ["low_novelty"],
+                    "editorial_reason": "本期不展示。",
+                    "confidence": 80,
+                },
+            ],
+        },
+        event_ids=[1, 2],
+    )
+    assert [row.decision for row in parsed.decisions] == ["watchlist", "omitted"]
+    assert all(row.display_order is None for row in parsed.decisions)
+    with pytest.raises(ValueError, match="stage_d_editorial_v3"):
+        strict_parse_stage_d_editorial({"schema_version": "stage_d_editorial_v2", "decisions": []}, event_ids=[])
 
 
 def test_stage_d_persists_private_build_rows_only():
     session_factory = _db()
     run_id = _build_with_event(session_factory)
+    client = _Client()
 
-    result = run_stage_d_job(session_factory=session_factory, run_id=run_id, ai_client=_Client())
+    result = run_stage_d_job(session_factory=session_factory, run_id=run_id, ai_client=client)
 
     assert result.selected == 1
+    assert client.calls == [[1]]
     with session_factory() as session:
         rows = session.query(IntelEventStageDSnapshot).all()
         assert len(rows) == 1
         assert rows[0].run_id == run_id
         assert rows[0].selected is True
         assert "snapshot_key" not in rows[0].metadata_json
+        stage = IntelRepository(session).get_stage(run_id, "stage_d")
+        assert stage is not None
+        assert [task.subject_type for task in stage.tasks] == ["run"]
 
 
 def test_stage_d_failure_does_not_create_a_local_fallback_report():
     session_factory = _db()
     run_id = _build_with_event(session_factory)
 
-    with pytest.raises(StageDExecutionError, match="composition"):
-        run_stage_d_job(session_factory=session_factory, run_id=run_id, ai_client=_Client(fail_composition=True))
+    with pytest.raises(StageDExecutionError, match="editorial"):
+        run_stage_d_job(session_factory=session_factory, run_id=run_id, ai_client=_Client(fail=True))
 
     with session_factory() as session:
         assert session.query(IntelEventStageDSnapshot).count() == 0

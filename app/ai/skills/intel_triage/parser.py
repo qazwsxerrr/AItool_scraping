@@ -75,14 +75,6 @@ def strict_parse_analysis(
         missing.append("selection_score")
     if not any(key in result_data for key in ("score_components", "scores", "score_breakdown")):
         missing.append("score_components")
-    if "paper_support" not in result_data and "paper" not in result_data and "paper_evidence" not in result_data:
-        missing.append("paper_support")
-    if "risk_flags" not in result_data and "risks" not in result_data and "risk" not in result_data:
-        missing.append("risk_flags")
-    if "reason" not in result_data:
-        missing.append("reason")
-    if "confidence" not in result_data:
-        missing.append("confidence")
     if missing:
         raise ValueError("Intel analysis response is missing required fields: " + ", ".join(dict.fromkeys(missing)))
 
@@ -99,16 +91,6 @@ def strict_parse_analysis(
         if normalized_source is None:
             raise ValueError("source_content_class is not supported")
         result_data["source_content_class"] = normalized_source
-    # Some providers emit explicit null for the required paper provenance
-    # token on non-paper items.  Keep the strict public contract while
-    # normalizing that harmless null to the model's neutral value instead of
-    # blocking the whole Stage-B run.
-    paper_support = result_data.get("paper_support")
-    if isinstance(paper_support, Mapping):
-        paper_support = dict(paper_support)
-        if paper_support.get("source_type") is None:
-            paper_support["source_type"] = "unknown"
-        result_data["paper_support"] = paper_support
     result_data["raw_response"] = dict(raw_mapping)
     parsed = AnalysisResult.model_validate(result_data)
     return apply_analysis_guards(parsed, item)

@@ -117,24 +117,26 @@ def build_daily_build_summary(
         run_item_statuses.get("screen_failed", 0),
         _failed_task_count(screen_tasks),
     )
-    stage_b_candidate, stage_b_filtered = _analysis_counts(analyze_tasks)
-    if not stage_b_candidate:
-        stage_b_candidate = run_item_statuses.get("candidate", 0)
-    if not stage_b_filtered:
-        stage_b_filtered = run_item_statuses.get("analysis_filtered", 0)
+    stage_b_successful, stage_b_structurally_filtered = _analysis_counts(analyze_tasks)
+    stage_b_analyzed = stage_b_successful + stage_b_structurally_filtered
+    if not stage_b_analyzed:
+        stage_b_analyzed = run_item_statuses.get("candidate", 0)
+    if not stage_b_structurally_filtered:
+        stage_b_structurally_filtered = run_item_statuses.get("analysis_filtered", 0)
+    stage_c_input = _stage_c_input_counts(cluster_tasks)
     stage_b_failed = max(
         run_item_statuses.get("analysis_failed", 0),
         _failed_task_count(analyze_tasks),
     )
 
-    stage_d_total, stage_d_selected, stage_d_watchlist, stage_d_shortlisted = _stage_d_counts(
+    stage_d_total, stage_d_selected, stage_d_watchlist = _stage_d_counts(
         session,
         run_id=run_id,
     )
     stage_d_metadata = stages_by_name.get("stage_d").metadata_dict if stages_by_name.get("stage_d") else {}
-    stage_d_shortlisted = max(
-        stage_d_shortlisted,
-        _as_nonnegative_int(stage_d_metadata.get("shortlist_count")),
+    stage_d_candidate_count = max(
+        stage_d_total,
+        _as_nonnegative_int(stage_d_metadata.get("candidate_count")),
     )
     fetch_metadata = stages_by_name.get("fetch").metadata_dict if stages_by_name.get("fetch") else {}
     fetched = _as_nonnegative_int(fetch_metadata.get("fetched")) or frozen
@@ -147,23 +149,27 @@ def build_daily_build_summary(
         within_72h = max(0, scope_items - time_excluded)
 
     funnel = {
-            "fetched": fetched,
-            "inserted": inserted,
-            "frozen": frozen,
-            "within_72h": max(0, within_72h),
-            "time_excluded": time_excluded,
-            "time_excluded_by_reason": time_excluded_by_reason,
-            "stage_a_pass": stage_a_pass,
-            "stage_a_excluded": stage_a_excluded,
-            "stage_a_failed": stage_a_failed,
-            "stage_b_candidate": stage_b_candidate,
-            "stage_b_filtered": stage_b_filtered,
-            "stage_b_failed": stage_b_failed,
-            "stage_c_events": _cluster_event_count(cluster_tasks),
-            "stage_d_total": stage_d_total,
-            "stage_d_selected": stage_d_selected,
-            "stage_d_watchlist": stage_d_watchlist,
-            "stage_d_shortlisted": stage_d_shortlisted,
+        "fetched": fetched,
+        "inserted": inserted,
+        "frozen": frozen,
+        "within_72h": max(0, within_72h),
+        "time_excluded": time_excluded,
+        "time_excluded_by_reason": time_excluded_by_reason,
+        "stage_a_pass": stage_a_pass,
+        "stage_a_excluded": stage_a_excluded,
+        "stage_a_failed": stage_a_failed,
+        "stage_b_analyzed": stage_b_analyzed,
+        "stage_b_structurally_filtered": stage_b_structurally_filtered,
+        "stage_b_failed": stage_b_failed,
+        "stage_c_input_selected": stage_c_input["selected"],
+        "stage_c_input_below_min_score": stage_c_input["below_min_score"],
+        "stage_c_input_structurally_filtered": stage_c_input["analysis_filtered"],
+        "stage_c_input_invalid_contract": stage_c_input["invalid_contract"],
+        "stage_c_events": _cluster_event_count(cluster_tasks),
+        "stage_d_total": stage_d_total,
+        "stage_d_candidate_count": stage_d_candidate_count,
+        "stage_d_selected": stage_d_selected,
+        "stage_d_watchlist": stage_d_watchlist,
     }
     funnel["full_rebuild_items"] = frozen
     return {
@@ -256,26 +262,16 @@ def _stage_details(
             "stage_d_version",
             "profile_version",
             "stage_d_source",
-            "assessment_prompt_version",
-            "composition_prompt_version",
-            "assessment_batch_count",
-            "assessed_count",
-            "shortlist_count",
+            "prompt_version",
+            "candidate_count",
             "selected_count",
             "watchlist_count",
             "omitted_count",
-            "assessment_batch_size",
-            "assessment_concurrency",
-            "assessment_retries",
-            "shortlist_max",
             "total_max",
             "watchlist_max",
-            "paper_hard_gate",
+            "recent_history_days",
             "model",
             "provider_attempts",
-            "assessment_provider_attempts",
-            "composition_provider_attempts",
-            "fallback_reason",
             "failed_phase",
             "response_hash",
             "provider_status_code",
@@ -378,18 +374,49 @@ def _screen_decision_counts(tasks: list[IntelRunStageTask]) -> tuple[int, int]:
 
 
 def _analysis_counts(tasks: list[IntelRunStageTask]) -> tuple[int, int]:
-    candidates = 0
+    analyzed = 0
     filtered = 0
     for task in tasks:
+        if task.subject_type != "item":
+            continue
         if task.status != "succeeded":
             continue
         result = _result_mapping(task)
-        reason = str(result.get("reason") or "").casefold()
-        if bool(result.get("filtered")) or reason.startswith("analysis_filtered:"):
+        if bool(result.get("filtered")) or bool(result.get("analysis_filtered_reason")):
             filtered += 1
         else:
-            candidates += 1
-    return candidates, filtered
+            analyzed += 1
+    return analyzed, filtered
+
+
+def _stage_c_input_counts(tasks: list[IntelRunStageTask]) -> dict[str, int]:
+    """Read the Stage-C input audit persisted alongside its aggregation task."""
+
+    empty = {
+        "selected": 0,
+        "below_min_score": 0,
+        "analysis_filtered": 0,
+        "invalid_contract": 0,
+    }
+    for task in tasks:
+        if task.subject_type != "run" or task.status != "succeeded":
+            continue
+        audit = _result_mapping(task).get("input_audit")
+        if not isinstance(audit, dict):
+            continue
+        excluded_counts = audit.get("excluded_counts")
+        if not isinstance(excluded_counts, dict):
+            excluded_counts = {}
+        return {
+            "selected": _as_nonnegative_int(audit.get("selected_count")),
+            "below_min_score": _as_nonnegative_int(excluded_counts.get("below_min_score")),
+            "analysis_filtered": _as_nonnegative_int(excluded_counts.get("analysis_filtered")),
+            "invalid_contract": sum(
+                _as_nonnegative_int(excluded_counts.get(key))
+                for key in ("missing_item", "missing_review")
+            ),
+        }
+    return empty
 
 
 def _failed_task_count(tasks: list[IntelRunStageTask]) -> int:
@@ -411,7 +438,7 @@ def _stage_d_counts(
     session: Session,
     *,
     run_id: int,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int]:
     rows = session.scalars(
         select(IntelEventStageDSnapshot)
         .where(
@@ -421,14 +448,12 @@ def _stage_d_counts(
     total = len(rows)
     selected = sum(1 for row in rows if bool(row.selected))
     watchlist = 0
-    shortlisted = selected
     for row in rows:
         metadata = _json_mapping(row.metadata_json)
         tier = str(metadata.get("editorial_tier") or "").strip().casefold()
         if not row.selected and tier == "watchlist":
             watchlist += 1
-            shortlisted += 1
-    return total, selected, watchlist, shortlisted
+    return total, selected, watchlist
 
 
 def _result_mapping(task: IntelRunStageTask) -> dict[str, Any]:

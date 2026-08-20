@@ -295,7 +295,7 @@ def pipeline_stage_b(
     retry_failed: bool = typer.Option(False, "--retry-failed", help="Retry failed Stage B tasks only."),
     include_blocked: bool = typer.Option(False, "--include-blocked", help="Include blocked Stage B tasks."),
 ) -> None:
-    """Run only Stage B (full analysis) for the current daily draft."""
+    """Run Stage B analysis for the current daily draft."""
 
     configure_logging()
     settings = Settings.from_env()
@@ -310,7 +310,7 @@ def pipeline_stage_b(
     )
     typer.echo(
         f"stage-b: processed={result.processed} analyzed={result.analyzed} "
-        f"filtered={result.analysis_filtered} candidate={result.candidate} "
+        f"structurally_filtered={result.analysis_filtered} "
         f"failed={result.analysis_failed} skipped={result.skipped}"
     )
 
@@ -318,10 +318,9 @@ def pipeline_stage_b(
 @pipeline_app.command("stage-c")
 def pipeline_stage_c(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to process."),
-    limit: int | None = typer.Option(DEFAULT_AI_REVIEW_LIMIT, "--limit", min=1),
     force: bool = typer.Option(False, "--force", help="Re-run Stage C only."),
 ) -> None:
-    """Run only Stage C event clustering for the current daily draft."""
+    """Run the single-call Stage C story aggregation for the current draft."""
 
     configure_logging()
     settings = Settings.from_env()
@@ -329,12 +328,11 @@ def pipeline_stage_c(
     result = run_pipeline_stage_c_from_settings(
         settings=workspace_settings,
         run_id=run_id,
-        limit=limit,
         force=force,
     )
     typer.echo(
         f"stage-c: processed={result.processed} events={result.events} "
-        f"repeats={result.repeats} failed={result.failed}"
+        f"merged={result.merged} repeats={result.repeats} updated={result.updated}"
     )
 
 

@@ -1,48 +1,49 @@
-"""Stage C event aggregation with bounded history and source provenance."""
+"""Stage C: successful Stage-B projections become aggregated stories in one AI call."""
 
 from __future__ import annotations
 
-import json
 import hashlib
-import logging
+import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
-from app.ai.event_resolution import event_resolution_client_from_settings, resolve_event_group
 from app.ai.skills.intel_triage import normalize_url
-from app.config.limits import DEFAULT_AI_REVIEW_LIMIT, RECENT_WINDOW_HOURS
-from app.domain.models import COMMUNITY_SOCIAL
-from app.domain.policies import is_first_party_x_source
-from app.domain.recency import recent_window_decision
+from app.ai.skills.stage_c_aggregation import (
+    STAGE_C_PROMPT_VERSION,
+    STAGE_C_SCHEMA_VERSION,
+    StageCAggregationCallResult,
+    StageCAggregationClient,
+    StageCStoryCluster,
+    strict_parse_stage_c_aggregation,
+)
+from app.config.limits import (
+    DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE,
+    STAGE_C_INPUT_POLICY_VERSION,
+)
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import (
     DailyEdition,
     DailyEditionReportEntry,
     IntelEvent,
-    IntelEventItem,
     IntelItem,
     IntelRun,
     IntelRunItem,
+    IntelRunStage,
+    IntelRunStageTask,
 )
-from app.storage.repository import DAILY_EDITION_TIMEZONE, IntelRepository
+from app.storage.repository import IntelRepository
 
-LOGGER = logging.getLogger(__name__)
-_TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
-_STOPWORDS = {"a", "an", "and", "for", "from", "new", "the", "to", "of", "in", "on", "with", "发布", "推出", "上线", "更新", "官方", "ai", "model", "release", "update"}
-# Stage C v2: only a high-confidence, multi-signal match is merged without
-# review.  Lower candidate matches are an AI ambiguity problem, never an
-# implicit transitive merge.
-SEMANTIC_REPEAT_THRESHOLD = 0.80
-SEMANTIC_AMBIGUITY_THRESHOLD = 0.55
+
 DAILY_HISTORY_DAYS = 3
+_TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
 
 
 @dataclass
@@ -52,30 +53,17 @@ class EventClusterResult:
     events: int = 0
     merged: int = 0
     repeats: int = 0
-    ambiguous: int = 0
-    ai_resolved: int = 0
-    ai_failed: int = 0
-    snapshots: int = 0
-    failed: int = 0
-    errors: list[str] = field(default_factory=list)
+    updated: int = 0
     event_ids: list[int] = field(default_factory=list)
-    # Stage D needs the complete current Stage-C projection, including
-    # candidates that were matched to an event already created in this build.
     current_event_ids: list[int] = field(default_factory=list)
     reference_time: datetime | None = None
-
-    @property
-    def new_event_ids(self) -> list[int]:
-        return self.event_ids
+    input_audit: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
-class _GroupResolution:
-    groups: tuple[tuple[dict[str, Any], ...], ...]
-    method: str
-    confidence: int
-    raw: Any = None
-    risk_flags: tuple[str, ...] = ()
+class _StageCInputSelection:
+    items: list[IntelItem]
+    audit: dict[str, Any]
 
 
 def normalize_event_title(value: Any) -> str:
@@ -113,7 +101,11 @@ def canonical_event_url(value: Any) -> str | None:
     if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
         netloc = f"{host}:{port}"
     path = parts.path.rstrip("/") or "/"
-    query_items = [(key, query_value) for key, query_value in parse_qsl(parts.query, keep_blank_values=True) if not key.casefold().startswith("utm_") and key.casefold() not in _TRACKING_QUERY_KEYS]
+    query_items = [
+        (key, query_value)
+        for key, query_value in parse_qsl(parts.query, keep_blank_values=True)
+        if not key.casefold().startswith("utm_") and key.casefold() not in _TRACKING_QUERY_KEYS
+    ]
     query_items.sort(key=lambda pair: (pair[0], pair[1]))
     return urlunsplit((scheme, netloc, path, urlencode(query_items, doseq=True), ""))
 
@@ -125,76 +117,12 @@ def _normalize_external_id(value: Any) -> str | None:
     return text or None
 
 
-def github_repo_identity(value: Any) -> str | None:
-    """Return a stable ``owner/repo`` identity for GitHub repository items.
-
-    The collector's ``github_repo:owner/repo`` external id is authoritative.
-    URL parsing is only a fallback, and deliberately uses the first two
-    GitHub path components so issue, commit and other repository sub-pages
-    remain attached to the same repository identity.
-    """
-
-    values = _mapping(value)
-    if not values and isinstance(value, str):
-        values = {"canonical_url": value}
-
-    external_id = _normalize_external_id(values.get("external_id") or values.get("guid"))
-    if external_id and external_id.startswith("github_repo:"):
-        parts = [part for part in external_id.split(":", 1)[1].split("/") if part]
-        if len(parts) >= 2:
-            owner = parts[0].strip()
-            repo = parts[1].removesuffix(".git").strip()
-            if owner and repo:
-                return f"{owner}/{repo}".casefold()
-
-    for name in ("canonical_url", "url", "source_url"):
-        raw = values.get(name)
-        if raw is None:
-            continue
-        text = str(raw).strip()
-        if not text:
-            continue
-        if "://" not in text and text.casefold().startswith(("github.com/", "www.github.com/")):
-            text = f"https://{text}"
-        try:
-            parsed = urlsplit(text)
-        except ValueError:
-            continue
-        host = (parsed.hostname or "").casefold()
-        if host not in {"github.com", "www.github.com"}:
-            continue
-        parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) < 2:
-            continue
-        owner = parts[0].strip()
-        repo = re.sub(r"\.git$", "", parts[1], flags=re.IGNORECASE).strip()
-        if owner and repo:
-            return f"{owner}/{repo}".casefold()
-    return None
-
-
 def exact_identity_keys(value: Any) -> tuple[str, ...]:
-    """Return stable identity anchors only (URL/external id, never title)."""
-
     values = _mapping(value)
     url = canonical_event_url(values.get("canonical_url") or values.get("url") or values.get("source_url"))
     external_id = _normalize_external_id(values.get("external_id") or values.get("guid"))
-    keys: list[str] = []
-    if url:
-        keys.append(f"url:{url}")
-    if external_id:
-        keys.append(f"external:{external_id}")
+    keys = [value for value in (f"url:{url}" if url else None, f"external:{external_id}" if external_id else None) if value]
     return tuple(dict.fromkeys(keys))
-
-
-def _weak_title_key(value: Any) -> str | None:
-    values = _mapping(value)
-    title = normalize_event_title(values.get("normalized_title") or values.get("title") or values.get("original_title"))
-    return f"title:{title}" if title else None
-
-
-def _strong_identity_keys(value: Any) -> frozenset[str]:
-    return frozenset(key for key in exact_identity_keys(value) if key.startswith(("url:", "external:")))
 
 
 def canonical_event_key(value: Any) -> str:
@@ -208,420 +136,538 @@ def canonical_event_key(value: Any) -> str:
         except (TypeError, ValueError, OverflowError):
             continue
         if item_id > 0:
-            # A title-only item is a weak identity candidate, not a durable
-            # event key.  The primary item ID keeps it distinct until Stage C
-            # can establish a real URL/external-id or an explicit AI merge.
             return f"item:{item_id}"
-    return _weak_title_key(value) or "item:unknown"
-
-
-def _text_tokens(value: Any) -> frozenset[str]:
-    normalized = normalize_event_title(value)
-    words = {token for token in re.findall(r"[a-z0-9_]+", normalized) if token not in _STOPWORDS and len(token) > 1}
-    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", normalized))
-    if len(cjk) >= 2:
-        words.update(cjk[index : index + 2] for index in range(len(cjk) - 1))
-    elif cjk:
-        words.add(cjk)
-    return frozenset(words)
-
-
-def _title_tokens(value: Any) -> frozenset[str]:
-    return _text_tokens(value)
-
-
-def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
-    if not left or not right:
-        return 0.0
-    return len(left & right) / len(left | right)
-
-
-def _normalized_keyword_terms(values: Any) -> frozenset[str]:
-    """Return stable, casefolded keyword labels for conservative matching."""
-
-    if values is None:
-        return frozenset()
-    if isinstance(values, str):
-        values = [values]
-    if not isinstance(values, Iterable) or isinstance(values, Mapping):
-        values = [values]
-    result: set[str] = set()
-    for value in values:
-        normalized = normalize_event_title(value)
-        if normalized and normalized not in _STOPWORDS:
-            result.add(normalized)
-    return frozenset(result)
-
-
-def _typed_entity_keys(values: Any) -> frozenset[str]:
-    """Normalize typed entities as ``type:name`` keys for overlap scoring."""
-
-    if values is None:
-        return frozenset()
-    if isinstance(values, Mapping) or isinstance(values, str):
-        values = [values]
-    if not isinstance(values, Iterable):
-        values = [values]
-    result: set[str] = set()
-    for value in values:
-        if not isinstance(value, Mapping):
-            continue
-        entity_type = value.get("type") or value.get("entity_type") or value.get("kind") or value.get("category")
-        entity_name = value.get("name") or value.get("text") or value.get("value") or value.get("entity")
-        name = normalize_event_title(entity_name)
-        if not name:
-            continue
-        result.add(f"{normalize_event_title(entity_type) if entity_type else ''}:{name}")
-    return frozenset(result)
-
-
-def _field(value: Any, name: str, default: Any = None) -> Any:
-    if isinstance(value, Mapping):
-        return value.get(name, default)
-    return getattr(value, name, default)
-
-
-def _json_objects(value: Any) -> list[dict[str, Any]]:
-    try:
-        parsed = json.loads(value) if isinstance(value, str) else value
-    except (TypeError, ValueError, json.JSONDecodeError):
-        parsed = []
-    if not isinstance(parsed, list):
-        return []
-    return [dict(item) for item in parsed if isinstance(item, Mapping)]
-
-
-def _semantic_match_components(left: Any, right: Any) -> tuple[float, float, float, float]:
-    """Return title, keyword, entity and v2 weighted semantic score.
-
-    The public tuple shape remains stable for callers; summary similarity is
-    deliberately included in the combined score rather than being hidden
-    behind a title-only shortcut.
-    """
-
-    title_score = _jaccard(_title_tokens(_field(left, "title") or _field(left, "normalized_title")), _title_tokens(_field(right, "title") or _field(right, "normalized_title")))
-    summary_score = _jaccard(
-        _text_tokens(_field(left, "summary_cn") or _field(left, "summary")),
-        _text_tokens(_field(right, "summary_cn") or _field(right, "summary")),
-    )
-    left_keywords = _field(left, "keywords", [])
-    right_keywords = _field(right, "keywords", _json_list(_field(right, "keywords_json")))
-    keyword_score = _jaccard(_normalized_keyword_terms(left_keywords), _normalized_keyword_terms(right_keywords))
-    left_entities = _field(left, "entities", [])
-    right_entities = _field(right, "entities", _json_objects(_field(right, "entities_json")))
-    entity_score = _jaccard(_typed_entity_keys(left_entities), _typed_entity_keys(right_entities))
-    combined_score = 0.40 * title_score + 0.25 * summary_score + 0.20 * entity_score + 0.15 * keyword_score
-    return title_score, keyword_score, entity_score, combined_score
-
-
-def _semantic_match_score(left: Any, right: Any) -> float:
-    return _semantic_match_components(left, right)[3]
-
-
-def cluster_candidates(candidates: Iterable[Any], *, title_threshold: float = SEMANTIC_AMBIGUITY_THRESHOLD, fuzzy: bool = True) -> list[list[Any]]:
-    rows = [_candidate(value) for value in candidates]
-    if not rows:
-        return []
-    groups = _safe_groups(rows, fuzzy_threshold=title_threshold if fuzzy else None)
-    return [[row["item"] for row in group] for group, _ambiguous in groups]
-
-
-def build_candidate_clusters(candidates: Iterable[Any], **kwargs: Any) -> list[list[Any]]:
-    return cluster_candidates(candidates, **kwargs)
-
-
-def _candidate(value: Any) -> dict[str, Any]:
-    values = _mapping(value)
-    title = values.get("title") or values.get("original_title") or ""
-    return {"item": value, "identity_keys": exact_identity_keys(values), "github_repo_identity": github_repo_identity(values), "title": str(title), "summary_cn": values.get("summary_cn") or values.get("summary"), "title_tokens": _title_tokens(title), "topic": _text(values.get("topic")), "content_class": _text(values.get("content_class")), "keywords": values.get("keywords", []), "entities": values.get("entities", [])}
-
-
-def _compatible_candidate(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    # Topic/content class describe presentation, not real-world identity.
-    # They must not force two reports about one announcement apart.
-    left_repo = left.get("github_repo_identity") or github_repo_identity(left)
-    right_repo = right.get("github_repo_identity") or github_repo_identity(right)
-    if left_repo and right_repo and left_repo != right_repo:
-        return False
-    return True
-
-
-def _safe_groups(
-    rows: Sequence[dict[str, Any]],
-    *,
-    fuzzy_threshold: float | None,
-) -> list[tuple[list[dict[str, Any]], bool]]:
-    """Build conservative groups without union-find transitive collapse.
-
-    A new fuzzy member must satisfy the threshold against every member of the
-    candidate group.  Thus A~B and B~C cannot pull C into A's event when
-    A~C is weak.  URL/external identity anchors may still join directly.
-    """
-
-    groups: list[list[dict[str, Any]]] = []
-    for row in rows:
-        anchors = set(row.get("identity_keys", ()))
-        exact_indexes = [
-            index
-            for index, group in enumerate(groups)
-            if anchors
-            and all(_compatible_candidate(row, member) for member in group)
-            and any(anchors & set(member.get("identity_keys", ())) for member in group)
-        ]
-        if exact_indexes:
-            first = exact_indexes[0]
-            groups[first].append(row)
-            # Strong identity may bridge aliases.  This is intentionally the
-            # only transitive operation; fuzzy signals never use it.
-            for index in reversed(exact_indexes[1:]):
-                groups[first].extend(groups.pop(index))
-            continue
-        if fuzzy_threshold is None:
-            groups.append([row])
-            continue
-        eligible: list[tuple[float, int]] = []
-        for index, group in enumerate(groups):
-            if not all(_compatible_candidate(row, member) for member in group):
-                continue
-            scores = [_semantic_match_score(row, member) for member in group]
-            if scores and min(scores) >= fuzzy_threshold:
-                eligible.append((sum(scores) / len(scores), index))
-        if eligible:
-            _score, index = max(eligible, key=lambda value: (value[0], -value[1]))
-            groups[index].append(row)
-        else:
-            groups.append([row])
-
-    result: list[tuple[list[dict[str, Any]], bool]] = []
-    for group in groups:
-        fuzzy_scores = [
-            _semantic_match_score(group[left], group[right])
-            for left in range(len(group))
-            for right in range(left + 1, len(group))
-            if not (set(group[left].get("identity_keys", ())) & set(group[right].get("identity_keys", ())))
-        ]
-        ambiguous = bool(fuzzy_scores and min(fuzzy_scores) < SEMANTIC_REPEAT_THRESHOLD)
-        result.append((group, ambiguous))
-    return result
+    title = normalize_event_title(values.get("title") or values.get("original_title"))
+    return f"title:{title}" if title else "item:unknown"
 
 
 def run_event_cluster_job(
     *,
     session_factory: sessionmaker[Session],
-    ai_client: Any | None = None,
-    limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
+    run_id: int,
+    ai_client: Any,
     force: bool = False,
     now: datetime | None = None,
     reference_time: datetime | None = None,
-    history_hook: Callable[..., Any] | None = None,
-    history_provider: Callable[..., Any] | None = None,
-    item_ids: Iterable[int] | None = None,
-    run_id: int,
-    **_: Any,
+    input_min_score: int = DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE,
 ) -> EventClusterResult:
-    """Aggregate current Stage-B candidates into new or historical events.
+    """Aggregate the current Stage-B item set in one AI request."""
 
-    The build's reference time and Stage-B membership are durable inputs. A
-    retry never invokes Stage A/B or consults a global item projection.
-    """
+    result = EventClusterResult(run_id=int(run_id))
+    owner = "stage-c-ai-aggregation"
+    raw_response: Any | None = None
+    request_metadata: Mapping[str, Any] | None = None
+    min_score = _bounded_score(input_min_score, DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE)
+    model_name = str(getattr(ai_client, "model", None) or "custom")
+    config_fingerprint = _stage_c_config_fingerprint(
+        model_name=model_name,
+        input_min_score=min_score,
+    )
 
-    result = EventClusterResult(run_id=run_id)
-    del history_hook, history_provider
-    stage = None
-    stage_task = None
-    owner = "event-cluster"
     with session_factory() as session:
-        try:
-            repo = IntelRepository(session)
-            run = session.get(IntelRun, int(run_id))
-            if run is None or run.edition_id is None:
-                raise ValueError("Stage C requires the current daily edition build")
-            frozen_reference = _as_utc(reference_time) or _as_utc(run.reference_time)
-            frozen_reference = frozen_reference or _as_utc(now) or datetime.now(timezone.utc)
-            stage = repo.ensure_stage(
-                int(run_id),
-                "cluster",
-                reference_time=frozen_reference,
-                metadata={
-                    "history_mode": "prior_published_daily_reports",
-                    "daily_history_days": DAILY_HISTORY_DAYS,
-                    "freshness_window_hours": RECENT_WINDOW_HOURS,
-                },
-            )
-            current = _as_utc(stage.reference_time if stage is not None else frozen_reference) or frozen_reference
-            result.reference_time = current
-            items = _load_cluster_items(
-                session,
-                run_id=run_id,
-                item_ids=item_ids,
-                limit=limit,
-                stage=stage,
-                reference_time=current,
-            )
-            candidates = [_item_candidate(item) for item in items]
-            result.processed = len(candidates)
-            input_fingerprint = _cluster_input_fingerprint(candidates)
-            stage_task = repo.ensure_stage_task(
-                stage,
-                subject_type="run",
-                subject_id=int(run_id),
-                target_run_id=int(run_id),
+        repo = IntelRepository(session)
+        run = session.get(IntelRun, int(run_id))
+        if run is None or run.edition_id is None:
+            raise ValueError("Stage C requires the current daily edition build")
+        frozen_reference = _as_utc(reference_time) or _as_utc(run.reference_time) or _as_utc(now)
+        frozen_reference = frozen_reference or datetime.now(timezone.utc)
+        stage = repo.ensure_stage(
+            int(run_id),
+            "cluster",
+            config_fingerprint=config_fingerprint,
+            reference_time=frozen_reference,
+            metadata={
+                "aggregation_mode": "ai_single_call",
+                "history_mode": "prior_published_daily_reports",
+                "daily_history_days": DAILY_HISTORY_DAYS,
+                "prompt_version": STAGE_C_PROMPT_VERSION,
+                "input_policy_version": STAGE_C_INPUT_POLICY_VERSION,
+                "input_min_score": min_score,
+            },
+        )
+        current = _as_utc(stage.reference_time) or frozen_reference
+        result.reference_time = current
+        selection = _load_cluster_items(
+            session,
+            run_id=int(run_id),
+            input_min_score=min_score,
+        )
+        result.input_audit = selection.audit
+        candidates = [_item_candidate(item) for item in selection.items]
+        history = _load_published_daily_history(session, run=run, days=DAILY_HISTORY_DAYS)
+        result.processed = len(candidates)
+        input_fingerprint = _cluster_input_fingerprint(candidates, history)
+        task = repo.ensure_stage_task(
+            stage,
+            subject_type="run",
+            subject_id=int(run_id),
+            target_run_id=int(run_id),
+            input_fingerprint=input_fingerprint,
+            config_fingerprint=config_fingerprint,
+        )
+        claimed = repo.claim_stage_task(
+            stage,
+            task_id=task.id,
+            owner=owner,
+            force=force,
+            input_fingerprint=input_fingerprint,
+            config_fingerprint=config_fingerprint,
+        )
+        if claimed is None:
+            if repo.task_is_reusable(
+                task,
                 input_fingerprint=input_fingerprint,
-                config_fingerprint="cluster-v2",
-            )
-            claimed = repo.claim_stage_task(
-                stage,
-                task_id=stage_task.id,
-                owner=owner,
-                force=force,
-                input_fingerprint=input_fingerprint,
-                config_fingerprint="cluster-v2",
-            )
-            if claimed is None:
-                if repo.task_is_reusable(
-                    stage_task,
-                    input_fingerprint=input_fingerprint,
-                    config_fingerprint="cluster-v2",
-                ):
-                    stored = _mapping(stage_task.result)
-                    result.event_ids = _event_id_list(stored.get("event_ids"))
-                    result.current_event_ids = _event_id_list(
-                        stored.get("current_event_ids"),
-                        fallback=result.event_ids,
-                    )
-                    result.processed = 0
-                    return result
-                result.failed = 1
-                result.errors.append("cluster stage is already running")
+                config_fingerprint=config_fingerprint,
+            ):
+                stored = _mapping(task.result)
+                result.event_ids = _event_id_list(stored.get("event_ids"))
+                result.current_event_ids = _event_id_list(stored.get("current_event_ids"))
+                result.input_audit = _mapping(stored.get("input_audit"))
+                result.processed = 0
                 return result
-            stage_task = claimed
-            # Keep the lease/task claim durable independently from event
-            # writes. A failed group must not roll it back.
-            session.commit()
-            history_events = _load_history_events(
-                session,
-                run=run,
-            )
-            in_run_events: dict[int, IntelEvent] = {}
-            for values, fuzzy_group in _cluster_rows(candidates):
-                try:
-                    with session.begin_nested():
-                        if fuzzy_group:
-                            result.ambiguous += 1
-                        resolution = _resolve_ambiguous_group(values, ai_client=ai_client, ambiguous=fuzzy_group)
-                        if resolution.method.startswith("ai"):
-                            result.ai_resolved += 1
-                        if "resolver_failed" in resolution.risk_flags:
-                            result.ai_failed += 1
-                        for subgroup in resolution.groups:
-                            event, is_new, _ = _persist_group(
-                                session,
-                                subgroup,
-                                current=current,
-                                run_id=run_id,
-                                history_events=history_events,
-                                in_run_events=in_run_events,
-                                resolver=resolution,
-                                ai_client=ai_client,
-                            )
-                            if is_new:
-                                result.events += 1
-                                if event.id not in result.event_ids:
-                                    result.event_ids.append(event.id)
-                            else:
-                                result.repeats += 1
-                            if event.id not in result.current_event_ids:
-                                result.current_event_ids.append(event.id)
-                            result.merged += max(0, len(subgroup) - 1)
-                            if event.id not in {row.id for row in history_events}:
-                                history_events.append(event)
-                            in_run_events[event.id] = event
-                except Exception as exc:
-                    result.failed += 1
-                    result.errors.append(f"event_group={values[0].get('id')}: {exc}")
-                    LOGGER.exception("Event aggregation failed for group %s", values[0].get("id"))
-                    # The nested transaction above isolates one bad group;
-                    # already persisted events and the stage lease survive.
-            session.commit()
-            if result.failed:
-                repo.fail_stage_task(
-                    stage_task,
-                    error_category="stage",
-                    error_code="cluster_group_failed",
-                    error_message="; ".join(result.errors)[-4000:],
-                    retryable=True,
-                    owner=owner,
-                )
-            else:
+            raise RuntimeError("Stage C task is already running")
+        task = claimed
+        session.commit()
+
+        try:
+            if not candidates:
+                _clear_build_events(session, run_id=int(run_id))
                 repo.complete_stage_task(
-                    stage_task,
+                    task,
                     owner=owner,
                     result={
-                        "event_ids": result.event_ids,
-                        "current_event_ids": result.current_event_ids,
-                        "processed": result.processed,
+                        "schema_version": STAGE_C_SCHEMA_VERSION,
+                        "event_ids": [],
+                        "current_event_ids": [],
+                        "processed": 0,
+                        "clusters": 0,
+                        "input_audit": result.input_audit,
                     },
+                    metadata={"input_audit": result.input_audit},
                 )
+                session.commit()
+                return result
+
+            if ai_client is None or not callable(getattr(ai_client, "aggregate", None)):
+                raise TypeError("Stage C requires an AI client with aggregate()")
+            call = ai_client.aggregate(
+                candidates,
+                recent_history=history,
+                edition={
+                    "edition_date": run.edition_date,
+                    "reference_time": current.isoformat(),
+                },
+            )
+            if not isinstance(call, StageCAggregationCallResult):
+                raise TypeError("Stage C aggregate() must return StageCAggregationCallResult")
+            raw_response = call.raw_response
+            request_metadata = call.request_metadata
+            parsed = strict_parse_stage_c_aggregation(
+                call.parsed.model_dump(mode="json"),
+                item_ids=[int(row["id"]) for row in candidates],
+                prior_event_keys=[str(row["event_key"]) for row in history],
+            )
+            _clear_build_events(session, run_id=int(run_id))
+            by_id = {int(row["id"]): row for row in candidates}
+            event_keys: set[str] = set()
+            for cluster in parsed.clusters:
+                event_key = cluster.prior_event_key or canonical_event_key(by_id[cluster.primary_item_id])
+                if event_key in event_keys:
+                    raise ValueError(f"Stage C response produces duplicate event_key: {event_key}")
+                event_keys.add(event_key)
+                event = _persist_ai_cluster(
+                    session,
+                    run_id=int(run_id),
+                    current=current,
+                    cluster=cluster,
+                    candidates=by_id,
+                    request_metadata=request_metadata,
+                )
+                result.current_event_ids.append(int(event.id))
+                result.merged += max(0, len(cluster.members) - 1)
+                if cluster.novelty_status == "new":
+                    result.events += 1
+                    result.event_ids.append(int(event.id))
+                elif cluster.novelty_status == "updated":
+                    result.updated += 1
+                else:
+                    result.repeats += 1
+
+            repo.complete_stage_task(
+                task,
+                owner=owner,
+                result={
+                    "schema_version": STAGE_C_SCHEMA_VERSION,
+                    "event_ids": result.event_ids,
+                    "current_event_ids": result.current_event_ids,
+                    "processed": result.processed,
+                    "clusters": len(parsed.clusters),
+                    "input_audit": result.input_audit,
+                    "request_metadata": dict(request_metadata or {}),
+                },
+                raw_response=raw_response,
+                metadata={
+                    **dict(request_metadata or {}),
+                    "input_audit": result.input_audit,
+                },
+            )
             session.commit()
+            return result
         except Exception as exc:
             session.rollback()
-            result.failed += 1
-            result.errors.append(str(exc))
-            LOGGER.exception("Event cluster job failed")
-            try:
-                with session_factory() as state_session:
-                    state_repo = IntelRepository(state_session)
-                    state_stage = state_repo.get_stage(int(run_id), "cluster")
-                    state_task = state_repo.get_task(state_stage, subject_type="run", subject_id=int(run_id)) if state_stage else None
-                    if state_task is not None and state_task.status == "running":
-                        state_repo.fail_stage_task(
-                            state_task,
-                            error_category="stage",
-                            error_code="cluster_failed",
-                            error_message=str(exc),
-                            retryable=True,
-                            owner=owner,
-                        )
-                    state_session.commit()
-            except Exception:
-                LOGGER.exception("Unable to persist cluster stage failure")
-    return result
+            raw_response = getattr(exc, "raw_response", raw_response)
+            request_metadata = getattr(exc, "request_metadata", request_metadata)
+            with session_factory() as failure_session:
+                failure_repo = IntelRepository(failure_session)
+                failure_stage = failure_repo.get_stage(int(run_id), "cluster")
+                failure_task = (
+                    failure_repo.get_task(
+                        failure_stage,
+                        subject_type="run",
+                        subject_id=int(run_id),
+                    )
+                    if failure_stage is not None
+                    else None
+                )
+                if failure_task is not None and failure_task.status == "running":
+                    failure_repo.fail_stage_task(
+                        failure_task,
+                        error_category="provider",
+                        error_code="stage_c_ai_aggregation_failed",
+                        error_message=str(exc),
+                        retryable=False,
+                        raw_response={
+                            "provider_response": raw_response,
+                            "request_metadata": dict(request_metadata or {}),
+                        },
+                        owner=owner,
+                    )
+                failure_session.commit()
+            raise
 
 
-def run_event_cluster_from_settings(*, settings: Settings, ai_client: Any | None = None, **kwargs: Any) -> EventClusterResult:
+def run_event_cluster_from_settings(
+    *,
+    settings: Settings,
+    run_id: int,
+    ai_client: Any | None = None,
+    force: bool = False,
+    now: datetime | None = None,
+    reference_time: datetime | None = None,
+) -> EventClusterResult:
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
-    resolver = ai_client
-    if resolver is None:
-        resolver = event_resolution_client_from_settings(settings)
-    return run_event_cluster_job(session_factory=create_session_factory(engine), ai_client=resolver, **kwargs)
+    client = ai_client or StageCAggregationClient.from_settings(settings)
+    return run_event_cluster_job(
+        session_factory=create_session_factory(engine),
+        ai_client=client,
+        run_id=run_id,
+        force=force,
+        now=now,
+        reference_time=reference_time,
+        input_min_score=settings.ai_stage_c_input_min_score,
+    )
 
 
-def _cluster_input_fingerprint(candidates: Sequence[Mapping[str, Any]]) -> str:
-    payload = [
-        {
-            "id": int(value.get("id")),
-            "title": value.get("title"),
-            "summary_cn": value.get("summary_cn"),
-            "url": value.get("canonical_url"),
-            "external_id": value.get("external_id"),
-            "topic": value.get("topic"),
-            "content_class": value.get("content_class"),
-            "keywords": value.get("keywords"),
-            "entities": value.get("entities"),
-            "published_at": _iso_datetime(value.get("published_at")),
-            "score": value.get("selection_score"),
+def _load_cluster_items(
+    session: Session,
+    *,
+    run_id: int,
+    input_min_score: int,
+) -> _StageCInputSelection:
+    """Build Stage C's auditable, deterministic input set from Stage-B items."""
+
+    stage = session.scalar(
+        select(IntelRunStage).where(
+            IntelRunStage.run_id == int(run_id),
+            IntelRunStage.stage_name == "analyze",
+        )
+    )
+    if stage is None:
+        raise ValueError("Stage C requires the Stage B analysis stage")
+    if str(stage.status) in {"pending", "running", "retry_waiting"}:
+        raise ValueError("Stage C requires the Stage B analysis stage to finish before aggregation")
+    if str(stage.status) not in {"succeeded", "failed", "blocked"}:
+        raise ValueError("Stage C requires a terminal Stage B analysis stage")
+
+    item_tasks = list(
+        session.scalars(
+            select(IntelRunStageTask)
+            .where(
+                IntelRunStageTask.stage_id == stage.id,
+                IntelRunStageTask.subject_type == "item",
+            )
+            .order_by(IntelRunStageTask.id.asc())
+        ).all()
+    )
+    active_statuses = {"pending", "running", "retry_waiting"}
+    if any(str(task.status) in active_statuses for task in item_tasks):
+        raise ValueError("Stage C requires Stage B item tasks to finish before aggregation")
+
+    status_counts: dict[str, int] = {}
+    succeeded_item_ids: list[int] = []
+    succeeded_tasks_by_item: dict[int, IntelRunStageTask] = {}
+    for task in item_tasks:
+        status = str(task.status)
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status != "succeeded":
+            continue
+        item_id = task.item_id
+        if item_id is None and str(task.subject_id).isdigit():
+            item_id = int(task.subject_id)
+        if item_id is not None and int(item_id) > 0 and int(item_id) not in succeeded_item_ids:
+            succeeded_item_ids.append(int(item_id))
+            succeeded_tasks_by_item[int(item_id)] = task
+
+    items_by_id: dict[int, IntelItem] = {}
+    if succeeded_item_ids:
+        stmt = (
+            select(IntelItem)
+            .join(IntelRunItem, IntelRunItem.item_id == IntelItem.id)
+            .where(
+                IntelRunItem.run_id == int(run_id),
+                IntelItem.id.in_(succeeded_item_ids),
+            )
+            .options(
+                joinedload(IntelItem.source),
+                joinedload(IntelItem.ai_review),
+            )
+        )
+        items_by_id = {
+            int(item.id): item
+            for item in session.scalars(stmt).unique().all()
         }
-        for value in candidates
+
+    excluded: dict[str, list[int]] = {
+        "analysis_filtered": [],
+        "below_min_score": [],
+        "missing_item": [],
+        "missing_review": [],
+    }
+    selected: list[IntelItem] = []
+    for item_id in succeeded_item_ids:
+        item = items_by_id.get(item_id)
+        if item is None:
+            excluded["missing_item"].append(item_id)
+            continue
+        review = item.ai_review
+        if (
+            item.status == "analysis_filtered"
+            or _stage_b_task_is_structurally_filtered(succeeded_tasks_by_item[item_id])
+            or _review_is_structurally_filtered(review)
+        ):
+            excluded["analysis_filtered"].append(item_id)
+            continue
+        if review is None or review.status != "success":
+            excluded["missing_review"].append(item_id)
+            continue
+        if int(review.selection_score or 0) < input_min_score:
+            excluded["below_min_score"].append(item_id)
+            continue
+        selected.append(item)
+
+    audit = {
+        "policy_version": STAGE_C_INPUT_POLICY_VERSION,
+        "min_score": input_min_score,
+        "stage_b_task_statuses": status_counts,
+        "stage_b_succeeded": len(succeeded_item_ids),
+        "selected_count": len(selected),
+        "selected_item_ids": [int(item.id) for item in selected],
+        "excluded_item_ids": excluded,
+        "excluded_counts": {reason: len(item_ids) for reason, item_ids in excluded.items()},
+    }
+    return _StageCInputSelection(items=selected, audit=audit)
+
+
+def _stage_b_task_is_structurally_filtered(task: IntelRunStageTask) -> bool:
+    result = task.result
+    if not isinstance(result, Mapping):
+        return False
+    if bool(result.get("filtered")):
+        return True
+    return bool(result.get("analysis_filtered_reason"))
+
+
+def _review_is_structurally_filtered(review: Any) -> bool:
+    # Structural filtering is recorded on the Stage-B task result.  The B1
+    # review projection no longer has a free-form reason field.
+    del review
+    return False
+
+
+def _load_published_daily_history(
+    session: Session,
+    *,
+    run: IntelRun,
+    days: int,
+) -> list[dict[str, Any]]:
+    if days <= 0 or run.edition_id is None or not run.edition_date:
+        return []
+    current_edition = date.fromisoformat(run.edition_date)
+    earliest = current_edition - timedelta(days=days)
+    rows = session.execute(
+        select(DailyEditionReportEntry, DailyEdition)
+        .join(DailyEdition, DailyEdition.id == DailyEditionReportEntry.edition_id)
+        .where(
+            DailyEdition.edition_date >= earliest,
+            DailyEdition.edition_date < current_edition,
+            DailyEdition.published_at.is_not(None),
+        )
+        .order_by(DailyEdition.edition_date.desc(), DailyEditionReportEntry.display_order.asc())
+    ).all()
+    return [
+        {
+            "event_key": entry.event_key,
+            "edition_date": edition.edition_date.isoformat(),
+            "title": entry.original_title or entry.title,
+            "summary_cn": entry.summary,
+            "url": canonical_event_url(entry.url),
+            "topic": entry.topic,
+            "content_class": entry.content_class,
+            "source_ids": entry.source_ids,
+            "keywords": entry.keywords,
+            "entities": entry.entities,
+            "metadata": entry.metadata_dict,
+        }
+        for entry, edition in rows
     ]
+
+
+def _item_candidate(item: IntelItem) -> dict[str, Any]:
+    review = item.ai_review
+    source = item.source
+    topics = list(review.topics) if review is not None else []
+    if review is not None and review.topic and review.topic not in topics:
+        topics.insert(0, review.topic)
+    return {
+        "id": int(item.id),
+        "source_id": item.source_id,
+        "source_group": source.source_group if source else None,
+        "source_role": source.source_role if source else None,
+        "source_subtype": source.source_subtype if source else None,
+        "primary_eligible": bool(source.primary_eligible) if source else False,
+        "content_class": (review.content_class if review else None) or item.content_class,
+        "canonical_url": canonical_event_url(item.canonical_url),
+        "external_id": _normalize_external_id(item.external_id),
+        "title": item.title,
+        "summary_cn": (review.summary_cn if review else None) or item.summary,
+        "topic": (review.topic if review else None) or (topics[0] if topics else None),
+        "topics": _clean_strings(topics),
+        "keywords": list(review.keywords) if review is not None else [],
+        "entities": list(review.entities) if review is not None else [],
+        "selection_score": _number(review.selection_score if review else item.selection_score),
+        "published_at": _iso_datetime(item.published_at or item.discovered_at or item.captured_at),
+        "captured_at": _iso_datetime(item.captured_at),
+        "identity_keys": exact_identity_keys(item),
+    }
+
+
+def _persist_ai_cluster(
+    session: Session,
+    *,
+    run_id: int,
+    current: datetime,
+    cluster: StageCStoryCluster,
+    candidates: Mapping[int, Mapping[str, Any]],
+    request_metadata: Mapping[str, Any],
+):
+    repo = IntelRepository(session)
+    members = [candidates[member.item_id] for member in cluster.members]
+    primary = candidates[cluster.primary_item_id]
+    times = [_as_utc(row.get("published_at") or row.get("captured_at")) for row in members]
+    times = [value for value in times if value is not None]
+    event_key = cluster.prior_event_key or canonical_event_key(primary)
+    resolution_raw = {
+        "schema_version": STAGE_C_SCHEMA_VERSION,
+        "cluster": cluster.model_dump(mode="json"),
+        "request_metadata": dict(request_metadata),
+    }
+    event = repo.upsert_event(
+        run_id=run_id,
+        event_key=event_key,
+        canonical_url=primary.get("canonical_url"),
+        external_id=primary.get("external_id"),
+        normalized_title=normalize_event_title(cluster.title_zh),
+        title=cluster.title_zh,
+        summary_cn=cluster.summary_zh,
+        topic=primary.get("topic") or "technology_insight",
+        topics=_clean_strings(topic for row in members for topic in [row.get("topic"), *row.get("topics", [])]),
+        keywords=_unique_strings(keyword for row in members for keyword in row.get("keywords", [])),
+        entities=_unique_json_objects(entity for row in members for entity in row.get("entities", [])),
+        content_class=primary.get("content_class"),
+        source_group=primary.get("source_group"),
+        source_ids=_unique_strings(row.get("source_id") for row in members),
+        source_groups=_unique_strings(row.get("source_group") for row in members),
+        identity_keys=_unique_strings(key for row in members for key in row.get("identity_keys", ())),
+        display_score=max((_number(row.get("selection_score")) for row in members), default=0.0),
+        novelty_status=cluster.novelty_status,
+        state="candidate",
+        resolution_method="ai_story_aggregation",
+        resolution_confidence=100,
+        resolution_raw=resolution_raw,
+        primary_item_id=cluster.primary_item_id,
+        first_seen_at=min(times) if times else current,
+        last_seen_at=max(times) if times else current,
+    )
+    event.primary_item_id = cluster.primary_item_id
+    for member in cluster.members:
+        row = candidates[member.item_id]
+        repo.upsert_event_item(
+            int(event.id),
+            member.item_id,
+            source_id=str(row.get("source_id") or ""),
+            source_group=_text(row.get("source_group")),
+            identity_key=next(iter(row.get("identity_keys", ())), None),
+            match_type=member.relation,
+            match_confidence=100,
+            is_primary=member.relation == "primary",
+            lineage={
+                "run_id": run_id,
+                "relation": member.relation,
+                "source_id": row.get("source_id"),
+                "source_group": row.get("source_group"),
+                "canonical_url": row.get("canonical_url"),
+                "external_id": row.get("external_id"),
+                "title": row.get("title"),
+            },
+        )
+    session.flush()
+    return event
+
+
+def _clear_build_events(session: Session, *, run_id: int) -> None:
+    """Replace the draft's prior Stage-C projection only after AI validation."""
+
+    events = session.scalars(
+        select(IntelEvent).where(IntelEvent.build_id == int(run_id))
+    ).all()
+    for event in events:
+        session.delete(event)
+    session.flush()
+
+
+def _cluster_input_fingerprint(
+    candidates: Sequence[Mapping[str, Any]],
+    history: Sequence[Mapping[str, Any]],
+) -> str:
+    payload = {"candidates": list(candidates), "history": list(history)}
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _event_id_list(value: Any, *, fallback: Iterable[int] = ()) -> list[int]:
-    """Normalize persisted Stage-C event id projections without duplicates."""
+def _stage_c_config_fingerprint(*, model_name: str, input_min_score: int) -> str:
+    payload = {
+        "prompt_version": STAGE_C_PROMPT_VERSION,
+        "model": model_name,
+        "input_policy_version": STAGE_C_INPUT_POLICY_VERSION,
+        "input_min_score": input_min_score,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    values = value if isinstance(value, Iterable) and not isinstance(value, (str, bytes, Mapping)) else fallback
+
+def _event_id_list(value: Any) -> list[int]:
+    values = value if isinstance(value, Iterable) and not isinstance(value, (str, bytes, Mapping)) else ()
     result: list[int] = []
     for item in values:
         try:
@@ -633,525 +679,12 @@ def _event_id_list(value: Any, *, fallback: Iterable[int] = ()) -> list[int]:
     return result
 
 
-def _load_cluster_items(
-    session: Session,
-    *,
-    run_id: int,
-    item_ids: Iterable[int] | None,
-    limit: int | None,
-    stage: Any | None = None,
-    reference_time: datetime | None = None,
-) -> list[IntelItem]:
-    stmt = select(IntelItem).options(joinedload(IntelItem.source), joinedload(IntelItem.ai_review), joinedload(IntelItem.ai_screen)).order_by(IntelItem.published_at.desc(), IntelItem.selection_score.desc(), IntelItem.id.asc())
-    if item_ids is not None:
-        ids = [int(item_id) for item_id in item_ids]
-        stmt = stmt.where(IntelItem.id.in_(ids or [-1]))
-    else:
-        task_ids = _successful_analysis_item_ids(session, int(run_id)) if stage is not None else []
-        stmt = (
-            stmt.join(IntelRunItem, IntelRunItem.item_id == IntelItem.id)
-            .where(
-                IntelRunItem.run_id == int(run_id),
-                IntelItem.id.in_(task_ids or [-1]),
-            )
-        )
-    items = list(session.scalars(stmt).unique().all())
-    if reference_time is not None:
-        items = [
-            item
-            for item in items
-            if recent_window_decision(
-                item,
-                source=item.source,
-                reference_time=reference_time,
-            ).eligible
-        ]
-    if limit is not None:
-        return items[: max(0, int(limit))]
-    return items
-
-
-def _successful_analysis_item_ids(session: Session, run_id: int) -> list[int]:
-    """Read successful Stage-B analysis tasks for ``run_id``.
-
-    Stage B's value score is a signal rather than a gate. Every succeeded
-    analysis task in the current build is therefore a Stage-C input.
-    """
-
-    from app.storage.models import IntelRunStage, IntelRunStageTask
-
-    stage = session.scalar(
-        select(IntelRunStage).where(
-            IntelRunStage.run_id == int(run_id),
-            IntelRunStage.stage_name == "analyze",
-        )
-    )
-    if stage is None:
-        return []
-    values: list[int] = []
-    for task in session.scalars(
-        select(IntelRunStageTask).where(
-            IntelRunStageTask.stage_id == stage.id,
-            IntelRunStageTask.subject_type == "item",
-            IntelRunStageTask.status == "succeeded",
-        )
-    ).all():
-        item_id: int | None = None
-        if task.item_id is not None:
-            item_id = int(task.item_id)
-        elif str(task.subject_id).isdigit():
-            item_id = int(task.subject_id)
-        if item_id is None:
-            continue
-
-        values.append(item_id)
-    return values
-
-
-def _load_history_events(
-    session: Session,
-    *,
-    run: IntelRun,
-    daily_history_days: int = DAILY_HISTORY_DAYS,
-) -> list[IntelEvent]:
-    """Load previous published daily reports plus this build's current events."""
-
-    return _load_selected_daily_history_events(
-        session,
-        run=run,
-        days=daily_history_days,
-    )
-
-
-def _load_selected_daily_history_events(
-    session: Session,
-    *,
-    run: IntelRun,
-    days: int,
-) -> list[IntelEvent]:
-    if days <= 0 or run.edition_id is None or not run.edition_date:
-        return []
-    try:
-        current_edition = date.fromisoformat(run.edition_date)
-    except ValueError:
-        return []
-
-    earliest = current_edition - timedelta(days=days)
-    # Published daily entries are the only cross-date historical source.
-    # Full build rows are retained only inside their own date audit workspace,
-    # so the history objects below remain read-only in-memory projections.
-    prior_entries = list(
-        session.execute(
-            select(DailyEditionReportEntry, DailyEdition)
-            .join(DailyEdition, DailyEdition.id == DailyEditionReportEntry.edition_id)
-            .where(
-                DailyEdition.edition_date >= earliest,
-                DailyEdition.edition_date < current_edition,
-                DailyEdition.published_at.is_not(None),
-            )
-            .order_by(DailyEdition.edition_date.desc(), DailyEditionReportEntry.display_order.asc())
-        ).all()
-    )
-    history = [
-        _history_event_from_report(entry, edition_date=edition.edition_date)
-        for entry, edition in prior_entries
-    ]
-
-    # A Stage-C retry must also see events already materialized by this same
-    # draft. This is execution-local idempotency, not cross-day history.
-    current_events = list(
-        session.scalars(
-            select(IntelEvent)
-            .options(
-                joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_review),
-                joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.source),
-                joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source),
-            )
-            .where(IntelEvent.build_id == int(run.id))
-            .order_by(IntelEvent.id.asc())
-        ).unique().all()
-    )
-    return [*history, *current_events]
-def _history_event_from_report(
-    entry: DailyEditionReportEntry,
-    *,
-    edition_date: date,
-) -> IntelEvent:
-    """Adapt one final report row to Stage-C's conservative matcher shape."""
-
-    key = str(entry.event_key or "").strip() or f"report:{entry.id}"
-    canonical_url = canonical_event_url(entry.url)
-    external_id = key.removeprefix("external:") if key.startswith("external:") else None
-    aliases = [value for value in (key, f"url:{canonical_url}" if canonical_url else None) if value]
-    # History is bounded by *edition date*, not an article's original source
-    # timestamp. An old article selected into yesterday's final report must
-    # still be available to the current 3-day semantic repeat guard.
-    edition_anchor = datetime(
-        edition_date.year,
-        edition_date.month,
-        edition_date.day,
-        tzinfo=DAILY_EDITION_TIMEZONE,
-    ).astimezone(timezone.utc)
-    published = _as_utc(entry.published_at)
-    if published is None or published < edition_anchor:
-        published = edition_anchor
-    event = IntelEvent(
-        id=-int(entry.id),
-        event_key=key,
-        canonical_url=canonical_url,
-        external_id=external_id,
-        normalized_title=normalize_event_title(entry.original_title or entry.title),
-        title=entry.original_title or entry.title or "(untitled)",
-        summary_cn=entry.summary,
-        topic=entry.topic or "unknown",
-        topics_json=json.dumps([entry.topic] if entry.topic else [], ensure_ascii=False),
-        keywords_json=json.dumps(entry.keywords, ensure_ascii=False),
-        entities_json=json.dumps(entry.entities, ensure_ascii=False),
-        content_class=entry.content_class,
-        source_group=entry.source_group,
-        source_ids_json=json.dumps(entry.source_ids, ensure_ascii=False),
-        source_groups_json=json.dumps([entry.source_group] if entry.source_group else [], ensure_ascii=False),
-        identity_keys_json=json.dumps(aliases, ensure_ascii=False),
-        display_score=float(entry.display_score or 0.0),
-        novelty_status="repeat",
-        state="published_history",
-        resolution_method="published_history",
-        resolution_confidence=100,
-        first_seen_at=published,
-        last_seen_at=published,
-    )
-    # The object is intentionally detached and has no retained raw members.
-    # A negative id cannot collide with the current draft's database ids.
-    event.event_items = []
-    return event
-
-
-def _item_candidate(item: IntelItem) -> dict[str, Any]:
-    review = item.ai_review
-    source = item.source
-    topics = list(review.topics) if review is not None else []
-    if review is not None and review.topic and review.topic not in topics:
-        topics.insert(0, review.topic)
-    return {
-        "id": item.id, "source_id": item.source_id, "source_group": source.source_group if source else None, "source_priority": source.priority if source else 100,
-        "content_class": (review.content_class if review else None) or item.content_class, "canonical_url": canonical_event_url(item.canonical_url), "external_id": _normalize_external_id(item.external_id),
-        "github_repo_identity": github_repo_identity(item),
-        "title": item.title, "normalized_title": normalize_event_title(item.title), "summary_cn": (review.summary_cn if review else None) or item.summary,
-        "topic": (review.topic if review else None) or (topics[0] if topics else None), "topics": _clean_strings(topics), "keywords": list(review.keywords) if review is not None else [], "entities": list(review.entities) if review is not None else [], "risk_flags": list(review.risk_flags) if review is not None else [],
-        "selection_score": _number(review.selection_score if review else item.selection_score), "published_at": _as_utc(item.published_at or item.discovered_at or item.captured_at), "captured_at": _as_utc(item.captured_at),
-        "identity_keys": exact_identity_keys({"canonical_url": item.canonical_url, "external_id": item.external_id, "title": item.title}),
-    }
-
-
-def _cluster_rows(candidates: Sequence[dict[str, Any]]) -> list[tuple[list[dict[str, Any]], bool]]:
-    return _safe_groups(list(candidates), fuzzy_threshold=SEMANTIC_AMBIGUITY_THRESHOLD)
-
-
-def _resolve_ambiguous_group(values: list[dict[str, Any]], *, ai_client: Any | None, ambiguous: bool) -> _GroupResolution:
-    github_repos = {
-        repo
-        for value in values
-        for repo in [value.get("github_repo_identity") or github_repo_identity(value)]
-        if repo
-    }
-    if len(github_repos) > 1:
-        # A provider must never be allowed to merge two known repository
-        # identities, even if the semantic group was ambiguous and the model
-        # claims ``merge``.  Keep each item auditable as a guarded singleton.
-        return _GroupResolution(
-            tuple((value,) for value in values),
-            "deterministic_fallback",
-            0,
-            risk_flags=("github_repo_mismatch",),
-        )
-    if not ambiguous:
-        return _GroupResolution((tuple(values),), "deterministic", 100)
-    if ai_client is None:
-        return _GroupResolution(tuple((value,) for value in values), "deterministic_fallback", 0, risk_flags=("ambiguous_unresolved",))
-    resolver = _find_resolver(ai_client)
-    if resolver is None:
-        return _GroupResolution(tuple((value,) for value in values), "deterministic_fallback", 0, risk_flags=("resolver_missing", "ambiguous_unresolved"))
-    evidence = resolve_event_group(values, resolver)
-    if evidence.decision == "merge" and evidence.confidence >= 80:
-        return _GroupResolution((tuple(values),), "ai_merge", evidence.confidence, evidence.raw)
-    if evidence.decision == "partition" and evidence.confidence >= 80:
-        groups = _resolution_partition(values, evidence.groups)
-        if groups is not None:
-            return _GroupResolution(groups, "ai_partition", evidence.confidence, evidence.raw)
-    if evidence.decision == "separate":
-        return _GroupResolution(tuple((value,) for value in values), "ai_separate", evidence.confidence, evidence.raw)
-    return _GroupResolution(tuple((value,) for value in values), "deterministic_fallback", 0, evidence.raw, ("resolver_failed", "ambiguous_unresolved"))
-
-
-def _resolution_partition(
-    values: Sequence[Mapping[str, Any]],
-    groups: Sequence[Sequence[int]],
-) -> tuple[tuple[dict[str, Any], ...], ...] | None:
-    """Accept only a complete, disjoint partition of the supplied item ids."""
-
-    by_id = {int(value["id"]): dict(value) for value in values if value.get("id") is not None}
-    expected = set(by_id)
-    assigned: set[int] = set()
-    resolved: list[tuple[dict[str, Any], ...]] = []
-    for raw_group in groups:
-        ids: list[int] = []
-        for raw_id in raw_group:
-            try:
-                item_id = int(raw_id)
-            except (TypeError, ValueError, OverflowError):
-                return None
-            if item_id not in by_id:
-                return None
-            ids.append(item_id)
-        if not ids or len(ids) != len(set(ids)) or any(item_id in assigned for item_id in ids):
-            return None
-        assigned.update(ids)
-        resolved.append(tuple(by_id[item_id] for item_id in ids))
-    return tuple(resolved) if assigned == expected and resolved else None
-
-
-def resolve_ambiguous_group(values: Iterable[Any], ai_client: Any | None = None) -> list[list[Any]]:
-    rows = [_mapping(value) for value in values]
-    resolution = _resolve_ambiguous_group(rows, ai_client=ai_client, ambiguous=True)
-    return [list(group) for group in resolution.groups]
-
-
-def _find_resolver(client: Any) -> Callable[..., Any] | None:
-    for name in ("resolve_event", "resolve_cluster", "judge_cluster", "cluster", "compare_event"):
-        value = getattr(client, name, None)
-        if callable(value):
-            return value
-    return client if callable(client) else None
-
-
-def _persist_group(session: Session, values: Sequence[Mapping[str, Any]], *, current: datetime, run_id: int, history_events: Sequence[IntelEvent], in_run_events: Mapping[int, IntelEvent], resolver: _GroupResolution, ai_client: Any | None) -> tuple[IntelEvent, bool, str]:
-    projection = _event_projection(values, current=current)
-    group_resolution_method = resolver.method
-    match, match_kind = _match_history_event(values, history_events, current=current, run_id=run_id, in_run_events=in_run_events)
-    if match is not None and match_kind == "ambiguous_semantic":
-        match, match_kind, resolver = _resolve_history_ambiguity(values, match, resolver=resolver, ai_client=ai_client)
-    if group_resolution_method in {"ai_separate", "ai_partition", "deterministic_fallback"} and match_kind in {"repeat_semantic", "repeat_semantic_ai"}:
-        match, match_kind = None, "new"
-    # A previous date's match is evidence for repeat suppression, never a row
-    # to mutate or reuse: published history has no retained working event.
-    # Only an event already created in *this* draft is reusable.
-    current_match = match is not None and int(match.id) in in_run_events
-    # A historical match still needs a fresh, build-private event row so its
-    # current source evidence can flow through Stage D.  It is nevertheless a
-    # repeat, not a newly discovered daily event.  Only an entirely unmatched
-    # group contributes to the new-event projection.
-    is_new = match is None
-    if match is not None:
-        if current_match and float(match.display_score or 0.0) > float(projection.get("display_score") or 0.0):
-            projection["title"] = match.title
-            projection["summary_cn"] = match.summary_cn
-            projection["normalized_title"] = match.normalized_title
-            if match.primary_item_id is not None:
-                projection["primary_item_id"] = match.primary_item_id
-        projection.update(
-            event_key=match.event_key,
-            run_id=run_id,
-            novelty_status="repeat" if not current_match else match.novelty_status,
-            resolution_method=match_kind,
-            resolution_confidence=100 if match_kind == "repeat_exact" else 85,
-        )
-    else:
-        projection.update(
-            run_id=run_id,
-            novelty_status="new",
-            resolution_method=resolver.method,
-            resolution_confidence=resolver.confidence,
-        )
-        if resolver.risk_flags:
-            projection["risk_flags"] = _clean_strings([*projection.get("risk_flags", []), *resolver.risk_flags])
-    if resolver.raw is not None:
-        projection["resolution_raw"] = resolver.raw
-    repo = IntelRepository(session)
-    event = repo.upsert_event(**projection)
-    for member in values:
-        exact = bool(_strong_identity_keys(member) & _strong_identity_keys({"canonical_url": event.canonical_url, "external_id": event.external_id}))
-        relation_type = match_kind if match is not None else ("exact_url_or_external" if exact else resolver.method)
-        repo.upsert_event_item(event.id, int(member["id"]), source_id=member.get("source_id"), source_group=member.get("source_group"), identity_key=_strongest_identity(member), match_type=relation_type, match_confidence=100 if relation_type in {"exact_url_or_external", "repeat_exact"} else max(0, resolver.confidence), is_primary=int(member["id"]) == int(projection["primary_item_id"]), lineage={"run_id": run_id, "provenance": "new" if is_new else "repeat", "match_type": relation_type, "source_id": member.get("source_id"), "source_group": member.get("source_group"), "canonical_url": member.get("canonical_url"), "external_id": member.get("external_id"), "title": member.get("title")})
-    _reconcile_event_social_only_risk(event)
-    session.flush()
-    return event, is_new, match_kind
-
-
-def _reconcile_event_social_only_risk(event: IntelEvent) -> None:
-    """Keep the event-level social-only flag aligned with its full lineage.
-
-    A historical official-X row can carry the former community classification.
-    The strict source identity triple remains authoritative, so an event with
-    any first-party or other non-community member is not a social-only event.
-    Individual source/item audits retain their original risk flags.
-    """
-
-    members = list(event.event_items)
-    if not members:
-        return
-    community_members = [member for member in members if _event_member_is_community(member)]
-    trusted_members = [member for member in members if not _event_member_is_community(member)]
-    flags = [flag for flag in _json_list(event.risk_flags_json) if flag != "source:social_only"]
-    if community_members and not trusted_members:
-        flags.append("source:social_only")
-    event.risk_flags_json = json.dumps(_clean_strings(flags), ensure_ascii=False)
-
-
-def _event_member_is_community(member: IntelEventItem) -> bool:
-    item = member.item
-    source = member.source or (item.source if item is not None else None)
-    # The configured account identity is stronger than stale stored classes
-    # from before the first-party X policy was introduced.
-    if source is not None and is_first_party_x_source(source):
-        return False
-    review = item.ai_review if item is not None else None
-    content_class = _text(
-        (review.content_class if review is not None else None)
-        or (item.content_class if item is not None else None)
-        or (source.content_class if source is not None else None)
-    )
-    review_flags = set(review.risk_flags if review is not None else [])
-    return content_class == COMMUNITY_SOCIAL or "source:social_only" in review_flags
-
-
-def _resolve_history_ambiguity(values: Sequence[Mapping[str, Any]], event: IntelEvent, *, resolver: _GroupResolution, ai_client: Any | None) -> tuple[IntelEvent | None, str, _GroupResolution]:
-    """Resolve a sub-threshold history candidate without inventing event copy."""
-
-    if ai_client is None:
-        return None, "new_ambiguous", _GroupResolution(resolver.groups, "deterministic_fallback", 0, risk_flags=("history:ambiguous",))
-    client_resolver = _find_resolver(ai_client)
-    if client_resolver is None:
-        return None, "new_ambiguous", _GroupResolution(resolver.groups, "deterministic_fallback", 0, risk_flags=("history:resolver_missing",))
-    evidence = resolve_event_group([*values, _event_resolution_value(event)], client_resolver)
-    if evidence.decision == "merge" and evidence.confidence >= 80:
-        return event, "repeat_semantic_ai", _GroupResolution(resolver.groups, "ai_merge", evidence.confidence, evidence.raw)
-    if evidence.decision == "separate":
-        return None, "new", _GroupResolution(resolver.groups, "ai_separate", evidence.confidence, evidence.raw)
-    return None, "new_ambiguous", _GroupResolution(resolver.groups, "deterministic_fallback", 0, evidence.raw, ("history:resolver_failed",))
-
-
-def _event_resolution_value(event: IntelEvent) -> dict[str, Any]:
-    return {
-        "id": event.id,
-        "canonical_url": event.canonical_url,
-        "external_id": event.external_id,
-        "title": event.title,
-        "summary_cn": event.summary_cn,
-        "topic": event.topic,
-        "topics": _json_list(event.topics_json),
-        "keywords": _json_list(event.keywords_json),
-        "entities": _json_objects(event.entities_json),
-        "content_class": event.content_class,
-        "source_group": event.source_group,
-    }
-
-
-def _event_github_repo_identities(event: IntelEvent) -> frozenset[str]:
-    identities: set[str] = set()
-    direct = github_repo_identity(event)
-    if direct:
-        identities.add(direct)
-    for relation in getattr(event, "event_items", ()) or ():
-        relation_identity = getattr(relation, "identity_key", None)
-        if isinstance(relation_identity, str):
-            if relation_identity.startswith("external:"):
-                relation_repo = github_repo_identity({"external_id": relation_identity[9:]})
-            elif relation_identity.startswith("url:"):
-                relation_repo = github_repo_identity({"canonical_url": relation_identity[4:]})
-            else:
-                relation_repo = None
-            if relation_repo:
-                identities.add(relation_repo)
-        item = getattr(relation, "item", None)
-        identity = github_repo_identity(item) if item is not None else None
-        if identity:
-            identities.add(identity)
-    return frozenset(identities)
-
-
-def _event_strong_identity_keys(event: IntelEvent) -> frozenset[str]:
-    identities = set(_strong_identity_keys(event))
-    for relation in getattr(event, "event_items", ()) or ():
-        relation_identity = getattr(relation, "identity_key", None)
-        if isinstance(relation_identity, str) and relation_identity.startswith(("url:", "external:")):
-            identities.add(relation_identity)
-        item = getattr(relation, "item", None)
-        if item is not None:
-            identities.update(_strong_identity_keys(item))
-    return frozenset(identities)
-
-
-def _history_github_repo_compatible(candidate_repos: frozenset[str], event_repos: frozenset[str]) -> bool:
-    """Allow semantic history only for a single compatible repo identity."""
-
-    if len(candidate_repos) > 1 or len(event_repos) > 1:
-        return False
-    if candidate_repos and event_repos and candidate_repos != event_repos:
-        return False
-    return True
-
-
-def _match_history_event(values: Sequence[Mapping[str, Any]], history_events: Sequence[IntelEvent], *, current: datetime, run_id: int, in_run_events: Mapping[int, IntelEvent]) -> tuple[IntelEvent | None, str]:
-    candidate_ids = {identity for value in values for identity in _strong_identity_keys(value)}
-    item_ids = {int(value["id"]) for value in values if value.get("id") is not None}
-    candidate_repos = frozenset(
-        repo
-        for value in values
-        for repo in [value.get("github_repo_identity") or github_repo_identity(value)]
-        if repo
-    )
-    seen: set[int] = set()
-    for event in [*in_run_events.values(), *history_events]:
-        if event.id in seen:
-            continue
-        seen.add(event.id)
-        event_identity = _event_strong_identity_keys(event)
-        if any(int(relation.item_id) in item_ids for relation in event.event_items) or candidate_ids & event_identity:
-            return event, "same_run" if int(event.id) in in_run_events else "repeat_exact"
-    primary = max(values, key=lambda value: (_number(value.get("selection_score")), _as_utc(value.get("published_at")) or datetime.min.replace(tzinfo=timezone.utc)))
-    candidates: list[tuple[float, IntelEvent]] = []
-    for event in [*in_run_events.values(), *history_events]:
-        event_time = _as_utc(event.last_seen_at or event.first_seen_at)
-        if event_time is None or event_time < current - timedelta(hours=72):
-            continue
-        if not _history_github_repo_compatible(candidate_repos, _event_github_repo_identities(event)):
-            continue
-        similarity = _semantic_match_score(primary, event)
-        if similarity >= SEMANTIC_AMBIGUITY_THRESHOLD:
-            candidates.append((similarity, event))
-    if not candidates:
-        return None, "new"
-    candidates.sort(key=lambda pair: (-pair[0], pair[1].id))
-    return candidates[0][1], "repeat_semantic" if candidates[0][0] >= SEMANTIC_REPEAT_THRESHOLD else "ambiguous_semantic"
-
-
-def _event_projection(values: Sequence[Mapping[str, Any]], *, current: datetime) -> dict[str, Any]:
-    primary = sorted(values, key=lambda value: (-_number(value.get("selection_score")), -((_as_utc(value.get("published_at")) or datetime.min.replace(tzinfo=timezone.utc)).timestamp()), int(value.get("source_priority") or 100), int(value.get("id") or 0)))[0]
-    times = [_as_utc(value.get("published_at") or value.get("captured_at")) for value in values]
-    times = [value for value in times if value is not None]
-    return {
-        "event_key": canonical_event_key(primary), "canonical_url": primary.get("canonical_url"), "external_id": primary.get("external_id"), "normalized_title": normalize_event_title(primary.get("title")), "title": primary.get("title") or "(untitled)", "summary_cn": primary.get("summary_cn") or primary.get("title"), "topic": primary.get("topic") or "unknown", "topics": _clean_strings(topic for value in values for topic in [value.get("topic"), *value.get("topics", [])]), "keywords": _unique_json_strings(value.get("keywords") for value in values), "entities": _unique_json_objects(entity for value in values for entity in value.get("entities", [])), "content_class": primary.get("content_class"), "source_group": primary.get("source_group"), "source_ids": _clean_strings(value.get("source_id") for value in values), "source_groups": _clean_strings(value.get("source_group") for value in values), "identity_keys": _clean_strings(identity for value in values for identity in value.get("identity_keys", ())), "display_score": max((_number(value.get("selection_score")) for value in values), default=0.0), "risk_flags": _clean_strings(flag for value in values for flag in value.get("risk_flags", [])), "primary_item_id": int(primary["id"]), "first_seen_at": min(times) if times else current, "last_seen_at": max(times) if times else current,
-    }
-
-
-def _json_list(value: Any) -> list[str]:
-    try:
-        parsed = json.loads(value) if isinstance(value, str) else value
-    except (TypeError, ValueError, json.JSONDecodeError):
-        parsed = []
-    if isinstance(parsed, str):
-        parsed = [parsed]
-    return [str(item) for item in parsed if item is not None and str(item).strip()] if isinstance(parsed, list) else []
-
-
-def _unique_json_strings(values: Iterable[Any]) -> list[str]:
+def _unique_strings(values: Iterable[Any]) -> list[str]:
     result: list[str] = []
     for value in values:
-        iterable = [value] if isinstance(value, str) or not isinstance(value, Iterable) else value
-        for item in iterable:
-            text = str(item).strip() if item is not None else ""
-            if text and text not in result:
-                result.append(text)
+        text = str(value).strip() if value is not None else ""
+        if text and text not in result:
+            result.append(text)
     return result
 
 
@@ -1176,26 +709,14 @@ def _clean_strings(values: Iterable[Any] | Any) -> list[str]:
         values = re.split(r"[,，;；|]+", values)
     elif not isinstance(values, Iterable):
         values = [values]
-    result: list[str] = []
-    for value in values:
-        text = str(value).strip() if value is not None else ""
-        if text and text not in result:
-            result.append(text)
-    return result
-
-
-def _strongest_identity(value: Mapping[str, Any]) -> str | None:
-    return next(iter(value.get("identity_keys", ())), None)
+    return _unique_strings(values)
 
 
 def _mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     if hasattr(value, "model_dump"):
-        try:
-            return dict(value.model_dump(mode="python"))
-        except TypeError:
-            return dict(value.model_dump())
+        return dict(value.model_dump(mode="python"))
     if hasattr(value, "__dict__"):
         return dict(vars(value))
     return {}
@@ -1215,6 +736,13 @@ def _number(value: Any) -> float:
         return 0.0
 
 
+def _bounded_score(value: Any, default: int) -> int:
+    try:
+        return max(0, min(100, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _as_utc(value: Any) -> datetime | None:
     if isinstance(value, str):
         try:
@@ -1231,4 +759,12 @@ def _iso_datetime(value: Any) -> str | None:
     return current.isoformat() if current is not None else None
 
 
-__all__ = ["EventClusterResult", "build_candidate_clusters", "canonical_event_key", "canonical_event_url", "cluster_candidates", "exact_identity_keys", "github_repo_identity", "normalize_event_title", "resolve_ambiguous_group", "run_event_cluster_from_settings", "run_event_cluster_job"]
+__all__ = [
+    "EventClusterResult",
+    "canonical_event_key",
+    "canonical_event_url",
+    "exact_identity_keys",
+    "normalize_event_title",
+    "run_event_cluster_from_settings",
+    "run_event_cluster_job",
+]

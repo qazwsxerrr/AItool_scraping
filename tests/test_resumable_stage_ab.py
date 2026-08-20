@@ -102,17 +102,22 @@ class _Provider:
             raise RuntimeError("analysis timeout")
         return AnalysisResult(
             item_id=envelope.item_id,
-            topic="product",
-            topics=["product"],
+            topic="product_application",
+            topics=["product_application"],
             summary_cn="中文摘要",
             keywords=["release"],
             entities=[],
             selection_score=88,
-            score_components={"total": 88},
-            paper_support={"is_paper": False},
-            risk_flags=[],
-            reason="candidate",
-            confidence=90,
+            score_components={
+                "relevance": 88,
+                "importance": 88,
+                "impact": 88,
+                "freshness": 88,
+                "source_authority": 88,
+                "specificity": 88,
+                "tracking_value": 88,
+                "total": 88,
+            },
             raw_response={"fixture": "analysis"},
         )
 

@@ -67,7 +67,7 @@
             {% if member.match_type %}<span class="badge">聚类 {{ member.match_type }}{% if member.match_confidence is not none %} · {{ member.match_confidence }}%{% endif %}</span>{% endif %}
             {% if member.screen_decision %}<span class="badge">Stage A {{ member.screen_decision }}</span>{% endif %}
             {% if member.review_status %}<span class="badge">Stage B {{ member.review_status }}</span>{% endif %}
-            {% if member.review_topic %}<span class="badge topic-badge">{{ member.review_topic }}</span>{% endif %}
+            {% if member.review_topic %}<span class="badge topic-badge">{{ member.review_topic | topic_label }}</span>{% endif %}
           </div>
           <details class="member-trace">
             <summary>查看筛选追溯</summary>

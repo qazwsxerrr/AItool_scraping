@@ -7,8 +7,6 @@ failure safe and inexpensive.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from uuid import uuid4
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -16,7 +14,8 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from pydantic import ValidationError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import select
+from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.ai.skills.intel_triage import (
     AnalysisResult,
@@ -26,10 +25,14 @@ from app.ai.skills.intel_triage import (
     preflight_intel_triage_schemas,
     strict_parse_analysis,
 )
-from app.config.limits import DEFAULT_AI_ANALYSIS_MIN_SCORE, DEFAULT_AI_REVIEW_CONCURRENCY, DEFAULT_AI_REVIEW_LIMIT
+from app.config.limits import (
+    DEFAULT_AI_ANALYSIS_MIN_SCORE,
+    DEFAULT_AI_REVIEW_CONCURRENCY,
+    DEFAULT_AI_REVIEW_LIMIT,
+)
 from app.domain.models import SourceSpec
 from app.jobs.provider_retry import ProviderResponseFailure, call_with_provider_retries
-from app.storage.models import IntelItem, IntelRun, IntelRunStageTask
+from app.storage.models import IntelItem, IntelRun, IntelRunStage, IntelRunStageTask
 from app.storage.repository import IntelRepository
 
 from .stage_a_screen_job import (
@@ -132,11 +135,11 @@ def run_stage_b_analysis_job(
     # analysis provider request and never causes Stage A to run.
     preflight_intel_triage_schemas()
 
-    # ``structured_v2`` deliberately invalidates the old value-gated Stage-B
-    # tasks.  Reusing those tasks would preserve ``analysis_filtered`` rows
-    # and defeat the new contract even when the provider output is unchanged.
+    # The minimal B1 contract deliberately invalidates old analysis tasks.
+    # Reusing them would preserve projections produced by the removed routing,
+    # event-signature, fact and paper-evidence contract.
     config_fingerprint = _config_fingerprint(
-        stage="analyze_structured_v2",
+        stage="analyze_b1_minimal_v1",
         model=getattr(ai_client, "model", None),
         reject_threshold=min_score,
     )
@@ -163,14 +166,28 @@ def run_stage_b_analysis_job(
             "analyze",
             config_fingerprint=config_fingerprint,
             force=stage_force if existing_stage is not None else False,
-            metadata={"analysis_min_score": min_score},
+            metadata={
+                "analysis_min_score": min_score,
+            },
         )
+        # Stage B is item-scoped. Remove obsolete run-level tasks so they
+        # cannot affect the stage's durable status or retry bookkeeping.
+        for task in repo.list_stage_tasks(stage, subject_type="run", include_expired=True):
+            session.delete(task)
+        session.flush()
         if retry_failed:
             repo.retry_failed(stage, include_blocked=include_blocked, task_ids=requested_task_ids)
 
         screen_stage = repo.get_stage(run_id, "screen")
         if screen_stage is None:
-            repo.finish_stage(stage, status="succeeded", metadata={"eligible": 0, "reason": "stage_a_missing"})
+            repo.finish_stage(
+                stage,
+                status="succeeded",
+                metadata={
+                    "eligible": 0,
+                    "reason": "stage_a_missing",
+                },
+            )
             session.commit()
             return result
 
@@ -354,10 +371,6 @@ def run_stage_b_analysis_job(
             guard_reason = analysis_guard_failure(analysis)
             score = int(analysis.selection_score or 0)
             analysis_tier = "low_signal" if score < min_score else "enriched"
-            flags = list(analysis.risk_flags)
-            if analysis_tier == "low_signal" and "analysis:low_signal" not in flags:
-                flags.append("analysis:low_signal")
-            enriched = analysis.model_copy(update={"risk_flags": flags}) if flags != analysis.risk_flags else analysis
             with session_factory() as session:
                 repo = IntelRepository(session)
                 task = session.get(IntelRunStageTask, task_id)
@@ -370,16 +383,15 @@ def run_stage_b_analysis_job(
                 # malformed success (for example, no summary after the
                 # envelope fallback) remains a structural filter.
                 filtered = bool(guard_reason)
-                persisted = (
-                    enriched.model_copy(update={"reason": f"analysis_filtered:{guard_reason}"})
-                    if filtered
-                    else enriched
-                )
+                persisted = analysis
+                task_result = persisted.model_dump(mode="json")
+                if filtered:
+                    task_result["analysis_filtered_reason"] = guard_reason
                 completed = repo.complete_stage_task(
                     task,
                     owner=owner,
                     result_ref={"projection": "AIItemReview", "item_id": context.item_id},
-                    result=persisted.model_dump(mode="json"),
+                    result=task_result,
                     raw_response=persisted.raw_response,
                     metadata={
                         "selection_score": score,
@@ -419,7 +431,7 @@ def run_stage_b_analysis_job(
                     item = session.get(IntelItem, context.item_id)
                     if item is not None:
                         item.selection_score = score
-                        item.selection_reason = persisted.reason[:4000] if persisted.reason else "analysis_candidate"
+                        item.selection_reason = "analysis_candidate"
                     repo.set_item_status(context.item_id, "candidate", run_id=run_id)
                 session.commit()
             result.analyzed += 1
@@ -632,17 +644,13 @@ def _analysis_failure(
     raw_response = {**raw_response, "provider_attempts": int(attempts)}
     return AnalysisResult(
         item_id=item_id,
-        topic="opinion",
-        topics=["opinion"],
+        topic="technology_insight",
+        topics=["technology_insight"],
         summary_cn="",
         keywords=[],
         entities=[],
         selection_score=0,
         score_components={},
-        paper_support={"is_paper": False},
-        risk_flags=["ai:analysis_failed"],
-        reason="Stage B provider call failed",
-        confidence=0,
         source_content_class=envelope.source_content_class,
         source_group=envelope.source_group,
         status="analysis_failed",

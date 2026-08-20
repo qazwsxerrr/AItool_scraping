@@ -8,7 +8,7 @@ from sqlalchemy import inspect, select, text
 
 from app.config.settings import Settings
 from app.jobs import pipeline_orchestrator as orchestrator
-from app.jobs.event_cluster_job import _load_selected_daily_history_events
+from app.jobs.event_cluster_job import _load_published_daily_history
 from app.jobs.export_job import IntelExportResult
 from app.jobs.stage_d_job import _recent_daily_history
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
@@ -124,8 +124,8 @@ def test_stage_history_is_seeded_from_prior_published_reports_only(tmp_path):
     with create_session_factory(draft_engine)() as session:
         run = session.get(IntelRun, build.id)
         assert run is not None
-        history = _load_selected_daily_history_events(session, run=run, days=3)
-        assert any(event.id < 0 and event.event_key == "url:https://daily.example/repeat" for event in history)
+        history = _load_published_daily_history(session, run=run, days=3)
+        assert [row["event_key"] for row in history] == ["url:https://daily.example/repeat"]
         current_event = session.get(IntelEvent, current.id)
         assert current_event is not None
         assert _recent_daily_history(session, candidates=[{"event": current_event}], run=run, days=3) == {

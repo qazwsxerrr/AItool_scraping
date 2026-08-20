@@ -11,44 +11,45 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from typing import Any, Literal, Mapping, TypeAlias
-from urllib.parse import urlsplit
-
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .normalize import normalize_html, normalize_text, normalize_url
 
 
-TOPIC_MODEL = "model"
-TOPIC_PRODUCT = "product"
-TOPIC_PROJECT = "project"
-TOPIC_INDUSTRY = "industry"
-TOPIC_TUTORIAL = "tutorial"
-TOPIC_OPINION = "opinion"
-TOPIC_PAPER = "paper"
+TOPIC_DEVELOPER_ECOSYSTEM = "developer_ecosystem"
+TOPIC_MODEL_RELEASE = "model_release"
+TOPIC_PRODUCT_APPLICATION = "product_application"
+TOPIC_INDUSTRY_DYNAMICS = "industry_dynamics"
+TOPIC_TECHNOLOGY_INSIGHT = "technology_insight"
+TOPIC_OUTLOOK_RUMOR = "outlook_rumor"
 
 IntelTopic: TypeAlias = Literal[
-    "model", "product", "project", "industry", "tutorial", "opinion", "paper"
+    "developer_ecosystem",
+    "model_release",
+    "product_application",
+    "industry_dynamics",
+    "technology_insight",
+    "outlook_rumor",
 ]
 INTEL_TOPICS: tuple[IntelTopic, ...] = (
-    TOPIC_MODEL, TOPIC_PRODUCT, TOPIC_PROJECT, TOPIC_INDUSTRY,
-    TOPIC_TUTORIAL, TOPIC_OPINION, TOPIC_PAPER,
+    TOPIC_DEVELOPER_ECOSYSTEM,
+    TOPIC_MODEL_RELEASE,
+    TOPIC_PRODUCT_APPLICATION,
+    TOPIC_INDUSTRY_DYNAMICS,
+    TOPIC_TECHNOLOGY_INSIGHT,
+    TOPIC_OUTLOOK_RUMOR,
 )
-SEVEN_TOPIC_TAXONOMY = INTEL_TOPICS
 INTEL_TOPIC_LABELS: dict[str, str] = {
-    TOPIC_MODEL: "模型", TOPIC_PRODUCT: "产品", TOPIC_PROJECT: "项目",
-    TOPIC_INDUSTRY: "行业", TOPIC_TUTORIAL: "教程", TOPIC_OPINION: "观点",
-    TOPIC_PAPER: "论文",
+    TOPIC_DEVELOPER_ECOSYSTEM: "开发生态",
+    TOPIC_MODEL_RELEASE: "模型发布",
+    TOPIC_PRODUCT_APPLICATION: "产品应用",
+    TOPIC_INDUSTRY_DYNAMICS: "行业动态",
+    TOPIC_TECHNOLOGY_INSIGHT: "技术与洞察",
+    TOPIC_OUTLOOK_RUMOR: "前瞻与传闻",
 }
 _TOPIC_ALIASES: dict[str, IntelTopic] = {
     **{topic: topic for topic in INTEL_TOPICS},
     **{label: topic for topic, label in INTEL_TOPIC_LABELS.items()},
-    "models": TOPIC_MODEL, "model_release": TOPIC_MODEL, "model_product": TOPIC_MODEL,
-    "tool": TOPIC_PRODUCT, "tools": TOPIC_PRODUCT, "app": TOPIC_PRODUCT,
-    "repo": TOPIC_PROJECT, "repository": TOPIC_PROJECT, "open_source": TOPIC_PROJECT,
-    "industry_infrastructure": TOPIC_INDUSTRY, "research": TOPIC_PAPER,
-    "paper/research": TOPIC_PAPER, "papers": TOPIC_PAPER, "guide": TOPIC_TUTORIAL,
-    "how_to": TOPIC_TUTORIAL, "how-to": TOPIC_TUTORIAL, "analysis": TOPIC_OPINION,
-    "commentary": TOPIC_OPINION,
 }
 
 OFFICIAL_MODEL_COMPANY = "official_model_company"
@@ -61,13 +62,6 @@ ContentClass: TypeAlias = Literal[
 CONTENT_CLASSES: tuple[ContentClass, ...] = (
     OFFICIAL_MODEL_COMPANY, PROJECT_TOOL, COMMUNITY_SOCIAL, NEWS_MEDIA,
 )
-CONTENT_CLASS_TO_DEFAULT_TOPIC: dict[str, IntelTopic] = {
-    OFFICIAL_MODEL_COMPANY: TOPIC_PRODUCT,
-    PROJECT_TOOL: TOPIC_PROJECT,
-    COMMUNITY_SOCIAL: TOPIC_OPINION,
-    NEWS_MEDIA: TOPIC_INDUSTRY,
-}
-
 ENTITY_COMPANY = "company"
 ENTITY_PRODUCT = "product"
 ENTITY_PERSON = "person"
@@ -87,10 +81,6 @@ _ENTITY_TYPE_ALIASES: dict[str, IntelEntityType] = {
     "行业": ENTITY_INDUSTRY_CONCEPT, "行业概念": ENTITY_INDUSTRY_CONCEPT,
     "concept": ENTITY_INDUSTRY_CONCEPT,
 }
-
-PAPER_SUPPORT_LEVELS: tuple[str, ...] = ("none", "weak", "supported", "strong")
-PaperSupportLevel: TypeAlias = Literal["none", "weak", "supported", "strong"]
-
 
 def normalize_topic(value: Any) -> IntelTopic | None:
     if not isinstance(value, str):
@@ -278,107 +268,6 @@ class RawIntelEnvelope(BaseModel):
         return self.model_dump(mode="json", by_alias=False)
 
 
-class PaperSupport(BaseModel):
-    """Explicit paper evidence used by the deterministic Stage B guard."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid", populate_by_name=True)
-    is_paper: bool = Field(default=False, validation_alias=AliasChoices("is_paper", "paper"))
-    support_level: PaperSupportLevel = Field(default="none", validation_alias=AliasChoices("support_level", "level", "paper_support_level"))
-    supported: bool = Field(default=False, validation_alias=AliasChoices("supported", "is_supported", "eligible", "hard_gate_pass"))
-    source_type: str = Field(default="unknown", validation_alias=AliasChoices("source_type", "source", "origin", "paper_source"))
-    paper_url: str | None = Field(default=None, validation_alias=AliasChoices("paper_url", "paper_link", "url", "arxiv_url"))
-    evidence_url: str | None = Field(default=None, validation_alias=AliasChoices("evidence_url", "support_url", "official_url", "official_x_url", "community_url", "code_url", "github_url"))
-    evidence_type: str | None = Field(default=None, validation_alias=AliasChoices("evidence_type", "support_type"))
-    has_official_source: bool = Field(default=False, validation_alias=AliasChoices("has_official_source", "official"))
-    has_code: bool = Field(default=False, validation_alias=AliasChoices("has_code", "code_available"))
-    arxiv_only: bool = Field(default=False, validation_alias=AliasChoices("arxiv_only", "only_arxiv"))
-    support_score: int = 0
-    evidence_links: list[str] = Field(default_factory=list)
-    notes: str | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_input(cls, value: Any) -> Any:
-        if value is None:
-            return {}
-        if isinstance(value, cls):
-            return value
-        if not isinstance(value, Mapping):
-            raise TypeError("paper_support must be a mapping")
-        data = dict(value)
-        paper_url = data.get("paper_url") or data.get("paper_link") or data.get("url") or data.get("arxiv_url")
-        evidence_url = data.get("evidence_url") or data.get("support_url") or data.get("official_url") or data.get("official_x_url") or data.get("community_url") or data.get("code_url") or data.get("github_url")
-        if paper_url is not None:
-            data["paper_url"] = normalize_url(paper_url)
-        if evidence_url is not None:
-            data["evidence_url"] = normalize_url(evidence_url)
-        if "is_paper" not in data and "paper" in data:
-            data["is_paper"] = data.get("paper")
-        if "support_level" not in data:
-            data["support_level"] = data.get("level", data.get("paper_support_level"))
-        if "supported" not in data:
-            data["supported"] = data.get("is_supported", data.get("eligible", data.get("hard_gate_pass")))
-        if "source_type" not in data:
-            data["source_type"] = data.get("source") or data.get("origin") or data.get("paper_source")
-        if "evidence_type" not in data:
-            data["evidence_type"] = data.get("support_type")
-        if "arxiv_only" not in data and isinstance(paper_url, str):
-            data["arxiv_only"] = _is_arxiv_url(paper_url) and not evidence_url
-        if "has_code" not in data:
-            data["has_code"] = bool(data.get("code_available") or data.get("code_url") or data.get("github_url"))
-        if "has_official_source" not in data:
-            data["has_official_source"] = bool(data.get("official") or data.get("official_url"))
-        if not data.get("support_level"):
-            data["support_level"] = "supported" if data.get("supported") or data.get("is_supported") or data.get("eligible") else "none"
-        if "supported" not in data or data.get("supported") is None:
-            data["supported"] = data.get("is_supported") or data.get("support_level") in {"supported", "strong"}
-        for bool_field in ("is_paper", "supported", "has_code", "has_official_source", "arxiv_only"):
-            data[bool_field] = _coerce_bool(data.get(bool_field), False)
-        data["support_score"] = _clamp_score(data.get("support_score"), 0)
-        data["evidence_links"] = [normalized for link in (data.get("evidence_links") or []) if (normalized := normalize_url(link))] if isinstance(data.get("evidence_links"), (list, tuple, set)) else []
-        if data.get("notes") is not None:
-            data["notes"] = normalize_text(data.get("notes"), preserve_newlines=False) or None
-        for alias in ("paper", "level", "paper_support_level", "eligible", "is_supported", "hard_gate_pass", "source", "origin", "paper_source", "url", "paper_link", "arxiv_url", "support_url", "official_url", "official_x_url", "community_url", "code_url", "github_url", "support_type", "official", "code_available", "only_arxiv"):
-            data.pop(alias, None)
-        return data
-
-    @field_validator("support_level", mode="before")
-    @classmethod
-    def _normalize_level(cls, value: Any) -> PaperSupportLevel:
-        text = str(value or "none").strip().casefold().replace("-", "_")
-        text = {"": "none", "no": "none", "false": "none", "weak_support": "weak", "pass": "supported", "true": "supported", "strong_support": "strong"}.get(text, text)
-        if text not in PAPER_SUPPORT_LEVELS:
-            raise ValueError("support_level must be none, weak, supported, or strong")
-        return text  # type: ignore[return-value]
-
-    @field_validator("source_type", "evidence_type", mode="before")
-    @classmethod
-    def _normalize_tokens(cls, value: Any) -> str | None:
-        if value is None:
-            return "unknown"
-        text = normalize_text(value, preserve_newlines=False)
-        return text.casefold().replace(" ", "_") if text else None
-
-    @field_validator("paper_url", "evidence_url", mode="before")
-    @classmethod
-    def _normalize_links(cls, value: Any) -> str | None:
-        return normalize_url(value)
-
-    @property
-    def hard_gate_pass(self) -> bool:
-        if not self.is_paper:
-            return True
-        if self.arxiv_only or not self.supported:
-            return False
-        if self.support_level not in {"supported", "strong"}:
-            return False
-        return bool(self.evidence_url or self.has_code or self.has_official_source)
-
-    @property
-    def paper_support_ok(self) -> bool:
-        return self.hard_gate_pass
-
-
 class IntelEntity(BaseModel):
     """A typed entity extracted by Stage B."""
 
@@ -428,9 +317,15 @@ class ScoreComponents(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", populate_by_name=True)
     relevance: int = 0
+    importance: int = 0
     impact: int = 0
     freshness: int = Field(default=0, validation_alias=AliasChoices("freshness", "timeliness", "recency"))
     source_authority: int = Field(default=0, validation_alias=AliasChoices("source_authority", "authority"))
+    specificity: int = 0
+    tracking_value: int = Field(default=0, validation_alias=AliasChoices("tracking_value", "tracking", "actionability"))
+    # Kept as a read/parse compatibility field for old provider payloads.  New
+    # prompts use ``tracking_value``; local guards map this value to tracking
+    # when the new field is omitted.
     actionability: int = 0
     total: int = Field(default=0, validation_alias=AliasChoices("total", "total_score", "selection_score", "score"))
 
@@ -444,17 +339,24 @@ class ScoreComponents(BaseModel):
         if not isinstance(value, Mapping):
             return {"total": value}
         data = dict(value)
-        for canonical, aliases in {"freshness": ("timeliness", "recency"), "source_authority": ("authority",), "total": ("total_score", "selection_score", "score")}.items():
+        for canonical, aliases in {
+            "freshness": ("timeliness", "recency"),
+            "source_authority": ("authority",),
+            "tracking_value": ("tracking", "actionability"),
+            "total": ("total_score", "selection_score", "score"),
+        }.items():
             if canonical not in data:
                 for alias in aliases:
                     if alias in data:
                         data[canonical] = data[alias]
                         break
-        for alias in ("timeliness", "recency", "authority", "total_score", "selection_score", "score"):
+        for alias in ("timeliness", "recency", "authority", "tracking", "total_score", "selection_score", "score"):
             data.pop(alias, None)
+        if not data.get("tracking_value") and data.get("actionability"):
+            data["tracking_value"] = data["actionability"]
         return data
 
-    @field_validator("relevance", "impact", "freshness", "source_authority", "actionability", "total", mode="before")
+    @field_validator("relevance", "importance", "impact", "freshness", "source_authority", "specificity", "tracking_value", "actionability", "total", mode="before")
     @classmethod
     def _clamp_fields(cls, value: Any) -> int:
         return _clamp_score(value)
@@ -527,21 +429,17 @@ class ScreenResult(BaseModel):
 
 
 class AnalysisResult(BaseModel):
-    """Strict Stage B analysis projection and auditable failure record."""
+    """Minimal Stage B projection consumed directly by Stage C."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", populate_by_name=True)
     item_id: int | str | None = None
-    topic: IntelTopic = TOPIC_OPINION
+    topic: IntelTopic = TOPIC_TECHNOLOGY_INSIGHT
     topics: list[IntelTopic] = Field(default_factory=list)
     summary_cn: str = ""
     keywords: list[str] = Field(default_factory=list)
     entities: list[IntelEntity] = Field(default_factory=list)
     selection_score: int = Field(default=0, validation_alias=AliasChoices("selection_score", "score", "display_score", "total_score"))
     score_components: ScoreComponents = Field(default_factory=ScoreComponents, validation_alias=AliasChoices("score_components", "scores", "score_breakdown"))
-    paper_support: PaperSupport = Field(default_factory=PaperSupport)
-    risk_flags: list[str] = Field(default_factory=list)
-    reason: str = ""
-    confidence: int = 0
     source_content_class: ContentClass | None = None
     source_group: str | None = None
     status: Literal["success", "analysis_failed"] = "success"
@@ -581,14 +479,11 @@ class AnalysisResult(BaseModel):
         data["keywords"] = _clean_list(data.get("keywords") or data.get("key_terms") or data.get("tags"), limit=48)
         data["entities"] = data.get("entities") or data.get("typed_entities") or []
         data["selection_score"] = _clamp_score(data.get("selection_score", data.get("score", data.get("display_score", data.get("total_score", 0)))))
-        data["risk_flags"] = _clean_list(data.get("risk_flags") or data.get("risks") or data.get("risk"), limit=32)
-        data["reason"] = normalize_text(data.get("reason"), preserve_newlines=False)
-        data["confidence"] = _clamp_score(data.get("confidence"))
         if "source_content_class" not in data and data.get("content_class") is not None:
             data["source_content_class"] = data.get("content_class")
         if data.get("source_group") is not None:
             data["source_group"] = normalize_text(data.get("source_group"), preserve_newlines=False) or None
-        for alias in ("id", "raw_item_id", "topic_labels", "summary", "key_terms", "tags", "score", "display_score", "total_score", "typed_entities", "risks", "risk", "content_class"):
+        for alias in ("id", "raw_item_id", "topic_labels", "summary", "key_terms", "tags", "score", "display_score", "total_score", "typed_entities", "content_class"):
             data.pop(alias, None)
         return data
 
@@ -600,17 +495,17 @@ class AnalysisResult(BaseModel):
             raise ValueError("topic must be one of: " + ", ".join(INTEL_TOPICS))
         return normalized
 
-    @field_validator("summary_cn", "reason", mode="before")
+    @field_validator("summary_cn", mode="before")
     @classmethod
     def _clean_text_fields(cls, value: Any) -> str:
         return normalize_text(value, preserve_newlines=False)
 
-    @field_validator("keywords", "risk_flags", mode="before")
+    @field_validator("keywords", mode="before")
     @classmethod
     def _clean_lists(cls, value: Any) -> list[str]:
         return _clean_list(value, limit=48)
 
-    @field_validator("selection_score", "confidence", mode="before")
+    @field_validator("selection_score", mode="before")
     @classmethod
     def _clamp_scores(cls, value: Any) -> int:
         return _clamp_score(value)
@@ -639,10 +534,6 @@ class AnalysisResult(BaseModel):
     def scores(self) -> ScoreComponents:
         return self.score_components
 
-    @property
-    def paper_gate_pass(self) -> bool:
-        return self.paper_support.hard_gate_pass if self.topic == TOPIC_PAPER else True
-
 
 def _normalize_decision(value: Any) -> Literal["pass", "reject", "uncertain"]:
     text = str(value or "uncertain").strip().casefold().replace("-", "_")
@@ -656,35 +547,13 @@ def _normalize_decision(value: Any) -> Literal["pass", "reject", "uncertain"]:
     return text  # type: ignore[return-value]
 
 
-def _coerce_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return value != 0
-    if isinstance(value, str):
-        text = value.strip().casefold()
-        if text in {"true", "1", "yes", "y", "on", "supported", "pass", "是"}:
-            return True
-        if text in {"false", "0", "no", "n", "off", "reject", "否"}:
-            return False
-    return default
-
-
-def _is_arxiv_url(value: str) -> bool:
-    try:
-        host = (urlsplit(value).hostname or "").casefold()
-    except ValueError:
-        return False
-    return host in {"arxiv.org", "export.arxiv.org"} or host.endswith(".arxiv.org")
-
-
 __all__ = [
-    "AnalysisResult", "COMMUNITY_SOCIAL", "CONTENT_CLASSES", "CONTENT_CLASS_TO_DEFAULT_TOPIC",
+    "AnalysisResult", "COMMUNITY_SOCIAL", "CONTENT_CLASSES",
     "ContentClass", "ENTITY_COMPANY", "ENTITY_INDUSTRY_CONCEPT", "ENTITY_PERSON", "ENTITY_PRODUCT",
     "ENTITY_TECHNOLOGY", "ENTITY_TYPES", "IntelEntity", "IntelEntityType", "IntelTopic",
-    "INTEL_TOPIC_LABELS", "INTEL_TOPICS", "NEWS_MEDIA", "OFFICIAL_MODEL_COMPANY", "PAPER_SUPPORT_LEVELS",
-    "PROJECT_TOOL", "PaperSupport", "PaperSupportLevel", "RawIntelEnvelope", "ScoreComponents",
-    "ScreenResult", "SEVEN_TOPIC_TAXONOMY", "TOPIC_INDUSTRY", "TOPIC_MODEL", "TOPIC_OPINION",
-    "TOPIC_PAPER", "TOPIC_PRODUCT", "TOPIC_PROJECT", "TOPIC_TUTORIAL", "normalize_content_class",
+    "INTEL_TOPIC_LABELS", "INTEL_TOPICS", "NEWS_MEDIA", "OFFICIAL_MODEL_COMPANY",
+    "PROJECT_TOOL", "RawIntelEnvelope", "ScoreComponents",
+    "ScreenResult", "TOPIC_DEVELOPER_ECOSYSTEM", "TOPIC_INDUSTRY_DYNAMICS", "TOPIC_MODEL_RELEASE",
+    "TOPIC_OUTLOOK_RUMOR", "TOPIC_PRODUCT_APPLICATION", "TOPIC_TECHNOLOGY_INSIGHT", "normalize_content_class",
     "normalize_entity_type", "normalize_topic",
 ]

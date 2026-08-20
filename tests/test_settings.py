@@ -35,6 +35,23 @@ def test_settings_read_ai_review_model(monkeypatch):
     assert settings.ai_review_model == "review-model"
 
 
+def test_settings_read_stage_c_input_min_score(monkeypatch):
+    monkeypatch.delenv("AI_STAGE_C_INPUT_MIN_SCORE", raising=False)
+    monkeypatch.setenv("AI_STAGE_C_INPUT_MIN_SCORE", "72")
+
+    settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
+
+    assert settings.ai_stage_c_input_min_score == 72
+
+
+def test_settings_stage_c_input_min_score_defaults_to_60(monkeypatch):
+    monkeypatch.delenv("AI_STAGE_C_INPUT_MIN_SCORE", raising=False)
+
+    settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
+
+    assert settings.ai_stage_c_input_min_score == 60
+
+
 def test_settings_stage_d_requires_its_own_configuration(monkeypatch):
     for name in (
         "AI_REVIEW_API_URL",
@@ -82,11 +99,16 @@ def test_settings_stage_d_timeout_is_independent_and_defaults_to_120(monkeypatch
 
 def test_settings_read_category_taxonomy(monkeypatch):
     monkeypatch.delenv("AI_REVIEW_CATEGORIES", raising=False)
-    monkeypatch.setenv("AI_REVIEW_CATEGORIES", "研究论文，产品与工具,研究论文")
-    monkeypatch.setenv("AI_REVIEW_CATEGORY_MODE", "source")
+    monkeypatch.setenv("AI_REVIEW_CATEGORIES", "论文，产品与工具,观点")
     settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
-    assert settings.ai_review_categories == ("研究论文", "产品与工具")
-    assert settings.ai_review_category_mode == "source"
+    assert settings.ai_review_categories == (
+        "开发生态",
+        "模型发布",
+        "产品应用",
+        "行业动态",
+        "技术与洞察",
+        "前瞻与传闻",
+    )
 
 
 def test_init_db_rejects_incompatible_legacy_schema_without_backfill(tmp_path):

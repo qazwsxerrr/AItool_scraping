@@ -33,6 +33,7 @@ ITEM_ANALYSIS_SYSTEM_PROMPT = (
     "official_model_company 用于官方模型、公司、产品或 API 发布；"
     "community_social 用于社区讨论、社交内容和仅供发现的线索。"
     "news_media 用于媒体报道或分析文章，不得把它表述成官方发布。"
+    "topic_category 只能使用开发生态、模型发布、产品应用、行业动态、技术与洞察、前瞻与传闻。"
     "输出字段必须为：keep(boolean), content_class(string), topic_category(string), summary_cn(string), "
     "reason(string), risk_flags(array of strings), confidence(integer 0-100)。"
 )
@@ -157,7 +158,6 @@ _INTEL_STAGE_PROMPT_EXPORTS = {
     "INTEL_SCREEN_RESPONSE_SCHEMA",
     "INTEL_SCREEN_SYSTEM_PROMPT",
     "INTEL_SCREEN_TASK",
-    "PAPER_SUPPORT_JSON_SCHEMA",
     "build_analysis_payload",
     "build_analysis_provider_payload",
     "build_screen_payload",

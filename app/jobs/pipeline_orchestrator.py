@@ -26,6 +26,7 @@ from app.config.limits import (
     DEFAULT_AI_REVIEW_LIMIT,
     DEFAULT_DAILY_REPORT_LIMIT,
     DEFAULT_FETCH_LIMIT_PER_SOURCE,
+    STAGE_C_INPUT_POLICY_VERSION,
 )
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
@@ -701,18 +702,14 @@ def run_pipeline_stage_c_from_settings(
     *,
     settings: Settings,
     run_id: int,
-    limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
     force: bool = False,
     ai_client: Any | None = None,
-    item_ids: Iterable[int] | None = None,
 ) -> EventClusterResult:
     _, session_factory = _engine_and_factory(settings)
     result = run_event_cluster_from_settings(
         settings=settings,
         run_id=int(run_id),
-        limit=limit,
         force=force,
-        item_ids=item_ids,
         ai_client=ai_client,
     )
     _sync_pipeline_run_status(session_factory, int(run_id), finalize=False)
@@ -1083,7 +1080,6 @@ def retry_pipeline_stage_from_settings(
         return run_pipeline_stage_c_from_settings(
             settings=settings,
             run_id=run_id,
-            limit=limit,
             force=force,
             ai_client=ai_client,
         )
@@ -1098,7 +1094,13 @@ def retry_pipeline_stage_from_settings(
     raise ValueError("export is an approval action; use pipeline export --edition-date instead")
 
 
-def _stage_needs_resume(session_factory, run_id: int, stage_name: str) -> bool:
+def _stage_needs_resume(
+    session_factory,
+    run_id: int,
+    stage_name: str,
+    *,
+    settings: Settings | None = None,
+) -> bool:
     with session_factory() as session:
         repo = IntelRepository(session)
         run = session.get(IntelRun, int(run_id))
@@ -1106,6 +1108,15 @@ def _stage_needs_resume(session_factory, run_id: int, stage_name: str) -> bool:
             raise ValueError(f"intel run {run_id} does not exist")
         stage = repo.get_stage(run_id, stage_name)
         if stage is not None:
+            if stage.status == "succeeded":
+                metadata = stage.metadata_dict
+                if stage_name == "cluster":
+                    if metadata.get("input_policy_version") != STAGE_C_INPUT_POLICY_VERSION:
+                        return True
+                    if settings is not None and metadata.get("input_min_score") != settings.ai_stage_c_input_min_score:
+                        return True
+                if stage_name == "stage_d" and str(metadata.get("stage_d_version") or "") != "stage-d-v4":
+                    return True
             if stage.status in {"pending", "retry_waiting", "failed", "blocked"}:
                 return True
             if repo.list_stage_tasks(stage, statuses=RETRYABLE_TASK_STATUSES, include_expired=True):
@@ -1173,7 +1184,7 @@ def resume_pipeline_from_settings(
             return result
 
     for stage_name in PIPELINE_STAGES:
-        if not _stage_needs_resume(session_factory, run_id, stage_name):
+        if not _stage_needs_resume(session_factory, run_id, stage_name, settings=settings):
             result.skipped_stages.append(stage_name)
             continue
         try:
@@ -1195,7 +1206,6 @@ def resume_pipeline_from_settings(
                 value = run_pipeline_stage_c_from_settings(
                     settings=settings,
                     run_id=run_id,
-                    limit=limit,
                     ai_client=ai_client,
                 )
             elif stage_name == "stage_d":

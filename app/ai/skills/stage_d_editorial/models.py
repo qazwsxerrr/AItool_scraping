@@ -1,4 +1,4 @@
-"""Strict provider-neutral contracts for the two Stage D AI phases."""
+"""Strict provider-neutral contracts for the single Stage-D editorial call."""
 
 from __future__ import annotations
 
@@ -12,11 +12,10 @@ _MARKDOWN_OR_URL_RE = re.compile(r"(?:https?://|www\.|\[[^\]]+\]\([^)]*\)|`|<[^>
 _MARKETING_WORDS = ("重磅", "颠覆", "史上最强", "最强", "革命性")
 STAGE_D_TITLE_MIN_CHARS = 8
 STAGE_D_TITLE_MAX_CHARS = 60
+STAGE_D_SCHEMA_VERSION = "stage_d_editorial_v3"
 
 
-# Stable reason vocabulary shared by D1 and D3.  Keeping the vocabulary in
-# code (rather than accepting arbitrary provider text) makes audit reports
-# comparable across models and runs.
+# Keep the reason vocabulary stable so daily audit reports remain comparable.
 STAGE_D_REASON_CODES: tuple[str, ...] = (
     "material_change",
     "impact",
@@ -45,8 +44,8 @@ STAGE_D_REASON_CODES: tuple[str, ...] = (
     "weak_specificity",
     "weak_source_support",
     "marketing_content",
-    "not_shortlisted",
-    "composition_limit",
+    "omitted_by_editor",
+    "editorial_limit",
     "weak_evidence",
     "information_gain",
     "developer_relevance",
@@ -56,64 +55,15 @@ STAGE_D_REASON_CODES: tuple[str, ...] = (
 STAGE_D_REASON_CODE_SET = frozenset(STAGE_D_REASON_CODES)
 
 
-class StageDAssessment(BaseModel):
-    """D1's independent editorial-value assessment for one event."""
-
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
-
-    event_id: int = Field(gt=0)
-    material_change: int = Field(ge=0, le=100)
-    impact: int = Field(ge=0, le=100)
-    reader_value: int = Field(ge=0, le=100)
-    actionability: int = Field(ge=0, le=100)
-    source_support: int = Field(ge=0, le=100)
-    freshness: int = Field(ge=0, le=100)
-    must_consider: bool
-    reason_codes: list[str] = Field(min_length=1, max_length=12)
-    assessment_reason: str = Field(min_length=1, max_length=240)
-    confidence: int = Field(ge=0, le=100)
-
-    _known_reason_codes: ClassVar[frozenset[str]] = STAGE_D_REASON_CODE_SET
-
-    @field_validator("reason_codes")
-    @classmethod
-    def _normalize_reason_codes(cls, value: list[str]) -> list[str]:
-        result: list[str] = []
-        for raw in value:
-            code = str(raw).strip().casefold().replace(" ", "_")
-            if not code:
-                raise ValueError("reason_codes must not contain empty values")
-            if code not in cls._known_reason_codes:
-                raise ValueError(f"unknown Stage D reason_code: {code}")
-            if code in result:
-                raise ValueError(f"duplicate Stage D reason_code: {code}")
-            result.append(code)
-        return result
-
-
-class StageDAssessmentResponse(BaseModel):
-    """Complete D1 response; ID coverage is checked by the parser."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    schema_version: Literal["stage_d_assessment_v1"]
-    assessments: list[StageDAssessment]
-
-    @model_validator(mode="after")
-    def _unique_event_ids(self) -> "StageDAssessmentResponse":
-        ids = [assessment.event_id for assessment in self.assessments]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Stage D assessment response contains duplicate event_id")
-        return self
-
-
 class StageDEditorialDecision(BaseModel):
-    """D3's composition decision for one short-listed event."""
+    """One complete decision returned by the Stage-D provider."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
 
     event_id: int = Field(gt=0)
     decision: Literal["selected", "watchlist", "omitted"]
+    # Only selected rows may carry a display order. Watchlist order is assigned
+    # locally so the provider cannot overlap the public selected-card order.
     display_order: int | None = Field(default=None, ge=1)
     editorial_score: int = Field(default=0, ge=0, le=100)
     story_family_id: str = Field(min_length=1, max_length=80)
@@ -128,6 +78,8 @@ class StageDEditorialDecision(BaseModel):
     editorial_reason: str = Field(default="", max_length=240)
     confidence: int = Field(default=0, ge=0, le=100)
 
+    _known_reason_codes: ClassVar[frozenset[str]] = STAGE_D_REASON_CODE_SET
+
     @field_validator("reason_codes")
     @classmethod
     def _normalize_reason_codes(cls, value: list[str]) -> list[str]:
@@ -136,9 +88,8 @@ class StageDEditorialDecision(BaseModel):
             code = str(raw).strip().casefold().replace(" ", "_")
             if not code or len(code) > 64 or code in result:
                 continue
-            # D3 may retain a provider-specific reason for forward
-            # compatibility; canonical codes are still normalized.  Unknown
-            # values are not silently promoted to facts and remain auditable.
+            # Unknown provider reason codes remain auditable; they are not
+            # promoted to factual claims.
             result.append(code)
         return result
 
@@ -164,49 +115,46 @@ class StageDEditorialDecision(BaseModel):
 
     @model_validator(mode="after")
     def _validate_decision_shape(self) -> "StageDEditorialDecision":
-        if self.decision in {"selected", "watchlist"}:
+        if self.decision == "selected":
             if self.display_order is None:
-                raise ValueError(f"{self.decision} decision requires display_order")
+                raise ValueError("selected decision requires display_order")
             if not self.display_title_zh:
-                raise ValueError(f"{self.decision} decision requires display_title_zh")
+                raise ValueError("selected decision requires display_title_zh")
             if not self.title_supporting_fields:
-                raise ValueError(f"{self.decision} decision requires title_supporting_fields")
-        else:
-            if any(
-                (
-                    self.display_order is not None,
-                    self.family_position is not None,
-                    self.display_title_zh is not None,
-                    bool(self.title_supporting_fields),
-                )
-            ):
-                raise ValueError("omitted decision must not contain display fields")
+                raise ValueError("selected decision requires title_supporting_fields")
+            if self.family_position is None:
+                raise ValueError("selected decision requires family_position")
+            return self
+
+        if self.display_order is not None:
+            raise ValueError(f"{self.decision} decision must not contain display_order")
+        if self.title_supporting_fields and not self.display_title_zh:
+            raise ValueError(f"{self.decision} title_supporting_fields require display_title_zh")
         return self
 
 
-class StageDCompositionResponse(BaseModel):
-    """Complete D3 response for the short-list supplied to the provider."""
+class StageDEditorialResponse(BaseModel):
+    """Complete Stage-D response; parser enforces exact input-ID coverage."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal["stage_d_editorial_v2"]
+    schema_version: Literal[STAGE_D_SCHEMA_VERSION]
     decisions: list[StageDEditorialDecision]
 
     @model_validator(mode="after")
-    def _unique_event_ids(self) -> "StageDCompositionResponse":
+    def _unique_event_ids(self) -> "StageDEditorialResponse":
         ids = [decision.event_id for decision in self.decisions]
         if len(ids) != len(set(ids)):
-            raise ValueError("Stage D composition response contains duplicate event_id")
+            raise ValueError("Stage D editorial response contains duplicate event_id")
         return self
 
 
 __all__ = [
     "STAGE_D_REASON_CODES",
     "STAGE_D_REASON_CODE_SET",
+    "STAGE_D_SCHEMA_VERSION",
     "STAGE_D_TITLE_MAX_CHARS",
     "STAGE_D_TITLE_MIN_CHARS",
-    "StageDAssessment",
-    "StageDAssessmentResponse",
-    "StageDCompositionResponse",
     "StageDEditorialDecision",
+    "StageDEditorialResponse",
 ]

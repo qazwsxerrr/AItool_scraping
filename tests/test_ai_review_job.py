@@ -11,7 +11,7 @@ from app.domain.models import FetchItem, SourceSpec
 from app.jobs.stage_a_screen_job import run_stage_a_screen_job
 from app.jobs.stage_b_analysis_job import run_stage_b_analysis_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelItem
+from app.storage.models import IntelItem, IntelRunStageTask
 from app.storage.repository import IntelRepository
 
 
@@ -134,28 +134,29 @@ class _AI:
             score = self.score_by_title.get(envelope.title, 80)
             return AnalysisResult(
                 item_id=envelope.item_id,
-                topic="paper" if envelope.title in self.paper_titles else "product",
-                topics=["paper"] if envelope.title in self.paper_titles else ["product"],
+                topic="technology_insight" if envelope.title in self.paper_titles else "product_application",
+                topics=["technology_insight"] if envelope.title in self.paper_titles else ["product_application"],
                 summary_cn="中文阶段 B 摘要",
                 keywords=["model", "release"],
                 entities=[],
                 selection_score=score,
-                score_components={"total": score},
-                paper_support={
-                    "is_paper": envelope.title in self.paper_titles,
-                    "paper_url": envelope.url if envelope.title in self.paper_titles else None,
-                    "arxiv_only": envelope.title in self.paper_titles,
+                score_components={
+                    "relevance": score,
+                    "importance": score,
+                    "impact": score,
+                    "freshness": score,
+                    "source_authority": score,
+                    "specificity": score,
+                    "tracking_value": score,
+                    "total": score,
                 },
-                risk_flags=[],
-                reason="analysis fixture",
-                confidence=90,
                 raw_response={"fixture": "analysis"},
             )
         finally:
             self._exit()
 
 
-def test_daily_stage_a_b_keeps_low_score_and_paper_for_stage_d(tmp_path):
+def test_daily_stage_a_b_keeps_all_successful_analyses_and_marks_low_signal(tmp_path):
     session_factory = _db(tmp_path)
     source = _source()
     run_id = _daily_build(session_factory, source, ["high reject", "low score", "paper", "candidate"])
@@ -185,8 +186,15 @@ def test_daily_stage_a_b_keeps_low_score_and_paper_for_stage_d(tmp_path):
     with session_factory() as session:
         rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
         assert [row.status for row in rows] == ["screened_out", "candidate", "candidate", "candidate"]
-        assert "analysis:low_signal" in rows[1].ai_review.risk_flags
-        assert "paper:arxiv_only" in rows[2].ai_review.risk_flags
+        assert rows[1].ai_review.selection_score == 59
+        assert rows[2].ai_review.selection_score == 99
+        run_tasks = session.scalars(
+            select(IntelRunStageTask).where(
+                IntelRunStageTask.subject_type == "run",
+                IntelRunStageTask.target_run_id == run_id,
+            )
+        ).all()
+        assert run_tasks == []
 
 
 def test_daily_stage_a_b_isolates_provider_failures(tmp_path):

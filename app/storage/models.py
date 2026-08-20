@@ -719,11 +719,7 @@ class AIItemReview(Base):
     entities_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     selection_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     score_components_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
-    paper_support_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
-    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
-    confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     raw_response_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="success")
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -766,16 +762,6 @@ class AIItemReview(Base):
     def entities(self) -> list[dict[str, object]]:
         value = self._decode_json(self.entities_json, [])
         return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
-
-    @property
-    def paper_support(self) -> dict[str, object]:
-        value = self._decode_json(self.paper_support_json, {})
-        return dict(value) if isinstance(value, dict) else {}
-
-    @property
-    def risk_flags(self) -> list[str]:
-        value = self._decode_json(self.risk_flags_json, [])
-        return [str(item) for item in value] if isinstance(value, list) else []
 
     @property
     def raw_response(self) -> dict[str, object]:

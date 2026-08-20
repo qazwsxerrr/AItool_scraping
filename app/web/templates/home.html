@@ -34,7 +34,7 @@
     <a class="topic-tab {{ 'active' if not category else '' }}" href="/?edition_date={{ active_edition_date or '' }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">全部主题</a>
     {% for option in category_options %}
       <a class="topic-tab {{ 'active' if category == option.value else '' }}" href="/?edition_date={{ active_edition_date or '' }}&amp;category={{ option.value }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">
-        <span>{{ option.value }}</span><em>{{ option.count }}</em>
+        <span>{{ option.value | topic_label }}</span><em>{{ option.count }}</em>
       </a>
     {% endfor %}
   </div>
@@ -75,7 +75,7 @@
       {% for group in grouped_cards %}
         <section class="feed-section">
           <div class="section-heading">
-            <div><p class="eyebrow">TOPIC {{ '%02d' | format(loop.index) }}</p><h2>{{ group.name }}</h2></div>
+            <div><p class="eyebrow">TOPIC {{ '%02d' | format(loop.index) }}</p><h2>{{ group.name | topic_label }}</h2></div>
             <span class="section-count">{{ group.cards | length }} 条</span>
           </div>
           {% for card in group.cards %}

@@ -34,7 +34,7 @@
   <select name="topic_category">
     <option value="">全部主题</option>
     {% for value in filter_options.topic_categories %}
-      <option value="{{ value }}" {{ 'selected' if filters.topic_category == value else '' }}>{{ value }}</option>
+      <option value="{{ value }}" {{ 'selected' if filters.topic_category == value else '' }}>{{ value | topic_label }}</option>
     {% endfor %}
   </select>
   <button type="submit">应用筛选</button>

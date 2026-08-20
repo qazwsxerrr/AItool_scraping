@@ -462,7 +462,6 @@ __all__ = [
     "strip_json_fence",
     "AnalysisResult",
     "IntelEntity",
-    "PaperSupport",
     "RawIntelEnvelope",
     "ScoreComponents",
     "ScreenResult",
@@ -485,7 +484,6 @@ __all__ = [
 _INTEL_EXPORTS = {
     "AnalysisResult",
     "IntelEntity",
-    "PaperSupport",
     "RawIntelEnvelope",
     "ScoreComponents",
     "ScreenResult",

@@ -370,7 +370,7 @@ def _manifest(
     """Build the machine-readable metadata for a date-addressed export."""
 
     payload = {
-        "schema_version": 5,
+        "schema_version": 6,
         "edition_date": run.edition_date,
         "edition_timezone": "Asia/Shanghai",
         "artifact_status": "partial" if partial else "ready",
@@ -381,7 +381,7 @@ def _manifest(
         "selected_count": len(records),
         "watchlist_count": max(0, int(watchlist_count)),
         "stage_d_count": int((build_summary or {}).get("funnel", {}).get("stage_d_total", 0)),
-        "stage_d_shortlisted": int((build_summary or {}).get("funnel", {}).get("stage_d_shortlisted", 0)),
+        "stage_d_candidate_count": int((build_summary or {}).get("funnel", {}).get("stage_d_candidate_count", 0)),
         "funnel": (build_summary or {}).get("funnel", {}),
         "stages": (build_summary or {}).get("stages", {}),
         "failure_reasons": (build_summary or {}).get("failure_reasons", []),
@@ -569,7 +569,8 @@ def _serialize_event(
         "community_signal_pending_verification": ["社区线索 / 待核实"],
         "multi_community_signal_pending_verification": ["多源社区线索 / 待核实"],
     }.get(str(presentation), [])
-    provenance_kind = "new" if event.novelty_status == "new" else "repeat"
+    novelty = str(event.novelty_status or "unknown").casefold()
+    provenance_kind = novelty if novelty in {"new", "updated", "repeat", "unknown"} else "unknown"
     return {
         "record_type": "intel_event",
         "stage": "stage_d",

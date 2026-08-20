@@ -33,7 +33,7 @@ def _app(tmp_path):
                 summary="摘要",
                 url="https://web.example/update",
                 display_score=90,
-                topic="model",
+                topic="model_release",
                 content_class="official_model_company",
                 source_group="official_blog",
                 source_ids_json='["web_source"]',

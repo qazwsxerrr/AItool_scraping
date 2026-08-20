@@ -1111,13 +1111,7 @@ class IntelRepository:
         if score_components is None:
             score_components = _response_value(response, "scores", {})
         review.score_components_json = _dump_json(_structured_json(score_components or {}))
-        review.paper_support_json = _dump_json(
-            _structured_json(_response_value(response, "paper_support", {}))
-        )
         review.summary_cn = _text(_response_value(response, "summary_cn") or _response_value(response, "summary"))
-        review.reason = _text(_response_value(response, "reason"))
-        review.risk_flags_json = _dump_json(_structured_json(_response_value(response, "risk_flags", [])))
-        review.confidence = _bounded_int(_response_value(response, "confidence", 0))
         raw = _response_value(response, "raw_response") if response is not None else None
         if raw is None and isinstance(response, Mapping):
             raw = dict(response)
@@ -1281,7 +1275,7 @@ class IntelRepository:
         _assign("source_group", _text(source_group))
         if merged_topics:
             row.topics_json = _dump_json(merged_topics)
-            if not row.topic or row.topic == "opinion":
+            if not row.topic or row.topic == "technology_insight":
                 row.topic = merged_topics[0]
         if merged_keywords:
             row.keywords_json = _dump_json(merged_keywords)
@@ -2838,15 +2832,16 @@ def _normalize_novelty_status(value: Any) -> str | None:
         "new_item": "new",
         "novel": "new",
         "fresh": "new",
-        "updated": "update",
-        "version_update": "update",
+        "update": "updated",
+        "updated": "updated",
+        "version_update": "updated",
         "duplicate": "repeat",
         "old": "repeat",
         "undetermined": "unknown",
         "": "unknown",
     }
     text = aliases.get(text, text)
-    return text if text in {"new", "update", "repeat", "unknown"} else "unknown"
+    return text if text in {"new", "updated", "repeat", "unknown"} else "unknown"
 
 
 def _load_json(value: str, default: Any) -> Any:

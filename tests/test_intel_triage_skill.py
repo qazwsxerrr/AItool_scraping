@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.ai.skills.intel_triage import (
     AnalysisResult,
+    INTEL_TOPIC_LABELS,
+    INTEL_TOPICS,
     IntelTriageClient,
     RawIntelEnvelope,
     ScreenResult,
@@ -55,24 +59,22 @@ def envelope(**overrides):
 
 def analysis_payload(**overrides):
     value = {
-        "topic": "project",
-        "topics": ["project"],
+        "topic": "developer_ecosystem",
+        "topics": ["developer_ecosystem"],
         "summary_cn": "一个可复用的 MCP 服务项目",
         "keywords": ["MCP", "开源"],
         "entities": [{"name": "MCP", "type": "technology", "aliases": []}],
         "selection_score": 87,
         "score_components": {
             "relevance": 90,
+            "importance": 85,
             "impact": 80,
             "freshness": 85,
             "source_authority": 70,
-            "actionability": 80,
+            "specificity": 80,
+            "tracking_value": 80,
             "total": 87,
         },
-        "paper_support": {"is_paper": False},
-        "risk_flags": [],
-        "reason": "项目材料明确",
-        "confidence": 91,
     }
     value.update(overrides)
     return value
@@ -141,35 +143,67 @@ def test_stage_b_strict_parser_has_entities_and_no_legacy_decision_fields():
     payload = analysis_payload()
     result = parse_analysis_result(payload, envelope=envelope())
     assert isinstance(result, AnalysisResult)
-    assert result.selection_score == 87
+    assert result.selection_score == 83
     assert result.entities[0].type == "technology"
     assert not hasattr(result, "keep")
     assert not hasattr(result, "novelty")
     assert result.raw_response == payload
 
 
-def test_stage_b_parser_normalizes_null_paper_source_type():
-    result = parse_analysis_result(
-        analysis_payload(paper_support={"is_paper": False, "source_type": None}),
-        envelope=envelope(),
+def test_stage_b_uses_juya_six_topic_taxonomy_only():
+    assert INTEL_TOPICS == (
+        "developer_ecosystem",
+        "model_release",
+        "product_application",
+        "industry_dynamics",
+        "technology_insight",
+        "outlook_rumor",
     )
-    assert result.paper_support.source_type == "unknown"
+    assert tuple(INTEL_TOPIC_LABELS.values()) == (
+        "开发生态",
+        "模型发布",
+        "产品应用",
+        "行业动态",
+        "技术与洞察",
+        "前瞻与传闻",
+    )
+    schema = build_analysis_provider_payload(envelope())[
+        "response_schema"
+    ]
+    assert "developer_ecosystem" in schema["topic"]
+    with pytest.raises(ValueError, match="topic must be one of"):
+        parse_analysis_result(analysis_payload(topic="paper", topics=["paper"]))
 
 
-def test_stage_b_empty_summary_falls_back_to_source_and_paper_is_risk_only():
+def test_stage_b_removed_contract_fields_are_not_in_schema():
+    schema = build_analysis_provider_payload(envelope(), api_style="openai_chat")["response_format"]["json_schema"]["schema"]
+    for field in (
+        "candidate_role",
+        "role_confidence",
+        "role_reason_code",
+        "role_reason",
+        "event_signature",
+        "material_facts",
+        "paper_support",
+        "risk_flags",
+        "reason",
+        "confidence",
+    ):
+        assert field not in schema["properties"]
+
+
+def test_stage_b_empty_summary_falls_back_to_source():
     item = envelope(summary="来源原始摘要，包含明确的项目变化。")
     result = parse_analysis_result(
         analysis_payload(
             summary_cn="",
-            topic="paper",
-            topics=["paper"],
-            paper_support={"is_paper": True, "supported": False},
+            topic="technology_insight",
+            topics=["technology_insight"],
         ),
         envelope=item,
     )
     assert result.summary_cn == item.summary
-    assert "summary:fallback" in result.risk_flags
-    assert "paper:unsupported" in result.risk_flags
+    assert not hasattr(result, "risk_flags")
     assert analysis_guard_failure(result) is None
 
 
@@ -181,7 +215,7 @@ def test_stage_b_empty_summary_without_source_text_remains_structural_failure():
     assert analysis_guard_failure(result) == "summary_empty"
 
 
-def test_first_party_x_accounts_are_not_marked_social_only_and_prompt_preserves_limits():
+def test_analysis_preserves_source_metadata_and_prompt_is_minimal():
     item = envelope(
         source_content_class="official_model_company",
         source_group="x_official",
@@ -190,28 +224,19 @@ def test_first_party_x_accounts_are_not_marked_social_only_and_prompt_preserves_
     )
     result = parse_analysis_result(analysis_payload(), envelope=item)
     assert result.source_content_class == "official_model_company"
-    assert "source:social_only" not in result.risk_flags
+    assert not hasattr(result, "risk_flags")
 
     analysis_instructions = build_analysis_provider_payload(item)["instructions"]
     screen_instructions = build_screen_provider_payload(item)["instructions"]
-    for instructions in (analysis_instructions, screen_instructions):
-        assert "source_group=x_official" in instructions
-        assert "不得补全正文未披露的交易细节" in instructions
-        assert "普通 x_social、x_search" in instructions
+    assert "summary_cn" in analysis_instructions
+    assert "keywords" in analysis_instructions
+    assert "selection_score" in analysis_instructions
+    assert "event_signature" not in analysis_instructions
+    assert "paper_support" not in analysis_instructions
+    assert "source_group=x_official" in screen_instructions
 
     assert "irrelevant、spam、pure_advertisement、navigation_or_index、empty_content、duplicate_without_update" in screen_instructions
     assert "low_information、insufficient_content" in screen_instructions
-
-
-def test_paper_guard_marks_arxiv_only_analysis():
-    item = envelope(url="https://arxiv.org/abs/1234.5678")
-    result = parse_analysis_result(
-        analysis_payload(topic="paper", topics=["paper"], paper_support={"is_paper": True, "paper_url": item.url}),
-        envelope=item,
-    )
-    assert result.paper_support.arxiv_only is True
-    assert result.paper_gate_pass is False
-    assert "paper:arxiv_only" in result.risk_flags
 
 
 def test_payloads_are_stage_specific_and_provider_styles_are_supported():
@@ -237,7 +262,7 @@ def test_client_calls_independent_stage_endpoints_and_isolates_failures():
     analysis_http = FakeHttp(analysis_payload())
     analysis_client = IntelTriageClient(api_url="https://ai.example.test", api_key="secret", http_client=analysis_http)
     analysis = analysis_client.analyze(item)
-    assert analysis.selection_score == 87
+    assert analysis.selection_score == 83
     assert analysis_http.calls[0]["json"]["task"] == "intel_analysis"
 
     class Failing:

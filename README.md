@@ -6,17 +6,17 @@
 source registry
 → fetch（抓取、解析、标准化、去重、来源健康记录）
 → Stage A screen（确定性初筛与轻量 AI 筛选）
-→ Stage B analyze（结构化分析、实体与评分）
-→ Stage C cluster（固定 reference time 的事件聚类）
-→ Stage D（日报主编选择、故事簇与展示标题）
+→ Stage B analyze（短摘要、关键词、主题分类与编辑优先级评分）
+→ Stage C aggregate（按本地评分门槛输入并一次 AI 调用聚合，同时判断近期重复/更新）
+→ Stage D（一次日报主编选择、故事簇与展示标题）
 → draft 审计工作区（按日期保留完整抓取与 A-D 决策）
 → export / approval（成功后发布为该日期唯一日报）
 → UI（首页、搜索、全部动态只读展示）
 ```
 
-AI review 对每个候选条目执行一次结构化分析，输出 `keep`、来源类型 `content_class`、编辑主题 `topic_category`、中文摘要、理由、风险标记和置信度。AI 结果是编辑分析输出，不是来源背书；完整 pipeline 会继续由 Stage C 判断真实事件身份，并由独立的 Stage D 编辑 skill 选择当天的日报组合。
+Stage B1 对每个通过 Stage A 的条目执行一次结构化分析，只输出来源归因、主题分类、中文短摘要、关键词、实体和编辑优先级评分。它不做事件角色路由、事实抽取、论文证据判断、风险标记或自评置信度；完整 pipeline 会继续由 Stage C 一次性聚合新闻主线，并由独立的 Stage D 编辑 skill 选择当天的日报组合。
 
-`content_class` 描述来源/信号类型（官方发布、媒体报道、项目/工具、社区线索），`topic_category` 描述内容主题（模型、产品、行业、论文、教程、观点）。两者分开保存，UI 和导出会同时展示，避免把第三方媒体报道误读成“官方产品发布”。
+`content_class` 描述来源/信号类型（官方发布、媒体报道、项目/工具、社区线索），`topic_category` 使用橘鸦日报的六类编辑主题（开发生态、模型发布、产品应用、行业动态、技术与洞察、前瞻与传闻）。两者分开保存，UI 和导出会同时展示，避免把第三方媒体报道误读成“官方产品发布”。
 
 ## 内容类别与来源归因
 
@@ -24,26 +24,26 @@ AI review 对每个候选条目执行一次结构化分析，输出 `keep`、来
 | --- | --- | --- |
 | `official_model_company` | 官方模型、公司产品、API 和研究更新 | 按来源身份、时间窗口和关键词筛选，再交给 AI 分类和摘要 |
 | `news_media` | 科技媒体、垂直 AI 新闻和分析博客 | 保持来源归因，按较短时效窗口和来源级关键词筛选，不标注为官方发布 |
-| `project_tool` | GitHub、Product Hunt、AI 工具项目 | 按项目指标和时间窗口筛选；GitHub 项目可生成一次项目摘要 |
+| `project_tool` | GitHub Release、Product Hunt、AI 工具项目 | 按项目更新和时间窗口筛选；GitHub 项目可单独生成项目摘要 |
 | `community_social` | X、Reddit、RSSHub、论坛 | 作为社区线索参与 AI 分类；输出保留来源归因和风险标记 |
 
-默认主题分类由 `AI_REVIEW_CATEGORIES` 控制：`模型`、`产品`、`行业`、`论文`、`教程`、`观点`。主题分类与来源类型是两个独立字段；如需更细粒度（例如“安全与治理”“开源项目”），可直接在 `.env` 中替换这组标签。
+默认主题分类为：`开发生态`、`模型发布`、`产品应用`、`行业动态`、`技术与洞察`、`前瞻与传闻`。主题分类与来源类型是两个独立字段；Stage B1 只输出这六类，不再使用旧的模型、产品、项目、行业、论文、教程、观点分类。
 
 导出和 UI 保留 `source_id`、`source_name`、`source_group`、`source_subtype`、`source_role`、`transport`、`tier` 与 `x_official` 等来源字段。X 官方账号可通过 `source_group=x_official`、`source_role=official` 和 `x_official=true` 归因；这些字段只描述来源身份。
 
 ## 抓取来源
 
-来源配置位于 `app/config/source_registry.yaml`。唯一的抓取路由字段是 `transport`：`feed`、`rsshub` 或 `github`；Feed 细节在 `feed` 下，GitHub 细节在 `github` 下。当前保留原生 RSS/Atom、RSSHub、GitHub Trending/Search/Releases 和 Product Hunt Atom 采集器。
+来源配置位于 `app/config/source_registry.yaml`。唯一的抓取路由字段是 `transport`：`feed`、`rsshub` 或 `github`；Feed 细节在 `feed` 下，GitHub 细节在 `github` 下。日报主链路已停用普通 arXiv 聚合源、GitHub Trending 和 GitHub Search 新项目源；当前只保留明确仓库的 GitHub Releases。后续新项目发现可在独立专栏中重新启用，不与日报事件池混跑。
 
-当前 registry 在配置 `RSSHUB_BASE_URL` 后有 83 个启用来源（具体数量以 YAML 为准）：
+当前 registry 在配置 `RSSHUB_BASE_URL` 后有 79 个启用来源（具体数量以 YAML 为准）：
 
 | `transport` | 当前数量 | 主要来源组 | 抓取方式与内容 |
 | --- | ---: | --- | --- |
-| `feed` | 31 | `official_blog`、`official_research`、`tech_media`、`hacker_news`、`producthunt`、`linux_do`、`reddit_fixed` | HTTP 获取 RSS/Atom，统一解析为条目；包括官方博客/研究、AI 垂直媒体、IT之家、Hacker News、Product Hunt、LINUX DO 和 LocalLLaMA Reddit Feed。个别公开源可在 registry 中显式 `bypass_proxy`，避免依赖进程级 `NO_PROXY`。 |
-| `github` | 11 | `github_trending`、`github_search`、`github_release` | 使用 GitHub API 或 Trending 页面抓取项目、Topic 搜索和 Release；保留 stars、forks、topics、Trending 周期等项目指标。 |
-| `rsshub` | 41 | 31 个 `x_official`、`x_social`、`x_search`，以及 Anthropic RSSHub 路由 | 访问本地 RSSHub 输出的 RSS/Atom；X 官方账号保留 `x_official=true` 等来源归因，不绕过 AI 筛选。 |
+| `feed` | 33 | `official_blog`、`official_research`、`tech_media`、`hacker_news`、`producthunt`、`linux_do`、`reddit_fixed` | HTTP 获取 RSS/Atom，统一解析为条目；普通 arXiv 聚合源当前禁用。个别公开源可在 registry 中显式 `bypass_proxy`，避免依赖进程级 `NO_PROXY`。 |
+| `github` | 3 | `github_release` | 只跟踪 Claude Code、Ollama、Transformers 等明确仓库的 Release；Trending 与 Topic Search 当前禁用。 |
+| `rsshub` | 43 | `x_official`、`x_social`，以及 Anthropic RSSHub 路由 | 访问本地 RSSHub 输出的 RSS/Atom；X 官方账号保留 `x_official=true` 等来源归因，不绕过 AI 筛选。 |
 
-如果没有配置 `RSSHUB_BASE_URL`，41 个 RSSHub 模板会被安全跳过，CLI 会显示 `Registry skipped`；这不会阻断其它 Feed 和 GitHub 来源。单个来源失败也只记录在 `fetch_attempts` 和来源健康状态中，不会中断整个批次。
+如果没有配置 `RSSHUB_BASE_URL`，43 个 RSSHub 模板会被安全跳过，CLI 会显示 `Registry skipped`；这不会阻断其它 Feed 和 GitHub Release 来源。单个来源失败也只记录在 `fetch_attempts` 和来源健康状态中，不会中断整个批次。
 
 本地 RSSHub 的 X 认证路径只有 `TWITTER_AUTH_TOKEN`。`scripts/start_rsshub.sh` 会保留该 token 和 `PROXY_URI`，并显式移除 OAuth 与第三方 X API 变量；脚本在默认 Node 不受支持时会优先尝试 NVM Node 24，再回退到 Node 22。
 
@@ -99,8 +99,8 @@ AI_REVIEW_MODEL=
 AI_REVIEW_API_STYLE=generic_json
 AI_REVIEW_TIMEOUT_SECONDS=30
 AI_REVIEW_CONCURRENCY=4
-AI_REVIEW_CATEGORIES=模型,产品,行业,论文,教程,观点
-AI_REVIEW_CATEGORY_MODE=ai
+AI_REVIEW_CATEGORIES=开发生态,模型发布,产品应用,行业动态,技术与洞察,前瞻与传闻
+AI_STAGE_C_INPUT_MIN_SCORE=60
 AI_STAGE_D_API_URL=
 AI_STAGE_D_API_KEY=
 AI_STAGE_D_MODEL=
@@ -108,6 +108,8 @@ AI_STAGE_D_API_STYLE=generic_json
 AI_STAGE_D_TIMEOUT_SECONDS=120
 AI_STAGE_D_RETRIES=2
 ```
+
+`AI_STAGE_C_INPUT_MIN_SCORE` 默认 `60`。Stage C 直接读取完成 Stage B1、通过结构性校验、且经本地 guard 后评分不低于该阈值的条目；这里没有独立的 B2 路由层。最终 selected/watchlist 数量仍由 Stage D 控制。
 
 `AI_REVIEW_CONCURRENCY` 取值为 `1..4`，默认 `4`，表示 Stage A/B provider 请求的并发上限。
 Stage D 必须显式配置自己的 `AI_STAGE_D_*`，不会回退复用 `AI_REVIEW_*`。
@@ -211,9 +213,9 @@ $PYTHON -m app.main source-health --source x_account_openai
 各阶段的职责、审计位置和批准门禁如下：
 
 1. 正式日报的 `fetch` 从 registry 载入全部当前启用来源，强制完整请求（不使用 HTTP 304 条件请求），把本次响应视为当天完整集合；每个条目只在当前 `draft.db` 内去重。
-2. `stage-a` 先执行来源级确定性初筛，再对保留条目调用结构化 AI；`stage-b` 对通过 Stage A 的条目做结构化分析。原始条目、拒绝原因、AI 结果和失败 attempt 都保留在该日期 `draft.db`。
-3. `stage-c` 只处理真实世界事件身份：URL/external ID 是精确锚点，标题只是弱候选信号；摘要、实体和关键词用于候选召回，模糊组交由窄域 AI resolver 分区，失败时保守拆分。跨日报重复判断只读取此前日期的最终日报条目，不读取历史 raw 数据。
-4. `stage-d` 只处理日报编辑：先应用论文证据硬门槛，再由独立编辑 skill 对本轮 Stage C canonical events 做全局选择、故事簇归并、展示顺序和中文展示标题。它不使用 topic/source/content/repeat 的本地配额，也不要求凑满 30 条；社区线索可被选中，但展示层会强制标注待核实。
+2. `stage-a` 先执行来源级确定性初筛，再对保留条目调用结构化 AI；`stage-b` 对通过 Stage A 的条目做 B1 分析，保存摘要、关键词、主题、实体和经本地 guard 的评分。原始条目、拒绝原因、AI 结果和失败 attempt 都保留在该日期 `draft.db`。
+3. `stage-c` 直接从当前 build 的成功 Stage B1 条目中按本地评分门槛和结构性校验构造输入，并把输入、排除原因和最近 3 天已发布日报一次性交给聚合 skill。AI 直接决定事件分组、`primary/duplicate/related` 关系、聚合标题与摘要，以及 `new/repeat/updated` 历史状态。本地代码校验所有输入 `item_id` 恰好出现一次、历史 key 合法，并保存事件、完整来源关系和输入审计。Provider、JSON 或 schema 任一失败都会让 Stage C 直接报错并保留失败审计。
+4. `stage-d` 只处理日报编辑：通过一次独立编辑 skill 请求对本轮 Stage C canonical events 做全局选择、故事簇归并、展示顺序和中文展示标题。它不使用 topic/source/content/repeat 的本地配额，也不要求凑满 30 条；社区线索可被选中，但展示层会强制标注待核实。
 5. `pipeline status --edition-date ...` 同时显示正式日报状态、当前 draft 状态和 retained audit 路径。构建期间 UI/API 始终读取旧的已发布日报；它们不读取 draft。
 6. `export` 是明确的批准动作：只有所有来源和 AI 阶段完整成功时，才把 `draft.db` 提升为 `audit.db`、原子替换 `output/daily/YYYY-MM-DD/`，并在正式库内替换该日期的最终日报条目。任一步失败都会恢复旧 audit 和旧日报；失败 draft 留在原处，可按日期检查、重试或恢复。
 7. 同日重新抓取不合并上午结果：下午响应中不存在的资讯、被移除来源的资讯及其派生事件，会在下午成功批准后从当天最终日报和新的 `audit.db` 中消失。新 draft 运行期间，上午已发布的 `audit.db` 仍保留，便于和下午 draft 比对。
@@ -241,7 +243,7 @@ sqlite3 "$AUDIT" \
 sqlite3 "$AUDIT" \
   "SELECT i.id, i.title, i.canonical_url, i.status AS item_status,
           s.decision AS stage_a_decision, s.reason_code AS stage_a_reason_code, s.reason AS stage_a_reason,
-          r.status AS stage_b_status, r.selection_score AS stage_b_score, r.reason AS stage_b_reason
+          r.status AS stage_b_status, r.selection_score AS stage_b_score
      FROM intel_items AS i
      LEFT JOIN ai_item_screens AS s ON s.item_id = i.id
      LEFT JOIN ai_item_reviews AS r ON r.item_id = i.id
@@ -269,7 +271,7 @@ $PYTHON -m uvicorn app.web.app:app --host 127.0.0.1 --port 8000
 
 Stage A/B 对每条 AI provider 任务执行瞬态错误自动重试：首次调用失败后最多再重试 5 次（最多 6 次 provider 调用）。429、5xx、timeout 和 rate-limit 属于可重试错误；永久性 4xx、鉴权失败和 schema 错误不会重复请求。达到上限后 draft 保留为失败状态，旧日报不被替换，修复后可使用同一 `edition_date` 恢复。
 
-默认数量策略为：每个来源抓取 20 条，Stage A/B 处理当前完整 build，日报默认导出 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；Stage D 始终对本轮通过论文门槛的完整事件池做编辑选择；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
+默认数量策略为：每个来源抓取 20 条，Stage A/B 处理当前完整 build，Stage C 仅聚合本地评分不低于 `AI_STAGE_C_INPUT_MIN_SCORE` 的有效条目，日报默认导出最多 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
 
 `export` 的日报产物默认写入 `output/daily/YYYY-MM-DD/`：
 

@@ -1,10 +1,9 @@
 """Deterministic Stage A/Stage B guards.
 
-Provider output is never allowed to upgrade a result.  The screen guard only
-preserves high-confidence rejects for an explicit, local hard-reject reason;
-all other provider rejects are downgraded to ``uncertain``.  The analysis
-guard records paper and empty-summary risks while leaving threshold decisions
-to the job.
+Stage A keeps its conservative hard-reject guard.  Stage B only normalizes
+source provenance, repairs an empty summary from the frozen input envelope,
+and recomputes the local priority score.  Editorial routing, event facts,
+paper evidence, and free-form risk judgments are intentionally outside B1.
 """
 
 from __future__ import annotations
@@ -13,11 +12,40 @@ from typing import Any, Mapping
 
 from .models import (
     AnalysisResult,
-    COMMUNITY_SOCIAL,
     RawIntelEnvelope,
     ScreenResult,
-    TOPIC_PAPER,
 )
+
+
+SCORE_WEIGHTS = {
+    "relevance": 0.20,
+    "importance": 0.20,
+    "impact": 0.20,
+    "freshness": 0.15,
+    "source_authority": 0.10,
+    "specificity": 0.10,
+    "tracking_value": 0.05,
+}
+
+
+def recompute_analysis_score(result: AnalysisResult) -> int:
+    """Calculate the local seven-dimension editorial priority score.
+
+    The provider score is retained in ``raw_response`` for audit, while the
+    value used by deterministic Stage-C ordering/gating is reproducible.
+    """
+
+    scores = result.score_components
+    values = {
+        "relevance": scores.relevance,
+        "importance": scores.importance or scores.impact,
+        "impact": scores.impact,
+        "freshness": scores.freshness,
+        "source_authority": scores.source_authority,
+        "specificity": scores.specificity or scores.relevance,
+        "tracking_value": scores.tracking_value or scores.actionability,
+    }
+    return max(0, min(100, int(round(sum(values[name] * weight for name, weight in SCORE_WEIGHTS.items())))))
 
 
 # These are the only provider-supplied reasons that can terminate Stage A.
@@ -122,12 +150,19 @@ def apply_analysis_guards(
     result: AnalysisResult | Mapping[str, Any],
     envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
 ) -> AnalysisResult:
-    """Apply monotonic Stage B safety guards and preserve raw provider data."""
+    """Apply the minimal deterministic Stage-B projection guards."""
 
     parsed = result if isinstance(result, AnalysisResult) else AnalysisResult.model_validate(result)
     updates: dict[str, Any] = {}
-    flags = list(parsed.risk_flags)
     item = _as_envelope(envelope) if envelope is not None else None
+
+    # The local score is authoritative for downstream ordering.  It is
+    # recomputed from the submitted components so the provider cannot return
+    # a total that disagrees with its own breakdown.
+    recomputed = recompute_analysis_score(parsed)
+    if parsed.selection_score != recomputed or parsed.score_components.total != recomputed:
+        updates["score_components"] = parsed.score_components.model_copy(update={"total": recomputed})
+        updates["selection_score"] = recomputed
 
     if item is not None:
         if parsed.item_id is None and item.item_id is not None:
@@ -138,16 +173,8 @@ def apply_analysis_guards(
             # Source metadata is authoritative for provenance; provider output
             # cannot relabel a community signal as an official source.
             updates["source_content_class"] = item.source_content_class
-            if "source:class_mismatch" not in flags:
-                flags.append("source:class_mismatch")
         if parsed.source_group is None and item.source_group:
             updates["source_group"] = item.source_group
-
-        if parsed.topic == TOPIC_PAPER and item.url and "arxiv.org" in item.url.casefold():
-            support = parsed.paper_support
-            if support.paper_url != item.url or not support.is_paper:
-                support = support.model_copy(update={"paper_url": item.url, "is_paper": True, "arxiv_only": True})
-                updates["paper_support"] = support
 
     if parsed.status == "success" and not parsed.summary_cn.strip():
         # A provider may omit the generated summary even though the frozen
@@ -160,22 +187,6 @@ def apply_analysis_guards(
             fallback = str(item.summary or item.title or "").strip()
         if fallback:
             updates["summary_cn"] = fallback
-            flags = [flag for flag in flags if flag != "summary:empty"]
-            if "summary:fallback" not in flags:
-                flags.append("summary:fallback")
-        elif "summary:empty" not in flags:
-            flags.append("summary:empty")
-
-    if parsed.topic == TOPIC_PAPER and not parsed.paper_support.hard_gate_pass:
-        if parsed.paper_support.arxiv_only and "paper:arxiv_only" not in flags:
-            flags.append("paper:arxiv_only")
-        elif "paper:unsupported" not in flags:
-            flags.append("paper:unsupported")
-
-    if parsed.source_content_class == COMMUNITY_SOCIAL and "source:social_only" not in flags:
-        flags.append("source:social_only")
-    if flags != parsed.risk_flags:
-        updates["risk_flags"] = flags
     return parsed.model_copy(update=updates) if updates else parsed
 
 
@@ -186,17 +197,11 @@ def guard_analysis_result(
     return apply_analysis_guards(result, envelope)
 
 
-def guard_paper_support(result: AnalysisResult | Mapping[str, Any]) -> AnalysisResult:
-    """Apply the paper-only guard without requiring the raw envelope."""
-
-    return apply_analysis_guards(result)
-
-
 def analysis_guard_failure(result: AnalysisResult | Mapping[str, Any]) -> str | None:
     """Return only a true provider/structural failure reason.
 
-    Editorial value, score and paper support are deliberately not Stage-B
-    gates.  An empty summary remains structural only after
+    Editorial value and score are deliberately not Stage-B gates.  An empty
+    summary remains structural only after
     :func:`apply_analysis_guards` had a chance to recover the source summary or
     title as a fallback.
     """
@@ -210,13 +215,14 @@ def analysis_guard_failure(result: AnalysisResult | Mapping[str, Any]) -> str | 
 
 
 __all__ = [
+    "SCORE_WEIGHTS",
     "SCREEN_HARD_REJECT_REASON_ALIASES",
     "SCREEN_HARD_REJECT_REASON_CODES",
     "analysis_guard_failure",
+    "recompute_analysis_score",
     "apply_analysis_guards",
     "apply_screen_guard",
     "canonical_screen_reason_code",
     "guard_analysis_result",
-    "guard_paper_support",
     "guard_screen_result",
 ]

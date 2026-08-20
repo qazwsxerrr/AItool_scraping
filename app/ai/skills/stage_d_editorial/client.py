@@ -1,4 +1,4 @@
-"""HTTP adapter for the one-shot Stage D editorial selection skill."""
+"""HTTP adapter for the single Stage-D editorial selection skill."""
 
 from __future__ import annotations
 
@@ -12,15 +12,9 @@ import httpx
 
 from app.config.settings import Settings
 
-from .models import StageDAssessmentResponse, StageDCompositionResponse
-from .parser import strict_parse_stage_d_assessment, strict_parse_stage_d_composition
-from .prompts import (
-    build_stage_d_assessment_payload,
-    build_stage_d_composition_payload,
-    build_stage_d_provider_payload,
-    preflight_stage_d_schema,
-    preflight_stage_d_v2_schemas,
-)
+from .models import StageDEditorialResponse
+from .parser import strict_parse_stage_d_editorial
+from .prompts import build_stage_d_provider_payload, preflight_stage_d_schema
 
 
 class SupportsPost(Protocol):
@@ -28,7 +22,7 @@ class SupportsPost(Protocol):
 
 
 class StageDEditorialProviderError(RuntimeError):
-    """Sanitized, structured HTTP/provider failure for Stage D audit paths."""
+    """Sanitized, structured HTTP/provider failure for Stage-D audit paths."""
 
     def __init__(
         self,
@@ -60,15 +54,15 @@ class StageDEditorialProviderError(RuntimeError):
 
 @dataclass(frozen=True)
 class StageDProviderCallResult:
-    """Single-call envelope used by D1/D3 and safe for concurrent callers."""
+    """Parsed response plus the raw provider payload and request audit."""
 
-    parsed: Any
+    parsed: StageDEditorialResponse
     raw_response: Any
     request_metadata: Mapping[str, Any]
 
 
 class StageDEditorialClient:
-    """A dedicated provider client; it never reuses Stage A/B semantics."""
+    """Dedicated provider client for one complete Stage-D editorial call."""
 
     def __init__(
         self,
@@ -86,7 +80,7 @@ class StageDEditorialClient:
         self.model = model
         self.api_style = _normalize_api_style(api_style)
         self.timeout_seconds = float(timeout_seconds)
-        self.max_retries = int(max_retries)
+        self.max_retries = max(0, int(max_retries))
         self._http_client = http_client
         self.last_raw_response: Any | None = None
         self.last_request_metadata: dict[str, Any] | None = None
@@ -108,33 +102,7 @@ class StageDEditorialClient:
     def is_configured(self) -> bool:
         return bool(self.api_url and self.api_key)
 
-    def assess_events(
-        self,
-        events: Sequence[Mapping[str, Any]],
-        *,
-        edition: Mapping[str, Any] | None = None,
-    ) -> StageDProviderCallResult:
-        """Run D1 independent assessments and return an audit envelope."""
-
-        if not self.is_configured:
-            raise RuntimeError("Stage D editorial API is not configured")
-        preflight_stage_d_v2_schemas()
-        event_ids = [int(event["event_id"]) for event in events]
-        payload = build_stage_d_assessment_payload(
-            events,
-            edition=edition or {},
-            model=self.model,
-            api_style=self.api_style,
-        )
-        return self._call_phase(
-            phase="assessment",
-            payload=payload,
-            event_ids=event_ids,
-            events=events,
-            parser=lambda value: strict_parse_stage_d_assessment(value, event_ids=event_ids),
-        )
-
-    def compose_events(
+    def select_events(
         self,
         events: Sequence[Mapping[str, Any]],
         *,
@@ -142,13 +110,13 @@ class StageDEditorialClient:
         total_max: int = 30,
         watchlist_max: int = 10,
     ) -> StageDProviderCallResult:
-        """Run D3 global composition over a bounded shortlist."""
+        """Select and compose the complete daily edition in one provider call."""
 
         if not self.is_configured:
             raise RuntimeError("Stage D editorial API is not configured")
-        preflight_stage_d_v2_schemas()
+        preflight_stage_d_schema()
         event_ids = [int(event["event_id"]) for event in events]
-        payload = build_stage_d_composition_payload(
+        payload = build_stage_d_provider_payload(
             events,
             edition=edition or {},
             model=self.model,
@@ -156,32 +124,22 @@ class StageDEditorialClient:
             total_max=total_max,
             watchlist_max=watchlist_max,
         )
-        return self._call_phase(
-            phase="composition",
+        return self._call(
             payload=payload,
             event_ids=event_ids,
             events=events,
             total_max=total_max,
             watchlist_max=watchlist_max,
-            parser=lambda value: strict_parse_stage_d_composition(
-                value,
-                event_ids=event_ids,
-                total_max=total_max,
-                watchlist_max=watchlist_max,
-                events=events,
-            ),
         )
 
-    def _call_phase(
+    def _call(
         self,
         *,
-        phase: str,
         payload: dict[str, Any],
         event_ids: Sequence[int],
         events: Sequence[Mapping[str, Any]],
-        parser: Any,
-        total_max: int = 30,
-        watchlist_max: int = 10,
+        total_max: int,
+        watchlist_max: int,
     ) -> StageDProviderCallResult:
         endpoint = self._endpoint_url()
         request_metadata = _request_metadata(
@@ -192,47 +150,71 @@ class StageDEditorialClient:
             event_count=len(event_ids),
             total_max=total_max,
             watchlist_max=watchlist_max,
-            phase=phase,
         )
         self.last_request_metadata = request_metadata
         self.last_raw_response = None
         self.last_error_metadata = None
-        try:
-            response = self._post_once(endpoint, payload, request_metadata=request_metadata)
-        except StageDEditorialProviderError as exc:
-            self.last_raw_response = exc.raw_response
-            self.last_error_metadata = exc.audit_payload()
-            raise
-        try:
-            raw_payload = response.json()
-        except (TypeError, ValueError) as exc:
-            error = StageDEditorialProviderError(
-                "Stage D API returned invalid JSON",
-                status_code=_response_status(response),
-                error_code="invalid_json",
-                raw_response=_safe_response_payload(response),
-                request_metadata=request_metadata,
-                cause=exc,
-            )
-            self.last_raw_response = error.raw_response
-            self.last_error_metadata = error.audit_payload()
-            raise error from exc
-        try:
-            parsed = parser(raw_payload)
-        except (TypeError, ValueError) as exc:
-            error = StageDEditorialProviderError(
-                f"Stage D {phase} response failed schema validation",
-                status_code=_response_status(response),
-                error_code="schema_validation_failed",
-                raw_response=raw_payload,
-                request_metadata=request_metadata,
-                cause=exc,
-            )
-            self.last_raw_response = raw_payload
-            self.last_error_metadata = error.audit_payload()
-            raise error from exc
-        self.last_raw_response = raw_payload
-        return StageDProviderCallResult(parsed=parsed, raw_response=raw_payload, request_metadata=request_metadata)
+        last_error: BaseException | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self._post_once(endpoint, payload, request_metadata=request_metadata)
+                try:
+                    raw_payload = response.json()
+                except (TypeError, ValueError) as exc:
+                    raise StageDEditorialProviderError(
+                        "Stage D API returned invalid JSON",
+                        status_code=_response_status(response),
+                        error_code="invalid_json",
+                        raw_response=_safe_response_payload(response),
+                        request_metadata=request_metadata,
+                        cause=exc,
+                    ) from exc
+                try:
+                    parsed = strict_parse_stage_d_editorial(
+                        raw_payload,
+                        event_ids=event_ids,
+                        total_max=total_max,
+                        watchlist_max=watchlist_max,
+                        events=events,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise StageDEditorialProviderError(
+                        "Stage D response failed schema validation",
+                        status_code=_response_status(response),
+                        error_code="schema_validation_failed",
+                        raw_response=raw_payload,
+                        request_metadata=request_metadata,
+                        cause=exc,
+                    ) from exc
+                self.last_raw_response = raw_payload
+                request_metadata = dict(request_metadata)
+                request_metadata["provider_attempts"] = attempt + 1
+                return StageDProviderCallResult(
+                    parsed=parsed,
+                    raw_response=raw_payload,
+                    request_metadata=request_metadata,
+                )
+            except BaseException as exc:
+                last_error = exc
+                if not _provider_failure_is_retryable(exc) or attempt >= self.max_retries:
+                    if isinstance(exc, StageDEditorialProviderError):
+                        self.last_raw_response = exc.raw_response
+                        self.last_error_metadata = exc.audit_payload()
+                        raise
+                    error = StageDEditorialProviderError(
+                        str(exc),
+                        error_code="provider_error",
+                        request_metadata=request_metadata,
+                        cause=exc,
+                    )
+                    self.last_error_metadata = error.audit_payload()
+                    raise error from exc
+        raise StageDEditorialProviderError(
+            str(last_error or "Stage D provider request failed"),
+            error_code="provider_error",
+            request_metadata=request_metadata,
+            cause=last_error,
+        )
 
     def _post_once(self, url: str, payload: dict[str, Any], *, request_metadata: Mapping[str, Any] | None = None):
         headers = {
@@ -240,32 +222,32 @@ class StageDEditorialClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        if self._http_client is not None:
-            try:
-                response = self._http_client.post(url, headers=headers, json=payload, timeout=self.timeout_seconds)
-            except TypeError:
-                response = self._http_client.post(url, headers=headers, json=payload)
-        else:
-            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True, http2=True, trust_env=True) as client:
-                response = client.post(url, headers=headers, json=payload)
+        try:
+            if self._http_client is not None:
+                try:
+                    response = self._http_client.post(url, headers=headers, json=payload, timeout=self.timeout_seconds)
+                except TypeError:
+                    response = self._http_client.post(url, headers=headers, json=payload)
+            else:
+                with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True, http2=True, trust_env=True) as client:
+                    response = client.post(url, headers=headers, json=payload)
+        except BaseException as exc:
+            raise StageDEditorialProviderError(
+                str(exc),
+                error_code="transport_error",
+                request_metadata=request_metadata,
+                cause=exc,
+            ) from exc
         status_code = _response_status(response)
         if status_code is not None and status_code >= 400:
-            raise _provider_error_from_response(
-                response,
-                request_metadata=request_metadata,
-                cause=None,
-            )
+            raise _provider_error_from_response(response, request_metadata=request_metadata, cause=None)
         raise_for_status = getattr(response, "raise_for_status", None)
         if callable(raise_for_status):
             try:
                 raise_for_status()
             except BaseException as exc:
                 if _response_status(response) is not None and _response_status(response) >= 400:
-                    raise _provider_error_from_response(
-                        response,
-                        request_metadata=request_metadata,
-                        cause=exc,
-                    ) from exc
+                    raise _provider_error_from_response(response, request_metadata=request_metadata, cause=exc) from exc
                 raise
         return response
 
@@ -281,10 +263,27 @@ class StageDEditorialClient:
 
 def _normalize_api_style(value: Any) -> str:
     style = str(value or "generic_json").strip().casefold().replace("-", "_")
-    style = {"responses": "openai_responses", "openai_response": "openai_responses", "chat": "openai_chat", "chat_completions": "openai_chat"}.get(style, style)
+    style = {
+        "responses": "openai_responses",
+        "openai_response": "openai_responses",
+        "chat": "openai_chat",
+        "chat_completions": "openai_chat",
+    }.get(style, style)
     if style not in {"generic_json", "openai_chat", "openai_responses"}:
         raise ValueError("api_style must be generic_json, openai_chat, or openai_responses")
     return style
+
+
+def _provider_failure_is_retryable(exc: BaseException) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    try:
+        if status_code is not None:
+            return int(status_code) == 429 or int(status_code) >= 500
+    except (TypeError, ValueError):
+        pass
+    name = exc.__class__.__name__.casefold()
+    text = str(exc).casefold()
+    return any(token in name or token in text for token in ("timeout", "connect", "network", "transport"))
 
 
 def _request_metadata(
@@ -295,10 +294,10 @@ def _request_metadata(
     api_style: str,
     event_count: int,
     total_max: int,
-    watchlist_max: int = 10,
-    phase: str = "composition",
+    watchlist_max: int,
 ) -> dict[str, Any]:
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    digest = hashlib.sha256(serialized).hexdigest()
     return {
         "endpoint": _safe_url(endpoint),
         "api_style": api_style,
@@ -306,12 +305,12 @@ def _request_metadata(
         "event_count": int(event_count),
         "total_max": int(total_max),
         "watchlist_max": int(watchlist_max),
-        "phase": str(phase),
-        "prompt_version": "stage_d_assessment_v1" if phase == "assessment" else "stage_d_editorial_v2",
-        "schema_version": "stage_d_assessment_v1" if phase == "assessment" else "stage_d_editorial_v2",
+        "phase": "editorial",
+        "prompt_version": "stage_d_editorial_v3",
+        "schema_version": "stage_d_editorial_v3",
         "request_bytes": len(serialized),
-        "request_sha256": hashlib.sha256(serialized).hexdigest(),
-        "request_hash": hashlib.sha256(serialized).hexdigest(),
+        "request_sha256": digest,
+        "request_hash": digest,
     }
 
 

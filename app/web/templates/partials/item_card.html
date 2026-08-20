@@ -17,7 +17,7 @@
     {% if item.summary_cn %}<p class="summary-clamp">{{ item.summary_cn }}</p>{% endif %}
     {% if item.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ item.selection_reason }}</p>{% endif %}
     <div class="badges">
-      {% if item.topic_category %}<span class="badge topic-badge">{{ item.topic_category }}</span>{% endif %}
+      {% if item.topic_category %}<span class="badge topic-badge">{{ item.topic_category | topic_label }}</span>{% endif %}
       {% if item.content_class %}<span class="badge badge-source">{{ item.content_class | content_class_label }}</span>{% endif %}
       {% if item.source_tier %}<span class="badge">{{ item.source_tier | tier_label }}</span>{% endif %}
       {% if item.source_subtype %}<span class="badge">{{ item.source_subtype }}</span>{% endif %}

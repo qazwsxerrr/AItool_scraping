@@ -117,7 +117,7 @@ def test_retry_stage_b_targets_only_current_draft_stage_b_tasks(tmp_path, monkey
         repo = IntelRepository(session)
         _, draft = repo.start_daily_build(edition_date="2026-08-19", reference_time=datetime.now(timezone.utc))
         stage = repo.ensure_stage(draft.id, "analyze")
-        task = repo.ensure_stage_task(stage, subject_type="run", subject_id=draft.id)
+        task = repo.ensure_stage_task(stage, subject_type="item", subject_id=draft.id)
         repo.fail_stage_task(task, error_code="provider_500", error_message="retry", retryable=True)
         session.commit()
         task_id = int(task.id)

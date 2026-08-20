@@ -269,7 +269,7 @@ sources:
   name: arXiv AI CL LG ML
   transport: feed
   url: https://rss.arxiv.org/atom/cs.AI+cs.CL+cs.LG+stat.ML
-  enabled: true
+  enabled: false
   priority: 38
   fetch_interval: 21600
   feed:
@@ -392,32 +392,6 @@ sources:
   topic_scopes:
   - model_product
   - open_source_tool
-  primary_eligible: true
-- id: gary_marcus_blog
-  name: Gary Marcus Blog
-  transport: feed
-  url: https://garymarcus.substack.com/feed
-  enabled: true
-  priority: 63
-  fetch_interval: 7200
-  feed:
-    format: rss
-    adapter: generic
-  source_group: tech_media
-  source_subtype: analysis_blog
-  quality_weight: 0.8
-  source_role: analysis
-  spam_risk: low
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 7
-    keywords: []
-  default_limit: 15
-  tier: p2
-  topic_scopes:
-  - research
-  - practice_opinion
   primary_eligible: true
 - id: tomer_tunguz_blog
   name: Tomer Tunguz Blog
@@ -843,7 +817,7 @@ sources:
   name: GitHub Trending Daily
   transport: github
   url: https://github.com/trending?since=daily
-  enabled: true
+  enabled: false
   priority: 40
   fetch_interval: 86400
   github:
@@ -868,7 +842,7 @@ sources:
   name: GitHub Trending Weekly
   transport: github
   url: https://github.com/trending?since=weekly
-  enabled: true
+  enabled: false
   priority: 41
   fetch_interval: 86400
   github:
@@ -893,7 +867,7 @@ sources:
   name: GitHub Search Topic LLM
   transport: github
   url: https://api.github.com/search/repositories
-  enabled: true
+  enabled: false
   priority: 45
   fetch_interval: 21600
   github:
@@ -922,7 +896,7 @@ sources:
   name: GitHub Search Topic AI Agent
   transport: github
   url: https://api.github.com/search/repositories
-  enabled: true
+  enabled: false
   priority: 46
   fetch_interval: 21600
   github:
@@ -951,7 +925,7 @@ sources:
   name: GitHub Search Topic RAG
   transport: github
   url: https://api.github.com/search/repositories
-  enabled: true
+  enabled: false
   priority: 47
   fetch_interval: 21600
   github:
@@ -981,7 +955,7 @@ sources:
   name: GitHub Search Topic Vector Database
   transport: github
   url: https://api.github.com/search/repositories
-  enabled: true
+  enabled: false
   priority: 48
   fetch_interval: 21600
   github:
@@ -1011,7 +985,7 @@ sources:
   name: GitHub Search Topic Large Language Model
   transport: github
   url: https://api.github.com/search/repositories
-  enabled: true
+  enabled: false
   priority: 49
   fetch_interval: 21600
   github:
@@ -1041,7 +1015,7 @@ sources:
   name: GitHub Search Topic Machine Learning
   transport: github
   url: https://api.github.com/search/repositories
-  enabled: true
+  enabled: false
   priority: 50
   fetch_interval: 21600
   github:
@@ -1153,27 +1127,6 @@ sources:
     mode: community_recent
     max_age_days: 7
   default_limit: 30
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
-- id: reddit_local_llama_new
-  name: Reddit LocalLLaMA New
-  transport: feed
-  url: https://www.reddit.com/r/LocalLLaMA/new/.rss
-  enabled: true
-  priority: 70
-  fetch_interval: 7200
-  feed:
-    format: atom
-    adapter: generic
-  source_group: reddit_fixed
-  source_subtype: fixed_new
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 40
   tier: p4
   topic_scopes:
   - practice_opinion
@@ -2356,20 +2309,21 @@ sources:
   feed:
     format: rss
     adapter: generic
-  source_group: x_social
+  source_group: x_official
   source_subtype: account
-  quality_weight: 0.35
-  source_role: social
-  spam_risk: high
-  content_class: community_social
+  quality_weight: 0.85
+  source_role: official
+  spam_risk: low
+  content_class: official_model_company
   selection_policy:
-    mode: community_recent
+    mode: first_party_recent
     max_age_days: 7
   default_limit: 5
-  tier: p4
+  tier: p1
   topic_scopes:
+  - model_product
   - practice_opinion
-  primary_eligible: false
+  primary_eligible: true
 - id: x_account_tibo
   name: X Tibo via RSSHub
   transport: rsshub
@@ -2380,20 +2334,21 @@ sources:
   feed:
     format: rss
     adapter: generic
-  source_group: x_social
+  source_group: x_official
   source_subtype: account
-  quality_weight: 0.35
-  source_role: social
-  spam_risk: high
-  content_class: community_social
+  quality_weight: 0.80
+  source_role: official
+  spam_risk: low
+  content_class: official_model_company
   selection_policy:
-    mode: community_recent
+    mode: first_party_recent
     max_age_days: 7
   default_limit: 5
-  tier: p4
+  tier: p1
   topic_scopes:
+  - model_product
   - practice_opinion
-  primary_eligible: false
+  primary_eligible: true
 - id: x_account_together_ai
   name: X Together AI via RSSHub
   transport: rsshub
@@ -2438,126 +2393,6 @@ sources:
     mode: community_recent
     max_age_days: 7
   default_limit: 5
-- id: x_search_github_launch
-  name: X Search GitHub Launch via RSSHub
-  transport: rsshub
-  url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Agithub.com%20%28launch%20OR%20released%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
-  enabled: true
-  priority: 150
-  fetch_interval: 14400
-  feed:
-    format: rss
-    adapter: generic
-  source_group: x_search
-  source_subtype: search
-  quality_weight: 0.45
-  source_role: social_search
-  spam_risk: high
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
-- id: x_search_huggingface_model
-  name: X Search Hugging Face Model via RSSHub
-  transport: rsshub
-  url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Ahuggingface.co%20%28model%20OR%20space%20OR%20dataset%20OR%20gguf%20OR%20weights%29%20-is%3Aretweet%20-is%3Areply
-  enabled: true
-  priority: 151
-  fetch_interval: 14400
-  feed:
-    format: rss
-    adapter: generic
-  source_group: x_search
-  source_subtype: search
-  quality_weight: 0.45
-  source_role: social_search
-  spam_risk: high
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
-- id: x_search_ai_tool_launch
-  name: X Search AI Tool Launch via RSSHub
-  transport: rsshub
-  url: ${RSSHUB_BASE_URL}/twitter/keyword/%28%22AI%20tool%22%20OR%20%22AI%20app%22%20OR%20agent%20OR%20workflow%29%20%28launch%20OR%20released%20OR%20introducing%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
-  enabled: true
-  priority: 152
-  fetch_interval: 14400
-  feed:
-    format: rss
-    adapter: generic
-  source_group: x_search
-  source_subtype: search
-  quality_weight: 0.45
-  source_role: social_search
-  spam_risk: high
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
-- id: x_search_github_ai_tool
-  name: X Search GitHub AI Tool via RSSHub
-  transport: rsshub
-  url: ${RSSHUB_BASE_URL}/twitter/keyword/url%3Agithub.com%20%28agent%20OR%20LLM%20OR%20MCP%20OR%20%22AI%20tool%22%20OR%20%22open%20source%22%29%20-is%3Aretweet%20-is%3Areply
-  enabled: true
-  priority: 153
-  fetch_interval: 14400
-  feed:
-    format: rss
-    adapter: generic
-  source_group: x_search
-  source_subtype: search
-  quality_weight: 0.45
-  source_role: social_search
-  spam_risk: high
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
-- id: x_search_mcp_agent
-  name: X Search MCP Agent via RSSHub
-  transport: rsshub
-  url: ${RSSHUB_BASE_URL}/twitter/keyword/%28MCP%20OR%20%22model%20context%20protocol%22%20OR%20%22AI%20agent%22%20OR%20%22agent%20workflow%22%29%20%28github%20OR%20release%20OR%20launch%20OR%20tool%29%20-is%3Aretweet%20-is%3Areply
-  enabled: true
-  priority: 155
-  fetch_interval: 14400
-  feed:
-    format: rss
-    adapter: generic
-  source_group: x_search
-  source_subtype: search
-  quality_weight: 0.45
-  source_role: social_search
-  spam_risk: high
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: deepseek_api_news_rsshub
   name: DeepSeek API News via RSSHub
   transport: rsshub

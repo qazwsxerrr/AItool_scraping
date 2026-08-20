@@ -9,6 +9,7 @@ from app.config.limits import (
     DEFAULT_AI_ANALYSIS_MIN_SCORE,
     DEFAULT_AI_REVIEW_CONCURRENCY,
     DEFAULT_AI_SCREEN_REJECT_THRESHOLD,
+    DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE,
 )
 
 
@@ -51,9 +52,9 @@ class Settings:
     ai_review_timeout_seconds: float = 30.0
     ai_screen_reject_threshold: int = DEFAULT_AI_SCREEN_REJECT_THRESHOLD
     ai_analysis_min_score: int = DEFAULT_AI_ANALYSIS_MIN_SCORE
+    ai_stage_c_input_min_score: int = DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE
     ai_review_concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY
     ai_review_categories: tuple[str, ...] = DEFAULT_AI_REVIEW_CATEGORIES
-    ai_review_category_mode: str = "ai"
     # Stage D is an independent editorial provider contract. Its settings are
     # intentionally explicit and never inherit Stage A/B provider values.
     ai_stage_d_api_url: str | None = None
@@ -72,9 +73,6 @@ class Settings:
         ai_stage_d_api_key = _env_value("AI_STAGE_D_API_KEY")
         ai_stage_d_model = _env_value("AI_STAGE_D_MODEL")
         categories = _parse_categories(os.getenv("AI_REVIEW_CATEGORIES"))
-        category_mode = (os.getenv("AI_REVIEW_CATEGORY_MODE") or "ai").strip().lower()
-        if category_mode not in {"ai", "source"}:
-            category_mode = "ai"
         return cls(
             database_url=os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL),
             rsshub_base_url=rsshub_base_url.rstrip("/") if rsshub_base_url else None,
@@ -96,12 +94,15 @@ class Settings:
             ai_analysis_min_score=_bounded_int(
                 os.getenv("AI_ANALYSIS_MIN_SCORE"), DEFAULT_AI_ANALYSIS_MIN_SCORE
             ),
+            ai_stage_c_input_min_score=_bounded_int(
+                os.getenv("AI_STAGE_C_INPUT_MIN_SCORE"),
+                DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE,
+            ),
             ai_review_concurrency=max(
                 1,
                 _bounded_int(os.getenv("AI_REVIEW_CONCURRENCY"), DEFAULT_AI_REVIEW_CONCURRENCY),
             ),
             ai_review_categories=categories,
-            ai_review_category_mode=category_mode,
             ai_stage_d_api_url=ai_stage_d_api_url,
             ai_stage_d_api_key=ai_stage_d_api_key,
             ai_stage_d_model=ai_stage_d_model,
@@ -120,8 +121,10 @@ def _parse_categories(value: str | None) -> tuple[str, ...]:
     if not value:
         return DEFAULT_AI_REVIEW_CATEGORIES
     parts = [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
-    # Keep order stable for the UI and prompts while avoiding duplicate labels.
-    unique = tuple(dict.fromkeys(parts))
+    # Stage B1 has one fixed six-label editorial taxonomy.  Ignore removed or
+    # ad-hoc labels instead of allowing configuration to reintroduce them.
+    allowed = set(DEFAULT_AI_REVIEW_CATEGORIES)
+    unique = tuple(dict.fromkeys(part for part in parts if part in allowed))
     return unique or DEFAULT_AI_REVIEW_CATEGORIES
 
 

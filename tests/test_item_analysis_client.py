@@ -55,17 +55,22 @@ def _request() -> ItemAnalysisRequest:
 
 def _analysis_payload():
     return {
-        "topic": "project",
-        "topics": ["project"],
+        "topic": "developer_ecosystem",
+        "topics": ["developer_ecosystem"],
         "summary_cn": "一个 MCP 工具",
         "keywords": ["MCP"],
         "entities": [{"type": "technology", "name": "MCP"}],
         "selection_score": 88,
-        "score_components": {"relevance": 90, "impact": 80, "freshness": 85, "source_authority": 70, "actionability": 80, "total": 88},
-        "paper_support": {"is_paper": False},
-        "risk_flags": [],
-        "reason": "项目材料",
-        "confidence": 90,
+        "score_components": {
+            "relevance": 88,
+            "importance": 88,
+            "impact": 88,
+            "freshness": 88,
+            "source_authority": 88,
+            "specificity": 88,
+            "tracking_value": 88,
+            "total": 88,
+        },
     }
 
 
