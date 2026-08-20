@@ -7,11 +7,12 @@ from typer.testing import CliRunner
 from app import main
 from app.config.limits import RECENT_WINDOW_HOURS
 from app.config.settings import Settings
-from app.jobs.fetch_job import IntelFetchResult
+from app.jobs.fetch_job import IntelFetchResult, IntelSourceStats
 from app.jobs import pipeline_orchestrator as orchestrator
 from app.jobs.stage_a_screen_job import StageAScreenResult
 from app.jobs.stage_b_analysis_job import StageBAnalysisResult
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
+from app.storage.draft_workspace import draft_database_url
 from app.storage.repository import IntelRepository
 
 
@@ -28,7 +29,7 @@ def test_pipeline_help_lists_only_date_addressed_formal_commands():
     assert "run-id" not in result.stdout
 
 
-def test_start_creates_and_freezes_the_single_daily_draft(tmp_path):
+def test_start_creates_and_freezes_an_isolated_daily_draft(tmp_path):
     settings = Settings(database_url=f"sqlite:///{tmp_path / 'pipeline.db'}")
 
     def fake_fetch(**kwargs):
@@ -42,9 +43,14 @@ def test_start_creates_and_freezes_the_single_daily_draft(tmp_path):
 
     assert result.edition_date == "2026-08-19"
     assert result.scope_frozen is True
-    engine = create_engine_from_url(settings.database_url)
-    init_db(engine)
-    with create_session_factory(engine)() as session:
+    public_engine = create_engine_from_url(settings.database_url)
+    init_db(public_engine)
+    with create_session_factory(public_engine)() as session:
+        repo = IntelRepository(session)
+        assert repo.get_daily_edition("2026-08-19") is None
+
+    draft_engine = create_engine_from_url(draft_database_url(settings.database_url, "2026-08-19"))
+    with create_session_factory(draft_engine)() as session:
         repo = IntelRepository(session)
         edition = repo.get_daily_edition("2026-08-19")
         draft = repo.draft_run_for_edition("2026-08-19")
@@ -54,6 +60,52 @@ def test_start_creates_and_freezes_the_single_daily_draft(tmp_path):
         assert draft.scope["freshness_window_hours"] == RECENT_WINDOW_HOURS
         assert draft.scope["freshness_undated_policy"] == "exclude"
         assert draft.scope["freshness_github_trending_policy"] == "exempt"
+
+
+def test_failed_fetch_keeps_a_partial_build_open_for_downstream_stages(tmp_path):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'pipeline.db'}")
+
+    def fake_fetch(**kwargs):
+        return IntelFetchResult(
+            run_id=kwargs["run_id"],
+            stats={"broken_source": IntelSourceStats(source_id="broken_source", failed=1, status="failed")},
+        )
+
+    result = orchestrator.start_pipeline_run_from_settings(
+        settings=settings,
+        edition_date="2026-08-19",
+        fetch_runner=fake_fetch,
+    )
+
+    public_engine = create_engine_from_url(settings.database_url)
+    init_db(public_engine)
+    with create_session_factory(public_engine)() as session:
+        repo = IntelRepository(session)
+        assert repo.get_daily_edition("2026-08-19") is None
+
+    draft_engine = create_engine_from_url(draft_database_url(settings.database_url, "2026-08-19"))
+    with create_session_factory(draft_engine)() as session:
+        repo = IntelRepository(session)
+        edition = repo.get_daily_edition("2026-08-19")
+        draft = repo.draft_run_for_edition("2026-08-19")
+        assert edition is not None and draft is not None
+        assert int(draft.id) == int(result.run_id)
+        assert edition.status == "building_with_errors"
+        assert edition.error == "fetch_failed_sources:1"
+        assert draft.status == "running"
+        assert draft.error == "fetch_failed_sources:1"
+        assert draft.partial is True
+        assert draft.partial_reason == "fetch_failed_sources:1"
+        assert draft.finished_at is None
+
+    status = orchestrator.pipeline_edition_status_from_settings(
+        settings=settings,
+        edition_date="2026-08-19",
+    )
+    fetch = next(row for row in status.stages if row["stage"] == "fetch")
+    assert fetch["status"] == "failed"
+    assert fetch["total"] == 1
+    assert fetch["failed"] == 1
 
 
 def test_retry_stage_b_targets_only_current_draft_stage_b_tasks(tmp_path, monkeypatch):

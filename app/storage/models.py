@@ -147,9 +147,9 @@ class DailyEdition(Base):
     """The single public daily workspace addressed by ``edition_date``.
 
     An edition is the only business-facing identity for a daily report.  The
-    optional draft run ID is deliberately opaque implementation detail: it
-    points at the one build currently being assembled. All user-facing
-    readers use the date and the persisted report entries below instead.
+    Builds are kept in a separate draft database, so this published model has
+    no pointer to a mutable run. All user-facing readers use the date and the
+    persisted report entries below instead.
     """
 
     __tablename__ = "daily_editions"
@@ -161,7 +161,6 @@ class DailyEdition(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     edition_date: Mapped[date] = mapped_column(Date, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="empty")
-    draft_run_id: Mapped[int | None] = mapped_column(ForeignKey("intel_runs.id"), nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)

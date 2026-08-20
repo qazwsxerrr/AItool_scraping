@@ -11,11 +11,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
+import logging
 from pathlib import Path
 import shutil
 from typing import Any, Callable, Iterable
 
 import httpx
+from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from app.ai.skills.intel_triage import IntelTriageClient
 from app.ai.skills.stage_d_editorial import StageDEditorialClient
@@ -44,7 +47,22 @@ from app.jobs.stage_b_analysis_job import StageBAnalysisResult, run_stage_b_anal
 from app.jobs.stage_d_job import StageDResult, run_stage_d_from_settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import DailyEdition, IntelRun
+from app.storage.draft_workspace import (
+    audit_database_path,
+    audit_settings,
+    create_daily_draft,
+    daily_audit_exists,
+    daily_draft_exists,
+    draft_settings,
+    finalize_daily_audit,
+    normalize_draft_edition_date,
+    promote_daily_draft_to_audit,
+    rollback_daily_audit,
+)
 from app.storage.repository import DAILY_EDITION_TIMEZONE, IntelRepository, StageStateSummary
+
+
+logger = logging.getLogger(__name__)
 
 
 STAGE_ALIASES: dict[str, str] = {
@@ -53,7 +71,6 @@ STAGE_ALIASES: dict[str, str] = {
     "stage-b": "analyze",
     "stage-c": "cluster",
     "stage-d": "stage_d",
-    "export": "export",
 }
 DISPLAY_STAGE_NAMES = {
     "fetch": "fetch",
@@ -63,7 +80,7 @@ DISPLAY_STAGE_NAMES = {
     "stage_d": "stage-d",
     "export": "export",
 }
-PIPELINE_STAGES = ("screen", "analyze", "cluster", "stage_d", "export")
+PIPELINE_STAGES = ("screen", "analyze", "cluster", "stage_d")
 PIPELINE_STAGE_ORDER = ("fetch", *PIPELINE_STAGES)
 RETRYABLE_TASK_STATUSES = frozenset({"failed", "retry_waiting", "pending"})
 STAGE_ACTIVE_TASK_STATUSES = frozenset({"pending", "running"})
@@ -100,6 +117,8 @@ class DailyEditionStatus:
     status: str
     published_at: datetime | None = None
     draft_status: str | None = None
+    audit_status: str | None = None
+    audit_path: str | None = None
     stages: tuple[dict[str, Any], ...] = ()
     total_failures: int = 0
     total_blocked: int = 0
@@ -138,6 +157,95 @@ def _engine_and_factory(settings: Settings):
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
     return engine, create_session_factory(engine)
+
+
+def _resolved_edition_date(value: date | str | None) -> str:
+    normalized = _normalize_edition_date(value)
+    if normalized is not None:
+        return normalized
+    return datetime.now(timezone.utc).astimezone(DAILY_EDITION_TIMEZONE).date().isoformat()
+
+
+def _published_edition_from_settings(settings: Settings, edition_date: str) -> tuple[datetime | None, str | None]:
+    """Read one public report without initializing or mutating its database."""
+
+    engine = create_engine_from_url(settings.database_url)
+    try:
+        session_factory = create_session_factory(engine)
+        with session_factory() as session:
+            edition = session.scalar(
+                select(DailyEdition).where(
+                    DailyEdition.edition_date == date.fromisoformat(edition_date),
+                    DailyEdition.published_at.is_not(None),
+                )
+            )
+            if edition is None:
+                return None, None
+            return edition.published_at, str(edition.status)
+    except OperationalError:
+        # A brand-new installation has no public report database yet.
+        return None, None
+    finally:
+        engine.dispose()
+
+
+def draft_settings_for_edition(*, settings: Settings, edition_date: date | str) -> Settings:
+    """Return the private database settings for one date-addressed draft."""
+
+    return draft_settings(settings, normalize_draft_edition_date(edition_date))
+
+
+def audit_settings_for_edition(*, settings: Settings, edition_date: date | str) -> Settings:
+    """Return settings for one date's retained, published-build audit."""
+
+    return audit_settings(settings, normalize_draft_edition_date(edition_date))
+
+
+def resolve_pending_daily_draft_from_settings(
+    *,
+    settings: Settings,
+    edition_date: date | str,
+) -> tuple[Settings, int]:
+    """Resolve the isolated draft DB and its opaque build ID for a date."""
+
+    normalized = normalize_draft_edition_date(edition_date)
+    if not daily_draft_exists(settings, normalized):
+        raise ValueError(
+            f"no pending draft for edition_date={normalized}; run pipeline start or pipeline run first"
+        )
+    workspace_settings = draft_settings_for_edition(settings=settings, edition_date=normalized)
+    engine, session_factory = _engine_and_factory(workspace_settings)
+    try:
+        with session_factory() as session:
+            run = IntelRepository(session).draft_run_for_edition(normalized)
+            if run is None:
+                raise ValueError(
+                    f"no pending draft for edition_date={normalized}; run pipeline start or pipeline run first"
+                )
+            return workspace_settings, int(run.id)
+    finally:
+        engine.dispose()
+
+
+def _retained_daily_audit_from_settings(
+    *,
+    settings: Settings,
+    edition_date: str,
+) -> tuple[Settings, int] | None:
+    """Resolve the retained audit build without treating it as a draft."""
+
+    if not daily_audit_exists(settings, edition_date):
+        return None
+    workspace_settings = audit_settings_for_edition(settings=settings, edition_date=edition_date)
+    engine, session_factory = _engine_and_factory(workspace_settings)
+    try:
+        with session_factory() as session:
+            run = IntelRepository(session).draft_run_for_edition(edition_date)
+            if run is None:
+                return None
+            return workspace_settings, int(run.id)
+    finally:
+        engine.dispose()
 
 
 def _registry(settings: Settings, registry_path=DEFAULT_REGISTRY_PATH) -> dict[str, SourceSpec]:
@@ -259,7 +367,7 @@ def _sync_pipeline_run_status(
 
         partial_stages = [name for name, state in progress.items() if state == "partial"]
         if partial_stages:
-            reason = partial_reason or "stage_partial:" + ",".join(partial_stages)
+            reason = partial_reason or run.partial_reason or "stage_partial:" + ",".join(partial_stages)
             repo.finish_run(
                 int(run_id),
                 status="partial",
@@ -388,32 +496,43 @@ def _freeze_after_fetch(
             "fetch",
             metadata={
                 "items": len(item_ids),
+                "sources": len(source_ids),
             },
         )
         repo.finish_stage(
             fetch_stage,
             status="failed" if getattr(fetch, "total_failed", 0) else "succeeded",
             metadata={
+                "sources": len(source_ids),
                 "fetched": getattr(fetch, "total_fetched", 0),
                 "inserted": getattr(fetch, "total_inserted", 0),
                 "failed": getattr(fetch, "total_failed", 0),
             },
         )
         if getattr(fetch, "total_failed", 0) and run.edition_id is not None:
-            repo.mark_daily_build_failed(
-                int(run_id),
-                error=f"fetch_failed_sources:{int(getattr(fetch, 'total_failed', 0))}",
-            )
+            error = f"fetch_failed_sources:{int(getattr(fetch, 'total_failed', 0))}"
+            # Source failures are isolated to their own attempts. Freeze the
+            # successful source set and let A-D build a non-public partial
+            # draft from it; only a complete source set may replace the daily
+            # report.
+            run.partial = True
+            run.partial_reason = error
+            run.error = error
+            edition = session.get(DailyEdition, int(run.edition_id))
+            if edition is not None:
+                edition.status = "building_with_errors"
+                edition.error = error
         session.commit()
         return run.reference_time
 
 
 def _mark_daily_build_failed(session_factory: Any, run_id: int, error: str | None) -> None:
-    """Persist a failed draft state without replacing its last public report."""
+    """Persist a failed draft state without replacing its public report."""
 
     with session_factory() as session:
         repo = IntelRepository(session)
         if session.get(IntelRun, int(run_id)) is not None:
+            repo.finish_run(int(run_id), status="failed", error=error)
             repo.mark_daily_build_failed(int(run_id), error=error)
             session.commit()
 
@@ -441,15 +560,19 @@ def start_pipeline_run_from_settings(
     registry_path=DEFAULT_REGISTRY_PATH,
     fetch_runner: Callable[..., IntelFetchResult] | None = None,
 ) -> PipelineStartResult:
-    """Create a full replacement draft for one public daily edition."""
+    """Create a fresh, fully isolated draft for one public edition date."""
 
-    normalized_edition = _normalize_edition_date(edition_date)
+    normalized_edition = _resolved_edition_date(edition_date)
+    # Starting again discards only the prior pending build for this date.  A
+    # retained audit from the last approved build, the published database and
+    # its old report all remain untouched until this new draft is approved.
+    workspace_settings = create_daily_draft(settings, normalized_edition)
 
-    _, session_factory = _engine_and_factory(settings)
+    _, session_factory = _engine_and_factory(workspace_settings)
     with session_factory() as session:
         repo = IntelRepository(session)
         edition, run = repo.start_daily_build(
-            edition_date=normalized_edition or datetime.now(timezone.utc).astimezone(DAILY_EDITION_TIMEZONE).date(),
+            edition_date=normalized_edition,
             filters={"stage": "fetch"},
             scope={
                 "fetch_limit": limit,
@@ -462,7 +585,7 @@ def start_pipeline_run_from_settings(
 
     runner = fetch_runner or run_intel_fetch_from_settings
     fetch = runner(
-        settings=settings,
+        settings=workspace_settings,
         registry_path=registry_path,
         limit_per_source=limit,
         source_filter=None,
@@ -476,7 +599,7 @@ def start_pipeline_run_from_settings(
     # Failed source attempts remain auditable, while downstream stages see a
     # stable item set and cannot accidentally ingest later fetches.
     frozen_reference = _freeze_after_fetch(
-        settings,
+        workspace_settings,
         run_id=run_id,
         limit=limit,
         fetch=fetch,
@@ -635,98 +758,122 @@ def run_pipeline_stage_d_from_settings(
     return result
 
 
-def run_pipeline_export_from_settings(
+def publish_daily_draft_from_settings(
     *,
     settings: Settings,
-    run_id: int,
+    edition_date: date | str,
     limit: int | None = DEFAULT_DAILY_REPORT_LIMIT,
     output_dir: str | Path = "output/intel",
 ) -> IntelExportResult:
-    _, session_factory = _engine_and_factory(settings)
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        run = session.get(IntelRun, int(run_id))
-        if run is None:
-            raise ValueError(f"intel run {run_id} does not exist")
-        if run.edition_id is None:
-            raise ValueError("daily export requires the current daily edition build")
-        edition = session.get(DailyEdition, int(run.edition_id))
-        if edition is None or edition.draft_run_id != int(run.id):
-            raise ValueError("daily export requires the edition's current pending build")
-        final_daily_dir = daily_output_dir_for_run(output_dir, run)
+    """Approve one draft and atomically replace its public report.
 
-    staging_dir: Path | None = None
-    with session_factory() as session:
-        current_run = session.get(IntelRun, int(run_id))
-        if current_run is None:
-            raise ValueError(f"intel run {run_id} disappeared before export")
-        staging_dir = create_daily_bundle_staging_dir(output_dir, current_run)
+    Export rendering and every stage row remain in the date workspace.  The
+    pending ``draft.db`` becomes the retained ``audit.db`` only as part of the
+    same success path that replaces the public bundle and final report.  The
+    published database is touched only inside the final replacement
+    transaction, after the draft is complete and its bundle has been staged.
+    """
 
+    normalized = normalize_draft_edition_date(edition_date)
+    workspace_settings, run_id = resolve_pending_daily_draft_from_settings(
+        settings=settings,
+        edition_date=normalized,
+    )
+    draft_engine, draft_factory = _engine_and_factory(workspace_settings)
     try:
+        with draft_factory() as session:
+            run = session.get(IntelRun, int(run_id))
+            if run is None:
+                raise ValueError(f"draft build disappeared for edition_date={normalized}")
+            if run.edition_date != normalized:
+                raise ValueError("draft build does not match the requested edition_date")
+            final_dir = daily_output_dir_for_run(output_dir, run)
+            staging_dir = create_daily_bundle_staging_dir(output_dir, run)
+    except Exception:
+        draft_engine.dispose()
+        raise
+
+    published = False
+    bundle_promotion = None
+    audit_promotion = None
+    try:
+        run_status = _sync_pipeline_run_status(draft_factory, int(run_id), finalize=True)
+        if run_status != "completed":
+            with draft_factory() as session:
+                repo = IntelRepository(session)
+                if run_status == "partial":
+                    repo.mark_daily_build_partial(int(run_id), error="daily build is partial and cannot be published")
+                else:
+                    repo.mark_daily_build_failed(
+                        int(run_id),
+                        error=f"daily build is not publishable: {run_status or 'unknown'}",
+                    )
+                session.commit()
+            raise RuntimeError(f"daily build is not publishable: {run_status or 'unknown'}")
+
         result = run_intel_export_from_settings(
-            settings=settings,
+            settings=workspace_settings,
             run_id=int(run_id),
             limit=limit,
             output_dir=output_dir,
             dry_run=False,
             artifact_dir=staging_dir,
         )
-        run_status = _sync_pipeline_run_status(session_factory, int(run_id), finalize=True)
-        if run_status != "completed":
-            reason = f"daily build is not publishable: {run_status or 'unknown'}"
-            _mark_daily_build_failed(session_factory, int(run_id), reason)
-            raise RuntimeError(reason)
+        if result.partial:
+            raise RuntimeError(f"daily build is not publishable: {result.partial_reason or 'partial'}")
 
-        promotion = promote_daily_bundle(staging_dir=staging_dir, final_dir=final_daily_dir)
+        # Close this process's connection pool before moving SQLite files.
+        # The exporter has completed all writes at this point, so the retained
+        # audit is a complete snapshot of raw fetches and every A-D decision.
+        draft_engine.dispose()
+        audit_promotion = promote_daily_draft_to_audit(settings, normalized)
+        bundle_promotion = promote_daily_bundle(staging_dir=staging_dir, final_dir=final_dir)
+        public_engine = create_engine_from_url(settings.database_url)
         try:
-            with session_factory() as session:
-                repo = IntelRepository(session)
-                repo.publish_daily_report(run_id=int(run_id), records=result.records)
-                # The report is now date-level durable. Remove every mutable
-                # raw/A-D/task/provider row before this transaction commits.
-                repo.delete_build(int(run_id))
+            # This initialization only creates missing tables; it never starts
+            # a build or marks a published edition as rebuilding.
+            init_db(public_engine)
+            public_factory = create_session_factory(public_engine)
+            with public_factory() as session:
+                IntelRepository(session).replace_published_daily_report(
+                    edition_date=normalized,
+                    records=result.records,
+                )
                 session.commit()
-        except Exception:
-            rollback_daily_bundle(promotion)
-            raise
-        finalize_daily_bundle(promotion)
+        finally:
+            public_engine.dispose()
+        published = True
+        try:
+            finalize_daily_bundle(bundle_promotion)
+            finalize_daily_audit(audit_promotion)
+        except OSError:
+            # The public report is already durable.  Leave a clearly named
+            # rollback artifact for an operator instead of misreporting the
+            # publication as failed or rolling back only part of it.
+            logger.warning("published daily audit backup cleanup failed", exc_info=True)
         return replace(
             result,
-            jsonl_path=str(final_daily_dir / "intel_items.jsonl"),
-            markdown_path=str(final_daily_dir / "intel_digest.md"),
-            manifest_path=str(final_daily_dir / "manifest.json"),
+            jsonl_path=str(final_dir / "intel_items.jsonl"),
+            markdown_path=str(final_dir / "intel_digest.md"),
+            manifest_path=str(final_dir / "manifest.json"),
             github_report_path=_remap_staged_artifact_path(
                 result.github_report_path,
                 staging_dir=staging_dir,
-                final_dir=final_daily_dir,
+                final_dir=final_dir,
             ),
         )
     except Exception as exc:
-        if staging_dir is not None and staging_dir.exists():
-            shutil.rmtree(staging_dir, ignore_errors=True)
-        _mark_daily_build_failed(session_factory, int(run_id), str(exc))
+        if not published:
+            if bundle_promotion is not None:
+                rollback_daily_bundle(bundle_promotion)
+            if audit_promotion is not None:
+                rollback_daily_audit(audit_promotion)
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            _mark_daily_build_failed(draft_factory, int(run_id), str(exc))
         raise
-
-
-def resolve_pending_daily_build_id_from_settings(*, settings: Settings, edition_date: date | str) -> int:
-    """Resolve a public date to its one pending private build.
-
-    Published reports intentionally have no retained run row.  Stage/retry/
-    resume/export commands therefore operate only on an unfinished draft and
-    instruct the caller to start a new build when none exists.
-    """
-
-    normalized = _normalize_edition_date(edition_date)
-    if normalized is None:
-        raise ValueError("edition_date must use YYYY-MM-DD")
-    _, session_factory = _engine_and_factory(settings)
-    with session_factory() as session:
-        run = IntelRepository(session).draft_run_for_edition(normalized)
-        if run is None:
-            raise ValueError(
-                f"no pending build for edition_date={normalized}; run pipeline start or pipeline run first"
-            )
-        return int(run.id)
+    finally:
+        draft_engine.dispose()
 
 
 def pipeline_edition_status_from_settings(
@@ -734,78 +881,139 @@ def pipeline_edition_status_from_settings(
     settings: Settings,
     edition_date: date | str,
 ) -> DailyEditionStatus:
-    """Return status without resolving a public date through a historical run id."""
+    """Return public, pending-draft and retained-audit state by date."""
 
-    normalized = _normalize_edition_date(edition_date)
-    if normalized is None:
-        raise ValueError("edition_date must use YYYY-MM-DD")
-    _, session_factory = _engine_and_factory(settings)
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        edition = repo.get_daily_edition(normalized)
-        if edition is None:
-            raise ValueError(f"no daily edition found for edition_date={normalized}")
-        draft = repo.draft_run_for_edition(normalized)
-        if draft is None:
+    normalized = normalize_draft_edition_date(edition_date)
+    published_at, _ = _published_edition_from_settings(settings, normalized)
+    retained_audit = _retained_daily_audit_from_settings(
+        settings=settings,
+        edition_date=normalized,
+    )
+    audit_path = str(audit_database_path(settings.database_url, normalized)) if retained_audit else None
+    audit_status = "retained" if retained_audit else None
+    audit_run_status = None
+    if retained_audit is not None:
+        audit_settings_value, audit_run_id = retained_audit
+        audit_run_status = pipeline_status_from_settings(
+            settings=audit_settings_value,
+            run_id=audit_run_id,
+        )
+
+    if not daily_draft_exists(settings, normalized):
+        if published_at is None and audit_run_status is None:
+            raise ValueError(f"no daily edition, draft, or audit found for edition_date={normalized}")
+        if published_at is None:
             return DailyEditionStatus(
                 edition_date=normalized,
-                status="published" if edition.published_at is not None else edition.status,
-                published_at=edition.published_at,
-                error=edition.error,
+                status="audit_retained",
+                audit_status=audit_status,
+                audit_path=audit_path,
+                stages=audit_run_status.stages if audit_run_status is not None else (),
+                total_failures=audit_run_status.total_failures if audit_run_status is not None else 0,
+                total_blocked=audit_run_status.total_blocked if audit_run_status is not None else 0,
             )
-        run_status = pipeline_status_from_settings(settings=settings, run_id=int(draft.id))
         return DailyEditionStatus(
             edition_date=normalized,
-            status=edition.status,
-            published_at=edition.published_at,
-            draft_status=run_status.run_status,
-            stages=run_status.stages,
-            total_failures=run_status.total_failures,
-            total_blocked=run_status.total_blocked,
-            error=edition.error or (draft.error if draft is not None else None),
+            status="published",
+            published_at=published_at,
+            audit_status=audit_status,
+            audit_path=audit_path,
+            stages=audit_run_status.stages if audit_run_status is not None else (),
+            total_failures=audit_run_status.total_failures if audit_run_status is not None else 0,
+            total_blocked=audit_run_status.total_blocked if audit_run_status is not None else 0,
         )
+
+    workspace_settings, run_id = resolve_pending_daily_draft_from_settings(
+        settings=settings,
+        edition_date=normalized,
+    )
+    run_status = pipeline_status_from_settings(settings=workspace_settings, run_id=run_id)
+    draft_state = str(run_status.run_status)
+    if draft_state == "completed":
+        draft_state = "ready_for_publish"
+    public_state = "published" if published_at is not None else draft_state
+    error: str | None = None
+    draft_engine, session_factory = _engine_and_factory(workspace_settings)
+    try:
+        with session_factory() as session:
+            run = session.get(IntelRun, int(run_id))
+            if run is not None:
+                error = run.error or run.partial_reason
+    finally:
+        draft_engine.dispose()
+    return DailyEditionStatus(
+        edition_date=normalized,
+        status=public_state,
+        published_at=published_at,
+        draft_status=draft_state,
+        audit_status=audit_status,
+        audit_path=audit_path,
+        stages=run_status.stages,
+        total_failures=run_status.total_failures,
+        total_blocked=run_status.total_blocked,
+        error=error,
+    )
 
 
 def pipeline_status_from_settings(*, settings: Settings, run_id: int) -> PipelineStatus:
-    _, session_factory = _engine_and_factory(settings)
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        run = session.get(IntelRun, int(run_id))
-        if run is None:
-            raise ValueError(f"intel run {run_id} does not exist")
-        existing = {stage.stage_name: repo.stage_summary(stage) for stage in repo.list_stages(run_id)}
-        rows: list[dict[str, Any]] = []
-        for name in ("fetch", *PIPELINE_STAGES):
-            summary = existing.get(name)
-            if summary is None:
-                rows.append(
-                    {
-                        "stage": DISPLAY_STAGE_NAMES.get(name, name),
-                        "stage_name": name,
-                        "status": "pending",
-                        "total": 0,
-                        "pending": 0,
-                        "running": 0,
-                        "succeeded": 0,
-                        "failed": 0,
-                        "retry_waiting": 0,
-                        "blocked": 0,
-                    }
-                )
-            else:
-                value = _summary_dict(summary)
-                value["stage"] = DISPLAY_STAGE_NAMES.get(name, name)
-                rows.append(value)
-        return PipelineStatus(
-            run_id=int(run_id),
-            run_status=str(run.status),
-            reference_time=run.reference_time,
-            scope_frozen=bool(run.scope_frozen),
-            edition_date=run.edition_date,
-            stages=tuple(rows),
-            total_failures=sum(int(row.get("failed", 0)) for row in rows),
-            total_blocked=sum(int(row.get("blocked", 0)) for row in rows),
-        )
+    engine, session_factory = _engine_and_factory(settings)
+    try:
+        with session_factory() as session:
+            repo = IntelRepository(session)
+            run = session.get(IntelRun, int(run_id))
+            if run is None:
+                raise ValueError(f"intel run {run_id} does not exist")
+            stages = {stage.stage_name: stage for stage in repo.list_stages(run_id)}
+            existing = {name: repo.stage_summary(stage) for name, stage in stages.items()}
+            rows: list[dict[str, Any]] = []
+            for name in ("fetch", *PIPELINE_STAGES):
+                summary = existing.get(name)
+                if summary is None:
+                    rows.append(
+                        {
+                            "stage": DISPLAY_STAGE_NAMES.get(name, name),
+                            "stage_name": name,
+                            "status": "pending",
+                            "total": 0,
+                            "pending": 0,
+                            "running": 0,
+                            "succeeded": 0,
+                            "failed": 0,
+                            "retry_waiting": 0,
+                            "blocked": 0,
+                        }
+                    )
+                else:
+                    value = _summary_dict(summary)
+                    # Fetch uses durable source attempts rather than generic
+                    # stage-task rows. Surface that source-level outcome instead
+                    # of rendering a failed fetch as ``failed=0``.
+                    if name == "fetch" and value["total"] == 0:
+                        metadata = stages[name].metadata_dict
+                        total = max(
+                            0,
+                            int(metadata.get("sources") or len(run.source_ids or ())),
+                        )
+                        failed = max(0, int(metadata.get("failed") or 0))
+                        value.update(
+                            total=total,
+                            succeeded=max(0, total - failed),
+                            failed=failed,
+                        )
+                    value["stage"] = DISPLAY_STAGE_NAMES.get(name, name)
+                    rows.append(value)
+            return PipelineStatus(
+                run_id=int(run_id),
+                run_status=str(run.status),
+                reference_time=run.reference_time,
+                scope_frozen=bool(run.scope_frozen),
+                edition_date=run.edition_date,
+                stages=tuple(rows),
+                total_failures=sum(int(row.get("failed", 0)) for row in rows),
+                total_blocked=sum(int(row.get("blocked", 0)) for row in rows),
+            )
+    finally:
+        engine.dispose()
 
 
 def retry_pipeline_stage_from_settings(
@@ -887,12 +1095,7 @@ def retry_pipeline_stage_from_settings(
             profile_path=profile_path,
             ai_client=ai_client,
         )
-    return run_pipeline_export_from_settings(
-        settings=settings,
-        run_id=run_id,
-        limit=limit if limit is not None else DEFAULT_DAILY_REPORT_LIMIT,
-        output_dir=output_dir,
-    )
+    raise ValueError("export is an approval action; use pipeline export --edition-date instead")
 
 
 def _stage_needs_resume(session_factory, run_id: int, stage_name: str) -> bool:
@@ -920,7 +1123,7 @@ def _stage_needs_resume(session_factory, run_id: int, stage_name: str) -> bool:
         if stage_name == "screen":
             return bool(repo.list_run_item_ids(run_id, role=None))
         previous = {name: repo.get_stage(run_id, name) for name in PIPELINE_STAGES}
-        dependency = {"analyze": "screen", "cluster": "analyze", "stage_d": "cluster", "export": "stage_d"}[stage_name]
+        dependency = {"analyze": "screen", "cluster": "analyze", "stage_d": "cluster"}[stage_name]
         dependency_stage = previous[dependency]
         # Downstream stages may consume the successful subset while the
         # dependency still has retryable/blocked tasks.  Live pending/running
@@ -956,8 +1159,14 @@ def resume_pipeline_from_settings(
         if run.edition_id is None:
             raise ValueError("pipeline resume requires the current daily edition build")
         fetch_stage = repo.get_stage(int(run_id), "fetch")
-        if fetch_stage is None or fetch_stage.status != "succeeded":
+        if fetch_stage is None or fetch_stage.status not in {"succeeded", "failed"}:
             reason = "fetch stage is incomplete; start a fresh full pipeline run for this edition"
+            repo.mark_daily_build_failed(int(run_id), error=reason)
+            session.commit()
+            result.errors.append(reason)
+            return result
+        if fetch_stage.status == "failed" and not repo.list_run_item_ids(int(run_id)):
+            reason = "fetch stage produced no usable items; start a fresh full pipeline run for this edition"
             repo.mark_daily_build_failed(int(run_id), error=reason)
             session.commit()
             result.errors.append(reason)
@@ -996,13 +1205,8 @@ def resume_pipeline_from_settings(
                     profile_path=profile_path,
                     ai_client=ai_client,
                 )
-            else:
-                value = run_pipeline_export_from_settings(
-                    settings=settings,
-                    run_id=run_id,
-                    limit=limit if limit is not None else DEFAULT_DAILY_REPORT_LIMIT,
-                    output_dir=output_dir,
-                )
+            else:  # pragma: no cover - PIPELINE_STAGES is exhaustive.
+                raise RuntimeError(f"unsupported pipeline stage: {stage_name}")
             result.ran_stages.append(stage_name)
             result.results[stage_name] = value
             stage_errors = _daily_stage_result_errors(stage_name, value)
@@ -1039,8 +1243,9 @@ def run_pipeline_from_settings(
     ai_client: Any | None = None,
     registry_path=DEFAULT_REGISTRY_PATH,
     on_start: Callable[[PipelineStartResult], None] | None = None,
+    publish: bool = False,
 ) -> PipelineExecutionResult:
-    """Fully rebuild and publish one date-addressed daily edition."""
+    """Fully rebuild one date-addressed draft, optionally publishing it."""
 
     start = start_pipeline_run_from_settings(
         settings=settings,
@@ -1053,8 +1258,12 @@ def run_pipeline_from_settings(
     if on_start is not None:
         on_start(start)
 
+    resolved_date = start.edition_date or _normalize_edition_date(edition_date)
+    if resolved_date is None:
+        raise RuntimeError("daily build did not resolve an edition date")
+    workspace_settings = draft_settings_for_edition(settings=settings, edition_date=resolved_date)
     resumed = resume_pipeline_from_settings(
-        settings=settings,
+        settings=workspace_settings,
         run_id=int(start.run_id),
         # The fetch limit is per source.  Do not accidentally reuse it as a
         # global cap for the downstream stages.
@@ -1063,9 +1272,19 @@ def run_pipeline_from_settings(
         profile_path=profile_path,
         ai_client=ai_client,
     )
-    resolved_date = start.edition_date or _normalize_edition_date(edition_date)
-    if resolved_date is None:
-        raise RuntimeError("daily build did not resolve an edition date")
+    if publish and not resumed.errors:
+        draft_run_status = pipeline_status_from_settings(
+            settings=workspace_settings,
+            run_id=int(start.run_id),
+        ).run_status
+        if draft_run_status == "completed":
+            resumed.results["export"] = publish_daily_draft_from_settings(
+                settings=settings,
+                edition_date=resolved_date,
+                limit=DEFAULT_DAILY_REPORT_LIMIT,
+                output_dir=output_dir,
+            )
+            resumed.ran_stages.append("export")
     status = pipeline_edition_status_from_settings(settings=settings, edition_date=resolved_date).status
     return PipelineExecutionResult(
         run_id=int(start.run_id),
@@ -1108,13 +1327,15 @@ __all__ = [
     "PipelineResumeResult",
     "PipelineStartResult",
     "PipelineStatus",
+    "draft_settings_for_edition",
     "normalize_stage",
+    "publish_daily_draft_from_settings",
     "pipeline_status_from_settings",
-    "resolve_pending_daily_build_id_from_settings",
+    "pipeline_edition_status_from_settings",
+    "resolve_pending_daily_draft_from_settings",
     "resume_pipeline_from_settings",
     "run_pipeline_from_settings",
     "retry_pipeline_stage_from_settings",
-    "run_pipeline_export_from_settings",
     "run_pipeline_stage_a_from_settings",
     "run_pipeline_stage_b_from_settings",
     "run_pipeline_stage_c_from_settings",

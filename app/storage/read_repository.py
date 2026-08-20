@@ -1,7 +1,8 @@
 """Read-only queries over published date-addressed daily reports.
 
-Temporary builds, raw items, AI rows and Stage-D snapshots are deleted after a
-successful publication.  The UI therefore reads only final report entries.
+Temporary builds, raw items, AI rows and Stage-D snapshots live in per-date
+filesystem audit workspaces, never in the published database.  The UI
+therefore reads only final report entries.
 """
 
 from __future__ import annotations
@@ -234,7 +235,7 @@ class UIReadRepository:
         rows = self.session.execute(
             select(DailyEdition, func.count(DailyEditionReportEntry.id))
             .outerjoin(DailyEditionReportEntry, DailyEditionReportEntry.edition_id == DailyEdition.id)
-            .where(DailyEdition.status == "published", DailyEdition.published_at.is_not(None))
+            .where(DailyEdition.published_at.is_not(None))
             .group_by(DailyEdition.id)
             .order_by(DailyEdition.edition_date.desc(), DailyEdition.published_at.desc())
         ).all()
@@ -244,7 +245,7 @@ class UIReadRepository:
         normalized = _normalize_edition_date(edition_date)
         if edition_date is not None and normalized is None:
             return None
-        stmt = select(DailyEdition).where(DailyEdition.status == "published", DailyEdition.published_at.is_not(None))
+        stmt = select(DailyEdition).where(DailyEdition.published_at.is_not(None))
         if normalized is not None:
             stmt = stmt.where(DailyEdition.edition_date == date.fromisoformat(normalized))
         else:

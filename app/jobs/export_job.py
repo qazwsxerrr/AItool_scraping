@@ -103,7 +103,7 @@ def run_intel_export_job(
                 run_id=run_id,
                 reference_time=run.reference_time,
             )
-            if run.partial or str(run.status).casefold() in {"failed", "partial"}:
+            if bool(run.partial) or str(run.status).casefold() in {"failed", "partial"}:
                 raise RuntimeError(f"daily build is not publishable: {run.partial_reason or run.status}")
             input_fingerprint = _export_input_fingerprint(records, int(run_id))
             stage_task = repo.ensure_stage_task(
@@ -244,17 +244,23 @@ def run_intel_export_from_settings(
 ) -> IntelExportResult:
     database_url = _readable_database_url(settings.database_url, dry_run=dry_run)
     engine = create_engine_from_url(database_url)
-    if not dry_run or database_url == "sqlite:///:memory:":
-        init_db(engine)
-    return run_intel_export_job(
-        session_factory=create_session_factory(engine),
-        output_dir=output_dir,
-        limit=_normalise_export_limit(limit),
-        dry_run=dry_run,
-        github_report_dir=github_report_dir,
-        run_id=run_id,
-        artifact_dir=artifact_dir,
-    )
+    try:
+        if not dry_run or database_url == "sqlite:///:memory:":
+            init_db(engine)
+        return run_intel_export_job(
+            session_factory=create_session_factory(engine),
+            output_dir=output_dir,
+            limit=_normalise_export_limit(limit),
+            dry_run=dry_run,
+            github_report_dir=github_report_dir,
+            run_id=run_id,
+            artifact_dir=artifact_dir,
+        )
+    finally:
+        # Daily publication moves the completed SQLite draft into its
+        # date-level audit slot immediately after export.  Dispose the export
+        # engine so it cannot keep a stale SQLite file handle open.
+        engine.dispose()
 
 
 def daily_output_dir_for_run(output_dir: str | Path, run: IntelRun) -> Path:
@@ -568,7 +574,7 @@ def _serialize_event(
         "record_type": "intel_event",
         "stage": "stage_d",
         # Stable public history identity.  It is deliberately distinct from
-        # the temporary database event id, which is deleted after publication.
+        # the audit-workspace event id, which never appears in public output.
         "event_key": event.event_key,
         "event_id": event.id,
         "id": event.id,

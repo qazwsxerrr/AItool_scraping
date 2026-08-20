@@ -223,7 +223,7 @@ class IntelRepository:
         return list(self.session.scalars(stmt).all())
 
     # ------------------------------------------------------------------
-    # Date-addressed public editions and hidden draft builds
+    # Date-addressed report rows and draft-workspace builds
     # ------------------------------------------------------------------
 
     def get_daily_edition(self, edition_date: date | str) -> DailyEdition | None:
@@ -247,9 +247,13 @@ class IntelRepository:
 
     def draft_run_for_edition(self, edition_date: date | str) -> IntelRun | None:
         edition = self.get_daily_edition(edition_date)
-        if edition is None or edition.draft_run_id is None:
+        if edition is None:
             return None
-        return self.session.get(IntelRun, int(edition.draft_run_id))
+        return self.session.scalar(
+            select(IntelRun)
+            .where(IntelRun.edition_id == int(edition.id))
+            .order_by(IntelRun.id.desc())
+        )
 
     def start_daily_build(
         self,
@@ -260,20 +264,25 @@ class IntelRepository:
         source_ids: Iterable[str] | None = None,
         reference_time: datetime | None = None,
     ) -> tuple[DailyEdition, IntelRun]:
-        """Create the single fresh draft for a public date.
+        """Create the one fresh build inside an isolated draft workspace.
 
-        The prior report remains published while the replacement build runs,
-        but every previous build's raw items and A-D state are physically
-        deleted before fetching.  This prevents same-day work from becoming a
-        hidden incremental continuation.
+        This method must be called with the date's pending draft database,
+        never the published report database.  Replacing an existing draft is
+        therefore safe: only that pending build's raw items and A-D state are
+        deleted; the prior retained ``audit.db`` is outside this database.
         """
 
         edition = self.get_or_create_daily_edition(edition_date)
-        stale_build_ids = {int(edition.draft_run_id)} if edition.draft_run_id is not None else set()
-        edition.draft_run_id = None
-        self.session.flush()
+        stale_build_ids = [
+            int(run_id)
+            for run_id in self.session.scalars(
+                select(IntelRun.id).where(IntelRun.edition_id == int(edition.id))
+            ).all()
+        ]
         for stale_build_id in stale_build_ids:
             self.delete_build(stale_build_id)
+        if stale_build_ids:
+            self.session.flush()
 
         source_values = _unique_strings(source_ids or ())
         scope_values = dict(scope or {})
@@ -289,11 +298,7 @@ class IntelRepository:
         run.edition = edition
         self.session.add(run)
         self.session.flush()
-        edition.draft_run_id = int(run.id)
-        # A previously published report remains readable while this draft is
-        # rebuilt.  The explicit state still tells operators whether the
-        # date is assembling its first report or replacing one.
-        edition.status = "rebuilding" if edition.published_at is not None else "building"
+        edition.status = "building"
         edition.error = None
         self.session.flush()
         return edition, run
@@ -303,27 +308,56 @@ class IntelRepository:
         if run is None or run.edition_id is None:
             return None
         edition = self.session.get(DailyEdition, int(run.edition_id))
-        if edition is None or edition.draft_run_id != int(run_id):
+        current = self.draft_run_for_edition(edition.edition_date) if edition is not None else None
+        if edition is None or current is None or int(current.id) != int(run_id):
             return edition
         edition.status = "draft_failed"
         edition.error = _text(error) or run.error
         self.session.flush()
         return edition
 
-    def publish_daily_report(
-        self,
-        *,
-        run_id: int,
-        records: Iterable[Mapping[str, Any]],
-    ) -> DailyEdition:
-        """Atomically replace the public report entries for a completed draft."""
+    def mark_daily_build_partial(self, run_id: int, *, error: str | None = None) -> DailyEdition | None:
+        """Keep a completed-but-incomplete draft without publishing it."""
 
         run = self.session.get(IntelRun, int(run_id))
         if run is None or run.edition_id is None:
-            raise ValueError(f"daily build {run_id} does not belong to an edition")
+            return None
         edition = self.session.get(DailyEdition, int(run.edition_id))
-        if edition is None or edition.draft_run_id != int(run_id):
-            raise ValueError(f"daily build {run_id} is not the active draft")
+        current = self.draft_run_for_edition(edition.edition_date) if edition is not None else None
+        if edition is None or current is None or int(current.id) != int(run_id):
+            return edition
+        edition.status = "draft_partial"
+        edition.error = _text(error) or run.partial_reason or run.error
+        self.session.flush()
+        return edition
+
+    def replace_published_daily_report(
+        self,
+        *,
+        edition_date: date | str,
+        records: Iterable[Mapping[str, Any]],
+    ) -> DailyEdition:
+        """Replace one public date's final report without touching any build.
+
+        The formal database intentionally stores only published date-level
+        content.  A draft workspace calls this once its own export has been
+        approved and its output directory is ready to promote.
+        """
+
+        edition = self.get_or_create_daily_edition(edition_date)
+        self._replace_daily_report_entries(edition, records)
+        edition.status = "published"
+        edition.published_at = utcnow()
+        edition.error = None
+        self.session.flush()
+        return edition
+
+    def _replace_daily_report_entries(
+        self,
+        edition: DailyEdition,
+        records: Iterable[Mapping[str, Any]],
+    ) -> None:
+        """Overwrite only compact final report rows for one date."""
 
         for entry in list(edition.report_entries):
             self.session.delete(entry)
@@ -376,15 +410,6 @@ class IntelRepository:
                     published_at=_as_utc(record.get("published_at")),
                 )
             )
-        # The selected result has been materialized above.  The caller then
-        # hard-deletes the temporary build, so never leave a durable public
-        # pointer to its opaque internal id.
-        edition.draft_run_id = None
-        edition.status = "published"
-        edition.published_at = utcnow()
-        edition.error = None
-        self.session.flush()
-        return edition
 
     def list_daily_report_entries(
         self,
@@ -432,15 +457,6 @@ class IntelRepository:
         run = self.session.get(IntelRun, int(run_id))
         if run is None:
             return
-        # Clear the pending-edition pointer before deleting the build.
-        for edition in self.session.scalars(
-            select(DailyEdition).where(
-                DailyEdition.draft_run_id == int(run_id)
-            )
-        ).all():
-            if edition.draft_run_id == int(run_id):
-                edition.draft_run_id = None
-
         # Stage tasks refer to items/events and attempts refer back to tasks.
         # Delete them first so SQLite installations with FK enforcement enabled
         # can purge an entire build without depending on implicit cascades.

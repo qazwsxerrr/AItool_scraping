@@ -29,12 +29,8 @@ def _publish(session_factory, *, edition_date: str, title: str, event_key: str) 
                 )
             )
             session.flush()
-        _, build = repo.start_daily_build(
+        repo.replace_published_daily_report(
             edition_date=edition_date,
-            reference_time=datetime(2026, 8, 19, 8, tzinfo=timezone.utc),
-        )
-        repo.publish_daily_report(
-            run_id=build.id,
             records=[
                 {
                     "event_key": event_key,
@@ -71,7 +67,6 @@ def _publish(session_factory, *, edition_date: str, title: str, event_key: str) 
                 }
             ],
         )
-        repo.delete_build(build.id)
         session.commit()
 
 

@@ -15,11 +15,11 @@ from app.jobs.fetch_job import run_intel_fetch_from_settings
 from app.jobs.fetch_only_job import run_fetch_only_from_settings
 from app.jobs.pipeline_orchestrator import (
     normalize_stage,
+    publish_daily_draft_from_settings,
     pipeline_edition_status_from_settings,
-    resolve_pending_daily_build_id_from_settings,
+    resolve_pending_daily_draft_from_settings,
     resume_pipeline_from_settings,
     retry_pipeline_stage_from_settings,
-    run_pipeline_export_from_settings,
     run_pipeline_from_settings,
     run_pipeline_stage_d_from_settings,
     run_pipeline_stage_a_from_settings,
@@ -29,6 +29,7 @@ from app.jobs.pipeline_orchestrator import (
 )
 from app.jobs.source_health_job import run_source_health_from_settings
 from app.logging_config import configure_logging
+from app.storage.draft_workspace import audit_database_path
 
 
 app = typer.Typer(help="AI tool intelligence ingestion CLI")
@@ -140,6 +141,7 @@ def run_once(
     ),
     output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
+    publish: bool = typer.Option(False, "--publish", help="Approve and replace the public daily report after a complete draft."),
 ) -> None:
     configure_logging()
     result = run_pipeline_from_settings(
@@ -148,6 +150,7 @@ def run_once(
         edition_date=_optional_edition_date(edition_date),
         output_dir=output_dir,
         profile_path=profile,
+        publish=publish,
     )
     typer.echo(
         f"fetch: fetched={result.start.fetch.total_fetched} inserted={result.start.fetch.total_inserted} "
@@ -158,7 +161,9 @@ def run_once(
         typer.echo(f"export: exported={exported.exported}")
         _echo_daily_edition(exported.markdown_path)
     typer.echo(f"status={result.status}")
-    if result.status != "published":
+    if result.status == "ready_for_publish" and result.start.edition_date:
+        typer.echo(f"next=pipeline export --edition-date {result.start.edition_date}")
+    if result.status in {"failed", "partial", "draft_failed"}:
         for error in result.resume.errors:
             typer.echo(f"error={error}")
         raise typer.Exit(code=1)
@@ -214,8 +219,9 @@ def pipeline_run(
         metavar="YYYY-MM-DD",
         help="Public daily edition to update; defaults to the current Asia/Shanghai date.",
     ),
+    publish: bool = typer.Option(False, "--publish", help="Approve and replace the public daily report after a complete draft."),
 ) -> None:
-    """Run the complete pipeline while keeping stage boundaries resumable."""
+    """Run A-D into a private draft; use --publish only after approval."""
 
     configure_logging()
 
@@ -231,6 +237,7 @@ def pipeline_run(
         output_dir=output_dir,
         profile_path=profile,
         on_start=announce_start,
+        publish=publish,
     )
     typer.echo(f"status={result.status}")
     export_result = result.resume.results.get("export")
@@ -247,7 +254,9 @@ def pipeline_run(
         typer.echo(f"skipped={','.join(result.resume.skipped_stages)}")
     for error in result.resume.errors:
         typer.echo(f"error={error}")
-    if result.status in {"failed", "partial"} or result.resume.errors:
+    if result.status == "ready_for_publish" and result.start.edition_date:
+        typer.echo(f"next=pipeline export --edition-date {result.start.edition_date}")
+    if result.status in {"failed", "partial", "draft_failed"} or result.resume.errors:
         raise typer.Exit(code=1)
 
 
@@ -263,9 +272,9 @@ def pipeline_stage_a(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_pending_build_id(settings, edition_date)
+    workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
     result = run_pipeline_stage_a_from_settings(
-        settings=settings,
+        settings=workspace_settings,
         run_id=run_id,
         limit=limit,
         force=force,
@@ -290,9 +299,9 @@ def pipeline_stage_b(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_pending_build_id(settings, edition_date)
+    workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
     result = run_pipeline_stage_b_from_settings(
-        settings=settings,
+        settings=workspace_settings,
         run_id=run_id,
         limit=limit,
         force=force,
@@ -316,9 +325,9 @@ def pipeline_stage_c(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_pending_build_id(settings, edition_date)
+    workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
     result = run_pipeline_stage_c_from_settings(
-        settings=settings,
+        settings=workspace_settings,
         run_id=run_id,
         limit=limit,
         force=force,
@@ -339,9 +348,9 @@ def pipeline_stage_d(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_pending_build_id(settings, edition_date)
+    workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
     result = run_pipeline_stage_d_from_settings(
-        settings=settings,
+        settings=workspace_settings,
         run_id=run_id,
         force=force,
         profile_path=profile,
@@ -362,10 +371,9 @@ def pipeline_export(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_pending_build_id(settings, edition_date)
-    result = run_pipeline_export_from_settings(
+    result = publish_daily_draft_from_settings(
         settings=settings,
-        run_id=run_id,
+        edition_date=_required_edition_date(edition_date),
         limit=limit,
         output_dir=output_dir,
     )
@@ -377,13 +385,16 @@ def pipeline_export(
     typer.echo(f"markdown={result.markdown_path}")
     if result.manifest_path:
         typer.echo(f"manifest={result.manifest_path}")
+    typer.echo(
+        f"audit={audit_database_path(settings.database_url, _required_edition_date(edition_date))}"
+    )
 
 
 @pipeline_app.command("status")
 def pipeline_status(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to inspect."),
 ) -> None:
-    """Show draft or published state for one date-addressed daily report."""
+    """Show public, draft, and retained-audit state for one daily report."""
 
     configure_logging()
     settings = Settings.from_env()
@@ -395,8 +406,11 @@ def pipeline_status(
     typer.echo(f"edition_date={status.edition_date}")
     typer.echo(
         f"status={status.status} draft_status={status.draft_status or '-'} "
+        f"audit_status={status.audit_status or '-'} "
         f"published_at={status.published_at.isoformat() if status.published_at else '-'}"
     )
+    if status.audit_path:
+        typer.echo(f"audit={status.audit_path}")
     for row in status.stages:
         typer.echo(
             f"{row['stage']}: status={row['status']} total={row['total']} "
@@ -409,7 +423,7 @@ def pipeline_status(
 @pipeline_app.command("retry")
 def pipeline_retry(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to retry."),
-    stage: str = typer.Option(..., "--stage", help="One stage: stage-a, stage-b, stage-c, stage-d, export."),
+    stage: str = typer.Option(..., "--stage", help="One stage: stage-a, stage-b, stage-c, or stage-d."),
     limit: int | None = typer.Option(None, "--limit", min=1),
     force: bool = typer.Option(False, "--force", help="Force only the named stage."),
     include_blocked: bool = typer.Option(False, "--include-blocked"),
@@ -420,11 +434,11 @@ def pipeline_retry(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_pending_build_id(settings, edition_date)
+    workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
     try:
         canonical = normalize_stage(stage)
         result = retry_pipeline_stage_from_settings(
-            settings=settings,
+            settings=workspace_settings,
             run_id=run_id,
             stage=canonical,
             include_blocked=include_blocked,
@@ -455,9 +469,9 @@ def pipeline_resume(
 
     configure_logging()
     settings = Settings.from_env()
-    run_id = _resolve_pending_build_id(settings, edition_date)
+    workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
     result = resume_pipeline_from_settings(
-        settings=settings,
+        settings=workspace_settings,
         run_id=run_id,
         limit=limit,
         output_dir=output_dir,
@@ -499,10 +513,10 @@ def _required_edition_date(value: str) -> str:
         raise typer.BadParameter("must use YYYY-MM-DD", param_hint="--edition-date") from exc
 
 
-def _resolve_pending_build_id(settings: Settings, edition_date: str) -> int:
+def _resolve_pending_draft(settings: Settings, edition_date: str) -> tuple[Settings, int]:
     normalized = _required_edition_date(edition_date)
     try:
-        return resolve_pending_daily_build_id_from_settings(settings=settings, edition_date=normalized)
+        return resolve_pending_daily_draft_from_settings(settings=settings, edition_date=normalized)
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--edition-date") from exc
 

@@ -424,12 +424,7 @@ def _conditional_headers(source: Source | None) -> dict[str, str]:
 
 
 def _router_collect(router: Any, source: SourceSpec, limit: int, request_headers: dict[str, str]) -> FetchBatch:
-    try:
-        return router.collect(source, limit, request_headers=request_headers)
-    except TypeError as exc:
-        if "request_headers" not in str(exc):
-            raise
-        return router.collect(source, limit)
+    return router.collect(source, limit, request_headers=request_headers)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:

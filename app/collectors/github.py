@@ -7,7 +7,7 @@ import json
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -67,7 +67,12 @@ class GitHubCollector(Collector):
         self.retries = max(0, int(retries))
         self.timeout_seconds = timeout_seconds
 
-    def collect(self, source: SourceSpec, limit: int) -> FetchBatch:
+    def collect(
+        self,
+        source: SourceSpec,
+        limit: int,
+        request_headers: Mapping[str, str] | None = None,
+    ) -> FetchBatch:
         if not source.url:
             return _failed_batch(source, "missing_url", "source has no URL")
         if source.transport != "github" or source.github is None or source.github.mode not in {"search", "releases"}:
@@ -90,6 +95,7 @@ class GitHubCollector(Collector):
             retries=self.retries,
             user_agent=self.user_agent,
             extra_headers={
+                **dict(request_headers or {}),
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": self.api_version,
                 **({"Authorization": f"Bearer {self.token}"} if self.token else {}),
@@ -293,7 +299,12 @@ class GitHubTrendingCollector(Collector):
         self.max_response_bytes = max_response_bytes
         self.sleeper = sleeper
 
-    def collect(self, source: SourceSpec, limit: int) -> FetchBatch:
+    def collect(
+        self,
+        source: SourceSpec,
+        limit: int,
+        request_headers: Mapping[str, str] | None = None,
+    ) -> FetchBatch:
         if not source.url:
             return _failed_batch(source, "missing_url", "source has no URL")
         if source.transport != "github" or source.github is None or source.github.mode != "trending":
@@ -304,7 +315,10 @@ class GitHubTrendingCollector(Collector):
             retries=self.retries,
             user_agent=self.user_agent,
             max_response_bytes=self.max_response_bytes,
-            extra_headers={"Accept": "text/html,application/xhtml+xml"},
+            extra_headers={
+                **dict(request_headers or {}),
+                "Accept": "text/html,application/xhtml+xml",
+            },
             sleeper=self.sleeper,
         )
         if error is not None:

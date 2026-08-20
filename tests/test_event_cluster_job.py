@@ -93,9 +93,8 @@ def _seed_daily_build(session_factory, *, edition_date: str, rows: list[dict[str
 def _publish_prior_report(session_factory, *, edition_date: str, event_key: str, url: str, title: str) -> None:
     with session_factory() as session:
         repo = IntelRepository(session)
-        _, build = repo.start_daily_build(edition_date=edition_date, reference_time=NOW)
-        repo.publish_daily_report(
-            run_id=build.id,
+        repo.replace_published_daily_report(
+            edition_date=edition_date,
             records=[
                 {
                     "event_key": event_key,
@@ -112,7 +111,6 @@ def _publish_prior_report(session_factory, *, edition_date: str, event_key: str,
                 }
             ],
         )
-        repo.delete_build(build.id)
         session.commit()
 
 

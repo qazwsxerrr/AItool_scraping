@@ -737,9 +737,9 @@ def _load_selected_daily_history_events(
         return []
 
     earliest = current_edition - timedelta(days=days)
-    # Published daily entries are the only historical source.  Old build
-    # items/events/snapshots are deliberately deleted after publication, so
-    # the history objects below are read-only in-memory projections.
+    # Published daily entries are the only cross-date historical source.
+    # Full build rows are retained only inside their own date audit workspace,
+    # so the history objects below remain read-only in-memory projections.
     prior_entries = list(
         session.execute(
             select(DailyEditionReportEntry, DailyEdition)

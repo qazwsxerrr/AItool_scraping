@@ -9,6 +9,7 @@ from app.config.settings import Settings
 from app.jobs import pipeline_orchestrator as orchestrator
 from app.jobs.fetch_job import IntelFetchResult
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
+from app.storage.draft_workspace import draft_database_url
 from app.storage.models import IntelRun
 from app.storage.repository import IntelRepository
 
@@ -63,10 +64,12 @@ def test_pipeline_start_resolves_only_the_date_draft(tmp_path):
     )
 
     assert result.edition_date == "2026-08-18"
-    assert orchestrator.resolve_pending_daily_build_id_from_settings(
+    workspace_settings, resolved_run_id = orchestrator.resolve_pending_daily_draft_from_settings(
         settings=settings,
         edition_date="2026-08-18",
-    ) == result.run_id
+    )
+    assert workspace_settings.database_url == draft_database_url(settings.database_url, "2026-08-18")
+    assert resolved_run_id == result.run_id
 
 
 def test_published_edition_has_no_pending_build_to_resume(tmp_path):
@@ -74,14 +77,11 @@ def test_published_edition_has_no_pending_build_to_resume(tmp_path):
     session_factory = _session_factory(settings.database_url)
     with session_factory() as session:
         repo = IntelRepository(session)
-        _, build = repo.start_daily_build(edition_date="2026-08-18")
-        repo.publish_daily_report(run_id=build.id, records=[])
-        repo.delete_build(build.id)
+        repo.replace_published_daily_report(edition_date="2026-08-18", records=[])
         session.commit()
 
-        assert repo.draft_run_for_edition("2026-08-18") is None
-    with pytest.raises(ValueError, match="no pending build"):
-        orchestrator.resolve_pending_daily_build_id_from_settings(
+    with pytest.raises(ValueError, match="no pending draft"):
+        orchestrator.resolve_pending_daily_draft_from_settings(
             settings=settings,
             edition_date="2026-08-18",
         )
