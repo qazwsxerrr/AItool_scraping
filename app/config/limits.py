@@ -23,6 +23,15 @@ Stage C receives the successful B1 projections directly; this is only a
 deterministic score floor, not a separate routing stage.
 """
 
+STAGE_C_BATCH_ITEM_LIMIT = 32
+"""Maximum number of candidates in one bounded Stage-C provider request."""
+
+STAGE_C_BATCH_INPUT_BYTE_LIMIT = 48 * 1024
+"""Conservative serialized-input budget for one Stage-C candidate batch."""
+
+STAGE_C_AGGREGATION_MODE = "ai_partitioned_calls_v2"
+"""Execution contract for bounded Stage-C aggregation requests."""
+
 STAGE_C_INPUT_POLICY_VERSION = "stage_c_direct_b1_score_gate_v2"
 """Version of the direct-B1 Stage-C input-selection contract."""
 
@@ -41,6 +50,9 @@ __all__ = [
     "DEFAULT_AI_SCREEN_REJECT_THRESHOLD",
     "DEFAULT_AI_ANALYSIS_MIN_SCORE",
     "DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE",
+    "STAGE_C_AGGREGATION_MODE",
+    "STAGE_C_BATCH_INPUT_BYTE_LIMIT",
+    "STAGE_C_BATCH_ITEM_LIMIT",
     "STAGE_C_INPUT_POLICY_VERSION",
     "DEFAULT_AI_REVIEW_CONCURRENCY",
     "DEFAULT_DAILY_REPORT_LIMIT",

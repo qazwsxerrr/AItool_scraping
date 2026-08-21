@@ -152,10 +152,6 @@ def apply_local_guard(
     return response
 
 
-# More explicit alias for callers that use the phrase from the pipeline docs.
-guard_item_analysis_response = apply_local_guard
-
-
 def parse_item_analysis_response(
     data: Any,
     source_content_class: str,
@@ -170,10 +166,7 @@ def parse_item_analysis_response(
 
     raw = _coerce_raw_mapping(data)
     result = _unwrap_response(raw)
-    # ``topic_category`` was added after the original AI-only contract. Keep
-    # it optional at the parser boundary so old provider responses and audit
-    # rows remain readable; the job assigns a deterministic fallback.
-    required_fields = [key for key in ITEM_ANALYSIS_RESPONSE_SCHEMA if key != "topic_category"]
+    required_fields = list(ITEM_ANALYSIS_RESPONSE_SCHEMA)
     missing = [key for key in required_fields if key not in result]
     if missing:
         raise ValueError("Item analysis response is missing required fields: " + ", ".join(missing))
@@ -455,54 +448,8 @@ __all__ = [
     "clamp_int",
     "coerce_bool",
     "content_to_text",
-    "guard_item_analysis_response",
     "normalize_content_class",
     "parse_item_analysis_response",
     "parse_project_summary_response",
     "strip_json_fence",
-    "AnalysisResult",
-    "IntelEntity",
-    "RawIntelEnvelope",
-    "ScoreComponents",
-    "ScreenResult",
-    "normalize_entity_type",
-    "normalize_topic",
-    "normalize_html",
-    "normalize_text",
-    "parse_analysis_result",
-    "parse_screen_result",
-    "strict_parse_analysis",
-    "strict_parse_screen",
-    "apply_analysis_guards",
-    "apply_screen_guard",
 ]
-
-
-# Stage A/B contracts live in ``app.ai.skills.intel_triage``.  Lazy aliases
-# avoid importing transport code while this legacy project-summary schema is
-# initialized.
-_INTEL_EXPORTS = {
-    "AnalysisResult",
-    "IntelEntity",
-    "RawIntelEnvelope",
-    "ScoreComponents",
-    "ScreenResult",
-    "normalize_entity_type",
-    "normalize_topic",
-    "normalize_html",
-    "normalize_text",
-    "parse_analysis_result",
-    "parse_screen_result",
-    "strict_parse_analysis",
-    "strict_parse_screen",
-    "apply_analysis_guards",
-    "apply_screen_guard",
-}
-
-
-def __getattr__(name: str):
-    if name in _INTEL_EXPORTS:
-        from app.ai.skills import intel_triage
-
-        return getattr(intel_triage, name)
-    raise AttributeError(name)

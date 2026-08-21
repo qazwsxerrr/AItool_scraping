@@ -18,18 +18,16 @@ from .models import (
 
 
 SCORE_WEIGHTS = {
-    "relevance": 0.20,
-    "importance": 0.20,
-    "impact": 0.20,
-    "freshness": 0.15,
-    "source_authority": 0.10,
+    "audience_relevance": 0.25,
+    "material_change": 0.25,
+    "impact_scope": 0.20,
+    "independent_news_value": 0.20,
     "specificity": 0.10,
-    "tracking_value": 0.05,
 }
 
 
 def recompute_analysis_score(result: AnalysisResult) -> int:
-    """Calculate the local seven-dimension editorial priority score.
+    """Calculate the local five-dimension B1 content-value priority.
 
     The provider score is retained in ``raw_response`` for audit, while the
     value used by deterministic Stage-C ordering/gating is reproducible.
@@ -37,21 +35,17 @@ def recompute_analysis_score(result: AnalysisResult) -> int:
 
     scores = result.score_components
     values = {
-        "relevance": scores.relevance,
-        "importance": scores.importance or scores.impact,
-        "impact": scores.impact,
-        "freshness": scores.freshness,
-        "source_authority": scores.source_authority,
-        "specificity": scores.specificity or scores.relevance,
-        "tracking_value": scores.tracking_value or scores.actionability,
+        "audience_relevance": scores.audience_relevance,
+        "material_change": scores.material_change,
+        "impact_scope": scores.impact_scope,
+        "independent_news_value": scores.independent_news_value,
+        "specificity": scores.specificity,
     }
     return max(0, min(100, int(round(sum(values[name] * weight for name, weight in SCORE_WEIGHTS.items())))))
 
 
 # These are the only provider-supplied reasons that can terminate Stage A.
-# Keep the canonical values small and stable; aliases below are accepted for
-# rolling compatibility with older prompts/providers and are never trusted as
-# a separate policy surface.
+# The provider must emit one of these canonical values.
 SCREEN_HARD_REJECT_REASON_CODES = frozenset(
     {
         "irrelevant",
@@ -62,25 +56,6 @@ SCREEN_HARD_REJECT_REASON_CODES = frozenset(
         "duplicate_without_update",
     }
 )
-SCREEN_HARD_REJECT_REASON_ALIASES = {
-    "not_relevant": "irrelevant",
-    "unrelated": "irrelevant",
-    "off_topic": "irrelevant",
-    "noise": "spam",
-    "ad": "pure_advertisement",
-    "advertisement": "pure_advertisement",
-    "marketing_only": "pure_advertisement",
-    "promotional": "pure_advertisement",
-    "navigation": "navigation_or_index",
-    "index_page": "navigation_or_index",
-    "empty": "empty_content",
-    "no_content": "empty_content",
-    "duplicate": "duplicate_without_update",
-    "repost": "duplicate_without_update",
-    "no_new_information": "duplicate_without_update",
-}
-
-
 def canonical_screen_reason_code(value: Any) -> str:
     """Normalize a provider reason code for deterministic local policy."""
 
@@ -89,8 +64,7 @@ def canonical_screen_reason_code(value: Any) -> str:
 
 def _screen_hard_reject_reason(value: Any) -> str | None:
     normalized = canonical_screen_reason_code(value)
-    canonical = SCREEN_HARD_REJECT_REASON_ALIASES.get(normalized, normalized)
-    return canonical if canonical in SCREEN_HARD_REJECT_REASON_CODES else None
+    return normalized if normalized in SCREEN_HARD_REJECT_REASON_CODES else None
 
 
 def _as_envelope(value: RawIntelEnvelope | Mapping[str, Any] | Any) -> RawIntelEnvelope:
@@ -135,17 +109,6 @@ def apply_screen_guard(
     return parsed.model_copy(update=updates) if updates else parsed
 
 
-def guard_screen_result(
-    result: ScreenResult | Mapping[str, Any],
-    envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
-    *,
-    reject_threshold: int = 90,
-) -> ScreenResult:
-    """Descriptive alias used by pipeline callers."""
-
-    return apply_screen_guard(result, envelope, reject_threshold=reject_threshold)
-
-
 def apply_analysis_guards(
     result: AnalysisResult | Mapping[str, Any],
     envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
@@ -156,25 +119,16 @@ def apply_analysis_guards(
     updates: dict[str, Any] = {}
     item = _as_envelope(envelope) if envelope is not None else None
 
-    # The local score is authoritative for downstream ordering.  It is
-    # recomputed from the submitted components so the provider cannot return
-    # a total that disagrees with its own breakdown.
+    # The local score is authoritative for downstream ordering. It is
+    # recomputed from the submitted components, rather than trusting the
+    # provider's top-level priority.
     recomputed = recompute_analysis_score(parsed)
-    if parsed.selection_score != recomputed or parsed.score_components.total != recomputed:
-        updates["score_components"] = parsed.score_components.model_copy(update={"total": recomputed})
-        updates["selection_score"] = recomputed
+    if parsed.b1_priority != recomputed:
+        updates["b1_priority"] = recomputed
 
     if item is not None:
         if parsed.item_id is None and item.item_id is not None:
             updates["item_id"] = item.item_id
-        if parsed.source_content_class is None:
-            updates["source_content_class"] = item.source_content_class
-        elif parsed.source_content_class != item.source_content_class:
-            # Source metadata is authoritative for provenance; provider output
-            # cannot relabel a community signal as an official source.
-            updates["source_content_class"] = item.source_content_class
-        if parsed.source_group is None and item.source_group:
-            updates["source_group"] = item.source_group
 
     if parsed.status == "success" and not parsed.summary_cn.strip():
         # A provider may omit the generated summary even though the frozen
@@ -188,13 +142,6 @@ def apply_analysis_guards(
         if fallback:
             updates["summary_cn"] = fallback
     return parsed.model_copy(update=updates) if updates else parsed
-
-
-def guard_analysis_result(
-    result: AnalysisResult | Mapping[str, Any],
-    envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
-) -> AnalysisResult:
-    return apply_analysis_guards(result, envelope)
 
 
 def analysis_guard_failure(result: AnalysisResult | Mapping[str, Any]) -> str | None:
@@ -216,13 +163,10 @@ def analysis_guard_failure(result: AnalysisResult | Mapping[str, Any]) -> str | 
 
 __all__ = [
     "SCORE_WEIGHTS",
-    "SCREEN_HARD_REJECT_REASON_ALIASES",
     "SCREEN_HARD_REJECT_REASON_CODES",
     "analysis_guard_failure",
     "recompute_analysis_score",
     "apply_analysis_guards",
     "apply_screen_guard",
     "canonical_screen_reason_code",
-    "guard_analysis_result",
-    "guard_screen_result",
 ]

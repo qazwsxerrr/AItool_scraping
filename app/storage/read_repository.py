@@ -1,6 +1,6 @@
 """Read-only queries over published date-addressed daily reports.
 
-Temporary builds, raw items, AI rows and Stage-D snapshots live in per-date
+Temporary builds, raw items and AI stage rows live in per-date
 filesystem audit workspaces, never in the published database.  The UI
 therefore reads only final report entries.
 """
@@ -57,8 +57,7 @@ class FeaturedItemRow:
     url: str | None
     risk_note: str | None
     status: str
-    selection_score: int
-    ai_confidence: int | None
+    display_score: int
     content_class: str | None
     source_name: str | None
     source_group: str | None
@@ -79,7 +78,6 @@ class FeaturedItemRow:
     source_role: str | None = None
     source_url: str | None = None
     account_url: str | None = None
-    presentation_labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -103,9 +101,6 @@ class FeaturedEventRow:
     entities: tuple[dict[str, object], ...] = ()
     provenance: str = "published"
     source_refs: tuple[dict[str, object], ...] = ()
-    story_family_id: str | None = None
-    family_position: int | None = None
-    presentation_labels: tuple[str, ...] = ()
 
     @property
     def id(self) -> int:
@@ -361,9 +356,9 @@ class UIReadRepository:
         metadata = entry.metadata_dict
         return EventDetailRow(
             event=self._event_from_entry(entry, self._sources_by_id([entry])),
-            selection_reason=_text(metadata.get("reason")) or _text(metadata.get("editorial_reason")),
+            selection_reason=_text(metadata.get("reason")),
             resolution_method="published_daily_report",
-            resolution_confidence=_int(metadata.get("confidence"), default=100),
+            resolution_confidence=None,
             members=self._members_from_entry(entry),
         )
 
@@ -387,7 +382,7 @@ class UIReadRepository:
             selected_items=[
                 SearchResultRow(
                     result_type="event", id=row.id, title=row.title, summary=row.summary, url=row.url,
-                    source_name=row.source_name, item_id=None, score=row.selection_score,
+                    source_name=row.source_name, item_id=None, score=row.display_score,
                     badges=[value for value in ("selected", row.content_class, row.source_group) if value],
                     published_at=row.published_at, created_at=row.created_at, content_class=row.content_class,
                     status="selected", ai_status="published_daily_report", selection_reason=row.selection_reason,
@@ -498,17 +493,11 @@ class UIReadRepository:
         refs = tuple(_public_source_ref(value) for value in entry.source_refs)
         primary = _primary_ref(refs)
         source = sources.get(_text(primary.get("source_id")) if primary else "")
-        display_title = _text(metadata.get("display_title_zh")) or entry.title
-        presentation = _text(metadata.get("source_presentation"))
-        labels = {
-            "community_signal_pending_verification": "社区线索 / 待核实",
-            "multi_community_signal_pending_verification": "多源社区线索 / 待核实",
-        }
         provenance = metadata.get("provenance")
         if isinstance(provenance, dict):
             provenance = provenance.get("kind")
         return FeaturedEventRow(
-            event_id=int(entry.id), display_order=int(entry.display_order), title=display_title,
+            event_id=int(entry.id), display_order=int(entry.display_order), title=entry.title,
             original_title=entry.original_title or entry.title, summary=entry.summary, url=_safe_url(entry.url),
             display_score=float(entry.display_score or 0.0), topic=entry.topic, content_class=entry.content_class,
             source_name=_text(primary.get("source_name")) if primary else None or (source.name if source is not None else (entry.source_ids[0] if entry.source_ids else None)),
@@ -517,8 +506,6 @@ class UIReadRepository:
             source_ids=tuple(entry.source_ids), risk_flags=list(entry.risk_flags), published_at=entry.published_at,
             keywords=tuple(entry.keywords), entities=tuple(value for value in entry.entities if isinstance(value, dict)),
             provenance=_text(provenance) or "published", source_refs=refs,
-            story_family_id=_text(metadata.get("story_family_id")), family_position=_int(metadata.get("family_position")),
-            presentation_labels=(labels[presentation],) if presentation in labels else (),
         )
 
     def _card_from_entry(self, entry: DailyEditionReportEntry, sources: dict[str, Source]) -> FeaturedItemRow:
@@ -528,9 +515,9 @@ class UIReadRepository:
         metadata = entry.metadata_dict
         return FeaturedItemRow(
             id=event.event_id, title=event.title, summary=event.summary,
-            selection_reason=_text(metadata.get("reason")) or _text(metadata.get("editorial_reason")), url=event.url,
+            selection_reason=_text(metadata.get("reason")), url=event.url,
             risk_note="；".join(event.risk_flags) if event.risk_flags else None, status="selected",
-            selection_score=int(round(event.display_score)), ai_confidence=_int(metadata.get("confidence"), default=100),
+            display_score=int(round(event.display_score)),
             content_class=event.content_class, source_name=event.source_name, source_group=event.source_group,
             source_subtype=event.source_subtype, risk_flags=event.risk_flags, published_at=event.published_at,
             created_at=entry.created_at, ai_status="published_daily_report", topic_category=event.topic,
@@ -540,7 +527,6 @@ class UIReadRepository:
             source_role=source.source_role if source is not None else None,
             source_url=_safe_url(_text(primary.get("source_url")) if primary else None) or (_safe_url(source.url) if source is not None else None),
             account_url=_safe_url(source.account_url) if source is not None else None,
-            presentation_labels=event.presentation_labels,
         )
 
     @staticmethod

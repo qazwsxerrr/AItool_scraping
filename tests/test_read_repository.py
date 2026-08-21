@@ -60,9 +60,8 @@ def _publish(session_factory, *, edition_date: str, title: str, event_key: str) 
                     "entities": [{"type": "company", "name": "Example"}],
                     "provenance": {"kind": "new"},
                     "metadata": {
-                        "display_title_zh": title,
-                        "editorial_reason": "变化明确",
-                        "confidence": 92,
+                        "reason_code": "material_change",
+                        "reason": "变化明确",
                     },
                 }
             ],
@@ -91,6 +90,7 @@ def test_read_repository_maps_final_report_provenance_and_source_refs():
     assert cards[0].risk_flags == ["needs_review"]
     assert stats.selected_items == 1
     assert detail is not None
+    assert detail.selection_reason == "变化明确"
     assert detail.resolution_method == "published_daily_report"
     assert detail.members[0].source_id == "ui-source"
     assert detail.members[0].review_topic == "model_release"

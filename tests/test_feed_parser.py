@@ -35,6 +35,22 @@ ATOM_SAMPLE = b"""<?xml version="1.0" encoding="UTF-8"?>
 </feed>
 """
 
+INVALID_DATE_SAMPLE = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Invalid date fixture</title>
+    <item>
+      <guid>invalid-date-1</guid>
+      <title>Entry with a malformed publication date</title>
+      <link>https://example.com/invalid-date</link>
+      <pubDate>Invalid Date</pubDate>
+      <lastBuildDate>2026-08-20T08:30:00Z</lastBuildDate>
+      <description>Still useful content</description>
+    </item>
+  </channel>
+</rss>
+"""
+
 
 def test_parse_rss_item_extracts_canonical_fields_and_payload():
     items = parse_feed(RSS_SAMPLE, source_id="example_rss")
@@ -67,3 +83,12 @@ def test_parse_atom_item_uses_updated_when_published_is_missing():
     assert item.published_at.isoformat() == "2026-04-20T08:30:00+00:00"
     assert item.raw_summary == "Atom summary"
     assert item.raw_content == "Atom full content"
+
+
+def test_parse_feed_keeps_entry_when_one_date_field_is_malformed():
+    items = parse_feed(INVALID_DATE_SAMPLE, source_id="invalid_date")
+
+    assert len(items) == 1
+    assert items[0].title == "Entry with a malformed publication date"
+    assert items[0].published_at is not None
+    assert items[0].published_at.isoformat() == "2026-08-20T08:30:00+00:00"

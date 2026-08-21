@@ -41,7 +41,7 @@ def _row(
         "topic": topic,
         "keywords": list(keywords),
         "entities": list(entities),
-        "selection_score": 88,
+        "b1_priority": 88,
     }
 
 
@@ -340,14 +340,7 @@ def _full_batch_response() -> dict[str, Any]:
             {
                 "title_zh": topic,
                 "summary_zh": f"聚合 {topic} 的官方发布、接入、教程和相关解读。",
-                "primary_item_id": int(rows[0]["id"]),
-                "members": [
-                    {
-                        "item_id": int(row["id"]),
-                        "relation": "primary" if index == 0 else "related",
-                    }
-                    for index, row in enumerate(rows)
-                ],
+                "item_ids": [int(row["id"]) for row in rows],
                 "novelty_status": "new",
                 "prior_event_key": None,
             }
@@ -365,7 +358,7 @@ def test_single_ai_response_can_merge_each_duplicate_topic_into_one_story():
     )
 
     actual = {
-        cluster.title_zh: {member.item_id for member in cluster.members}
+        cluster.title_zh: set(cluster.item_ids)
         for cluster in parsed.clusters
     }
     expected = {
@@ -378,9 +371,35 @@ def test_single_ai_response_can_merge_each_duplicate_topic_into_one_story():
 def test_single_ai_response_must_cover_every_input_item_once():
     rows = [row for values in DUPLICATE_TOPIC_FIXTURES.values() for row in values]
     response = _full_batch_response()
-    response["clusters"][0]["members"].pop()
+    response["clusters"][0]["item_ids"].pop()
 
     with pytest.raises(ValueError, match="missing item_ids"):
+        strict_parse_stage_c_aggregation(
+            response,
+            item_ids=[int(row["id"]) for row in rows],
+            prior_event_keys=[],
+        )
+
+
+def test_single_ai_response_rejects_duplicate_global_item_assignment():
+    rows = [row for values in DUPLICATE_TOPIC_FIXTURES.values() for row in values]
+    response = _full_batch_response()
+    response["clusters"][1]["item_ids"].append(response["clusters"][0]["item_ids"][0])
+
+    with pytest.raises(ValueError, match="assigns one item_id to multiple clusters"):
+        strict_parse_stage_c_aggregation(
+            response,
+            item_ids=[int(row["id"]) for row in rows],
+            prior_event_keys=[],
+        )
+
+
+def test_v2_contract_has_no_redundant_primary_cross_field():
+    rows = [row for values in DUPLICATE_TOPIC_FIXTURES.values() for row in values]
+    response = _full_batch_response()
+    response["clusters"][0]["primary_item_id"] = response["clusters"][0]["item_ids"][0]
+
+    with pytest.raises(ValueError, match="primary_item_id"):
         strict_parse_stage_c_aggregation(
             response,
             item_ids=[int(row["id"]) for row in rows],

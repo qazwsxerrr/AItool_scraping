@@ -50,7 +50,7 @@ def _app(tmp_path):
                         }
                     ]
                 ),
-                metadata_json='{"display_title_zh":"Model update"}',
+                metadata_json='{"reason_code":"material_change","reason":"变化明确"}',
             )
         )
         session.commit()

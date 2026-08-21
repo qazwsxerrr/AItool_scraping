@@ -1,4 +1,4 @@
-"""Minimal structured contract for one complete Stage-C aggregation call."""
+"""Minimal structured contract for one bounded Stage-C aggregation call."""
 
 from __future__ import annotations
 
@@ -9,14 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.ai.skills.intel_triage.parser import unwrap_provider_response
 
 
-STAGE_C_SCHEMA_VERSION = "stage_c_story_aggregation_v1"
-
-
-class StageCStoryMember(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    item_id: int = Field(gt=0)
-    relation: Literal["primary", "duplicate", "related"]
+STAGE_C_SCHEMA_VERSION = "stage_c_story_aggregation_v2"
 
 
 class StageCStoryCluster(BaseModel):
@@ -24,19 +17,14 @@ class StageCStoryCluster(BaseModel):
 
     title_zh: str = Field(min_length=1)
     summary_zh: str = Field(min_length=1)
-    primary_item_id: int = Field(gt=0)
-    members: list[StageCStoryMember] = Field(min_length=1)
+    item_ids: list[int] = Field(min_length=1)
     novelty_status: Literal["new", "repeat", "updated"]
     prior_event_key: str | None
 
     @model_validator(mode="after")
     def _validate_cluster(self) -> "StageCStoryCluster":
-        member_ids = [member.item_id for member in self.members]
-        if len(member_ids) != len(set(member_ids)):
+        if len(self.item_ids) != len(set(self.item_ids)):
             raise ValueError("Stage C cluster contains duplicate item_id")
-        primary_ids = [member.item_id for member in self.members if member.relation == "primary"]
-        if primary_ids != [self.primary_item_id]:
-            raise ValueError("Stage C cluster must contain exactly one primary matching primary_item_id")
         if self.novelty_status == "new" and self.prior_event_key is not None:
             raise ValueError("new Stage C cluster must not reference prior_event_key")
         if self.novelty_status != "new" and not self.prior_event_key:
@@ -52,7 +40,7 @@ class StageCAggregationResponse(BaseModel):
 
     @model_validator(mode="after")
     def _validate_global_uniqueness(self) -> "StageCAggregationResponse":
-        item_ids = [member.item_id for cluster in self.clusters for member in cluster.members]
+        item_ids = [item_id for cluster in self.clusters for item_id in cluster.item_ids]
         if len(item_ids) != len(set(item_ids)):
             raise ValueError("Stage C response assigns one item_id to multiple clusters")
         prior_keys = [cluster.prior_event_key for cluster in self.clusters if cluster.prior_event_key]
@@ -74,7 +62,7 @@ def strict_parse_stage_c_aggregation(
     expected = [int(item_id) for item_id in item_ids]
     if len(expected) != len(set(expected)):
         raise ValueError("Stage C input contains duplicate item_id")
-    actual = [member.item_id for cluster in parsed.clusters for member in cluster.members]
+    actual = [item_id for cluster in parsed.clusters for item_id in cluster.item_ids]
     unknown = sorted(set(actual) - set(expected))
     missing = sorted(set(expected) - set(actual))
     if unknown:
@@ -101,6 +89,5 @@ __all__ = [
     "STAGE_C_SCHEMA_VERSION",
     "StageCAggregationResponse",
     "StageCStoryCluster",
-    "StageCStoryMember",
     "strict_parse_stage_c_aggregation",
 ]

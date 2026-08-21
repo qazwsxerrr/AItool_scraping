@@ -287,15 +287,15 @@ def pipeline_stage_a(
     )
 
 
-@pipeline_app.command("stage-b")
-def pipeline_stage_b(
+@pipeline_app.command("stage-b1")
+def pipeline_stage_b1(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to process."),
     limit: int | None = typer.Option(DEFAULT_AI_REVIEW_LIMIT, "--limit", min=1),
     force: bool = typer.Option(False, "--force", help="Re-run Stage B tasks only."),
     retry_failed: bool = typer.Option(False, "--retry-failed", help="Retry failed Stage B tasks only."),
     include_blocked: bool = typer.Option(False, "--include-blocked", help="Include blocked Stage B tasks."),
 ) -> None:
-    """Run Stage B analysis for the current daily draft."""
+    """Run Stage B1 content-value analysis for the current daily draft."""
 
     configure_logging()
     settings = Settings.from_env()
@@ -309,7 +309,7 @@ def pipeline_stage_b(
         include_blocked=include_blocked,
     )
     typer.echo(
-        f"stage-b: processed={result.processed} analyzed={result.analyzed} "
+        f"stage-b1: processed={result.processed} analyzed={result.analyzed} "
         f"structurally_filtered={result.analysis_filtered} "
         f"failed={result.analysis_failed} skipped={result.skipped}"
     )
@@ -354,8 +354,8 @@ def pipeline_stage_d(
         profile_path=profile,
     )
     typer.echo(
-        f"stage-d: processed={result.processed} eligible={result.eligible} selected={result.selected} "
-        f"omitted={result.omitted} failed={result.ai_failed}"
+        f"stage-d: candidates={result.candidates} selected={result.selected} "
+        f"unselected={result.unselected} reused={result.reused} failed={result.ai_failed}"
     )
 
 
@@ -421,7 +421,7 @@ def pipeline_status(
 @pipeline_app.command("retry")
 def pipeline_retry(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to retry."),
-    stage: str = typer.Option(..., "--stage", help="One stage: stage-a, stage-b, stage-c, or stage-d."),
+    stage: str = typer.Option(..., "--stage", help="One stage: stage-a, stage-b1, stage-c, or stage-d."),
     limit: int | None = typer.Option(None, "--limit", min=1),
     force: bool = typer.Option(False, "--force", help="Force only the named stage."),
     include_blocked: bool = typer.Option(False, "--include-blocked"),

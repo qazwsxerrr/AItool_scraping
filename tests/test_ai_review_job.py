@@ -107,7 +107,7 @@ class _AI:
                 return ScreenResult(
                     item_id=envelope.item_id,
                     decision="reject",
-                    reason_code="not_relevant",
+                    reason_code="irrelevant",
                     reason="screen decision",
                     confidence=self.reject_titles[envelope.title],
                     risk_flags=["screen_fixture"],
@@ -139,16 +139,13 @@ class _AI:
                 summary_cn="中文阶段 B 摘要",
                 keywords=["model", "release"],
                 entities=[],
-                selection_score=score,
+                b1_priority=score,
                 score_components={
-                    "relevance": score,
-                    "importance": score,
-                    "impact": score,
-                    "freshness": score,
-                    "source_authority": score,
+                    "audience_relevance": score,
+                    "material_change": score,
+                    "impact_scope": score,
+                    "independent_news_value": score,
                     "specificity": score,
-                    "tracking_value": score,
-                    "total": score,
                 },
                 raw_response={"fixture": "analysis"},
             )
@@ -186,8 +183,8 @@ def test_daily_stage_a_b_keeps_all_successful_analyses_and_marks_low_signal(tmp_
     with session_factory() as session:
         rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
         assert [row.status for row in rows] == ["screened_out", "candidate", "candidate", "candidate"]
-        assert rows[1].ai_review.selection_score == 59
-        assert rows[2].ai_review.selection_score == 99
+        assert rows[1].ai_review.b1_priority == 59
+        assert rows[2].ai_review.b1_priority == 99
         run_tasks = session.scalars(
             select(IntelRunStageTask).where(
                 IntelRunStageTask.subject_type == "run",

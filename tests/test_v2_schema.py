@@ -28,7 +28,6 @@ def test_fresh_database_contains_only_ai_core_tables(tmp_path):
         "daily_editions",
         "fetch_attempts",
         "intel_event_items",
-        "intel_event_stage_d_snapshots",
         "intel_events",
         "intel_items",
         "intel_run_items",

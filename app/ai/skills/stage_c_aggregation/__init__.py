@@ -1,4 +1,4 @@
-"""Single-call Stage-C story aggregation skill."""
+"""Bounded-call Stage-C story aggregation skill."""
 
 from .client import (
     StageCAggregationCallResult,
@@ -9,7 +9,6 @@ from .models import (
     STAGE_C_SCHEMA_VERSION,
     StageCAggregationResponse,
     StageCStoryCluster,
-    StageCStoryMember,
     strict_parse_stage_c_aggregation,
 )
 from .prompts import (
@@ -31,7 +30,6 @@ __all__ = [
     "StageCAggregationProviderError",
     "StageCAggregationResponse",
     "StageCStoryCluster",
-    "StageCStoryMember",
     "build_stage_c_provider_payload",
     "strict_parse_stage_c_aggregation",
 ]

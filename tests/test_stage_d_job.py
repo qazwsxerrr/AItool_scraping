@@ -1,188 +1,344 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import inspect
 
-from app.ai.skills.stage_d_editorial import strict_parse_stage_d_editorial
-from app.domain.models import FetchItem, SourceSpec
-from app.jobs.stage_d_job import StageDExecutionError, run_stage_d_job
+from app.ai.skills.stage_d_selection import (
+    STAGE_D_SELECTION_SCHEMA_VERSION,
+    strict_parse_stage_d_selection,
+)
+from app.jobs.stage_d_job import StageDExecutionError, StageDProfile, run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelEventStageDSnapshot, IntelItem
+from app.storage.models import IntelEvent, IntelRunStageAttempt
 from app.storage.repository import IntelRepository
+
+
+REFERENCE = datetime(2026, 8, 19, 8, tzinfo=timezone.utc)
 
 
 def _db():
     engine = create_engine_from_url("sqlite:///:memory:")
     init_db(engine)
-    return create_session_factory(engine)
+    return engine, create_session_factory(engine)
 
 
-def _build_with_event(session_factory) -> int:
-    source = SourceSpec(
-        id="stage-d-source",
-        name="Stage D source",
-        transport="feed",
-        url="https://example.test/feed.xml",
-        feed={"format": "rss", "adapter": "generic"},
-        source_group="official_blog",
-        source_subtype="fixed_news",
-        source_role="official",
-        content_class="official_model_company",
-    )
-    now = datetime.now(timezone.utc)
+def _build(
+    session_factory,
+    *,
+    event_count: int = 3,
+    candidate_indexes: list[int] | None = None,
+    with_cluster: bool = True,
+) -> tuple[int, list[int]]:
     with session_factory() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(source, policy=source)
-        _, build = repo.start_daily_build(edition_date="2026-08-19", reference_time=now)
-        item_result = repo.insert_item(
-            FetchItem(
-                source_id=source.id,
-                external_id="stage-d-item",
-                title="模型发布了新的企业能力",
-                url="https://example.test/model-update",
-                summary="官方发布企业能力与部署更新。",
-                published_at=now,
-                captured_at=now,
-            ),
-            run_id=build.id,
+        _, build = repo.start_daily_build(
+            edition_date="2026-08-19",
+            reference_time=REFERENCE,
         )
-        item = session.get(IntelItem, item_result.item_id)
-        assert item is not None
-        session.add(
-            AIItemReview(
-                item_id=item.id,
-                content_class=source.content_class,
+        event_ids: list[int] = []
+        for index in range(event_count):
+            event = repo.upsert_event(
+                run_id=build.id,
+                event_key=f"event:{index}",
+                canonical_url=f"https://example.test/events/{index}",
+                title=f"Stage C 标题 {index}",
+                summary_cn=f"Stage C 摘要 {index}",
                 topic="model_release",
-                topics_json='["model_release"]',
-                summary_cn="官方发布企业能力与部署更新。",
-                selection_score=90,
-                score_components_json='{"total":90}',
-                status="success",
+                topics=["model_release"],
+                keywords=["模型", f"能力{index}"],
+                entities=[{"name": f"Model {index}", "type": "product"}],
+                content_class="official_model_company",
+                source_group="official_blog",
+                source_ids=["official-source"],
+                source_groups=["official_blog"],
+                display_score=90 - index,
+                novelty_status="new",
+                state="candidate",
+                first_seen_at=REFERENCE,
+                last_seen_at=REFERENCE,
             )
-        )
-        event = repo.upsert_event(
-            run_id=build.id,
-            event_key="url:https://example.test/model-update",
-            canonical_url="https://example.test/model-update",
-            title="模型发布了新的企业能力",
-            summary_cn="官方发布企业能力与部署更新。",
-            topic="model_release",
-            topics=["model_release"],
-            content_class=source.content_class,
-            source_group=source.source_group,
-            source_ids=[source.id],
-            source_groups=[source.source_group],
-            display_score=90,
-            primary_item_id=item.id,
-            first_seen_at=now,
-            last_seen_at=now,
-        )
-        repo.upsert_event_item(event.id, item.id, source_id=source.id, source_group=source.source_group, is_primary=True)
-        cluster = repo.ensure_stage(build.id, "cluster")
-        task = repo.ensure_stage_task(cluster, subject_type="run", subject_id=build.id, target_run_id=build.id)
-        repo.complete_stage_task(task, result={"current_event_ids": [event.id]})
-        repo.finish_stage(cluster, status="succeeded")
-        repo.freeze_run_scope(build.id)
+            event_ids.append(int(event.id))
+        if with_cluster:
+            candidates = (
+                [event_ids[index] for index in candidate_indexes]
+                if candidate_indexes is not None
+                else event_ids
+            )
+            cluster = repo.ensure_stage(build.id, "cluster")
+            task = repo.ensure_stage_task(
+                cluster,
+                subject_type="run",
+                subject_id=build.id,
+                target_run_id=build.id,
+            )
+            repo.complete_stage_task(
+                task,
+                result={
+                    "current_event_ids": event_ids,
+                    "candidate_event_ids": candidates,
+                },
+            )
+            repo.finish_stage(cluster, status="succeeded")
         session.commit()
-        return int(build.id)
+        return int(build.id), event_ids
 
 
-class _Client:
-    model = "stage-d-test"
+class _SelectionClient:
+    model = "stage-d-selection-test"
+    api_style = "generic_json"
+    max_retries = 0
+    timeout_seconds = 1
 
-    def __init__(self, *, fail: bool = False):
-        self.fail = fail
-        self.calls: list[list[int]] = []
+    def __init__(self, selected_indexes: list[int] | None = None, *, payload=None, error=None):
+        self.selected_indexes = selected_indexes
+        self.payload = payload
+        self.error = error
+        self.calls: list[dict] = []
 
-    def select_events(self, events, *, edition, total_max, watchlist_max):
-        if self.fail:
-            raise RuntimeError("editorial unavailable")
-        ids = [int(event["event_id"]) for event in events]
-        self.calls.append(ids)
+    def select(self, events, *, edition, max_selected):
+        self.calls.append(
+            {
+                "events": [dict(event) for event in events],
+                "edition": dict(edition),
+                "max_selected": max_selected,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        if self.payload is not None:
+            return self.payload
+        indexes = self.selected_indexes
+        selected_events = list(events) if indexes is None else [events[index] for index in indexes]
         return {
-            "schema_version": "stage_d_editorial_v3",
-            "decisions": [
+            "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+            "selected": [
                 {
-                    "event_id": event_id,
-                    "decision": "selected",
-                    "display_order": index,
-                    "editorial_score": 90,
-                    "story_family_id": f"story-{index}",
-                    "family_position": 1,
-                    "display_title_zh": "模型发布企业部署新能力",
-                    "title_supporting_fields": ["title", "summary_cn"],
-                    "reason_codes": ["material_change"],
-                    "editorial_reason": "变化明确。",
-                    "confidence": 90,
+                    "event_id": int(event["event_id"]),
+                    "reason_code": "daily_value",
+                    "reason": f"事件 {event['event_id']} 对本期读者有明确价值。",
                 }
-                for index, event_id in enumerate(ids, start=1)
+                for event in selected_events
             ],
         }
 
 
-def test_stage_d_schema_v3_requires_exact_coverage_and_nonselected_no_order():
-    parsed = strict_parse_stage_d_editorial(
+def test_selection_schema_accepts_only_an_ordered_candidate_subset():
+    parsed = strict_parse_stage_d_selection(
         {
-            "schema_version": "stage_d_editorial_v3",
-            "decisions": [
-                {
-                    "event_id": 1,
-                    "decision": "watchlist",
-                    "editorial_score": 70,
-                    "story_family_id": "family-1",
-                    "family_position": None,
-                    "reason_codes": ["low_impact"],
-                    "editorial_reason": "保留观察。",
-                    "confidence": 80,
-                },
-                {
-                    "event_id": 2,
-                    "decision": "omitted",
-                    "editorial_score": 20,
-                    "story_family_id": "family-2",
-                    "family_position": None,
-                    "reason_codes": ["low_novelty"],
-                    "editorial_reason": "本期不展示。",
-                    "confidence": 80,
-                },
+            "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+            "selected": [
+                {"event_id": 3, "reason_code": "high_impact", "reason": "影响范围明确。"},
+                {"event_id": 1, "reason_code": "actionable", "reason": "读者可立即使用。"},
             ],
         },
-        event_ids=[1, 2],
+        candidate_event_ids=[1, 2, 3],
+        max_selected=2,
     )
-    assert [row.decision for row in parsed.decisions] == ["watchlist", "omitted"]
-    assert all(row.display_order is None for row in parsed.decisions)
-    with pytest.raises(ValueError, match="stage_d_editorial_v3"):
-        strict_parse_stage_d_editorial({"schema_version": "stage_d_editorial_v2", "decisions": []}, event_ids=[])
+
+    assert [row.event_id for row in parsed.selected] == [3, 1]
+
+    with pytest.raises(ValueError, match="unknown candidate"):
+        strict_parse_stage_d_selection(
+            {
+                "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+                "selected": [{"event_id": 4, "reason_code": "impact", "reason": "未知事件。"}],
+            },
+            candidate_event_ids=[1, 2, 3],
+            max_selected=2,
+        )
+    with pytest.raises(ValueError, match="duplicate event_id"):
+        strict_parse_stage_d_selection(
+            {
+                "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+                "selected": [
+                    {"event_id": 1, "reason_code": "impact", "reason": "理由一。"},
+                    {"event_id": 1, "reason_code": "impact", "reason": "理由二。"},
+                ],
+            },
+            candidate_event_ids=[1, 2, 3],
+            max_selected=2,
+        )
+    with pytest.raises(ValueError, match="exceeding max_selected"):
+        strict_parse_stage_d_selection(
+            {
+                "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+                "selected": [
+                    {"event_id": 1, "reason_code": "impact", "reason": "理由一。"},
+                    {"event_id": 2, "reason_code": "impact", "reason": "理由二。"},
+                ],
+            },
+            candidate_event_ids=[1, 2, 3],
+            max_selected=1,
+        )
+    with pytest.raises(ValueError):
+        strict_parse_stage_d_selection(
+            {
+                "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+                "selected": [
+                    {
+                        "event_id": 1,
+                        "reason_code": "impact",
+                        "reason": "理由。",
+                        "display_title_zh": "Stage D 不得改标题",
+                    }
+                ],
+            },
+            candidate_event_ids=[1],
+            max_selected=1,
+        )
 
 
-def test_stage_d_persists_private_build_rows_only():
-    session_factory = _db()
-    run_id = _build_with_event(session_factory)
-    client = _Client()
+def test_stage_d_requires_a_successful_stage_c_candidate_contract():
+    _engine, session_factory = _db()
+    run_id, _ = _build(session_factory, with_cluster=False)
 
-    result = run_stage_d_job(session_factory=session_factory, run_id=run_id, ai_client=client)
+    with pytest.raises(StageDExecutionError, match="Stage C cluster stage must succeed"):
+        run_stage_d_job(
+            session_factory=session_factory,
+            run_id=run_id,
+            ai_client=_SelectionClient(),
+        )
 
-    assert result.selected == 1
-    assert client.calls == [[1]]
     with session_factory() as session:
-        rows = session.query(IntelEventStageDSnapshot).all()
-        assert len(rows) == 1
-        assert rows[0].run_id == run_id
-        assert rows[0].selected is True
-        assert "snapshot_key" not in rows[0].metadata_json
-        stage = IntelRepository(session).get_stage(run_id, "stage_d")
-        assert stage is not None
-        assert [task.subject_type for task in stage.tasks] == ["run"]
+        assert IntelRepository(session).get_stage(run_id, "stage_d") is None
 
 
-def test_stage_d_failure_does_not_create_a_local_fallback_report():
-    session_factory = _db()
-    run_id = _build_with_event(session_factory)
+def test_empty_stage_c_candidates_finish_without_calling_the_provider():
+    _engine, session_factory = _db()
+    run_id, _ = _build(session_factory, event_count=0)
+    client = _SelectionClient(error=AssertionError("provider must not be called"))
 
-    with pytest.raises(StageDExecutionError, match="editorial"):
-        run_stage_d_job(session_factory=session_factory, run_id=run_id, ai_client=_Client(fail=True))
+    result = run_stage_d_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=client,
+    )
+
+    assert (result.candidates, result.selected, result.unselected) == (0, 0, 0)
+    assert client.calls == []
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        stage = repo.get_stage(run_id, "stage_d")
+        assert stage is not None and stage.status == "succeeded"
+        task = repo.get_task(stage, subject_type="run", subject_id=run_id)
+        assert task is not None
+        assert task.result == {
+            "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+            "candidate_event_ids": [],
+            "selected": [],
+            "input_fingerprint": task.input_fingerprint,
+            "config_fingerprint": task.config_fingerprint,
+            "provider_attempts": 0,
+        }
+
+
+def test_stage_d_persists_only_the_ordered_selection_task_result():
+    engine, session_factory = _db()
+    run_id, event_ids = _build(session_factory, candidate_indexes=[2, 0])
+    client = _SelectionClient(selected_indexes=[1])
+
+    result = run_stage_d_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=client,
+    )
+
+    assert (result.candidates, result.selected, result.unselected) == (2, 1, 1)
+    assert [row["event_id"] for row in client.calls[0]["events"]] == [event_ids[2], event_ids[0]]
+    assert client.calls[0]["max_selected"] == 30
+    assert "intel_event_stage_d_snapshots" not in inspect(engine).get_table_names()
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        stage = repo.get_stage(run_id, "stage_d")
+        assert stage is not None and stage.status == "succeeded"
+        tasks = repo.list_stage_tasks(stage, include_expired=True)
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert task.result["candidate_event_ids"] == [event_ids[2], event_ids[0]]
+        assert task.result["selected"] == [
+            {
+                "event_id": event_ids[0],
+                "reason_code": "daily_value",
+                "reason": f"事件 {event_ids[0]} 对本期读者有明确价值。",
+            }
+        ]
+        assert set(task.result) == {
+            "schema_version",
+            "candidate_event_ids",
+            "selected",
+            "input_fingerprint",
+            "config_fingerprint",
+            "provider_attempts",
+        }
+        event = session.get(IntelEvent, event_ids[0])
+        assert event is not None and event.title == "Stage C 标题 0"
+        attempts = repo.list_stage_attempts(task)
+        assert len(attempts) == 1
+        assert isinstance(attempts[0], IntelRunStageAttempt)
+        assert attempts[0].raw_response["schema_version"] == STAGE_D_SELECTION_SCHEMA_VERSION
+
+
+def test_invalid_selection_is_blocked_without_local_fallback():
+    _engine, session_factory = _db()
+    run_id, event_ids = _build(session_factory, event_count=1)
+    client = _SelectionClient(
+        payload={
+            "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+            "selected": [
+                {
+                    "event_id": event_ids[0],
+                    "reason_code": "impact",
+                    "reason": "选择该事件。",
+                    "title": "Stage D 试图覆盖 Stage C 标题",
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(StageDExecutionError, match="selection"):
+        run_stage_d_job(
+            session_factory=session_factory,
+            run_id=run_id,
+            ai_client=client,
+        )
 
     with session_factory() as session:
-        assert session.query(IntelEventStageDSnapshot).count() == 0
+        repo = IntelRepository(session)
+        stage = repo.get_stage(run_id, "stage_d")
+        assert stage is not None and stage.status == "blocked"
+        task = repo.get_task(stage, subject_type="run", subject_id=run_id)
+        assert task is not None and task.status == "blocked"
+        assert task.result.get("selected") is None
+        attempts = repo.list_stage_attempts(task)
+        assert attempts[0].raw_response["selected"][0]["title"] == "Stage D 试图覆盖 Stage C 标题"
+
+
+def test_profile_enforces_the_only_stage_d_limit():
+    _engine, session_factory = _db()
+    run_id, _ = _build(session_factory, event_count=2)
+
+    with pytest.raises(StageDExecutionError, match="max_selected=1"):
+        run_stage_d_job(
+            session_factory=session_factory,
+            run_id=run_id,
+            ai_client=_SelectionClient(),
+            profile=StageDProfile(max_selected=1),
+        )
+
+
+def test_zero_selection_limit_finishes_without_calling_the_provider():
+    _engine, session_factory = _db()
+    run_id, _ = _build(session_factory, event_count=2)
+    client = _SelectionClient(error=AssertionError("provider must not be called"))
+
+    result = run_stage_d_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=client,
+        profile=StageDProfile(max_selected=0),
+    )
+
+    assert (result.candidates, result.selected, result.unselected) == (2, 0, 2)
+    assert client.calls == []

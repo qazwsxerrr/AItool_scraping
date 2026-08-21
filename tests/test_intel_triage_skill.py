@@ -64,16 +64,13 @@ def analysis_payload(**overrides):
         "summary_cn": "一个可复用的 MCP 服务项目",
         "keywords": ["MCP", "开源"],
         "entities": [{"name": "MCP", "type": "technology", "aliases": []}],
-        "selection_score": 87,
+        "b1_priority": 87,
         "score_components": {
-            "relevance": 90,
-            "importance": 85,
-            "impact": 80,
-            "freshness": 85,
-            "source_authority": 70,
+            "audience_relevance": 90,
+            "material_change": 85,
+            "impact_scope": 80,
+            "independent_news_value": 85,
             "specificity": 80,
-            "tracking_value": 80,
-            "total": 87,
         },
     }
     value.update(overrides)
@@ -82,14 +79,14 @@ def analysis_payload(**overrides):
 
 def test_stage_a_low_confidence_reject_becomes_uncertain():
     result = parse_screen_result(
-        {"decision": "reject", "reason_code": "noise", "reason": "weak signal", "confidence": 40, "risk_flags": []},
+        {"decision": "reject", "reason_code": "spam", "reason": "weak signal", "confidence": 40, "risk_flags": []},
         envelope=envelope(),
     )
     assert result.decision == "uncertain"
     assert "screen:low_confidence_reject" in result.risk_flags
 
 
-def test_stage_a_only_hard_reject_reasons_survive_at_high_confidence():
+def test_stage_a_only_canonical_hard_reject_reasons_survive_at_high_confidence():
     canonical = parse_screen_result(
         {
             "decision": "reject",
@@ -100,10 +97,10 @@ def test_stage_a_only_hard_reject_reasons_survive_at_high_confidence():
         },
         envelope=envelope(),
     )
-    alias = parse_screen_result(
+    advertisement = parse_screen_result(
         {
             "decision": "reject",
-            "reason_code": "ad",
+            "reason_code": "pure_advertisement",
             "reason": "广告营销",
             "confidence": 95,
             "risk_flags": [],
@@ -111,7 +108,7 @@ def test_stage_a_only_hard_reject_reasons_survive_at_high_confidence():
         envelope=envelope(),
     )
     assert canonical.decision == "reject"
-    assert alias.decision == "reject"
+    assert advertisement.decision == "reject"
 
 
 def test_stage_a_non_hard_reject_reaches_stage_b_even_at_high_confidence():
@@ -130,8 +127,8 @@ def test_stage_a_non_hard_reject_reaches_stage_b_even_at_high_confidence():
         assert "screen:non_hard_reject_reason" in result.risk_flags
 
 
-def test_stage_a_strict_parser_preserves_raw_and_threshold_compatible_fields():
-    payload = {"decision": "reject", "reason_code": "ad", "reason": "marketing", "confidence": 95, "risk_flags": ["ad"]}
+def test_stage_a_strict_parser_preserves_raw_and_canonical_fields():
+    payload = {"decision": "reject", "reason_code": "pure_advertisement", "reason": "marketing", "confidence": 95, "risk_flags": ["advertisement"]}
     result = parse_screen_result(payload, envelope=envelope())
     assert isinstance(result, ScreenResult)
     assert result.decision == "reject"
@@ -143,7 +140,7 @@ def test_stage_b_strict_parser_has_entities_and_no_legacy_decision_fields():
     payload = analysis_payload()
     result = parse_analysis_result(payload, envelope=envelope())
     assert isinstance(result, AnalysisResult)
-    assert result.selection_score == 83
+    assert result.b1_priority == 85
     assert result.entities[0].type == "technology"
     assert not hasattr(result, "keep")
     assert not hasattr(result, "novelty")
@@ -192,6 +189,23 @@ def test_stage_b_removed_contract_fields_are_not_in_schema():
         assert field not in schema["properties"]
 
 
+def test_stage_b_priority_uses_only_the_five_content_value_components():
+    result = parse_analysis_result(
+        analysis_payload(
+            b1_priority=0,
+            score_components={
+                "audience_relevance": 100,
+                "material_change": 80,
+                "impact_scope": 60,
+                "independent_news_value": 40,
+                "specificity": 20,
+            },
+        )
+    )
+
+    assert result.b1_priority == 67
+
+
 def test_stage_b_empty_summary_falls_back_to_source():
     item = envelope(summary="来源原始摘要，包含明确的项目变化。")
     result = parse_analysis_result(
@@ -215,7 +229,7 @@ def test_stage_b_empty_summary_without_source_text_remains_structural_failure():
     assert analysis_guard_failure(result) == "summary_empty"
 
 
-def test_analysis_preserves_source_metadata_and_prompt_is_minimal():
+def test_analysis_keeps_source_metadata_out_of_the_b1_result_and_prompt_is_minimal():
     item = envelope(
         source_content_class="official_model_company",
         source_group="x_official",
@@ -223,14 +237,17 @@ def test_analysis_preserves_source_metadata_and_prompt_is_minimal():
         source_subtype="account",
     )
     result = parse_analysis_result(analysis_payload(), envelope=item)
-    assert result.source_content_class == "official_model_company"
+    assert not hasattr(result, "source_content_class")
+    assert build_analysis_provider_payload(item)["item"]["source_group"] == "x_official"
     assert not hasattr(result, "risk_flags")
 
     analysis_instructions = build_analysis_provider_payload(item)["instructions"]
     screen_instructions = build_screen_provider_payload(item)["instructions"]
     assert "summary_cn" in analysis_instructions
     assert "keywords" in analysis_instructions
-    assert "selection_score" in analysis_instructions
+    assert "b1_priority" in analysis_instructions
+    assert "source_authority" not in analysis_instructions
+    assert "tracking_value" not in analysis_instructions
     assert "event_signature" not in analysis_instructions
     assert "paper_support" not in analysis_instructions
     assert "source_group=x_official" in screen_instructions
@@ -262,7 +279,7 @@ def test_client_calls_independent_stage_endpoints_and_isolates_failures():
     analysis_http = FakeHttp(analysis_payload())
     analysis_client = IntelTriageClient(api_url="https://ai.example.test", api_key="secret", http_client=analysis_http)
     analysis = analysis_client.analyze(item)
-    assert analysis.selection_score == 83
+    assert analysis.b1_priority == 85
     assert analysis_http.calls[0]["json"]["task"] == "intel_analysis"
 
     class Failing:

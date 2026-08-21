@@ -23,7 +23,6 @@ from app.storage.models import (
     DailyEditionReportEntry,
     IntelEvent,
     IntelEventItem,
-    IntelEventStageDSnapshot,
     IntelItem,
     IntelRun,
     IntelRunItem,
@@ -71,12 +70,6 @@ class EventItemUpsertResult:
     @property
     def event_item(self) -> IntelEventItem:
         return self.relation
-
-
-@dataclass(frozen=True)
-class EventStageDSnapshotUpsertResult:
-    snapshot: IntelEventStageDSnapshot
-    created: bool
 
 
 @dataclass(frozen=True)
@@ -370,16 +363,9 @@ class IntelRepository:
             entities = record.get("entities") if isinstance(record.get("entities"), list) else []
             metadata = dict(record.get("metadata") or {}) if isinstance(record.get("metadata"), Mapping) else {}
             # The final report is the only durable UI/history payload after
-            # raw build rows are deleted. Preserve the small public editorial
-            # fields that used to live beside ``metadata`` on the export row.
-            for key in (
-                "reason",
-                "provenance",
-                "story_family_id",
-                "family_position",
-                "editorial_score",
-                "presentation_labels",
-            ):
+            # raw build rows are deleted. Preserve the small selection fields
+            # that are intentionally public.
+            for key in ("reason", "reason_code", "provenance"):
                 if key in record and key not in metadata:
                     metadata[key] = record[key]
             event_key = _text(record.get("event_key"))
@@ -397,7 +383,7 @@ class IntelRepository:
                     original_title=_text(record.get("original_title")) or _text(record.get("title")),
                     summary=_text(record.get("summary_cn")) or _text(record.get("summary")),
                     url=_text(record.get("url")) or _text(record.get("canonical_url")),
-                    display_score=float(record.get("display_score") or record.get("selection_score") or 0.0),
+                    display_score=float(record.get("display_score") or 0.0),
                     topic=_text(record.get("topic")) or _text(record.get("topic_category")),
                     content_class=_text(record.get("content_class")),
                     source_group=_text(record.get("source_group")),
@@ -460,15 +446,12 @@ class IntelRepository:
         # Stage tasks refer to items/events and attempts refer back to tasks.
         # Delete them first so SQLite installations with FK enforcement enabled
         # can purge an entire build without depending on implicit cascades.
-        for stage in list(self.session.scalars(select(IntelRunStage).where(IntelRunStage.run_id == int(run_id))).all()):
-            for task in list(self.session.scalars(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id)).all()):
-                task.last_attempt_id = None
-                for attempt in list(
-                    self.session.scalars(select(IntelRunStageAttempt).where(IntelRunStageAttempt.task_id == task.id)).all()
-                ):
-                    self.session.delete(attempt)
-                self.session.delete(task)
-            self.session.delete(stage)
+        for stage in list(
+            self.session.scalars(
+                select(IntelRunStage).where(IntelRunStage.run_id == int(run_id))
+            ).all()
+        ):
+            self._delete_stage_row(stage)
 
         item_ids = [
             int(value)
@@ -493,11 +476,6 @@ class IntelRepository:
             )
         event_ids = list(dict.fromkeys(event_ids))
 
-        snapshot_conditions = [IntelEventStageDSnapshot.run_id == int(run_id)]
-        if event_ids:
-            snapshot_conditions.append(IntelEventStageDSnapshot.event_id.in_(event_ids))
-        for snapshot in list(self.session.scalars(select(IntelEventStageDSnapshot).where(or_(*snapshot_conditions))).all()):
-            self.session.delete(snapshot)
         if event_ids:
             for relation in list(
                 self.session.scalars(select(IntelEventItem).where(IntelEventItem.event_id.in_(event_ids))).all()
@@ -871,7 +849,7 @@ class IntelRepository:
                 # previous AI result remains available for audit until the
                 # next AI review replaces it.
                 existing.status = "new"
-                existing.selection_score = 0
+                existing.b1_priority = 0
                 existing.selection_reason = None
             existing.updated_at = utcnow()
             self.record_run_item(
@@ -1093,25 +1071,19 @@ class IntelRepository:
             self.session.add(review)
         review.model = model
         review.content_class = _text(
-            _response_value(response, "source_content_class")
-            or _response_value(response, "content_class")
-            or content_class
+            content_class
             or item.content_class
             or "community_social"
         ) or "community_social"
         review.topic = _text(_response_value(response, "topic"))
         review.topics_json = _dump_json(_structured_json(_response_value(response, "topics", [])))
         review.keywords_json = _dump_json(_structured_json(_response_value(response, "keywords", [])))
-        review.entities_json = _dump_json(
-            _structured_json(_response_value(response, "entities") or _response_value(response, "typed_entities", []))
-        )
-        score = _response_value(response, "selection_score")
-        review.selection_score = _bounded_int(score) if score is not None else None
+        review.entities_json = _dump_json(_structured_json(_response_value(response, "entities", [])))
+        score = _response_value(response, "b1_priority")
+        review.b1_priority = _bounded_int(score) if score is not None else None
         score_components = _response_value(response, "score_components")
-        if score_components is None:
-            score_components = _response_value(response, "scores", {})
         review.score_components_json = _dump_json(_structured_json(score_components or {}))
-        review.summary_cn = _text(_response_value(response, "summary_cn") or _response_value(response, "summary"))
+        review.summary_cn = _text(_response_value(response, "summary_cn"))
         raw = _response_value(response, "raw_response") if response is not None else None
         if raw is None and isinstance(response, Mapping):
             raw = dict(response)
@@ -1136,7 +1108,7 @@ class IntelRepository:
             self.update_run_item_status(run_id, item_id, status=status)
 
     # ------------------------------------------------------------------
-    # Event aggregation and Stage-D snapshot persistence
+    # Event aggregation
     # ------------------------------------------------------------------
 
     def upsert_event(
@@ -1399,61 +1371,6 @@ class IntelRepository:
         )
         return list(self.session.scalars(stmt).unique().all())
 
-    def upsert_event_stage_d_snapshot(
-        self,
-        event_id: int,
-        *,
-        run_id: int,
-        display_order: int = 0,
-        display_score: float = 0.0,
-        selected: bool = False,
-        topic: str | None = None,
-        source_group: str | None = None,
-        content_class: str | None = None,
-        reason: str | None = None,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> EventStageDSnapshotUpsertResult:
-        row = self.session.scalar(
-            select(IntelEventStageDSnapshot).where(
-                IntelEventStageDSnapshot.run_id == int(run_id),
-                IntelEventStageDSnapshot.event_id == int(event_id),
-            )
-        )
-        created = row is None
-        if row is None:
-            row = IntelEventStageDSnapshot(event_id=int(event_id), run_id=int(run_id))
-            self.session.add(row)
-        row.run_id = int(run_id)
-        row.display_order = max(0, int(display_order))
-        try:
-            row.display_score = max(0.0, min(100.0, float(display_score)))
-        except (TypeError, ValueError, OverflowError):
-            row.display_score = 0.0
-        row.selected = bool(selected)
-        row.topic = _text(topic)
-        row.source_group = _text(source_group)
-        row.content_class = _text(content_class)
-        row.reason = _text(reason)
-        row.metadata_json = _dump_json(metadata or {})
-        row.updated_at = utcnow()
-        self.session.flush()
-        return EventStageDSnapshotUpsertResult(row, created)
-
-    def clear_event_stage_d_snapshot(self, *, run_id: int) -> int:
-        """Remove stale Stage-D rows for one private daily build."""
-
-        rows = list(
-            self.session.scalars(
-                select(IntelEventStageDSnapshot).where(
-                    IntelEventStageDSnapshot.run_id == int(run_id),
-                )
-            ).all()
-        )
-        for row in rows:
-            self.session.delete(row)
-        self.session.flush()
-        return len(rows)
-
     # ------------------------------------------------------------------
     # Durable resumable run/stage/task/attempt state
     # ------------------------------------------------------------------
@@ -1546,6 +1463,88 @@ class IntelRepository:
         if statuses:
             stmt = stmt.where(IntelRunStage.status.in_(list(statuses)))
         return list(self.session.scalars(stmt).all())
+
+    def invalidate_downstream_stages(
+        self,
+        run_id: int,
+        *,
+        stage_names: Iterable[str],
+        upstream_stage: str,
+    ) -> list[str]:
+        """Delete stale downstream stage state after an upstream rebuild.
+
+        Stage outputs are keyed to exact upstream IDs. Keeping a reset shell
+        would leave old attempts/results structurally reachable, so the new
+        contract removes the stale stage rows entirely. A live worker blocks
+        invalidation instead of being allowed to resurrect deleted output.
+        """
+
+        names = _unique_strings(stage_names)
+        self.assert_stages_idle(
+            int(run_id),
+            stage_names=names,
+            upstream_stage=upstream_stage,
+        )
+        stages = [stage for name in names if (stage := self.get_stage(int(run_id), name)) is not None]
+
+        removed: list[str] = []
+        for stage in stages:
+            removed.append(stage.stage_name)
+            self._delete_stage_row(stage)
+
+        if removed:
+            run = self.session.get(IntelRun, int(run_id))
+            if run is not None:
+                run.status = "running"
+                run.finished_at = None
+                run.selected = 0
+                run.error = None
+                if run.edition is not None:
+                    run.edition.status = "building"
+                    if not run.partial:
+                        run.edition.error = None
+        self.session.flush()
+        return removed
+
+    def assert_stages_idle(
+        self,
+        run_id: int,
+        *,
+        stage_names: Iterable[str],
+        upstream_stage: str,
+    ) -> None:
+        """Reject an upstream rebuild while a downstream lease is live."""
+
+        current = utcnow()
+        busy: list[str] = []
+        for name in _unique_strings(stage_names):
+            stage = self.get_stage(int(run_id), name)
+            if stage is None:
+                continue
+            stage_lease_active = bool(
+                stage.lease_owner
+                and (
+                    stage.lease_expires_at is None
+                    or _as_utc(stage.lease_expires_at) > current
+                )
+            )
+            task_lease_active = any(
+                task.status == "running"
+                and (
+                    task.lease_expires_at is None
+                    or _as_utc(task.lease_expires_at) > current
+                )
+                for task in self.session.scalars(
+                    select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id)
+                ).all()
+            )
+            if stage_lease_active or task_lease_active:
+                busy.append(stage.stage_name)
+        if busy:
+            raise RuntimeError(
+                "downstream_stage_busy: cannot rebuild "
+                f"{upstream_stage} while {','.join(sorted(busy))} is running"
+            )
 
     def start_stage(
         self,
@@ -2484,6 +2483,26 @@ class IntelRepository:
     def _stage_id(self, stage: IntelRunStage | int) -> int | None:
         row = self._coerce_stage(stage)
         return row.id if row is not None else None
+
+    def _delete_stage_row(self, stage: IntelRunStage) -> None:
+        tasks = list(
+            self.session.scalars(
+                select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id)
+            ).all()
+        )
+        for task in tasks:
+            task.last_attempt_id = None
+            for attempt in list(
+                self.session.scalars(
+                    select(IntelRunStageAttempt).where(
+                        IntelRunStageAttempt.task_id == task.id
+                    )
+                ).all()
+            ):
+                self.session.delete(attempt)
+            self.session.delete(task)
+        self.session.flush()
+        self.session.delete(stage)
 
     def _current_attempt(self, task: IntelRunStageTask) -> IntelRunStageAttempt | None:
         if task.last_attempt_id:

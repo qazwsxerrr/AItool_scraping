@@ -21,6 +21,8 @@ from datetime import date, datetime
 import os
 from pathlib import Path
 import sqlite3
+import shutil
+import time
 from typing import Iterable
 from uuid import uuid4
 
@@ -200,9 +202,9 @@ def promote_daily_draft_to_audit(
     """Move a complete pending build into the retained audit slot.
 
     The previous audit is kept as a rollback copy until the public output and
-    final-report transaction both succeed.  This operation intentionally
-    moves rather than copies ``draft.db``: after publication there is no
-    pending build, only the current date's retained audit.
+    final-report transaction both succeed.  The checkpointed draft is copied
+    through a durable temporary file and then removed, so after publication
+    there is no pending build, only the current date's retained audit.
     """
 
     normalized = normalize_draft_edition_date(edition_date)
@@ -219,12 +221,18 @@ def promote_daily_draft_to_audit(
     backup: Path | None = None
     if audit.exists():
         backup = audit.parent / f".audit.previous-{uuid4().hex}.db"
-        os.replace(audit, backup)
     try:
-        os.replace(draft, audit)
+        if backup is not None:
+            _copy_sqlite_snapshot(audit, backup)
+            _remove_sqlite_database(audit)
+        _copy_sqlite_snapshot(draft, audit)
+        _remove_sqlite_database(draft)
     except Exception:
-        if backup is not None and backup.exists() and not audit.exists():
-            os.replace(backup, audit)
+        if audit.exists():
+            _remove_sqlite_database(audit)
+        if backup is not None and backup.exists():
+            _copy_sqlite_snapshot(backup, audit)
+            _remove_sqlite_database(backup)
         raise
     return DailyAuditPromotion(draft_path=draft, audit_path=audit, backup_path=backup)
 
@@ -237,9 +245,11 @@ def rollback_daily_audit(promotion: DailyAuditPromotion) -> None:
             raise RuntimeError(
                 f"cannot restore daily draft because its path already exists: {promotion.draft_path}"
             )
-        os.replace(promotion.audit_path, promotion.draft_path)
+        _copy_sqlite_snapshot(promotion.audit_path, promotion.draft_path)
+        _remove_sqlite_database(promotion.audit_path)
     if promotion.backup_path is not None and promotion.backup_path.exists():
-        os.replace(promotion.backup_path, promotion.audit_path)
+        _copy_sqlite_snapshot(promotion.backup_path, promotion.audit_path)
+        _remove_sqlite_database(promotion.backup_path)
 
 
 def finalize_daily_audit(promotion: DailyAuditPromotion) -> None:
@@ -261,6 +271,51 @@ def _prepare_sqlite_database_for_move(path: Path) -> None:
     except sqlite3.DatabaseError as exc:
         raise RuntimeError(f"cannot checkpoint daily SQLite workspace {path}: {exc}") from exc
     _remove_sqlite_sidecars(path)
+
+
+def _copy_sqlite_snapshot(source: Path, destination: Path) -> None:
+    """Copy a checkpointed SQLite snapshot through a closed temporary file.
+
+    Moving an open SQLite file with ``os.replace`` is reliable on native Linux
+    but can expose an empty or stale inode on WSL's mounted Windows paths.
+    Copying the closed snapshot, fsyncing it, and only then replacing the
+    destination keeps the audit bytes observable before the operation returns.
+    """
+
+    if not source.exists():
+        raise FileNotFoundError(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.parent / f".{destination.name}.tmp-{uuid4().hex}"
+    try:
+        with source.open("rb") as source_file, temporary.open("wb") as target_file:
+            shutil.copyfileobj(source_file, target_file, length=1024 * 1024)
+            target_file.flush()
+            os.fsync(target_file.fileno())
+        os.replace(temporary, destination)
+        _wait_for_replaced_file(destination)
+    except Exception:
+        if temporary.exists():
+            temporary.unlink()
+        raise
+
+
+def _wait_for_replaced_file(path: Path) -> None:
+    """Confirm a renamed audit file is visible before returning to callers.
+
+    WSL mounted Windows directories can briefly delay directory-entry
+    visibility after ``os.replace``.  The SQLite move itself is already
+    complete; this bounded check only prevents the caller from observing a
+    transient ``FileNotFoundError`` immediately after a successful publish.
+    """
+
+    for attempt in range(20):
+        try:
+            with path.open("rb"):
+                return
+        except FileNotFoundError:
+            if attempt == 19:
+                raise
+            time.sleep(0.01)
 
 
 def _remove_sqlite_database(path: Path) -> None:

@@ -1,11 +1,5 @@
-version: stage-d-v4
+version: stage-d-selection-v1
 
-# Default editorial pool size. There is intentionally no minimum: an empty
-# candidate pool produces an empty report rather than padded content.
-total_max: 30
-watchlist_max: 10
-
-# Stage C classifies new/updated/repeat before this stage. Repeat rows are
-# omitted locally; non-first-party community rows can only enter watchlist.
-# The model may select fewer than total_max entries.
-recent_history_days: 3
+# Stage D only selects an ordered subset from Stage C's new/updated candidate
+# event IDs. There is intentionally no minimum.
+max_selected: 30

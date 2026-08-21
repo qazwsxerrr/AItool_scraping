@@ -1,4 +1,4 @@
-"""HTTP client for the single Stage-C story aggregation call."""
+"""HTTP client for one bounded Stage-C aggregation request."""
 
 from __future__ import annotations
 
@@ -21,16 +21,32 @@ class SupportsPost(Protocol):
 
 
 class StageCAggregationProviderError(RuntimeError):
+    """Sanitized provider failure retained in the Stage-C task audit."""
+
     def __init__(
         self,
         message: str,
         *,
+        status_code: int | None = None,
+        error_code: str | None = None,
         raw_response: Any | None = None,
         request_metadata: Mapping[str, Any] | None = None,
+        cause: BaseException | None = None,
     ) -> None:
+        self.status_code = status_code
+        self.error_code = error_code
         self.raw_response = raw_response
         self.request_metadata = dict(request_metadata or {})
-        super().__init__(message)
+        self.cause = cause
+        super().__init__(str(message or "Stage C aggregation provider request failed"))
+
+    @property
+    def retryable(self) -> bool:
+        if self.status_code is not None:
+            return int(self.status_code) == 429 or int(self.status_code) >= 500
+        if self.error_code in {"invalid_json", "schema_validation_failed", "configuration"}:
+            return False
+        return _looks_like_transport_failure(self.cause or self)
 
 
 @dataclass(frozen=True)
@@ -41,7 +57,7 @@ class StageCAggregationCallResult:
 
 
 class StageCAggregationClient:
-    """Call the configured provider once; any failure is returned as an error."""
+    """Call the configured provider for one already-bounded candidate batch."""
 
     def __init__(
         self,
@@ -51,6 +67,7 @@ class StageCAggregationClient:
         model: str | None,
         api_style: str,
         timeout_seconds: float,
+        max_retries: int = 2,
         http_client: SupportsPost | None = None,
     ) -> None:
         self.api_url = api_url.rstrip("/") if api_url else None
@@ -58,6 +75,7 @@ class StageCAggregationClient:
         self.model = model
         self.api_style = str(api_style or "generic_json")
         self.timeout_seconds = float(timeout_seconds)
+        self.max_retries = max(0, int(max_retries))
         self._http_client = http_client
 
     @classmethod
@@ -68,6 +86,7 @@ class StageCAggregationClient:
             model=settings.ai_review_model,
             api_style=settings.ai_review_api_style,
             timeout_seconds=settings.ai_review_timeout_seconds,
+            max_retries=settings.request_retries,
             http_client=http_client,
         )
 
@@ -92,9 +111,97 @@ class StageCAggregationClient:
             endpoint,
             payload,
             model=self.model,
+            api_style=self.api_style,
             item_count=len(current_items),
             history_count=len(recent_history),
         )
+        return self._call(
+            endpoint=endpoint,
+            payload=payload,
+            request_metadata=request_metadata,
+            item_ids=[int(item["id"]) for item in current_items],
+            prior_event_keys=[str(row["event_key"]) for row in recent_history],
+        )
+
+    def _call(
+        self,
+        *,
+        endpoint: str,
+        payload: dict[str, Any],
+        request_metadata: Mapping[str, Any],
+        item_ids: Sequence[int],
+        prior_event_keys: Sequence[str],
+    ) -> StageCAggregationCallResult:
+        last_error: StageCAggregationProviderError | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self._post_once(endpoint, payload, request_metadata=request_metadata)
+                try:
+                    raw_response = response.json()
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise StageCAggregationProviderError(
+                        "Stage C API returned invalid JSON",
+                        status_code=_response_status(response),
+                        error_code="invalid_json",
+                        raw_response=_safe_response_payload(response),
+                        request_metadata=request_metadata,
+                        cause=exc,
+                    ) from exc
+                try:
+                    parsed = strict_parse_stage_c_aggregation(
+                        raw_response,
+                        item_ids=item_ids,
+                        prior_event_keys=prior_event_keys,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise StageCAggregationProviderError(
+                        f"Stage C response failed schema validation: {exc}",
+                        status_code=_response_status(response),
+                        error_code="schema_validation_failed",
+                        raw_response=raw_response,
+                        request_metadata=request_metadata,
+                        cause=exc,
+                    ) from exc
+                completed_metadata = dict(request_metadata)
+                completed_metadata["provider_attempts"] = attempt + 1
+                return StageCAggregationCallResult(
+                    parsed=parsed,
+                    raw_response=raw_response,
+                    request_metadata=completed_metadata,
+                )
+            except StageCAggregationProviderError as exc:
+                last_error = exc
+                completed_metadata = dict(exc.request_metadata or request_metadata)
+                completed_metadata["provider_attempts"] = attempt + 1
+                exc.request_metadata = completed_metadata
+                if not exc.retryable or attempt >= self.max_retries:
+                    raise
+            except BaseException as exc:
+                wrapped = StageCAggregationProviderError(
+                    str(exc),
+                    error_code="transport_error",
+                    request_metadata=request_metadata,
+                    cause=exc,
+                )
+                last_error = wrapped
+                completed_metadata = dict(request_metadata)
+                completed_metadata["provider_attempts"] = attempt + 1
+                wrapped.request_metadata = completed_metadata
+                if not wrapped.retryable or attempt >= self.max_retries:
+                    raise wrapped from exc
+        raise last_error or StageCAggregationProviderError(
+            "Stage C aggregation provider request failed",
+            error_code="provider_error",
+            request_metadata=request_metadata,
+        )
+
+    def _post_once(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        *,
+        request_metadata: Mapping[str, Any],
+    ) -> Any:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -109,27 +216,42 @@ class StageCAggregationClient:
                     timeout=self.timeout_seconds,
                 )
             else:
-                with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True, http2=True, trust_env=True) as client:
+                # The local relay previously returned HTTP/2 stream errors for
+                # the large v1 response. Retain HTTP/1.1 for this bounded v2
+                # request contract as well.
+                with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True, http2=False, trust_env=True) as client:
                     response = client.post(endpoint, headers=headers, json=payload)
-            response.raise_for_status()
-            raw_response = response.json()
-            parsed = strict_parse_stage_c_aggregation(
-                raw_response,
-                item_ids=[int(item["id"]) for item in current_items],
-                prior_event_keys=[str(row["event_key"]) for row in recent_history],
-            )
-        except Exception as exc:
-            raw_response = _safe_response_payload(locals().get("response"))
+        except BaseException as exc:
             raise StageCAggregationProviderError(
                 str(exc),
-                raw_response=raw_response,
+                error_code="transport_error",
                 request_metadata=request_metadata,
+                cause=exc,
             ) from exc
-        return StageCAggregationCallResult(
-            parsed=parsed,
-            raw_response=raw_response,
-            request_metadata=request_metadata,
-        )
+
+        status_code = _response_status(response)
+        if status_code is not None and status_code >= 400:
+            raise StageCAggregationProviderError(
+                f"Stage C provider returned HTTP {status_code}",
+                status_code=status_code,
+                error_code=f"http_{status_code}",
+                raw_response=_safe_response_payload(response),
+                request_metadata=request_metadata,
+            )
+        raise_for_status = getattr(response, "raise_for_status", None)
+        if callable(raise_for_status):
+            try:
+                raise_for_status()
+            except BaseException as exc:
+                raise StageCAggregationProviderError(
+                    str(exc),
+                    status_code=_response_status(response),
+                    error_code="provider_error",
+                    raw_response=_safe_response_payload(response),
+                    request_metadata=request_metadata,
+                    cause=exc,
+                ) from exc
+        return response
 
     def _endpoint_url(self) -> str:
         assert self.api_url is not None
@@ -146,12 +268,14 @@ def _request_metadata(
     payload: Mapping[str, Any],
     *,
     model: str | None,
+    api_style: str,
     item_count: int,
     history_count: int,
 ) -> dict[str, Any]:
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return {
         "endpoint": _safe_url(endpoint),
+        "api_style": api_style,
         "model": model,
         "item_count": int(item_count),
         "history_count": int(history_count),
@@ -159,6 +283,23 @@ def _request_metadata(
         "request_bytes": len(serialized),
         "request_sha256": hashlib.sha256(serialized).hexdigest(),
     }
+
+
+def _response_status(response: Any) -> int | None:
+    try:
+        value = getattr(response, "status_code", None)
+        return int(value) if value is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _looks_like_transport_failure(exc: BaseException) -> bool:
+    name = exc.__class__.__name__.casefold()
+    text = str(exc).casefold()
+    return any(
+        token in name or token in text
+        for token in ("timeout", "timed out", "connect", "network", "transport", "stream", "internal_error")
+    )
 
 
 def _safe_url(value: str) -> str:
@@ -171,10 +312,10 @@ def _safe_response_payload(response: Any) -> Any:
         return None
     try:
         return response.json()
-    except Exception:
+    except BaseException:
         try:
             return str(response.text)[:4000]
-        except Exception:
+        except BaseException:
             return None
 
 

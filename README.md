@@ -8,7 +8,7 @@ source registry
 → Stage A screen（确定性初筛与轻量 AI 筛选）
 → Stage B analyze（短摘要、关键词、主题分类与编辑优先级评分）
 → Stage C aggregate（按本地评分门槛输入并一次 AI 调用聚合，同时判断近期重复/更新）
-→ Stage D（一次日报主编选择、故事簇与展示标题）
+→ Stage D select（仅从 Stage C 候选中选择有序子集）
 → draft 审计工作区（按日期保留完整抓取与 A-D 决策）
 → export / approval（成功后发布为该日期唯一日报）
 → UI（首页、搜索、全部动态只读展示）
@@ -67,9 +67,9 @@ data/
         └── audit.db  # 最近一次成功发布的完整构建审计
 ```
 
-`draft.db` 和 `audit.db` 都包含原始资讯、`intel_runs`、A/B 结果、Stage C 事件、Stage D 的 selected / omitted / watchlist、任务、attempt 和 provider 响应。`draft.db` 仅有一份；同日期重新 `pipeline start` / `pipeline run` 时会从头替换它。成功 `export` 后，`draft.db` 会整体替换 `audit.db`，因此每个日期默认只保留一份最近成功日报的完整审计，不累计旧版本。
+`draft.db` 和 `audit.db` 都包含原始资讯、`intel_runs`、A/B 结果、Stage C 事件、Stage D 的候选 ID 与有序入选结果、通用阶段任务、attempt 和 provider 响应。Stage D 不再维护独立快照表，也不保存未选事件记录。`draft.db` 仅有一份；同日期重新 `pipeline start` / `pipeline run` 时会从头替换它。成功 `export` 后，`draft.db` 会整体替换 `audit.db`，因此每个日期默认只保留一份最近成功日报的完整审计，不累计旧版本。
 
-旧正式库中的历史 raw / stage 数据不会在启动时自动迁移、删除或改写。新日报流程不再读取或写入这些遗留中间行；如需清理，必须先备份后执行明确的运维操作。
+旧正式库中的历史 raw / stage 数据不会在启动时自动迁移、删除或改写。包含旧 `intel_event_stage_d_snapshots` 表的 draft/audit 数据库与当前结构不兼容，启动时会明确报错；需要先备份，再显式删除并重建对应工作区。本项目不保留旧 Stage D 兼容读取或自动迁移代码。
 
 ## 安装与配置
 
@@ -101,18 +101,14 @@ AI_REVIEW_TIMEOUT_SECONDS=30
 AI_REVIEW_CONCURRENCY=4
 AI_REVIEW_CATEGORIES=开发生态,模型发布,产品应用,行业动态,技术与洞察,前瞻与传闻
 AI_STAGE_C_INPUT_MIN_SCORE=60
-AI_STAGE_D_API_URL=
-AI_STAGE_D_API_KEY=
-AI_STAGE_D_MODEL=
-AI_STAGE_D_API_STYLE=generic_json
-AI_STAGE_D_TIMEOUT_SECONDS=120
-AI_STAGE_D_RETRIES=2
 ```
 
-`AI_STAGE_C_INPUT_MIN_SCORE` 默认 `60`。Stage C 直接读取完成 Stage B1、通过结构性校验、且经本地 guard 后评分不低于该阈值的条目；这里没有独立的 B2 路由层。最终 selected/watchlist 数量仍由 Stage D 控制。
+`AI_STAGE_C_INPUT_MIN_SCORE` 默认 `60`。Stage C 直接读取完成 Stage B1、通过结构性校验、且经本地 guard 后评分不低于该阈值的条目；这里没有独立的 B2 路由层。Stage C 输出 `candidate_event_ids`，Stage D 只在 `max_selected` 上限内选择其中的有序子集。
+
+Stage B1 的 `b1_priority` 只衡量内容价值，由本地 guard 按 `audience_relevance` 25%、`material_change` 25%、`impact_scope` 20%、`independent_news_value` 20% 和 `specificity` 10% 重算。来源身份、AI 把握度和时间新鲜度不参与该分数：来源归因来自 source registry，72 小时窗口由本地 recency policy 处理。
 
 `AI_REVIEW_CONCURRENCY` 取值为 `1..4`，默认 `4`，表示 Stage A/B provider 请求的并发上限。
-Stage D 必须显式配置自己的 `AI_STAGE_D_*`，不会回退复用 `AI_REVIEW_*`。
+Stage D 与 Stage A/B/C 共用 `AI_REVIEW_*` provider 配置；它只使用不同的提示词和输出 schema，不需要额外的模型、API URL 或 API key。由于 Stage D 一次提交完整事件池，实际请求超时下限为 120 秒，但仍不引入独立的 provider 配置。
 
 真实 token、API key、Cookie 和代理地址只放在本地 `.env`，不要写入 README 或提交到 Git。Product Hunt 使用公开 Atom feed，不需要额外 token。
 
@@ -130,7 +126,7 @@ python -m app.main source-health [--source SOURCE_ID]
 python -m app.main pipeline run [--limit N] [--output-dir DIR] [--edition-date YYYY-MM-DD] [--publish]
 python -m app.main pipeline start [--limit N] [--edition-date YYYY-MM-DD]
 python -m app.main pipeline stage-a --edition-date YYYY-MM-DD
-python -m app.main pipeline stage-b --edition-date YYYY-MM-DD
+python -m app.main pipeline stage-b1 --edition-date YYYY-MM-DD
 python -m app.main pipeline stage-c --edition-date YYYY-MM-DD
 python -m app.main pipeline stage-d --edition-date YYYY-MM-DD
 python -m app.main pipeline export --edition-date YYYY-MM-DD
@@ -171,7 +167,7 @@ $PYTHON -m app.main pipeline run \
 # 已发布日报、output/daily 和 audit.db 在新 draft 成功批准前不会被改动。
 $PYTHON -m app.main pipeline start --limit 20 --edition-date 2026-08-18
 $PYTHON -m app.main pipeline stage-a --edition-date 2026-08-18
-$PYTHON -m app.main pipeline stage-b --edition-date 2026-08-18
+$PYTHON -m app.main pipeline stage-b1 --edition-date 2026-08-18
 $PYTHON -m app.main pipeline stage-c --edition-date 2026-08-18
 $PYTHON -m app.main pipeline stage-d --edition-date 2026-08-18
 $PYTHON -m app.main pipeline export --edition-date 2026-08-18
@@ -184,7 +180,7 @@ $PYTHON -m app.main fetch-only \
   --output-dir output/fetch
 
 # Stage B 失败后的安全恢复：只重试 Stage B，不会重新调用 Stage A
-$PYTHON -m app.main pipeline retry --edition-date 2026-08-18 --stage stage-b
+$PYTHON -m app.main pipeline retry --edition-date 2026-08-18 --stage stage-b1
 # 或按依赖顺序恢复所有当前可执行的下游阶段（默认不 fetch）
 $PYTHON -m app.main pipeline resume --edition-date 2026-08-18
 ```
@@ -213,9 +209,9 @@ $PYTHON -m app.main source-health --source x_account_openai
 各阶段的职责、审计位置和批准门禁如下：
 
 1. 正式日报的 `fetch` 从 registry 载入全部当前启用来源，强制完整请求（不使用 HTTP 304 条件请求），把本次响应视为当天完整集合；每个条目只在当前 `draft.db` 内去重。
-2. `stage-a` 先执行来源级确定性初筛，再对保留条目调用结构化 AI；`stage-b` 对通过 Stage A 的条目做 B1 分析，保存摘要、关键词、主题、实体和经本地 guard 的评分。原始条目、拒绝原因、AI 结果和失败 attempt 都保留在该日期 `draft.db`。
+2. `stage-a` 先执行来源级确定性初筛，再对保留条目调用结构化 AI；`stage-b1` 对通过 Stage A 的条目做 B1 分析，保存摘要、关键词、主题、实体和经本地 guard 的评分。原始条目、拒绝原因、AI 结果和失败 attempt 都保留在该日期 `draft.db`。
 3. `stage-c` 直接从当前 build 的成功 Stage B1 条目中按本地评分门槛和结构性校验构造输入，并把输入、排除原因和最近 3 天已发布日报一次性交给聚合 skill。AI 直接决定事件分组、`primary/duplicate/related` 关系、聚合标题与摘要，以及 `new/repeat/updated` 历史状态。本地代码校验所有输入 `item_id` 恰好出现一次、历史 key 合法，并保存事件、完整来源关系和输入审计。Provider、JSON 或 schema 任一失败都会让 Stage C 直接报错并保留失败审计。
-4. `stage-d` 只处理日报编辑：通过一次独立编辑 skill 请求对本轮 Stage C canonical events 做全局选择、故事簇归并、展示顺序和中文展示标题。它不使用 topic/source/content/repeat 的本地配额，也不要求凑满 30 条；社区线索可被选中，但展示层会强制标注待核实。
+4. `stage-d` 只做最终选稿：读取 Stage C 成功任务中的 `candidate_event_ids`，通过一次独立 skill 请求返回 `selected=[{event_id, reason_code, reason}]`。数组顺序就是展示顺序；未选事件由候选集合与入选集合之差推导。Stage D 不改写标题或摘要，不重新评分、聚合、判断新旧、核实来源，也不生成观察池。Stage C 未完成或候选合同缺失时，Stage D 直接失败；候选为空时不调用 provider。
 5. `pipeline status --edition-date ...` 同时显示正式日报状态、当前 draft 状态和 retained audit 路径。构建期间 UI/API 始终读取旧的已发布日报；它们不读取 draft。
 6. `export` 是明确的批准动作：只有所有来源和 AI 阶段完整成功时，才把 `draft.db` 提升为 `audit.db`、原子替换 `output/daily/YYYY-MM-DD/`，并在正式库内替换该日期的最终日报条目。任一步失败都会恢复旧 audit 和旧日报；失败 draft 留在原处，可按日期检查、重试或恢复。
 7. 同日重新抓取不合并上午结果：下午响应中不存在的资讯、被移除来源的资讯及其派生事件，会在下午成功批准后从当天最终日报和新的 `audit.db` 中消失。新 draft 运行期间，上午已发布的 `audit.db` 仍保留，便于和下午 draft 比对。
@@ -243,20 +239,35 @@ sqlite3 "$AUDIT" \
 sqlite3 "$AUDIT" \
   "SELECT i.id, i.title, i.canonical_url, i.status AS item_status,
           s.decision AS stage_a_decision, s.reason_code AS stage_a_reason_code, s.reason AS stage_a_reason,
-          r.status AS stage_b_status, r.selection_score AS stage_b_score
+          r.status AS stage_b1_status, r.b1_priority
      FROM intel_items AS i
      LEFT JOIN ai_item_screens AS s ON s.item_id = i.id
      LEFT JOIN ai_item_reviews AS r ON r.item_id = i.id
     WHERE i.canonical_url = 'https://example.com/article';"
 
-# 查看 Stage C 事件和 Stage D 选择/省略理由
+# 查看 Stage D 的有序入选事件与选稿理由
 sqlite3 "$AUDIT" \
-  'SELECT e.event_key, e.title, e.state AS stage_c_state,
-          d.selected AS stage_d_selected, d.reason AS stage_d_reason
-     FROM intel_events AS e
-     LEFT JOIN intel_event_stage_d_snapshots AS d ON d.event_id = e.id
-    WHERE e.build_id = (SELECT id FROM intel_runs ORDER BY id DESC LIMIT 1)
-    ORDER BY d.display_order, e.id;'
+  "WITH stage_d_result AS (
+       SELECT t.result_json
+         FROM intel_run_stage_tasks AS t
+         JOIN intel_run_stages AS s ON s.id = t.stage_id
+        WHERE s.run_id = (SELECT id FROM intel_runs ORDER BY id DESC LIMIT 1)
+          AND s.stage_name = 'stage_d'
+          AND t.subject_type = 'run'
+          AND t.status = 'succeeded'
+        LIMIT 1
+   ), selected AS (
+       SELECT CAST(j.key AS INTEGER) + 1 AS display_order,
+              CAST(json_extract(j.value, '$.event_id') AS INTEGER) AS event_id,
+              json_extract(j.value, '$.reason_code') AS reason_code,
+              json_extract(j.value, '$.reason') AS reason
+         FROM stage_d_result, json_each(stage_d_result.result_json, '$.selected') AS j
+   )
+   SELECT selected.display_order, e.event_key, e.title,
+          selected.reason_code, selected.reason
+     FROM selected
+     JOIN intel_events AS e ON e.id = selected.event_id
+    ORDER BY selected.display_order;"
 ```
 
 审计库包含原始抓取 payload 和 provider 响应，可能含来源原文或内部错误细节；它只应保存在本地 `data/editions/`，不应提交到 Git 或作为公开日报文件发布。

@@ -1,4 +1,4 @@
-"""Stage C: successful Stage-B projections become aggregated stories in one AI call."""
+"""Stage C: bounded AI aggregation of successful Stage-B projections."""
 
 from __future__ import annotations
 
@@ -20,11 +20,15 @@ from app.ai.skills.stage_c_aggregation import (
     STAGE_C_SCHEMA_VERSION,
     StageCAggregationCallResult,
     StageCAggregationClient,
+    StageCAggregationProviderError,
     StageCStoryCluster,
     strict_parse_stage_c_aggregation,
 )
 from app.config.limits import (
     DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE,
+    STAGE_C_AGGREGATION_MODE,
+    STAGE_C_BATCH_INPUT_BYTE_LIMIT,
+    STAGE_C_BATCH_ITEM_LIMIT,
     STAGE_C_INPUT_POLICY_VERSION,
 )
 from app.config.settings import Settings
@@ -43,7 +47,13 @@ from app.storage.repository import IntelRepository
 
 
 DAILY_HISTORY_DAYS = 3
+STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_candidate_events_v1"
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
+_STAGE_C_PRIMARY_POLICY_VERSION = "source_then_b1_priority_v1"
+
+
+class StageCDownstreamBusyError(RuntimeError):
+    """A live Stage-D/export worker prevents safe Stage-C replacement."""
 
 
 @dataclass
@@ -56,6 +66,7 @@ class EventClusterResult:
     updated: int = 0
     event_ids: list[int] = field(default_factory=list)
     current_event_ids: list[int] = field(default_factory=list)
+    candidate_event_ids: list[int] = field(default_factory=list)
     reference_time: datetime | None = None
     input_audit: dict[str, Any] = field(default_factory=dict)
 
@@ -150,18 +161,27 @@ def run_event_cluster_job(
     now: datetime | None = None,
     reference_time: datetime | None = None,
     input_min_score: int = DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE,
+    batch_item_limit: int = STAGE_C_BATCH_ITEM_LIMIT,
+    batch_input_byte_limit: int = STAGE_C_BATCH_INPUT_BYTE_LIMIT,
 ) -> EventClusterResult:
-    """Aggregate the current Stage-B item set in one AI request."""
+    """Aggregate the current Stage-B item set through bounded AI requests."""
 
     result = EventClusterResult(run_id=int(run_id))
     owner = "stage-c-ai-aggregation"
     raw_response: Any | None = None
     request_metadata: Mapping[str, Any] | None = None
     min_score = _bounded_score(input_min_score, DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE)
+    resolved_batch_item_limit = _positive_int(batch_item_limit, STAGE_C_BATCH_ITEM_LIMIT)
+    resolved_batch_input_byte_limit = _positive_int(
+        batch_input_byte_limit,
+        STAGE_C_BATCH_INPUT_BYTE_LIMIT,
+    )
     model_name = str(getattr(ai_client, "model", None) or "custom")
     config_fingerprint = _stage_c_config_fingerprint(
         model_name=model_name,
         input_min_score=min_score,
+        batch_item_limit=resolved_batch_item_limit,
+        batch_input_byte_limit=resolved_batch_input_byte_limit,
     )
 
     with session_factory() as session:
@@ -169,6 +189,7 @@ def run_event_cluster_job(
         run = session.get(IntelRun, int(run_id))
         if run is None or run.edition_id is None:
             raise ValueError("Stage C requires the current daily edition build")
+        _assert_downstream_idle(repo, int(run_id))
         frozen_reference = _as_utc(reference_time) or _as_utc(run.reference_time) or _as_utc(now)
         frozen_reference = frozen_reference or datetime.now(timezone.utc)
         stage = repo.ensure_stage(
@@ -177,12 +198,16 @@ def run_event_cluster_job(
             config_fingerprint=config_fingerprint,
             reference_time=frozen_reference,
             metadata={
-                "aggregation_mode": "ai_single_call",
+                "aggregation_mode": STAGE_C_AGGREGATION_MODE,
                 "history_mode": "prior_published_daily_reports",
                 "daily_history_days": DAILY_HISTORY_DAYS,
                 "prompt_version": STAGE_C_PROMPT_VERSION,
+                "candidate_contract_version": STAGE_C_CANDIDATE_CONTRACT_VERSION,
                 "input_policy_version": STAGE_C_INPUT_POLICY_VERSION,
                 "input_min_score": min_score,
+                "batch_item_limit": resolved_batch_item_limit,
+                "batch_input_byte_limit": resolved_batch_input_byte_limit,
+                "primary_policy_version": _STAGE_C_PRIMARY_POLICY_VERSION,
             },
         )
         current = _as_utc(stage.reference_time) or frozen_reference
@@ -222,11 +247,23 @@ def run_event_cluster_job(
                 stored = _mapping(task.result)
                 result.event_ids = _event_id_list(stored.get("event_ids"))
                 result.current_event_ids = _event_id_list(stored.get("current_event_ids"))
+                result.candidate_event_ids = _event_id_list(stored.get("candidate_event_ids"))
                 result.input_audit = _mapping(stored.get("input_audit"))
                 result.processed = 0
                 return result
             raise RuntimeError("Stage C task is already running")
         task = claimed
+        try:
+            repo.invalidate_downstream_stages(
+                int(run_id),
+                stage_names=("stage_d", "export"),
+                upstream_stage="cluster",
+            )
+        except RuntimeError as exc:
+            session.rollback()
+            if str(exc).startswith("downstream_stage_busy:"):
+                raise StageCDownstreamBusyError(str(exc)) from exc
+            raise
         session.commit()
 
         try:
@@ -239,6 +276,7 @@ def run_event_cluster_job(
                         "schema_version": STAGE_C_SCHEMA_VERSION,
                         "event_ids": [],
                         "current_event_ids": [],
+                        "candidate_event_ids": [],
                         "processed": 0,
                         "clusters": 0,
                         "input_audit": result.input_audit,
@@ -250,16 +288,17 @@ def run_event_cluster_job(
 
             if ai_client is None or not callable(getattr(ai_client, "aggregate", None)):
                 raise TypeError("Stage C requires an AI client with aggregate()")
-            call = ai_client.aggregate(
-                candidates,
+            call = _aggregate_stage_c_batches(
+                ai_client=ai_client,
+                candidates=candidates,
                 recent_history=history,
                 edition={
                     "edition_date": run.edition_date,
                     "reference_time": current.isoformat(),
                 },
+                batch_item_limit=resolved_batch_item_limit,
+                batch_input_byte_limit=resolved_batch_input_byte_limit,
             )
-            if not isinstance(call, StageCAggregationCallResult):
-                raise TypeError("Stage C aggregate() must return StageCAggregationCallResult")
             raw_response = call.raw_response
             request_metadata = call.request_metadata
             parsed = strict_parse_stage_c_aggregation(
@@ -271,7 +310,8 @@ def run_event_cluster_job(
             by_id = {int(row["id"]): row for row in candidates}
             event_keys: set[str] = set()
             for cluster in parsed.clusters:
-                event_key = cluster.prior_event_key or canonical_event_key(by_id[cluster.primary_item_id])
+                primary_item_id = _select_primary_item_id(cluster.item_ids, candidates=by_id)
+                event_key = cluster.prior_event_key or canonical_event_key(by_id[primary_item_id])
                 if event_key in event_keys:
                     raise ValueError(f"Stage C response produces duplicate event_key: {event_key}")
                 event_keys.add(event_key)
@@ -284,12 +324,14 @@ def run_event_cluster_job(
                     request_metadata=request_metadata,
                 )
                 result.current_event_ids.append(int(event.id))
-                result.merged += max(0, len(cluster.members) - 1)
+                result.merged += max(0, len(cluster.item_ids) - 1)
                 if cluster.novelty_status == "new":
                     result.events += 1
                     result.event_ids.append(int(event.id))
+                    result.candidate_event_ids.append(int(event.id))
                 elif cluster.novelty_status == "updated":
                     result.updated += 1
+                    result.candidate_event_ids.append(int(event.id))
                 else:
                     result.repeats += 1
 
@@ -300,6 +342,7 @@ def run_event_cluster_job(
                     "schema_version": STAGE_C_SCHEMA_VERSION,
                     "event_ids": result.event_ids,
                     "current_event_ids": result.current_event_ids,
+                    "candidate_event_ids": result.candidate_event_ids,
                     "processed": result.processed,
                     "clusters": len(parsed.clusters),
                     "input_audit": result.input_audit,
@@ -335,7 +378,11 @@ def run_event_cluster_job(
                         error_category="provider",
                         error_code="stage_c_ai_aggregation_failed",
                         error_message=str(exc),
-                        retryable=False,
+                        retryable=(
+                            bool(getattr(exc, "retryable", False))
+                            or isinstance(exc, StageCDownstreamBusyError)
+                            or str(exc).startswith("downstream_stage_busy:")
+                        ),
                         raw_response={
                             "provider_response": raw_response,
                             "request_metadata": dict(request_metadata or {}),
@@ -461,7 +508,7 @@ def _load_cluster_items(
         if review is None or review.status != "success":
             excluded["missing_review"].append(item_id)
             continue
-        if int(review.selection_score or 0) < input_min_score:
+        if int(review.b1_priority or 0) < input_min_score:
             excluded["below_min_score"].append(item_id)
             continue
         selected.append(item)
@@ -555,11 +602,335 @@ def _item_candidate(item: IntelItem) -> dict[str, Any]:
         "topics": _clean_strings(topics),
         "keywords": list(review.keywords) if review is not None else [],
         "entities": list(review.entities) if review is not None else [],
-        "selection_score": _number(review.selection_score if review else item.selection_score),
+        "b1_priority": _number(review.b1_priority if review else item.b1_priority),
         "published_at": _iso_datetime(item.published_at or item.discovered_at or item.captured_at),
         "captured_at": _iso_datetime(item.captured_at),
         "identity_keys": exact_identity_keys(item),
     }
+
+
+def _aggregate_stage_c_batches(
+    *,
+    ai_client: Any,
+    candidates: Sequence[Mapping[str, Any]],
+    recent_history: Sequence[Mapping[str, Any]],
+    edition: Mapping[str, Any],
+    batch_item_limit: int,
+    batch_input_byte_limit: int,
+) -> StageCAggregationCallResult:
+    """Run independently valid bounded calls, then validate their exact union."""
+
+    # History is repeated in every request. Reserve its conservative serialized
+    # footprint before packing current candidates, rather than letting a large
+    # three-day history silently defeat the request budget.
+    current_item_byte_budget = max(1, batch_input_byte_limit - _serialized_size(recent_history))
+    batches = _partition_stage_c_candidates(
+        candidates,
+        item_limit=batch_item_limit,
+        input_byte_limit=current_item_byte_budget,
+    )
+    batch_records: list[dict[str, Any]] = []
+    raw_batches: list[dict[str, Any]] = []
+    clusters: list[StageCStoryCluster] = []
+    expected_history_keys = [str(row["event_key"]) for row in recent_history]
+
+    for batch_index, batch in enumerate(batches, start=1):
+        item_ids = [int(row["id"]) for row in batch]
+        try:
+            call = ai_client.aggregate(
+                batch,
+                recent_history=recent_history,
+                edition=edition,
+            )
+            if not isinstance(call, StageCAggregationCallResult):
+                raise TypeError("Stage C aggregate() must return StageCAggregationCallResult")
+            parsed = strict_parse_stage_c_aggregation(
+                call.parsed.model_dump(mode="json"),
+                item_ids=item_ids,
+                prior_event_keys=expected_history_keys,
+            )
+        except Exception as exc:
+            failed_metadata = _stage_c_batch_request_metadata(
+                batch_records,
+                candidate_count=len(candidates),
+                history_count=len(recent_history),
+                batch_item_limit=batch_item_limit,
+                batch_input_byte_limit=batch_input_byte_limit,
+                history_link_merges=(),
+                failed_batch_index=batch_index,
+            )
+            failed_raw_response = getattr(exc, "raw_response", None)
+            raise StageCAggregationProviderError(
+                str(exc),
+                status_code=getattr(exc, "status_code", None),
+                error_code=getattr(exc, "error_code", None) or "batch_aggregation_failed",
+                raw_response={
+                    "batch_responses": raw_batches,
+                    "failed_batch": {
+                        "batch_index": batch_index,
+                        "item_ids": item_ids,
+                        "provider_response": failed_raw_response,
+                    },
+                },
+                request_metadata=failed_metadata,
+                cause=exc,
+            ) from exc
+
+        request_metadata = dict(call.request_metadata)
+        batch_records.append(
+            {
+                "batch_index": batch_index,
+                "item_ids": item_ids,
+                "item_count": len(item_ids),
+                "request_metadata": request_metadata,
+            }
+        )
+        raw_batches.append(
+            {
+                "batch_index": batch_index,
+                "item_ids": item_ids,
+                "provider_response": call.raw_response,
+            }
+        )
+        clusters.extend(parsed.clusters)
+
+    candidates_by_id = {int(row["id"]): row for row in candidates}
+    merged_clusters, history_link_merges = _merge_history_linked_clusters(
+        clusters,
+        candidates=candidates_by_id,
+    )
+    combined = strict_parse_stage_c_aggregation(
+        {
+            "schema_version": STAGE_C_SCHEMA_VERSION,
+            "clusters": [cluster.model_dump(mode="json") for cluster in merged_clusters],
+        },
+        item_ids=[int(row["id"]) for row in candidates],
+        prior_event_keys=expected_history_keys,
+    )
+    aggregate_metadata = _stage_c_batch_request_metadata(
+        batch_records,
+        candidate_count=len(candidates),
+        history_count=len(recent_history),
+        batch_item_limit=batch_item_limit,
+        batch_input_byte_limit=batch_input_byte_limit,
+        history_link_merges=history_link_merges,
+    )
+    return StageCAggregationCallResult(
+        parsed=combined,
+        raw_response={"batch_responses": raw_batches},
+        request_metadata=aggregate_metadata,
+    )
+
+
+def _partition_stage_c_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    item_limit: int,
+    input_byte_limit: int,
+) -> list[list[Mapping[str, Any]]]:
+    """Co-locate likely related records without deciding their final grouping."""
+
+    ordered = sorted(candidates, key=_stage_c_batch_key)
+    batches: list[list[Mapping[str, Any]]] = []
+    current: list[Mapping[str, Any]] = []
+    current_bytes = 0
+    for candidate in ordered:
+        candidate_bytes = _serialized_size(candidate)
+        would_exceed_item_limit = len(current) >= item_limit
+        would_exceed_byte_limit = bool(current) and current_bytes + candidate_bytes > input_byte_limit
+        if current and (would_exceed_item_limit or would_exceed_byte_limit):
+            batches.append(current)
+            current = []
+            current_bytes = 0
+        current.append(candidate)
+        current_bytes += candidate_bytes
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _stage_c_batch_key(candidate: Mapping[str, Any]) -> tuple[str, str, int]:
+    typed_entities: list[tuple[int, str]] = []
+    entity_rank = {
+        "model": 0,
+        "product": 1,
+        "project": 2,
+        "organization": 3,
+        "company": 4,
+    }
+    entities = candidate.get("entities")
+    if isinstance(entities, Iterable) and not isinstance(entities, (str, bytes, Mapping)):
+        for entity in entities:
+            if not isinstance(entity, Mapping):
+                continue
+            name = normalize_event_title(entity.get("name"))
+            if not name:
+                continue
+            entity_type = str(entity.get("type") or "").strip().casefold()
+            typed_entities.append((entity_rank.get(entity_type, 9), name))
+    if typed_entities:
+        rank, name = min(typed_entities)
+        anchor = f"entity:{rank}:{name}"
+    else:
+        keyword_values = candidate.get("keywords")
+        keywords = (
+            [normalize_event_title(value) for value in keyword_values]
+            if isinstance(keyword_values, Iterable) and not isinstance(keyword_values, (str, bytes, Mapping))
+            else []
+        )
+        keywords = [value for value in keywords if value]
+        if keywords:
+            anchor = f"keyword:{min(keywords, key=lambda value: (-len(value), value))}"
+        else:
+            anchor = f"topic:{normalize_event_title(candidate.get('topic'))}"
+    title = normalize_event_title(candidate.get("title"))
+    return anchor, title, int(candidate["id"])
+
+
+def _merge_history_linked_clusters(
+    clusters: Sequence[StageCStoryCluster],
+    *,
+    candidates: Mapping[int, Mapping[str, Any]],
+) -> tuple[list[StageCStoryCluster], list[dict[str, Any]]]:
+    """Merge only clusters whose model output names the same published event."""
+
+    by_history_key: dict[str, list[StageCStoryCluster]] = {}
+    for cluster in clusters:
+        if cluster.prior_event_key:
+            by_history_key.setdefault(cluster.prior_event_key, []).append(cluster)
+
+    merged: list[StageCStoryCluster] = []
+    audit: list[dict[str, Any]] = []
+    processed_history_keys: set[str] = set()
+    for cluster in clusters:
+        history_key = cluster.prior_event_key
+        if not history_key:
+            merged.append(cluster)
+            continue
+        if history_key in processed_history_keys:
+            continue
+        processed_history_keys.add(history_key)
+        linked = by_history_key[history_key]
+        if len(linked) == 1:
+            merged.append(cluster)
+            continue
+        item_ids = [item_id for current in linked for item_id in current.item_ids]
+        primary_item_id = _select_primary_item_id(item_ids, candidates=candidates)
+        representative = next(current for current in linked if primary_item_id in current.item_ids)
+        novelty_status = "updated" if any(current.novelty_status == "updated" for current in linked) else "repeat"
+        merged.append(
+            StageCStoryCluster(
+                title_zh=representative.title_zh,
+                summary_zh=representative.summary_zh,
+                item_ids=item_ids,
+                novelty_status=novelty_status,
+                prior_event_key=history_key,
+            )
+        )
+        audit.append(
+            {
+                "prior_event_key": history_key,
+                "source_cluster_count": len(linked),
+                "item_ids": item_ids,
+                "novelty_status": novelty_status,
+            }
+        )
+    return merged, audit
+
+
+def _stage_c_batch_request_metadata(
+    batch_records: Sequence[Mapping[str, Any]],
+    *,
+    candidate_count: int,
+    history_count: int,
+    batch_item_limit: int,
+    batch_input_byte_limit: int,
+    history_link_merges: Sequence[Mapping[str, Any]],
+    failed_batch_index: int | None = None,
+) -> dict[str, Any]:
+    normalized_records = [dict(row) for row in batch_records]
+    request_bytes = sum(
+        int(_number(_mapping(row.get("request_metadata")).get("request_bytes")))
+        for row in normalized_records
+    )
+    digest_payload = [
+        _mapping(row.get("request_metadata")).get("request_sha256")
+        for row in normalized_records
+    ]
+    request_sha256 = hashlib.sha256(
+        json.dumps(digest_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    result: dict[str, Any] = {
+        "aggregation_mode": STAGE_C_AGGREGATION_MODE,
+        "item_count": int(candidate_count),
+        "history_count": int(history_count),
+        "batch_count": len(normalized_records),
+        "batch_item_limit": int(batch_item_limit),
+        "batch_input_byte_limit": int(batch_input_byte_limit),
+        "request_bytes": request_bytes,
+        "request_sha256": request_sha256,
+        "batches": normalized_records,
+        "history_link_merges": [dict(row) for row in history_link_merges],
+    }
+    if failed_batch_index is not None:
+        result["failed_batch_index"] = int(failed_batch_index)
+    return result
+
+
+def _select_primary_item_id(
+    item_ids: Iterable[int],
+    *,
+    candidates: Mapping[int, Mapping[str, Any]],
+) -> int:
+    rows = [candidates[int(item_id)] for item_id in item_ids]
+    if not rows:
+        raise ValueError("Stage C cluster must contain at least one item_id")
+    return int(min(rows, key=_primary_sort_key)["id"])
+
+
+def _primary_sort_key(candidate: Mapping[str, Any]) -> tuple[int, int, float, float, int]:
+    source_role = str(candidate.get("source_role") or "").strip().casefold()
+    source_role_rank = {
+        "official": 0,
+        "first_party_official": 0,
+        "publisher": 1,
+        "news_media": 2,
+        "analysis": 3,
+        "code_hosting": 4,
+        "community": 5,
+        "social": 6,
+    }.get(source_role, 7)
+    published_at = _as_utc(candidate.get("published_at") or candidate.get("captured_at"))
+    published_rank = -(published_at.timestamp() if published_at is not None else 0.0)
+    return (
+        0 if bool(candidate.get("primary_eligible")) else 1,
+        source_role_rank,
+        -_number(candidate.get("b1_priority")),
+        published_rank,
+        int(candidate["id"]),
+    )
+
+
+def _materialize_member_relations(
+    item_ids: Iterable[int],
+    *,
+    primary_item_id: int,
+    candidates: Mapping[int, Mapping[str, Any]],
+) -> dict[int, str]:
+    primary_keys = set(candidates[primary_item_id].get("identity_keys", ()))
+    relations: dict[int, str] = {}
+    for item_id in item_ids:
+        item_id = int(item_id)
+        if item_id == primary_item_id:
+            relations[item_id] = "primary"
+            continue
+        item_keys = set(candidates[item_id].get("identity_keys", ()))
+        relations[item_id] = "duplicate" if primary_keys and primary_keys & item_keys else "related"
+    return relations
+
+
+def _serialized_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8"))
 
 
 def _persist_ai_cluster(
@@ -572,8 +943,14 @@ def _persist_ai_cluster(
     request_metadata: Mapping[str, Any],
 ):
     repo = IntelRepository(session)
-    members = [candidates[member.item_id] for member in cluster.members]
-    primary = candidates[cluster.primary_item_id]
+    primary_item_id = _select_primary_item_id(cluster.item_ids, candidates=candidates)
+    member_relations = _materialize_member_relations(
+        cluster.item_ids,
+        primary_item_id=primary_item_id,
+        candidates=candidates,
+    )
+    members = [candidates[item_id] for item_id in cluster.item_ids]
+    primary = candidates[primary_item_id]
     times = [_as_utc(row.get("published_at") or row.get("captured_at")) for row in members]
     times = [value for value in times if value is not None]
     event_key = cluster.prior_event_key or canonical_event_key(primary)
@@ -581,6 +958,11 @@ def _persist_ai_cluster(
         "schema_version": STAGE_C_SCHEMA_VERSION,
         "cluster": cluster.model_dump(mode="json"),
         "request_metadata": dict(request_metadata),
+        "local_materialization": {
+            "primary_item_id": primary_item_id,
+            "member_relations": member_relations,
+            "primary_policy_version": _STAGE_C_PRIMARY_POLICY_VERSION,
+        },
     }
     event = repo.upsert_event(
         run_id=run_id,
@@ -599,31 +981,31 @@ def _persist_ai_cluster(
         source_ids=_unique_strings(row.get("source_id") for row in members),
         source_groups=_unique_strings(row.get("source_group") for row in members),
         identity_keys=_unique_strings(key for row in members for key in row.get("identity_keys", ())),
-        display_score=max((_number(row.get("selection_score")) for row in members), default=0.0),
+        display_score=max((_number(row.get("b1_priority")) for row in members), default=0.0),
         novelty_status=cluster.novelty_status,
         state="candidate",
         resolution_method="ai_story_aggregation",
         resolution_confidence=100,
         resolution_raw=resolution_raw,
-        primary_item_id=cluster.primary_item_id,
+        primary_item_id=primary_item_id,
         first_seen_at=min(times) if times else current,
         last_seen_at=max(times) if times else current,
     )
-    event.primary_item_id = cluster.primary_item_id
-    for member in cluster.members:
-        row = candidates[member.item_id]
+    event.primary_item_id = primary_item_id
+    for item_id, relation in member_relations.items():
+        row = candidates[item_id]
         repo.upsert_event_item(
             int(event.id),
-            member.item_id,
+            item_id,
             source_id=str(row.get("source_id") or ""),
             source_group=_text(row.get("source_group")),
             identity_key=next(iter(row.get("identity_keys", ())), None),
-            match_type=member.relation,
+            match_type=relation,
             match_confidence=100,
-            is_primary=member.relation == "primary",
+            is_primary=relation == "primary",
             lineage={
                 "run_id": run_id,
-                "relation": member.relation,
+                "relation": relation,
                 "source_id": row.get("source_id"),
                 "source_group": row.get("source_group"),
                 "canonical_url": row.get("canonical_url"),
@@ -655,15 +1037,39 @@ def _cluster_input_fingerprint(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _stage_c_config_fingerprint(*, model_name: str, input_min_score: int) -> str:
+def _stage_c_config_fingerprint(
+    *,
+    model_name: str,
+    input_min_score: int,
+    batch_item_limit: int,
+    batch_input_byte_limit: int,
+) -> str:
     payload = {
         "prompt_version": STAGE_C_PROMPT_VERSION,
+        "aggregation_mode": STAGE_C_AGGREGATION_MODE,
+        "candidate_contract_version": STAGE_C_CANDIDATE_CONTRACT_VERSION,
+        "primary_policy_version": _STAGE_C_PRIMARY_POLICY_VERSION,
         "model": model_name,
         "input_policy_version": STAGE_C_INPUT_POLICY_VERSION,
         "input_min_score": input_min_score,
+        "batch_item_limit": batch_item_limit,
+        "batch_input_byte_limit": batch_input_byte_limit,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _assert_downstream_idle(repo: IntelRepository, run_id: int) -> None:
+    try:
+        repo.assert_stages_idle(
+            int(run_id),
+            stage_names=("stage_d", "export"),
+            upstream_stage="cluster",
+        )
+    except RuntimeError as exc:
+        if str(exc).startswith("downstream_stage_busy:"):
+            raise StageCDownstreamBusyError(str(exc)) from exc
+        raise
 
 
 def _event_id_list(value: Any) -> list[int]:
@@ -741,6 +1147,14 @@ def _bounded_score(value: Any, default: int) -> int:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return result if result > 0 else default
 
 
 def _as_utc(value: Any) -> datetime | None:

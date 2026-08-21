@@ -126,7 +126,7 @@ def run_stage_b_analysis_job(
     selected_limit = _normalise_limit(ai_limit if ai_limit is not None else limit)
     min_score = _bounded_score(analysis_min_score, DEFAULT_AI_ANALYSIS_MIN_SCORE)
     result = StageBAnalysisResult(run_id=run_id)
-    owner = owner or f"stage-b-{uuid4().hex}"
+    owner = owner or f"stage-b1-{uuid4().hex}"
     specs = dict(source_specs or {})
     requested_ids = {int(value) for value in item_ids} if item_ids is not None else None
     requested_task_ids = {int(value) for value in task_ids} if task_ids is not None else None
@@ -135,11 +135,10 @@ def run_stage_b_analysis_job(
     # analysis provider request and never causes Stage A to run.
     preflight_intel_triage_schemas()
 
-    # The minimal B1 contract deliberately invalidates old analysis tasks.
-    # Reusing them would preserve projections produced by the removed routing,
-    # event-signature, fact and paper-evidence contract.
+    # The content-value B1 contract deliberately invalidates old analysis
+    # tasks. Reusing them would retain the removed mixed score dimensions.
     config_fingerprint = _config_fingerprint(
-        stage="analyze_b1_minimal_v1",
+        stage="analyze_b1_content_value_v2",
         model=getattr(ai_client, "model", None),
         reject_threshold=min_score,
     )
@@ -369,7 +368,7 @@ def run_stage_b_analysis_job(
 
         try:
             guard_reason = analysis_guard_failure(analysis)
-            score = int(analysis.selection_score or 0)
+            score = int(analysis.b1_priority or 0)
             analysis_tier = "low_signal" if score < min_score else "enriched"
             with session_factory() as session:
                 repo = IntelRepository(session)
@@ -394,7 +393,7 @@ def run_stage_b_analysis_job(
                     result=task_result,
                     raw_response=persisted.raw_response,
                     metadata={
-                        "selection_score": score,
+                        "b1_priority": score,
                         "filtered": filtered,
                         "analysis_tier": "structural_invalid" if filtered else analysis_tier,
                     },
@@ -416,7 +415,7 @@ def run_stage_b_analysis_job(
                     )
                     item = session.get(IntelItem, context.item_id)
                     if item is not None:
-                        item.selection_score = score
+                        item.b1_priority = score
                         item.selection_reason = f"analysis_filtered:{guard_reason}"
                     repo.set_item_status(context.item_id, "analysis_filtered", run_id=run_id)
                 else:
@@ -430,7 +429,7 @@ def run_stage_b_analysis_job(
                     )
                     item = session.get(IntelItem, context.item_id)
                     if item is not None:
-                        item.selection_score = score
+                        item.b1_priority = score
                         item.selection_reason = "analysis_candidate"
                     repo.set_item_status(context.item_id, "candidate", run_id=run_id)
                 session.commit()
@@ -457,7 +456,7 @@ def run_stage_b_analysis_job(
     # its lease while waiting behind earlier provider calls.
     if contexts:
         pending = iter((context, task_ids_by_item[context.item_id]) for context in contexts)
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="intel-stage-b") as executor:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="intel-stage-b1") as executor:
             futures: dict[Any, tuple[_AnalysisContext, int]] = {}
 
             def submit_next() -> bool:
@@ -623,7 +622,7 @@ def _analysis_provider_outcome(
             code=getattr(exc, "error_code", None),
             message=str(exc),
         )[0],
-        stage="stage-b",
+        stage="stage-b1",
     )
     if failure is not None:
         return _analysis_failure(context.item_id, context.envelope, failure, attempts=attempts), failure
@@ -649,10 +648,8 @@ def _analysis_failure(
         summary_cn="",
         keywords=[],
         entities=[],
-        selection_score=0,
+        b1_priority=0,
         score_components={},
-        source_content_class=envelope.source_content_class,
-        source_group=envelope.source_group,
         status="analysis_failed",
         error_code=getattr(exc, "error_code", None) or exc.__class__.__name__,
         error_message=message[:4000],

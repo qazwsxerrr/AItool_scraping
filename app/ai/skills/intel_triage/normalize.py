@@ -94,12 +94,6 @@ def normalize_html(value: Any) -> str:
     return _normalize_plain_text(text)
 
 
-def html_to_text(value: Any) -> str:
-    """Alias kept for parser callers that use the more explicit name."""
-
-    return normalize_html(value)
-
-
 def normalize_url(value: Any) -> str | None:
     """Canonicalize a URL without inventing a URL for malformed input."""
 
@@ -134,4 +128,4 @@ def normalize_url(value: Any) -> str | None:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
-__all__ = ["html_to_text", "normalize_html", "normalize_text", "normalize_url"]
+__all__ = ["normalize_html", "normalize_text", "normalize_url"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import select
 
 from app.ai.skills.stage_c_aggregation import (
@@ -10,6 +11,7 @@ from app.ai.skills.stage_c_aggregation import (
     StageCAggregationCallResult,
     StageCAggregationResponse,
 )
+from app.ai.skills.stage_d_selection import STAGE_D_SELECTION_SCHEMA_VERSION
 from app.domain.models import FetchItem
 from app.jobs.event_cluster_job import run_event_cluster_job
 from app.jobs.export_job import run_intel_export_job
@@ -19,28 +21,20 @@ from app.storage.models import AIItemReview, IntelEventItem, IntelItem, IntelRun
 from app.storage.repository import IntelRepository
 
 
-class _EditorialClient:
-    model = "test-stage-d-v3"
+class _SelectionClient:
+    model = "test-stage-d-selection"
     max_retries = 0
 
-    def select_events(self, events, *, edition, total_max, watchlist_max):
+    def select(self, events, *, edition, max_selected):
         return {
-            "schema_version": "stage_d_editorial_v3",
-            "decisions": [
+            "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+            "selected": [
                 {
                     "event_id": int(event["event_id"]),
-                    "decision": "selected",
-                    "display_order": index,
-                    "editorial_score": 90,
-                    "story_family_id": f"family-{event['event_id']}",
-                    "family_position": 1,
-                    "display_title_zh": "本期日报运行范围更新事件",
-                    "title_supporting_fields": ["title", "summary_cn"],
-                    "reason_codes": ["material_change"],
-                    "editorial_reason": "测试事件适合进入日报。",
-                    "confidence": 90,
+                    "reason_code": "material_change",
+                    "reason": "测试事件适合进入日报。",
                 }
-                for index, event in enumerate(events, start=1)
+                for event in events[:max_selected]
             ],
         }
 
@@ -55,8 +49,7 @@ class _StageCClient:
                 {
                     "title_zh": str(item["title"]),
                     "summary_zh": str(item.get("summary_cn") or item["title"]),
-                    "primary_item_id": int(item["id"]),
-                    "members": [{"item_id": int(item["id"]), "relation": "primary"}],
+                    "item_ids": [int(item["id"])],
                     "novelty_status": "new",
                     "prior_event_key": None,
                 }
@@ -68,6 +61,13 @@ class _StageCClient:
             raw_response=raw,
             request_metadata={"model": self.model},
         )
+
+
+class _FailingStageCClient:
+    model = "test-stage-c-failure"
+
+    def aggregate(self, current_items, *, recent_history, edition):
+        raise RuntimeError("stage c provider failed")
 
 
 def _db():
@@ -129,7 +129,7 @@ def _build_with_stage_b_items(
                     keywords_json='["gpt-5", "release"]',
                     entities_json=json.dumps([{"type": "company", "name": "OpenAI"}]),
                     summary_cn=f"{title} summary",
-                    selection_score=score,
+                    b1_priority=score,
                     status="success",
                 )
             )
@@ -145,7 +145,7 @@ def _build_with_stage_b_items(
             )
             repo.complete_stage_task(
                 task,
-                result={"item_id": item_id, "status": "success", "selection_score": score},
+                result={"item_id": item_id, "status": "success", "b1_priority": score},
             )
         repo.finish_stage(analyze, status="succeeded")
         repo.freeze_run_scope(build.id)
@@ -178,6 +178,7 @@ def test_cluster_retry_keeps_the_frozen_reference_time_and_current_build_project
     )
 
     assert first.events == 1
+    assert first.candidate_event_ids == first.current_event_ids
     assert first.reference_time == reference
     assert second.reference_time == reference
     assert second.events == 1
@@ -235,12 +236,13 @@ def test_stage_d_and_export_use_only_the_current_daily_build(tmp_path):
         ai_client=_StageCClient(),
     )
     assert cluster.current_event_ids
+    assert cluster.candidate_event_ids == cluster.current_event_ids
 
     stage_d = run_stage_d_job(
         session_factory=session_factory,
         run_id=run_id,
-        profile=StageDProfile(total_max=1),
-        ai_client=_EditorialClient(),
+        profile=StageDProfile(max_selected=1),
+        ai_client=_SelectionClient(),
     )
     assert stage_d.selected == 1
 
@@ -253,5 +255,93 @@ def test_stage_d_and_export_use_only_the_current_daily_build(tmp_path):
     )
 
     assert exported.exported == 1
-    assert "本期日报运行范围更新事件" in (artifact_dir / "intel_digest.md").read_text(encoding="utf-8")
+    assert "Current build update" in (artifact_dir / "intel_digest.md").read_text(encoding="utf-8")
     assert not (tmp_path / "public-intel" / "daily" / "2026-08-15").exists()
+
+
+def test_stage_c_rerun_removes_stale_stage_d_and_export_state(tmp_path):
+    session_factory = _db()
+    reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
+    run_id, _ = _build_with_stage_b_items(
+        session_factory,
+        reference_time=reference,
+        rows=[("Current build update", 90, "candidate")],
+    )
+    run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        reference_time=reference,
+        ai_client=_StageCClient(),
+    )
+    run_stage_d_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        profile=StageDProfile(max_selected=1),
+        ai_client=_SelectionClient(),
+    )
+    run_intel_export_job(
+        session_factory=session_factory,
+        output_dir=tmp_path / "public-intel",
+        artifact_dir=tmp_path / "draft",
+        run_id=run_id,
+    )
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        assert repo.get_stage(run_id, "stage_d") is not None
+        assert repo.get_stage(run_id, "export") is not None
+
+    run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        reference_time=reference,
+        force=True,
+        ai_client=_StageCClient(),
+    )
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        assert repo.get_stage(run_id, "stage_d") is None
+        assert repo.get_stage(run_id, "export") is None
+
+
+def test_failed_stage_c_rerun_still_removes_stale_stage_d_and_export_state(tmp_path):
+    session_factory = _db()
+    reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
+    run_id, _ = _build_with_stage_b_items(
+        session_factory,
+        reference_time=reference,
+        rows=[("Current build update", 90, "candidate")],
+    )
+    run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        reference_time=reference,
+        ai_client=_StageCClient(),
+    )
+    run_stage_d_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        profile=StageDProfile(max_selected=1),
+        ai_client=_SelectionClient(),
+    )
+    run_intel_export_job(
+        session_factory=session_factory,
+        output_dir=tmp_path / "public-intel",
+        artifact_dir=tmp_path / "draft",
+        run_id=run_id,
+    )
+
+    with pytest.raises(RuntimeError, match="stage c provider failed"):
+        run_event_cluster_job(
+            session_factory=session_factory,
+            run_id=run_id,
+            reference_time=reference,
+            force=True,
+            ai_client=_FailingStageCClient(),
+        )
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        assert repo.get_stage(run_id, "stage_d") is None
+        assert repo.get_stage(run_id, "export") is None

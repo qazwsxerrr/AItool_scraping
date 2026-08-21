@@ -37,13 +37,12 @@
         {% if detail.event.risk_flags %}
           <div class="badges">{% for flag in detail.event.risk_flags %}<span class="badge warning">{{ flag }}</span>{% endfor %}</div>
         {% else %}<p class="muted-text">本事件没有结构化风险标记。</p>{% endif %}
-        {% if detail.event.presentation_labels %}<div class="badges">{% for label in detail.event.presentation_labels %}<span class="badge warning">{{ label }}</span>{% endfor %}</div>{% endif %}
         {% if detail.event.keywords %}<h3>关键词</h3><div class="badges">{% for keyword in detail.event.keywords %}<span class="badge">{{ keyword }}</span>{% endfor %}</div>{% endif %}
       </div>
       <div>
         <h3>聚类与编辑追溯</h3>
         <p class="detail-copy">聚类方式：{{ detail.resolution_method or '未知' }}{% if detail.resolution_confidence is not none %} · 置信度 {{ detail.resolution_confidence }}%{% endif %}</p>
-        {% if detail.selection_reason %}<p class="detail-copy"><strong>Stage D 依据：</strong>{{ detail.selection_reason }}</p>{% endif %}
+        {% if detail.selection_reason %}<p class="detail-copy"><strong>选稿依据：</strong>{{ detail.selection_reason }}</p>{% endif %}
         <p class="detail-copy">日报：{{ active_edition_date or '当前版本' }}</p>
       </div>
     </div>

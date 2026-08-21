@@ -131,7 +131,13 @@ def _extract_datetime(entry: Any) -> datetime | None:
         text_value = _as_text(entry.get(text_key))
         if not text_value:
             continue
-        parsed_dt = date_parser.parse(text_value)
+        try:
+            parsed_dt = date_parser.parse(text_value)
+        except (TypeError, ValueError, OverflowError):
+            # A malformed date on one feed entry must not discard the whole
+            # source batch.  Try the next date field (for example ``updated``)
+            # and let the local recent-window policy handle an undated item.
+            continue
         if parsed_dt.tzinfo is None:
             parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
         return parsed_dt.astimezone(timezone.utc)

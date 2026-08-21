@@ -10,7 +10,6 @@ from app.config.settings import Settings
 from app.jobs import pipeline_orchestrator as orchestrator
 from app.jobs.event_cluster_job import _load_published_daily_history
 from app.jobs.export_job import IntelExportResult
-from app.jobs.stage_d_job import _recent_daily_history
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.draft_workspace import (
     audit_database_path,
@@ -95,7 +94,7 @@ def test_draft_creation_does_not_modify_the_published_database(tmp_path):
     )
 
 
-def test_stage_history_is_seeded_from_prior_published_reports_only(tmp_path):
+def test_stage_c_history_is_seeded_from_prior_published_reports_only(tmp_path):
     settings = Settings(database_url=f"sqlite:///{tmp_path / 'daily.db'}")
     public_engine = create_engine_from_url(settings.database_url)
     init_db(public_engine)
@@ -128,9 +127,6 @@ def test_stage_history_is_seeded_from_prior_published_reports_only(tmp_path):
         assert [row["event_key"] for row in history] == ["url:https://daily.example/repeat"]
         current_event = session.get(IntelEvent, current.id)
         assert current_event is not None
-        assert _recent_daily_history(session, candidates=[{"event": current_event}], run=run, days=3) == {
-            current_event.id: {"appeared_recently": True, "prior_editions": ["2026-08-18"]}
-        }
 
 
 def test_approved_draft_replaces_public_report_and_retains_its_full_audit(tmp_path, monkeypatch):

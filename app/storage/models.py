@@ -610,7 +610,7 @@ class IntelItem(Base):
         Index("ix_intel_items_build", "build_id"),
         Index("ix_intel_items_content_class", "content_class"),
         Index("ix_intel_items_published_at", "published_at"),
-        Index("ix_intel_items_selection_score", "selection_score"),
+        Index("ix_intel_items_b1_priority", "b1_priority"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -633,7 +633,7 @@ class IntelItem(Base):
     discovered_links_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     raw_payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    selection_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    b1_priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     selection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="new")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
@@ -705,7 +705,7 @@ class AIItemReview(Base):
         UniqueConstraint("item_id", name="uq_ai_item_reviews_item_id"),
         Index("ix_ai_item_reviews_status", "status"),
         Index("ix_ai_item_reviews_topic", "topic"),
-        Index("ix_ai_item_reviews_score", "selection_score"),
+        Index("ix_ai_item_reviews_b1_priority", "b1_priority"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -717,7 +717,7 @@ class AIItemReview(Base):
     topics_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     keywords_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     entities_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
-    selection_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    b1_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
     score_components_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw_response_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
@@ -750,13 +750,9 @@ class AIItemReview(Base):
         return [str(item) for item in value] if isinstance(value, list) else []
 
     @property
-    def scores(self) -> dict[str, object]:
+    def score_components(self) -> dict[str, object]:
         value = self._decode_json(self.score_components_json, {})
         return dict(value) if isinstance(value, dict) else {}
-
-    @property
-    def score_components(self) -> dict[str, object]:
-        return self.scores
 
     @property
     def entities(self) -> list[dict[str, object]]:
@@ -833,11 +829,6 @@ class IntelEvent(Base):
         cascade="all, delete-orphan",
         order_by="IntelEventItem.id",
     )
-    stage_d_snapshots: Mapped[list["IntelEventStageDSnapshot"]] = relationship(
-        back_populates="event",
-        cascade="all, delete-orphan",
-        order_by="IntelEventStageDSnapshot.display_order",
-    )
 
     @property
     def novelty(self) -> str:
@@ -885,32 +876,3 @@ class IntelEventItem(Base):
     event: Mapped[IntelEvent] = relationship(back_populates="event_items")
     item: Mapped[IntelItem] = relationship(back_populates="event_items")
     source: Mapped[Source] = relationship()
-
-
-class IntelEventStageDSnapshot(Base):
-    """Private Stage-D output for one hidden daily build."""
-
-    __tablename__ = "intel_event_stage_d_snapshots"
-    __table_args__ = (
-        UniqueConstraint("run_id", "event_id", name="uq_intel_event_stage_d_snapshot_run_event"),
-        Index("ix_intel_event_stage_d_snapshot_run_order", "run_id", "display_order"),
-        Index("ix_intel_event_stage_d_snapshot_run_selected", "run_id", "selected"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    event_id: Mapped[int] = mapped_column(ForeignKey("intel_events.id"), nullable=False)
-    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id"), nullable=False)
-    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    display_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    topic: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    source_group: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    content_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
-    )
-
-    event: Mapped[IntelEvent] = relationship(back_populates="stage_d_snapshots")

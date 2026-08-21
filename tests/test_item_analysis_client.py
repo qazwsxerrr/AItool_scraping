@@ -60,16 +60,13 @@ def _analysis_payload():
         "summary_cn": "一个 MCP 工具",
         "keywords": ["MCP"],
         "entities": [{"type": "technology", "name": "MCP"}],
-        "selection_score": 88,
+        "b1_priority": 88,
         "score_components": {
-            "relevance": 88,
-            "importance": 88,
-            "impact": 88,
-            "freshness": 88,
-            "source_authority": 88,
+            "audience_relevance": 88,
+            "material_change": 88,
+            "impact_scope": 88,
+            "independent_news_value": 88,
             "specificity": 88,
-            "tracking_value": 88,
-            "total": 88,
         },
     }
 
@@ -94,7 +91,7 @@ def test_item_analysis_client_exposes_only_screen_and_analyze_for_intelligence()
     )
     analyzed = analysis_client.analyze(_envelope())
     assert isinstance(analyzed, AnalysisResult)
-    assert analyzed.selection_score == 88
+    assert analyzed.b1_priority == 88
     assert analysis_http.calls[0]["json"]["task"] == "intel_analysis"
 
 

@@ -58,39 +58,32 @@ def strict_parse_analysis(
     data: Any,
     *,
     envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
-    source_content_class: str | None = None,
 ) -> AnalysisResult:
     result_data, raw_mapping = unwrap_provider_response(data)
     result_data = dict(result_data)
-    missing: list[str] = []
-    if "topic" not in result_data and not result_data.get("topics") and not result_data.get("topic_labels"):
-        missing.append("topic")
-    if "summary_cn" not in result_data and "summary" not in result_data:
-        missing.append("summary_cn")
-    if "keywords" not in result_data and "key_terms" not in result_data and "tags" not in result_data:
-        missing.append("keywords")
-    if "entities" not in result_data and "typed_entities" not in result_data:
-        missing.append("entities")
-    if not any(key in result_data for key in ("selection_score", "score", "display_score", "total_score")):
-        missing.append("selection_score")
-    if not any(key in result_data for key in ("score_components", "scores", "score_breakdown")):
-        missing.append("score_components")
+    required_fields = ("topic", "topics", "summary_cn", "keywords", "entities", "b1_priority", "score_components")
+    missing = [name for name in required_fields if name not in result_data]
     if missing:
-        raise ValueError("Intel analysis response is missing required fields: " + ", ".join(dict.fromkeys(missing)))
+        raise ValueError("Intel analysis response is missing required fields: " + ", ".join(missing))
+
+    components = result_data["score_components"]
+    required_components = (
+        "audience_relevance",
+        "material_change",
+        "impact_scope",
+        "independent_news_value",
+        "specificity",
+    )
+    if not isinstance(components, Mapping):
+        raise ValueError("Intel analysis score_components must be an object")
+    missing_components = [name for name in required_components if name not in components]
+    if missing_components:
+        raise ValueError("Intel analysis score_components is missing required fields: " + ", ".join(missing_components))
 
     item = _as_envelope(envelope) if envelope is not None else None
     if item is not None:
         if "item_id" not in result_data and item.item_id is not None:
             result_data["item_id"] = item.item_id
-        if "source_content_class" not in result_data:
-            result_data["source_content_class"] = item.source_content_class
-        if "source_group" not in result_data and item.source_group:
-            result_data["source_group"] = item.source_group
-    if source_content_class is not None:
-        normalized_source = normalize_content_class(source_content_class)
-        if normalized_source is None:
-            raise ValueError("source_content_class is not supported")
-        result_data["source_content_class"] = normalized_source
     result_data["raw_response"] = dict(raw_mapping)
     parsed = AnalysisResult.model_validate(result_data)
     return apply_analysis_guards(parsed, item)
@@ -99,15 +92,8 @@ def strict_parse_analysis(
 def parse_analysis_result(
     data: Any,
     envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
-    source_content_class: str | None = None,
 ) -> AnalysisResult:
-    return strict_parse_analysis(data, envelope=envelope, source_content_class=source_content_class)
-
-
-# Descriptive aliases used by callers that name the transport operation rather
-# than the provider-neutral result class.
-parse_screen_response = parse_screen_result
-parse_analysis_response = parse_analysis_result
+    return strict_parse_analysis(data, envelope=envelope)
 
 
 def _as_envelope(value: RawIntelEnvelope | Mapping[str, Any]) -> RawIntelEnvelope:
@@ -233,7 +219,7 @@ def _parse_json_text(value: str, *, label: str) -> Any:
 
 
 __all__ = [
-    "parse_analysis_response", "parse_analysis_result", "parse_screen_response", "parse_screen_result",
+    "parse_analysis_result", "parse_screen_result",
     "strict_parse_analysis", "strict_parse_screen",
     "unwrap_provider_response",
 ]

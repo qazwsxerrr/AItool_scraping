@@ -155,10 +155,8 @@ def _analysis_failure(item: RawIntelEnvelope, exc: BaseException) -> AnalysisRes
         summary_cn="",
         keywords=[],
         entities=[],
-        selection_score=0,
+        b1_priority=0,
         score_components={},
-        source_content_class=item.source_content_class,
-        source_group=item.source_group,
         status=ANALYSIS_FAILURE_STATUS,
         error_code=exc.__class__.__name__,
         error_message=message,
@@ -208,16 +206,6 @@ def run_analysis_isolated(client: Any, envelopes: Iterable[RawIntelEnvelope | di
     return results
 
 
-safe_screen = screen_item
-safe_analyze = analyze_item
-screen_items = run_screen_isolated
-analyze_items = run_analysis_isolated
-isolate_screen_failure = screen_item
-isolate_analysis_failure = analyze_item
-isolate_screen_failures = run_screen_isolated
-isolate_analysis_failures = run_analysis_isolated
-
-
 def _normalize_api_style(value: Any) -> str:
     style = str(value or "generic_json").strip().casefold().replace("-", "_")
     style = {
@@ -231,7 +219,5 @@ def _normalize_api_style(value: Any) -> str:
 
 __all__ = [
     "ANALYSIS_FAILURE_STATUS", "IntelTriageClient", "SCREEN_FAILURE_STATUS", "SupportsPost",
-    "analyze_item", "analyze_items", "isolate_analysis_failure", "isolate_analysis_failures",
-    "isolate_screen_failure", "isolate_screen_failures", "run_analysis_isolated", "run_screen_isolated",
-    "safe_analyze", "safe_screen", "screen_item", "screen_items",
+    "analyze_item", "run_analysis_isolated", "run_screen_isolated", "screen_item",
 ]

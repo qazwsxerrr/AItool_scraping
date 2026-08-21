@@ -17,13 +17,17 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
+from app.ai.skills.stage_d_selection import (
+    STAGE_D_SELECTION_SCHEMA_VERSION,
+    strict_parse_stage_d_selection,
+)
 from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
 from app.config.settings import Settings
 from app.domain.recency import RecentWindowDecision, recent_window_decision
 from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
-from app.storage.models import IntelEvent, IntelEventItem, IntelEventStageDSnapshot, IntelItem, IntelRun, IntelRunItem
+from app.storage.models import IntelEvent, IntelEventItem, IntelItem, IntelRun, IntelRunItem
 from app.storage.daily_build_summary import build_daily_build_summary
 
 
@@ -76,7 +80,6 @@ def run_intel_export_job(
     stage_task = None
     run: IntelRun
     build_summary: dict[str, Any] | None = None
-    watchlist_records: list[dict[str, Any]] = []
     owner = "intel-export"
     with session_factory() as session:
         try:
@@ -84,22 +87,17 @@ def run_intel_export_job(
             run = session.get(IntelRun, int(run_id))
             if run is None or run.edition_id is None:
                 raise ValueError("export requires the current daily edition build")
-            _ensure_stage_d_ready(repo, int(run_id))
+            stage_d_selection = _load_stage_d_selection(repo, int(run_id))
             artifact_output = Path(artifact_dir) if artifact_dir is not None else _daily_output_dir(final_output, run)
             stage = repo.ensure_stage(
                 int(run_id),
                 "export",
                 metadata={"artifact_dir": str(artifact_output)},
             )
-            snapshot_rows = _list_export_events(
+            records = _list_export_events(
                 session,
+                selection=stage_d_selection,
                 limit=effective_limit,
-                run_id=run_id,
-                reference_time=run.reference_time,
-            )
-            records = snapshot_rows
-            watchlist_records = _list_watchlist_events(
-                session,
                 run_id=run_id,
                 reference_time=run.reference_time,
             )
@@ -160,7 +158,6 @@ def run_intel_export_job(
                 edition_date=run.edition_date,
                 status_counts=status_counts,
                 failure_counts=failure_counts,
-                watchlist_records=watchlist_records,
                 partial=False,
                 partial_reason=None,
             )
@@ -172,7 +169,6 @@ def run_intel_export_job(
                 run=run,
                 records=records,
                 jsonl_payload=jsonl_payload,
-                watchlist_count=len(watchlist_records),
                 partial=False,
                 partial_reason=None,
                 build_summary=build_summary,
@@ -341,8 +337,8 @@ def _edition_report_date(run: IntelRun) -> date:
         raise ValueError("daily build has an invalid edition date") from exc
 
 
-def _ensure_stage_d_ready(repo: IntelRepository, run_id: int) -> None:
-    """Block publication until this daily build has a complete Stage D result."""
+def _load_stage_d_selection(repo: IntelRepository, run_id: int) -> list[dict[str, Any]]:
+    """Return the validated ordered Stage-D subset for this build."""
 
     stage = repo.get_stage(int(run_id), "stage_d")
     if stage is None:
@@ -355,6 +351,31 @@ def _ensure_stage_d_ready(repo: IntelRepository, run_id: int) -> None:
         raise RuntimeError(
             f"stage_d_incomplete: run {int(run_id)} status={status} blocking_tasks={task_statuses}"
         )
+    run_tasks = [
+        task
+        for task in tasks
+        if task.subject_type == "run" and task.subject_id == str(int(run_id))
+    ]
+    if len(run_tasks) != 1 or run_tasks[0].status != "succeeded":
+        raise RuntimeError("stage_d_incomplete: Stage D run task is missing or incomplete")
+    result = run_tasks[0].result
+    if not isinstance(result, dict) or result.get("schema_version") != STAGE_D_SELECTION_SCHEMA_VERSION:
+        raise RuntimeError("stage_d_incomplete: Stage D result uses an unsupported schema")
+    candidate_event_ids = result.get("candidate_event_ids")
+    if not isinstance(candidate_event_ids, list):
+        raise RuntimeError("stage_d_incomplete: Stage D result is missing candidate_event_ids")
+    try:
+        parsed = strict_parse_stage_d_selection(
+            {
+                "schema_version": result.get("schema_version"),
+                "selected": result.get("selected"),
+            },
+            candidate_event_ids=candidate_event_ids,
+            max_selected=len(candidate_event_ids),
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"stage_d_incomplete: invalid Stage D selection: {exc}") from exc
+    return [row.model_dump(mode="json") for row in parsed.selected]
 
 
 def _manifest(
@@ -362,7 +383,6 @@ def _manifest(
     run: IntelRun,
     records: list[dict[str, Any]],
     jsonl_payload: str,
-    watchlist_count: int,
     partial: bool,
     partial_reason: str | None,
     build_summary: dict[str, Any] | None,
@@ -370,7 +390,7 @@ def _manifest(
     """Build the machine-readable metadata for a date-addressed export."""
 
     payload = {
-        "schema_version": 6,
+        "schema_version": 7,
         "edition_date": run.edition_date,
         "edition_timezone": "Asia/Shanghai",
         "artifact_status": "partial" if partial else "ready",
@@ -379,7 +399,6 @@ def _manifest(
         "partial_reason": partial_reason,
         "reference_time": _date(run.reference_time),
         "selected_count": len(records),
-        "watchlist_count": max(0, int(watchlist_count)),
         "stage_d_count": int((build_summary or {}).get("funnel", {}).get("stage_d_total", 0)),
         "stage_d_candidate_count": int((build_summary or {}).get("funnel", {}).get("stage_d_candidate_count", 0)),
         "funnel": (build_summary or {}).get("funnel", {}),
@@ -434,15 +453,18 @@ def _atomic_write_bundle(payloads: dict[Path, str]) -> None:
 def _list_export_events(
     session: Session,
     *,
+    selection: list[dict[str, Any]],
     limit: int | None,
     run_id: int,
     reference_time: datetime | None = None,
-    selected: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return selected or watchlist records from the current daily build."""
+    """Serialize selected events in the exact order returned by Stage D."""
+
+    if not selection:
+        return []
+    selected_event_ids = [int(row["event_id"]) for row in selection]
     stmt = (
-        select(IntelEventStageDSnapshot, IntelEvent)
-        .join(IntelEvent, IntelEvent.id == IntelEventStageDSnapshot.event_id)
+        select(IntelEvent)
         .options(
             joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_screen),
             joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_review),
@@ -450,69 +472,42 @@ def _list_export_events(
             joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source),
         )
         .where(
-            IntelEventStageDSnapshot.run_id == int(run_id),
-            IntelEventStageDSnapshot.selected.is_(bool(selected)),
             IntelEvent.build_id == int(run_id),
+            IntelEvent.id.in_(selected_event_ids),
         )
-        .order_by(IntelEventStageDSnapshot.display_order.asc(), IntelEvent.id.asc())
     )
-    rows = list(session.execute(stmt).unique().all())
+    by_id = {
+        int(event.id): event
+        for event in session.scalars(stmt).unique().all()
+    }
+    missing = [event_id for event_id in selected_event_ids if event_id not in by_id]
+    if missing:
+        raise RuntimeError(f"stage_d_incomplete: selected events are missing from this build: {missing}")
     records: list[dict[str, Any]] = []
-    for snapshot, event in rows:
+    for display_order, decision in enumerate(selection, start=1):
+        event = by_id[int(decision["event_id"])]
         freshness = _event_freshness(event, reference_time=reference_time)
         # Stage D is fed by the frozen build scope; repeat the freshness check
         # only to defend against malformed transient rows.
         if freshness is not None and not freshness.eligible:
             continue
-        record = _serialize_event(snapshot, event, freshness=freshness)
+        record = _serialize_event(
+            event,
+            decision=decision,
+            display_order=display_order,
+            freshness=freshness,
+        )
         records.append(record)
         if limit is not None and len(records) >= limit:
             break
     return records
 
 
-def _list_watchlist_events(
-    session: Session,
-    *,
-    run_id: int,
-    reference_time: datetime | None = None,
-    limit: int = 10,
-) -> list[dict[str, Any]]:
-    """Return at most ``limit`` public watchlist rows in display order."""
-
-    if limit <= 0:
-        return []
-    rows = _list_export_events(
-        session,
-        limit=None,
-        run_id=run_id,
-        reference_time=reference_time,
-        selected=False,
-    )
-    watchlist: list[dict[str, Any]] = []
-    for record in rows:
-        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-        if str(metadata.get("editorial_tier") or "").casefold() != "watchlist":
-            continue
-        watchlist.append(record)
-    watchlist.sort(
-        key=lambda record: (
-            _as_nonnegative_int(
-                (record.get("metadata") or {}).get("watchlist_order")
-                if isinstance(record.get("metadata"), dict)
-                else None
-            )
-            or _as_nonnegative_int(record.get("display_order")),
-            _as_nonnegative_int(record.get("event_id")),
-        )
-    )
-    return watchlist[:limit]
-
-
 def _serialize_event(
-    snapshot: IntelEventStageDSnapshot,
     event: IntelEvent,
     *,
+    decision: dict[str, Any],
+    display_order: int,
     freshness: RecentWindowDecision | None = None,
 ) -> dict[str, Any]:
     source_ids = _json_list(event.source_ids_json)
@@ -560,17 +555,15 @@ def _serialize_event(
             }
         )
     risk_flags = _json_list(event.risk_flags_json)
-    raw_metadata = _json(snapshot.metadata_json, {})
-    metadata = _public_value(raw_metadata)
-    display_title = raw_metadata.get("display_title_zh") if isinstance(raw_metadata, dict) else None
-    display_title = str(display_title).strip() if display_title else None
-    presentation = raw_metadata.get("source_presentation") if isinstance(raw_metadata, dict) else None
-    labels = {
-        "community_signal_pending_verification": ["社区线索 / 待核实"],
-        "multi_community_signal_pending_verification": ["多源社区线索 / 待核实"],
-    }.get(str(presentation), [])
     novelty = str(event.novelty_status or "unknown").casefold()
     provenance_kind = novelty if novelty in {"new", "updated", "repeat", "unknown"} else "unknown"
+    reason_code = str(decision.get("reason_code") or "selected")
+    reason = str(decision.get("reason") or "").strip()
+    metadata = {
+        "reason_code": reason_code,
+        "reason": reason,
+        "provenance": {"kind": provenance_kind},
+    }
     return {
         "record_type": "intel_event",
         "stage": "stage_d",
@@ -579,18 +572,17 @@ def _serialize_event(
         "event_key": event.event_key,
         "event_id": event.id,
         "id": event.id,
-        "display_order": snapshot.display_order,
-        "selected": bool(snapshot.selected),
-        "status": "selected" if snapshot.selected else "rejected",
-        "display_score": float(snapshot.display_score or event.display_score or 0.0),
-        "selection_score": float(snapshot.display_score or event.display_score or 0.0),
-        "topic": snapshot.topic or event.topic,
+        "display_order": int(display_order),
+        "selected": True,
+        "status": "selected",
+        "display_score": float(event.display_score or 0.0),
+        "topic": event.topic,
         "topics": _json_list(event.topics_json),
-        "content_class": snapshot.content_class or event.content_class,
-        "source_group": snapshot.source_group or event.source_group or (source_groups[0] if source_groups else None),
+        "content_class": event.content_class,
+        "source_group": event.source_group or (source_groups[0] if source_groups else None),
         "source_groups": source_groups,
         "source_ids": source_ids,
-        "title": display_title or event.title,
+        "title": event.title,
         "original_title": event.title,
         "summary": event.summary_cn,
         "summary_cn": event.summary_cn,
@@ -600,12 +592,9 @@ def _serialize_event(
             "kind": provenance_kind,
         },
         "risk_flags": risk_flags,
-        "reason": snapshot.reason,
+        "reason": reason,
+        "reason_code": reason_code,
         "metadata": metadata,
-        "story_family_id": raw_metadata.get("story_family_id") if isinstance(raw_metadata, dict) else None,
-        "family_position": raw_metadata.get("family_position") if isinstance(raw_metadata, dict) else None,
-        "editorial_score": raw_metadata.get("editorial_score") if isinstance(raw_metadata, dict) else None,
-        "presentation_labels": labels,
         "keywords": _json_list(event.keywords_json),
         "entities": _public_value(_json(event.entities_json, [])),
         "source_refs": source_refs,
@@ -649,7 +638,6 @@ def _markdown(
     edition_date: str | None = None,
     status_counts: dict[str, int] | None = None,
     failure_counts: dict[str, int] | None = None,
-    watchlist_records: list[dict[str, Any]] | None = None,
     partial: bool = False,
     partial_reason: str | None = None,
 ) -> str:
@@ -683,31 +671,13 @@ def _markdown(
                     ),
                     _event_time_line(record),
                     f"- 摘要：{record.get('summary_cn') or record.get('summary') or '暂无摘要'}",
+                    f"- 选稿依据：{record.get('reason') or '未记录'}",
                     f"- 风险：{', '.join(record.get('risk_flags') or []) or '无'}",
-                    *([f"- 展示标签：{', '.join(record.get('presentation_labels') or [])}"] if record.get("presentation_labels") else []),
                     f"- 链接：{record.get('url') or '无'}",
                     "",
                 ]
             )
             continue
-    watchlist = list(watchlist_records or [])[:10]
-    if watchlist:
-        lines.extend(["## 候选观察", "", "以下条目已进入观察池，未计入日报精选。", ""])
-        for index, record in enumerate(watchlist, start=1):
-            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-            reason_codes = metadata.get("reason_codes") if isinstance(metadata.get("reason_codes"), list) else []
-            reason = metadata.get("editorial_reason") or record.get("reason") or "暂无原因"
-            if reason_codes:
-                reason = f"{reason}（{', '.join(str(code) for code in reason_codes)}）"
-            lines.extend(
-                [
-                    f"### {index}. {record.get('title') or '(untitled)' }",
-                    f"- 摘要：{record.get('summary_cn') or record.get('summary') or '暂无摘要'}",
-                    f"- 原因：{reason}",
-                    f"- 链接：{record.get('url') or '无'}",
-                    "",
-                ]
-            )
     return "\n".join(lines) + "\n"
 
 
@@ -775,13 +745,6 @@ def _normalise_export_limit(value: int | None) -> int:
         return max(0, int(value))
     except (TypeError, ValueError, OverflowError):
         return DEFAULT_DAILY_REPORT_LIMIT
-
-
-def _as_nonnegative_int(value: object) -> int:
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError, OverflowError):
-        return 0
 
 
 def _date(value: datetime | None) -> str | None:

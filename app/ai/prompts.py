@@ -147,27 +147,3 @@ __all__ = [
     "build_openai_responses_payload",
     "PROJECT_SUMMARY_TASK",
 ]
-
-
-_INTEL_STAGE_PROMPT_EXPORTS = {
-    "INTEL_ANALYSIS_JSON_SCHEMA",
-    "INTEL_ANALYSIS_RESPONSE_SCHEMA",
-    "INTEL_ANALYSIS_SYSTEM_PROMPT",
-    "INTEL_ANALYSIS_TASK",
-    "INTEL_SCREEN_JSON_SCHEMA",
-    "INTEL_SCREEN_RESPONSE_SCHEMA",
-    "INTEL_SCREEN_SYSTEM_PROMPT",
-    "INTEL_SCREEN_TASK",
-    "build_analysis_payload",
-    "build_analysis_provider_payload",
-    "build_screen_payload",
-    "build_screen_provider_payload",
-}
-
-
-def __getattr__(name: str):
-    if name in _INTEL_STAGE_PROMPT_EXPORTS:
-        from app.ai.skills import intel_triage
-
-        return getattr(intel_triage, name)
-    raise AttributeError(name)

@@ -1,6 +1,6 @@
 """Private build summary data used while publishing an edition.
 
-The pipeline keeps durable detail in run items, stage tasks and Stage-D rows.
+The pipeline keeps durable detail in run items and generic stage tasks.
 This module derives the compact funnel/status projection needed by a daily
 manifest without relying on aggregate counter columns on :class:`IntelRun`.
 """
@@ -9,14 +9,12 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
-import json
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.storage.models import (
-    IntelEventStageDSnapshot,
     IntelRun,
     IntelRunItem,
     IntelRunStage,
@@ -98,6 +96,7 @@ def build_daily_build_summary(
     screen_tasks = tasks_by_stage.get(stages_by_name["screen"].id, []) if "screen" in stages_by_name else []
     analyze_tasks = tasks_by_stage.get(stages_by_name["analyze"].id, []) if "analyze" in stages_by_name else []
     cluster_tasks = tasks_by_stage.get(stages_by_name["cluster"].id, []) if "cluster" in stages_by_name else []
+    stage_d_tasks = tasks_by_stage.get(stages_by_name["stage_d"].id, []) if "stage_d" in stages_by_name else []
 
     time_excluded_by_reason = _time_exclusion_counts(screen_tasks)
     time_excluded = sum(time_excluded_by_reason.values())
@@ -129,10 +128,7 @@ def build_daily_build_summary(
         _failed_task_count(analyze_tasks),
     )
 
-    stage_d_total, stage_d_selected, stage_d_watchlist = _stage_d_counts(
-        session,
-        run_id=run_id,
-    )
+    stage_d_total, stage_d_selected = _stage_d_counts(stage_d_tasks)
     stage_d_metadata = stages_by_name.get("stage_d").metadata_dict if stages_by_name.get("stage_d") else {}
     stage_d_candidate_count = max(
         stage_d_total,
@@ -169,7 +165,6 @@ def build_daily_build_summary(
         "stage_d_total": stage_d_total,
         "stage_d_candidate_count": stage_d_candidate_count,
         "stage_d_selected": stage_d_selected,
-        "stage_d_watchlist": stage_d_watchlist,
     }
     funnel["full_rebuild_items"] = frozen
     return {
@@ -261,45 +256,18 @@ def _stage_details(
         for key in (
             "stage_d_version",
             "profile_version",
-            "stage_d_source",
             "prompt_version",
+            "schema_version",
             "candidate_count",
             "selected_count",
-            "watchlist_count",
-            "omitted_count",
-            "total_max",
-            "watchlist_max",
-            "recent_history_days",
+            "unselected_count",
+            "max_selected",
             "model",
             "provider_attempts",
-            "failed_phase",
-            "response_hash",
-            "provider_status_code",
-            "provider_error_code",
-            "provider_error_message",
         ):
             value = metadata.get(key)
             if value is not None:
                 details[key] = value
-        request_metadata = metadata.get("request_metadata")
-        if isinstance(request_metadata, dict):
-            # Request metadata is intentionally limited to non-secret
-            # fingerprints and transport facts; raw bodies stay in attempts.
-            details["request_metadata"] = {
-                key: request_metadata[key]
-                for key in (
-                    "endpoint",
-                    "api_style",
-                    "model",
-                    "event_count",
-                    "total_max",
-                    "prompt_version",
-                    "schema_version",
-                    "request_bytes",
-                    "request_sha256",
-                )
-                if key in request_metadata
-            }
         return details
     if stage_name in {"cluster", "export"}:
         # These stages expose their public state through the edition manifest.
@@ -434,26 +402,17 @@ def _cluster_event_count(tasks: list[IntelRunStageTask]) -> int:
     return 0
 
 
-def _stage_d_counts(
-    session: Session,
-    *,
-    run_id: int,
-) -> tuple[int, int, int]:
-    rows = session.scalars(
-        select(IntelEventStageDSnapshot)
-        .where(
-            IntelEventStageDSnapshot.run_id == run_id,
-        )
-    ).all()
-    total = len(rows)
-    selected = sum(1 for row in rows if bool(row.selected))
-    watchlist = 0
-    for row in rows:
-        metadata = _json_mapping(row.metadata_json)
-        tier = str(metadata.get("editorial_tier") or "").strip().casefold()
-        if not row.selected and tier == "watchlist":
-            watchlist += 1
-    return total, selected, watchlist
+def _stage_d_counts(tasks: list[IntelRunStageTask]) -> tuple[int, int]:
+    for task in tasks:
+        if task.subject_type != "run" or task.status != "succeeded":
+            continue
+        result = _result_mapping(task)
+        candidates = result.get("candidate_event_ids")
+        selected = result.get("selected")
+        total_count = len(candidates) if isinstance(candidates, list) else 0
+        selected_count = len(selected) if isinstance(selected, list) else 0
+        return total_count, selected_count
+    return 0, 0
 
 
 def _result_mapping(task: IntelRunStageTask) -> dict[str, Any]:
@@ -477,18 +436,6 @@ def _as_nonnegative_int(value: object) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
-
-
-def _json_mapping(value: object) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return dict(value)
-    if not value:
-        return {}
-    try:
-        parsed = json.loads(str(value))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return {}
-    return dict(parsed) if isinstance(parsed, dict) else {}
 
 
 def _is_int_like(value: object) -> bool:

@@ -23,7 +23,7 @@ def test_pipeline_help_lists_only_date_addressed_formal_commands():
     result = runner.invoke(main.app, ["pipeline", "--help"])
 
     assert result.exit_code == 0
-    for command in ("run", "start", "stage-a", "stage-b", "stage-c", "stage-d", "export", "status", "retry", "resume"):
+    for command in ("run", "start", "stage-a", "stage-b1", "stage-c", "stage-d", "export", "status", "retry", "resume"):
         assert command in result.stdout
     assert "adopt-existing" not in result.stdout
     assert "run-id" not in result.stdout
@@ -108,7 +108,7 @@ def test_failed_fetch_keeps_a_partial_build_open_for_downstream_stages(tmp_path)
     assert fetch["failed"] == 1
 
 
-def test_retry_stage_b_targets_only_current_draft_stage_b_tasks(tmp_path, monkeypatch):
+def test_retry_stage_b1_targets_only_current_draft_stage_b1_tasks(tmp_path, monkeypatch):
     settings = Settings(database_url=f"sqlite:///{tmp_path / 'pipeline.db'}")
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
@@ -132,7 +132,7 @@ def test_retry_stage_b_targets_only_current_draft_stage_b_tasks(tmp_path, monkey
     value = orchestrator.retry_pipeline_stage_from_settings(
         settings=settings,
         run_id=draft.id,
-        stage="stage-b",
+        stage="stage-b1",
     )
 
     assert value is not None

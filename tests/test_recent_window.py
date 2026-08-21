@@ -11,6 +11,7 @@ from app.ai.skills.stage_c_aggregation import (
     StageCAggregationResponse,
 )
 from app.ai.skills.intel_triage import ScreenResult
+from app.ai.skills.stage_d_selection import STAGE_D_SELECTION_SCHEMA_VERSION
 from app.domain.models import FetchItem, SourceSpec
 from app.domain.recency import recent_window_decision, recent_window_scope
 from app.jobs.event_cluster_job import run_event_cluster_job
@@ -23,7 +24,6 @@ from app.storage.models import (
     AIItemReview,
     IntelEvent,
     IntelEventItem,
-    IntelEventStageDSnapshot,
     IntelItem,
     IntelRunItem,
     IntelRunStageTask,
@@ -119,8 +119,7 @@ class _StageCClient:
                 {
                     "title_zh": str(item["title"]),
                     "summary_zh": str(item.get("summary_cn") or item["title"]),
-                    "primary_item_id": int(item["id"]),
-                    "members": [{"item_id": int(item["id"]), "relation": "primary"}],
+                    "item_ids": [int(item["id"])],
                     "novelty_status": "new",
                     "prior_event_key": None,
                 }
@@ -296,7 +295,7 @@ def test_stage_c_uses_successful_stage_b_items_without_reapplying_recency(tmp_pa
             assert inserted.item_id is not None
             item = session.get(IntelItem, inserted.item_id)
             assert item is not None
-            item.selection_score = 80
+            item.b1_priority = 80
             item.status = "candidate"
             item_ids[title] = int(item.id)
             session.add(
@@ -306,7 +305,7 @@ def test_stage_c_uses_successful_stage_b_items_without_reapplying_recency(tmp_pa
                     topic="model_release",
                     topics_json='["model_release"]',
                     keywords_json='["release"]',
-                    selection_score=80,
+                    b1_priority=80,
                     status="success",
                 )
             )
@@ -431,26 +430,39 @@ def test_daily_build_export_cannot_leak_a_stale_primary_item(tmp_path):
             last_seen_at=stale.published_at,
         )
         repo.upsert_event_item(event.id, stale.id, source_id=source.id, is_primary=True)
-        session.add(
-            IntelEventStageDSnapshot(
-                run_id=run.id,
-                event_id=event.id,
-                display_order=1,
-                display_score=90,
-                selected=True,
-            )
-        )
         cluster = repo.ensure_stage(run.id, "cluster")
         cluster_task = repo.ensure_stage_task(
             cluster, subject_type="run", subject_id=run.id, target_run_id=run.id
         )
-        repo.complete_stage_task(cluster_task, result={"current_event_ids": [event.id]})
+        repo.complete_stage_task(
+            cluster_task,
+            result={
+                "current_event_ids": [event.id],
+                "candidate_event_ids": [event.id],
+            },
+        )
         repo.finish_stage(cluster, status="succeeded")
         stage_d = repo.ensure_stage(run.id, "stage_d")
         stage_d_task = repo.ensure_stage_task(
             stage_d, subject_type="run", subject_id=run.id, target_run_id=run.id
         )
-        repo.complete_stage_task(stage_d_task, result={"selected": 1})
+        repo.complete_stage_task(
+            stage_d_task,
+            result={
+                "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+                "candidate_event_ids": [event.id],
+                "selected": [
+                    {
+                        "event_id": event.id,
+                        "reason_code": "test_selection",
+                        "reason": "用于验证导出端仍会拒绝超出时间窗的异常候选。",
+                    }
+                ],
+                "input_fingerprint": "test-input",
+                "config_fingerprint": "test-config",
+                "provider_attempts": 1,
+            },
+        )
         repo.finish_stage(stage_d, status="succeeded")
         repo.freeze_run_scope(run.id)
         session.commit()

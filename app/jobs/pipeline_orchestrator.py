@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
 from app.ai.skills.intel_triage import IntelTriageClient
-from app.ai.skills.stage_d_editorial import StageDEditorialClient
+from app.ai.skills.stage_d_selection import MIN_STAGE_D_TIMEOUT_SECONDS, StageDSelectionClient
 from app.config.limits import (
     DEFAULT_AI_REVIEW_LIMIT,
     DEFAULT_DAILY_REPORT_LIMIT,
@@ -45,7 +45,7 @@ from app.jobs.export_job import (
 from app.jobs.fetch_job import IntelFetchResult, run_intel_fetch_from_settings
 from app.jobs.stage_a_screen_job import StageAScreenResult, run_stage_a_screen_job
 from app.jobs.stage_b_analysis_job import StageBAnalysisResult, run_stage_b_analysis_job
-from app.jobs.stage_d_job import StageDResult, run_stage_d_from_settings
+from app.jobs.stage_d_job import STAGE_D_VERSION, StageDResult, run_stage_d_from_settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import DailyEdition, IntelRun
 from app.storage.draft_workspace import (
@@ -66,17 +66,17 @@ from app.storage.repository import DAILY_EDITION_TIMEZONE, IntelRepository, Stag
 logger = logging.getLogger(__name__)
 
 
-STAGE_ALIASES: dict[str, str] = {
+PUBLIC_STAGE_NAMES: dict[str, str] = {
     "fetch": "fetch",
     "stage-a": "screen",
-    "stage-b": "analyze",
+    "stage-b1": "analyze",
     "stage-c": "cluster",
     "stage-d": "stage_d",
 }
 DISPLAY_STAGE_NAMES = {
     "fetch": "fetch",
     "screen": "stage-a",
-    "analyze": "stage-b",
+    "analyze": "stage-b1",
     "cluster": "stage-c",
     "stage_d": "stage-d",
     "export": "export",
@@ -147,10 +147,12 @@ class PipelineExecutionResult:
 
 def normalize_stage(value: str) -> str:
     key = str(value or "").strip().casefold()
+    if key in PIPELINE_STAGE_ORDER:
+        return key
     try:
-        return STAGE_ALIASES[key]
+        return PUBLIC_STAGE_NAMES[key]
     except KeyError as exc:
-        allowed = ", ".join(sorted(set(STAGE_ALIASES.values())))
+        allowed = ", ".join((*PUBLIC_STAGE_NAMES, "screen", "analyze", "cluster", "stage_d"))
         raise ValueError(f"unknown pipeline stage {value!r}; expected one of: {allowed}") from exc
 
 
@@ -723,12 +725,11 @@ def run_pipeline_stage_d_from_settings(
     force: bool = False,
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
-    event_ids: Iterable[int] | None = None,
 ) -> StageDResult:
     _, session_factory = _engine_and_factory(settings)
     if ai_client is None:
         with httpx.Client(
-            timeout=settings.ai_stage_d_timeout_seconds,
+            timeout=max(float(settings.ai_review_timeout_seconds), MIN_STAGE_D_TIMEOUT_SECONDS),
             follow_redirects=True,
             http2=True,
             trust_env=True,
@@ -739,8 +740,7 @@ def run_pipeline_stage_d_from_settings(
                 run_id=int(run_id),
                 force=force,
                 profile_path=profile_path,
-                ai_client=StageDEditorialClient.from_settings(settings, http_client=http_client),
-                event_ids=event_ids,
+                ai_client=StageDSelectionClient.from_settings(settings, http_client=http_client),
             )
     else:
         result = run_stage_d_from_settings(
@@ -749,7 +749,6 @@ def run_pipeline_stage_d_from_settings(
             force=force,
             profile_path=profile_path,
             ai_client=ai_client,
-            event_ids=event_ids,
         )
     _sync_pipeline_run_status(session_factory, int(run_id), finalize=False)
     return result
@@ -1115,7 +1114,7 @@ def _stage_needs_resume(
                         return True
                     if settings is not None and metadata.get("input_min_score") != settings.ai_stage_c_input_min_score:
                         return True
-                if stage_name == "stage_d" and str(metadata.get("stage_d_version") or "") != "stage-d-v4":
+                if stage_name == "stage_d" and str(metadata.get("stage_d_version") or "") != STAGE_D_VERSION:
                     return True
             if stage.status in {"pending", "retry_waiting", "failed", "blocked"}:
                 return True

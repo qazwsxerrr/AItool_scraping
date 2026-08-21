@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from app.ai.skills.intel_triage import RawIntelEnvelope, build_analysis_provider_payload, parse_analysis_result
+from app.ai.skills.intel_triage import (
+    RawIntelEnvelope,
+    build_analysis_provider_payload,
+    parse_analysis_result,
+)
 
 
 def _payload(**overrides):
@@ -13,16 +17,13 @@ def _payload(**overrides):
         "summary_cn": "Acme 发布 Model X",
         "keywords": ["Model X"],
         "entities": [],
-        "selection_score": 88,
+        "b1_priority": 88,
         "score_components": {
-            "relevance": 88,
-            "importance": 88,
-            "impact": 88,
-            "freshness": 88,
-            "source_authority": 88,
+            "audience_relevance": 88,
+            "material_change": 88,
+            "impact_scope": 88,
+            "independent_news_value": 88,
             "specificity": 88,
-            "tracking_value": 88,
-            "total": 88,
         },
     }
     value.update(overrides)
@@ -33,7 +34,7 @@ def test_stage_b_minimal_projection_is_parseable():
     result = parse_analysis_result(_payload())
     assert result.summary_cn == "Acme 发布 Model X"
     assert result.keywords == ["Model X"]
-    assert result.selection_score == 88
+    assert result.b1_priority == 88
     assert not hasattr(result, "candidate_role")
     assert not hasattr(result, "event_signature")
     assert not hasattr(result, "material_facts")
@@ -51,6 +52,12 @@ def test_removed_stage_b_fields_are_rejected_by_strict_contract():
         "risk_flags": [],
         "reason": "legacy reason",
         "confidence": 90,
+        "source_content_class": "official_model_company",
+        "source_group": "official_blog",
+        "source_role": "first_party_official",
+        "source_subtype": "website",
+        "source_tier": "tier_1",
+        "primary_eligible": True,
     }.items():
         with pytest.raises(ValidationError):
             parse_analysis_result(_payload(**{field: value}))
@@ -65,7 +72,7 @@ def test_provider_schema_contains_only_minimal_analysis_fields():
         "summary_cn",
         "keywords",
         "entities",
-        "selection_score",
+        "b1_priority",
         "score_components",
     }
     assert "candidate_role" not in schema["properties"]
@@ -78,3 +85,60 @@ def test_provider_schema_contains_only_minimal_analysis_fields():
     assert "risk_flags" not in schema["properties"]
     assert "reason" not in schema["properties"]
     assert "confidence" not in schema["properties"]
+    assert set(schema["properties"]["score_components"]["properties"]) == {
+        "audience_relevance",
+        "material_change",
+        "impact_scope",
+        "independent_news_value",
+        "specificity",
+    }
+
+
+def test_b1_score_schema_declares_the_zero_to_hundred_scale():
+    envelope = RawIntelEnvelope(source_id="test", title="Test item", body_text="Test body")
+    schema = build_analysis_provider_payload(envelope, api_style="openai_chat")["response_format"]["json_schema"]["schema"]
+
+    score_fields = [
+        "audience_relevance",
+        "material_change",
+        "impact_scope",
+        "independent_news_value",
+        "specificity",
+    ]
+    assert "0–100" in schema["properties"]["b1_priority"]["description"]
+    for field in score_fields:
+        definition = schema["properties"]["score_components"]["properties"][field]
+        assert definition["minimum"] == 0
+        assert definition["maximum"] == 100
+        assert "0–100" in definition["description"]
+
+
+def test_legacy_score_dimensions_are_rejected_by_the_b1_v2_contract():
+    with pytest.raises(ValueError, match="score_components is missing required fields"):
+        parse_analysis_result(
+            _payload(
+                score_components={
+                    "relevance": 88,
+                    "importance": 88,
+                    "impact": 88,
+                    "freshness": 88,
+                    "source_authority": 88,
+                    "specificity": 88,
+                    "tracking_value": 88,
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize("legacy_field", ("selection_score", "score", "display_score", "total_score"))
+def test_legacy_b1_priority_aliases_are_rejected(legacy_field):
+    payload = _payload()
+    payload[legacy_field] = payload.pop("b1_priority")
+
+    with pytest.raises(ValueError, match="b1_priority"):
+        parse_analysis_result(payload)
+
+
+def test_redundant_score_components_total_is_rejected():
+    with pytest.raises(ValidationError):
+        parse_analysis_result(_payload(score_components={**_payload()["score_components"], "total": 88}))

@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from app.ai.skills.stage_d_editorial.client import StageDEditorialClient
+from app.ai.skills.stage_d_selection.client import StageDSelectionClient
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, init_db
 
@@ -52,49 +52,22 @@ def test_settings_stage_c_input_min_score_defaults_to_60(monkeypatch):
     assert settings.ai_stage_c_input_min_score == 60
 
 
-def test_settings_stage_d_requires_its_own_configuration(monkeypatch):
-    for name in (
-        "AI_REVIEW_API_URL",
-        "AI_REVIEW_API_KEY",
-        "AI_REVIEW_MODEL",
-        "AI_STAGE_D_API_URL",
-        "AI_STAGE_D_API_KEY",
-        "AI_STAGE_D_MODEL",
-        "AI_STAGE_D_RETRIES",
-    ):
+def test_settings_stage_d_reuses_ai_review_configuration(monkeypatch):
+    for name in ("AI_REVIEW_API_URL", "AI_REVIEW_API_KEY", "AI_REVIEW_MODEL", "AI_REVIEW_API_STYLE", "REQUEST_RETRIES"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AI_REVIEW_API_URL", "https://review.example/v1")
     monkeypatch.setenv("AI_REVIEW_API_KEY", "review-secret")
     monkeypatch.setenv("AI_REVIEW_MODEL", "review-model")
-
-    unconfigured = Settings.from_env(dotenv_path="/path/that/does/not/exist")
-    assert unconfigured.ai_stage_d_api_url is None
-    assert unconfigured.ai_stage_d_api_key is None
-    assert unconfigured.ai_stage_d_model is None
-
-    monkeypatch.setenv("AI_STAGE_D_API_URL", "https://editor.example/v1")
-    monkeypatch.setenv("AI_STAGE_D_API_KEY", "editor-secret")
-    monkeypatch.setenv("AI_STAGE_D_MODEL", "editor-model")
-    monkeypatch.setenv("AI_STAGE_D_RETRIES", "3")
-    dedicated = Settings.from_env(dotenv_path="/path/that/does/not/exist")
-    assert dedicated.ai_stage_d_api_url == "https://editor.example/v1"
-    assert dedicated.ai_stage_d_api_key == "editor-secret"
-    assert dedicated.ai_stage_d_model == "editor-model"
-    assert dedicated.ai_stage_d_retries == 3
-    client = StageDEditorialClient.from_settings(dedicated)
-    assert client.max_retries == 3
-
-
-def test_settings_stage_d_timeout_is_independent_and_defaults_to_120(monkeypatch):
-    for name in ("AI_REVIEW_TIMEOUT_SECONDS", "AI_STAGE_D_TIMEOUT_SECONDS"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("AI_REVIEW_TIMEOUT_SECONDS", "7")
+    monkeypatch.setenv("AI_REVIEW_API_STYLE", "openai_responses")
+    monkeypatch.setenv("REQUEST_RETRIES", "3")
     settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
-    assert settings.ai_stage_d_timeout_seconds == 120.0
-
-    monkeypatch.setenv("AI_STAGE_D_TIMEOUT_SECONDS", "31")
-    overridden = Settings.from_env(dotenv_path="/path/that/does/not/exist")
-    assert overridden.ai_stage_d_timeout_seconds == 31.0
+    client = StageDSelectionClient.from_settings(settings)
+    assert client.api_url == "https://review.example/v1"
+    assert client.api_key == "review-secret"
+    assert client.model == "review-model"
+    assert client.api_style == "openai_responses"
+    assert client.max_retries == 3
+    assert client.timeout_seconds >= 120
 
 
 def test_settings_read_category_taxonomy(monkeypatch):

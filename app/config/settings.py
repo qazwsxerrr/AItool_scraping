@@ -55,23 +55,12 @@ class Settings:
     ai_stage_c_input_min_score: int = DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE
     ai_review_concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY
     ai_review_categories: tuple[str, ...] = DEFAULT_AI_REVIEW_CATEGORIES
-    # Stage D is an independent editorial provider contract. Its settings are
-    # intentionally explicit and never inherit Stage A/B provider values.
-    ai_stage_d_api_url: str | None = None
-    ai_stage_d_api_key: str | None = field(default=None, repr=False)
-    ai_stage_d_model: str | None = None
-    ai_stage_d_api_style: str = "generic_json"
-    ai_stage_d_timeout_seconds: float = 120.0
-    ai_stage_d_retries: int = 2
 
     @classmethod
     def from_env(cls, dotenv_path: str | Path = ".env") -> "Settings":
         load_dotenv(dotenv_path)
         rsshub_base_url = _env_value("RSSHUB_BASE_URL")
         ai_review_model = os.getenv("AI_REVIEW_MODEL") or None
-        ai_stage_d_api_url = _env_value("AI_STAGE_D_API_URL")
-        ai_stage_d_api_key = _env_value("AI_STAGE_D_API_KEY")
-        ai_stage_d_model = _env_value("AI_STAGE_D_MODEL")
         categories = _parse_categories(os.getenv("AI_REVIEW_CATEGORIES"))
         return cls(
             database_url=os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL),
@@ -103,12 +92,6 @@ class Settings:
                 _bounded_int(os.getenv("AI_REVIEW_CONCURRENCY"), DEFAULT_AI_REVIEW_CONCURRENCY),
             ),
             ai_review_categories=categories,
-            ai_stage_d_api_url=ai_stage_d_api_url,
-            ai_stage_d_api_key=ai_stage_d_api_key,
-            ai_stage_d_model=ai_stage_d_model,
-            ai_stage_d_api_style=_env_value("AI_STAGE_D_API_STYLE") or "generic_json",
-            ai_stage_d_timeout_seconds=float(os.getenv("AI_STAGE_D_TIMEOUT_SECONDS", "120")),
-            ai_stage_d_retries=max(0, _bounded_int(os.getenv("AI_STAGE_D_RETRIES"), 2)),
         )
 
 

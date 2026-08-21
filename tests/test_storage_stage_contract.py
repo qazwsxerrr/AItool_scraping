@@ -28,6 +28,15 @@ def test_fresh_schema_contains_stage_rows_and_run_scope(tmp_path):
     assert {"ai_item_screens", "ai_item_reviews", "intel_runs", "intel_run_items"} <= tables
 
 
+def test_fresh_schema_uses_only_canonical_b1_priority_columns(tmp_path):
+    _factory(tmp_path)
+    with sqlite3.connect(tmp_path / "intel.db") as connection:
+        for table in ("intel_items", "ai_item_reviews"):
+            columns = {row[1] for row in connection.execute(f"pragma table_info({table})")}
+            assert "b1_priority" in columns
+            assert "selection_score" not in columns
+
+
 def test_old_schema_fails_fast_without_alter_or_backfill(tmp_path):
     database = tmp_path / "old.db"
     with sqlite3.connect(database) as connection:
@@ -88,8 +97,14 @@ def test_stage_a_b_raw_payloads_and_run_scope_are_serially_persisted(tmp_path):
                 "summary_cn": "一段摘要",
                 "keywords": ["release"],
                 "entities": [{"name": "Acme", "type": "company"}],
-                "selection_score": 88,
-                "score_components": {"total": 88, "impact": 80},
+                "b1_priority": 88,
+                "score_components": {
+                    "audience_relevance": 88,
+                    "material_change": 88,
+                    "impact_scope": 80,
+                    "independent_news_value": 88,
+                    "specificity": 88,
+                },
                 "raw_response": {"provider": "analysis"},
             },
             run_id=run.id,
