@@ -7,55 +7,49 @@ DEFAULT_AI_REVIEW_LIMIT: int | None = None
 """Default AI item cap. ``None`` means no global cap."""
 
 DEFAULT_AI_SCREEN_REJECT_THRESHOLD = 90
-"""Minimum Stage A confidence required for a hard rejection."""
+"""Minimum Stage-A confidence required for a hard rejection."""
 
 DEFAULT_AI_ANALYSIS_MIN_SCORE = 60
-"""Low-signal annotation threshold for a successful Stage-B analysis.
+"""Minimum deterministic Stage-B score admitted to the C-agent workbench."""
 
-It only annotates a completed Stage-B analysis.  Stage C owns its own input
-threshold.
-"""
-
-DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE = 60
-"""Minimum guarded Stage-B score admitted to the Stage-C aggregation input.
-
-Stage C receives the successful B1 projections directly; this is only a
-deterministic score floor, not a separate routing stage.
-"""
-
-STAGE_C_BATCH_ITEM_LIMIT = 32
-"""Maximum number of candidates in one bounded Stage-C provider request."""
-
-STAGE_C_BATCH_INPUT_BYTE_LIMIT = 48 * 1024
-"""Conservative serialized-input budget for one Stage-C candidate batch."""
-
-STAGE_C_AGGREGATION_MODE = "ai_partitioned_calls_v2"
-"""Execution contract for bounded Stage-C aggregation requests."""
-
-STAGE_C_INPUT_POLICY_VERSION = "stage_c_direct_b1_score_gate_v2"
-"""Version of the direct-B1 Stage-C input-selection contract."""
+DEFAULT_STAGE_B_ACTIVE_TARGET = 100
+DEFAULT_STAGE_B_ACTIVE_MIN = 60
+DEFAULT_STAGE_B_ACTIVE_MAX = 120
+DEFAULT_STAGE_B_RESERVE_LIMIT = 20
+STAGE_B_ADMISSION_POLICY_VERSION = "stage_b_admission_v1"
 
 DEFAULT_AI_REVIEW_CONCURRENCY = 4
 """Maximum concurrent provider calls for Stage A or Stage B."""
 
+STAGE_C_AGENT_VERSION = "stage_c_agent_v3"
+DEFAULT_STAGE_C_AGENT_MAX_TURNS = 24
+DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS = 80
+DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES = 8
+DEFAULT_STAGE_C_AGENT_HISTORY_DAYS = 3
+
 DEFAULT_DAILY_REPORT_LIMIT = 30
-"""Default number of items for one editorial/daily export."""
+"""Hard maximum number of selected events in one daily report."""
 
 RECENT_WINDOW_HOURS = 72
 """Hard maximum age for items admitted to a run's AI/news pipeline."""
 
 
 __all__ = [
+    "DEFAULT_AI_ANALYSIS_MIN_SCORE",
+    "DEFAULT_AI_REVIEW_CONCURRENCY",
     "DEFAULT_AI_REVIEW_LIMIT",
     "DEFAULT_AI_SCREEN_REJECT_THRESHOLD",
-    "DEFAULT_AI_ANALYSIS_MIN_SCORE",
-    "DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE",
-    "STAGE_C_AGGREGATION_MODE",
-    "STAGE_C_BATCH_INPUT_BYTE_LIMIT",
-    "STAGE_C_BATCH_ITEM_LIMIT",
-    "STAGE_C_INPUT_POLICY_VERSION",
-    "DEFAULT_AI_REVIEW_CONCURRENCY",
     "DEFAULT_DAILY_REPORT_LIMIT",
     "DEFAULT_FETCH_LIMIT_PER_SOURCE",
+    "DEFAULT_STAGE_B_ACTIVE_MAX",
+    "DEFAULT_STAGE_B_ACTIVE_MIN",
+    "DEFAULT_STAGE_B_ACTIVE_TARGET",
+    "DEFAULT_STAGE_B_RESERVE_LIMIT",
+    "DEFAULT_STAGE_C_AGENT_HISTORY_DAYS",
+    "DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS",
+    "DEFAULT_STAGE_C_AGENT_MAX_TURNS",
+    "DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES",
     "RECENT_WINDOW_HOURS",
+    "STAGE_B_ADMISSION_POLICY_VERSION",
+    "STAGE_C_AGENT_VERSION",
 ]

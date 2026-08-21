@@ -123,7 +123,7 @@ def test_stage_c_history_is_seeded_from_prior_published_reports_only(tmp_path):
     with create_session_factory(draft_engine)() as session:
         run = session.get(IntelRun, build.id)
         assert run is not None
-        history = _load_published_daily_history(session, run=run, days=3)
+        history = _load_published_daily_history(IntelRepository(session), run=run, days=3)
         assert [row["event_key"] for row in history] == ["url:https://daily.example/repeat"]
         current_event = session.get(IntelEvent, current.id)
         assert current_event is not None

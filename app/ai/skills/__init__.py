@@ -4,4 +4,4 @@ The package is intentionally small: individual skills expose pure contracts
 and provider adapters without importing storage or job orchestration code.
 """
 
-__all__ = ["intel_triage", "stage_c_aggregation", "stage_d_selection"]
+__all__ = ["intel_triage", "stage_c_agent", "stage_d_selection"]

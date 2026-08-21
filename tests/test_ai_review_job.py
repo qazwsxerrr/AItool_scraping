@@ -178,11 +178,11 @@ def test_daily_stage_a_b_keeps_all_successful_analyses_and_marks_low_signal(tmp_
 
     assert stage_a.screened_out == 1
     assert stage_b.analyzed == 3
-    assert stage_b.analysis_filtered == 0
-    assert stage_b.candidate == 3
+    assert stage_b.analysis_filtered == 1
+    assert stage_b.candidate == 2
     with session_factory() as session:
         rows = session.scalars(select(IntelItem).order_by(IntelItem.id)).all()
-        assert [row.status for row in rows] == ["screened_out", "candidate", "candidate", "candidate"]
+        assert [row.status for row in rows] == ["screened_out", "analysis_filtered", "candidate", "candidate"]
         assert rows[1].ai_review.b1_priority == 59
         assert rows[2].ai_review.b1_priority == 99
         run_tasks = session.scalars(

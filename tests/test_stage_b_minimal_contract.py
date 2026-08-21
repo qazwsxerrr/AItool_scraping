@@ -65,7 +65,7 @@ def test_removed_stage_b_fields_are_rejected_by_strict_contract():
 
 def test_provider_schema_contains_only_minimal_analysis_fields():
     envelope = RawIntelEnvelope(source_id="test", title="Test item", body_text="Test body")
-    schema = build_analysis_provider_payload(envelope, api_style="openai_chat")["response_format"]["json_schema"]["schema"]
+    schema = build_analysis_provider_payload(envelope)["text"]["format"]["schema"]
     assert set(schema["required"]) == {
         "topic",
         "topics",
@@ -96,7 +96,7 @@ def test_provider_schema_contains_only_minimal_analysis_fields():
 
 def test_b1_score_schema_declares_the_zero_to_hundred_scale():
     envelope = RawIntelEnvelope(source_id="test", title="Test item", body_text="Test body")
-    schema = build_analysis_provider_payload(envelope, api_style="openai_chat")["response_format"]["json_schema"]["schema"]
+    schema = build_analysis_provider_payload(envelope)["text"]["format"]["schema"]
 
     score_fields = [
         "audience_relevance",

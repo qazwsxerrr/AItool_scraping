@@ -72,7 +72,7 @@ def _assert_supported_schema(engine: Engine) -> None:
         "Existing database schema is unsupported by the current pipeline; "
         "no conversion is available and no automatic migration is performed: "
         + "; ".join(details)
-        + ". Migrate or reinitialize it explicitly."
+        + ". Reinitialize it explicitly."
     )
 
 

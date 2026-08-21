@@ -2,203 +2,20 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping
 
 import pytest
 from sqlalchemy import select
 
-from app.ai.skills.stage_c_aggregation import (
-    STAGE_C_SCHEMA_VERSION,
-    StageCAggregationCallResult,
-    StageCAggregationClient,
-    StageCAggregationProviderError,
-    StageCAggregationResponse,
-)
+from app.ai.responses import AgentBudgetExceeded, AgentProtocolError, AgentRunResult
 from app.domain.models import FetchItem
-from app.jobs.event_cluster_job import (
-    canonical_event_key,
-    normalize_event_title,
-    run_event_cluster_job,
-)
+from app.jobs.event_cluster_job import _stage_c_lease_seconds, run_event_cluster_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import (
-    AIItemReview,
-    DailyEditionReportEntry,
-    IntelEvent,
-    IntelEventItem,
-    IntelRunStage,
-    IntelRunStageTask,
-    Source,
-)
+from app.storage.models import AIItemReview, IntelAgentSession, IntelEvent, IntelEventEvidence, IntelRunStageTask, Source
 from app.storage.repository import IntelRepository
 
 
 NOW = datetime(2026, 8, 19, 8, tzinfo=timezone.utc)
-
-
-class _AggregationClient:
-    model = "stage-c-test"
-
-    def __init__(
-        self,
-        responder: Callable[[Sequence[Mapping[str, Any]], Sequence[Mapping[str, Any]]], dict[str, Any]],
-    ) -> None:
-        self.responder = responder
-        self.calls: list[dict[str, Any]] = []
-
-    def aggregate(self, current_items, *, recent_history, edition):
-        self.calls.append(
-            {
-                "current_items": list(current_items),
-                "recent_history": list(recent_history),
-                "edition": dict(edition),
-            }
-        )
-        raw = self.responder(current_items, recent_history)
-        return StageCAggregationCallResult(
-            parsed=StageCAggregationResponse.model_validate(raw),
-            raw_response=raw,
-            request_metadata={"model": self.model, "call_count": len(self.calls)},
-        )
-
-
-class _FailingAggregationClient:
-    model = "stage-c-test"
-
-    def aggregate(self, current_items, *, recent_history, edition):
-        raise RuntimeError("provider unavailable")
-
-
-class _SecondBatchFailureClient:
-    model = "stage-c-test"
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def aggregate(self, current_items, *, recent_history, edition):
-        self.calls += 1
-        if self.calls == 2:
-            raise RuntimeError("provider unavailable on second partition")
-        raw = _new_clusters(current_items, recent_history)
-        return StageCAggregationCallResult(
-            parsed=StageCAggregationResponse.model_validate(raw),
-            raw_response=raw,
-            request_metadata={"model": self.model, "call_count": self.calls},
-        )
-
-
-class _HttpResponse:
-    status_code = 200
-
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
-
-    def raise_for_status(self) -> None:
-        return None
-
-    def json(self) -> dict[str, Any]:
-        return self.payload
-
-
-class _HttpClient:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
-        self.calls = 0
-
-    def post(self, url, *, headers, json, timeout):
-        self.calls += 1
-        return _HttpResponse(self.payload)
-
-
-class _FlakyHttpClient:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
-        self.calls = 0
-
-    def post(self, url, *, headers, json, timeout):
-        self.calls += 1
-        if self.calls == 1:
-            raise TimeoutError("timed out")
-        return _HttpResponse(self.payload)
-
-
-def _new_clusters(current_items, _history):
-    return {
-        "schema_version": STAGE_C_SCHEMA_VERSION,
-        "clusters": [
-            {
-                "title_zh": str(item["title"]),
-                "summary_zh": str(item.get("summary_cn") or item["title"]),
-                "item_ids": [int(item["id"])],
-                "novelty_status": "new",
-                "prior_event_key": None,
-            }
-            for item in current_items
-        ],
-    }
-
-
-def _merge_all(current_items, _history):
-    primary = current_items[0]
-    return {
-        "schema_version": STAGE_C_SCHEMA_VERSION,
-        "clusters": [
-            {
-                "title_zh": "模型发布汇总",
-                "summary_zh": "多条来源共同描述同一模型发布事件。",
-                "item_ids": [int(item["id"]) for item in current_items],
-                "novelty_status": "new",
-                "prior_event_key": None,
-            }
-        ],
-    }
-
-
-def _repeat_first(current_items, history):
-    item = current_items[0]
-    return {
-        "schema_version": STAGE_C_SCHEMA_VERSION,
-        "clusters": [
-            {
-                "title_zh": "模型发布重复消息",
-                "summary_zh": "该消息与前一日已发布事件相同，没有实质更新。",
-                "item_ids": [int(item["id"])],
-                "novelty_status": "repeat",
-                "prior_event_key": str(history[0]["event_key"]),
-            }
-        ],
-    }
-
-
-def _updated_first(current_items, history):
-    item = current_items[0]
-    return {
-        "schema_version": STAGE_C_SCHEMA_VERSION,
-        "clusters": [
-            {
-                "title_zh": "模型发布新增企业能力",
-                "summary_zh": "同一事件出现了可独立报道的新进展。",
-                "item_ids": [int(item["id"])],
-                "novelty_status": "updated",
-                "prior_event_key": str(history[0]["event_key"]),
-            }
-        ],
-    }
-
-
-def _repeat_all(current_items, history):
-    return {
-        "schema_version": STAGE_C_SCHEMA_VERSION,
-        "clusters": [
-            {
-                "title_zh": "模型发布重复消息",
-                "summary_zh": "该消息与前一日已发布事件相同，没有实质更新。",
-                "item_ids": [int(item["id"]) for item in current_items],
-                "novelty_status": "repeat",
-                "prior_event_key": str(history[0]["event_key"]),
-            }
-        ],
-    }
 
 
 def _db():
@@ -207,602 +24,396 @@ def _db():
     return create_session_factory(engine)
 
 
-def _seed_daily_build(session_factory, *, edition_date: str, rows: list[dict[str, Any]]) -> tuple[int, list[int]]:
+def _seed_build(
+    session_factory,
+    *,
+    rows: list[tuple[str, int, str]],
+    edition_date: str = "2026-08-19",
+) -> tuple[int, dict[str, int]]:
     with session_factory() as session:
         repo = IntelRepository(session)
-        for source_id in sorted({row["source_id"] for row in rows}):
-            session.add(
-                Source(
-                    id=source_id,
-                    name=source_id,
-                    transport="feed",
-                    url=f"https://{source_id}.example/feed.xml",
-                    source_group="official_blog",
-                    content_class="official_model_company",
-                )
+        session.add(
+            Source(
+                id="agent-source",
+                name="Agent source",
+                transport="feed",
+                url="https://source.example/feed.xml",
+                source_group="official_blog",
+                source_role="official",
+                primary_eligible=True,
+                content_class="official_model_company",
             )
+        )
         session.flush()
-        _, build = repo.start_daily_build(edition_date=edition_date, reference_time=NOW)
-        item_ids: list[int] = []
-        for row in rows:
+        _, run = repo.start_daily_build(edition_date=edition_date, reference_time=NOW)
+        stage = repo.ensure_stage(run.id, "analyze")
+        ids: dict[str, int] = {}
+        admissions: list[dict[str, Any]] = []
+        for index, (title, score, decision) in enumerate(rows, start=1):
             inserted = repo.insert_item(
                 FetchItem(
-                    source_id=row["source_id"],
-                    external_id=row.get("external_id"),
-                    url=row.get("url"),
-                    title=row["title"],
-                    summary=row.get("summary") or row["title"],
+                    source_id="agent-source",
+                    external_id=f"agent-{index}",
+                    title=title,
+                    summary=f"{title} 的摘要",
+                    content_text=f"{title} 的完整正文，含有可聚合的发布信息。",
+                    url=f"https://source.example/{index}",
                     content_class="official_model_company",
                     published_at=NOW,
                     captured_at=NOW,
                 ),
-                run_id=build.id,
+                run_id=run.id,
             )
             assert inserted.item_id is not None
-            item_ids.append(int(inserted.item_id))
+            item_id = int(inserted.item_id)
+            ids[title] = item_id
             session.add(
                 AIItemReview(
-                    item_id=int(inserted.item_id),
+                    item_id=item_id,
                     content_class="official_model_company",
                     topic="model_release",
-                    topics_json=json.dumps(["model_release"]),
-                    keywords_json=json.dumps(["model", "release"]),
-                    entities_json="[]",
-                    summary_cn=row.get("summary") or row["title"],
-                    b1_priority=int(row.get("score", 80)),
+                    topics_json='["model_release"]',
+                    keywords_json=json.dumps([title, "release"]),
+                    entities_json='[{"name":"Acme","type":"company","aliases":[]}]',
+                    summary_cn=f"{title} 的分析摘要",
+                    b1_priority=score,
+                    score_components_json='{}',
                     status="success",
                 )
             )
-        repo.freeze_run_scope(build.id)
-        stage = repo.ensure_stage(build.id, "analyze")
-        for item_id, row in zip(item_ids, rows, strict=True):
             task = repo.ensure_stage_task(stage, subject_type="item", subject_id=item_id, item_id=item_id)
-            repo.complete_stage_task(
-                task,
-                result={
+            repo.complete_stage_task(task, result={"item_id": item_id, "b1_priority": score})
+            admissions.append(
+                {
                     "item_id": item_id,
-                    "filtered": bool(row.get("task_filtered", False)),
-                    **(
-                        {"analysis_filtered_reason": "stage_b_guard"}
-                        if row.get("task_filtered", False)
-                        else {}
+                    "decision": decision,
+                    "rank": index if decision != "filtered" else None,
+                    "guarded_score": score,
+                    "reason_code": "fixture",
+                    "reason": "fixture admission",
+                    "policy_version": "fixture-v1",
+                    "policy_fingerprint": "fixture-policy",
+                }
+            )
+        repo.replace_candidate_admissions(run.id, admissions)
+        repo.finish_stage(stage, status="succeeded")
+        repo.freeze_run_scope(run.id)
+        session.commit()
+        return int(run.id), ids
+
+
+class _ToolAgent:
+    model = "stage-c-agent-fixture"
+    transport = "responses"
+    timeout_seconds = 30.0
+
+    def __init__(
+        self,
+        *,
+        web_evidence: bool = False,
+        bad_evidence: bool = False,
+        source_less_web: bool = False,
+        opened_page_evidence: bool = False,
+    ) -> None:
+        self.web_evidence = web_evidence
+        self.bad_evidence = bad_evidence
+        self.source_less_web = source_less_web
+        self.opened_page_evidence = opened_page_evidence
+        self.contexts: list[dict[str, Any]] = []
+
+    def run(self, *, initial_context, function_tools, on_response, on_tool, **_kwargs):
+        self.contexts.append(dict(initial_context))
+        tools = {tool.name: tool for tool in function_tools}
+        turn = 1
+        output: list[dict[str, Any]] = []
+        if self.web_evidence:
+            output.append(
+                {
+                    "type": "web_search_call",
+                    "action": (
+                        {"type": "open_page", "url": "https://source.example/opened"}
+                        if self.opened_page_evidence
+                        else {} if self.source_less_web else {"sources": [{"url": "https://source.example/verified"}]}
                     ),
+                }
+            )
+        on_response(turn, {"id": "fixture-response", "output": output})
+        calls = 0
+
+        def invoke(name: str, arguments: Mapping[str, Any]):
+            nonlocal calls
+            calls += 1
+            call = {"name": name, "call_id": f"call-{calls}", "arguments": json.dumps(arguments)}
+            result = dict(tools[name].handler(dict(arguments)))
+            on_tool(turn, call, result)
+            return result
+
+        active: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = invoke("list_candidates", {"bucket": "active", "offset": offset, "limit": 30})
+            rows = list(page.get("items") or [])
+            active.extend(rows)
+            offset += len(rows)
+            if offset >= int(page.get("total") or 0):
+                break
+        drafts = [
+            {
+                "draft_key": f"draft-{item['id']}",
+                "item_ids": [item["id"]],
+                "title": item["title"],
+                "summary_cn": item.get("summary_cn") or item["title"],
+                "topic": item.get("topic") or "technology_insight",
+                "topics": [item.get("topic") or "technology_insight"],
+                "keywords": item.get("keywords") or [],
+                "entities": item.get("entities") or [],
+                "novelty_status": "new",
+                "prior_event_key": None,
+                "review_state": "candidate",
+                "confidence": 88,
+                "risk_flags": [],
+            }
+            for item in active
+        ]
+        for offset in range(0, len(drafts), 8):
+            saved = invoke("save_event_drafts", {"drafts": drafts[offset : offset + 8]})
+            assert saved["ok"] is True
+        if active and (self.web_evidence or self.bad_evidence):
+            invoke(
+                "record_verification_evidence",
+                {
+                    "draft_key": f"draft-{active[0]['id']}",
+                    "url": (
+                        "https://evil.example/not-returned"
+                        if self.bad_evidence
+                        else "https://source.example/opened"
+                        if self.opened_page_evidence
+                        else "https://source.example/verified"
+                    ),
+                    "title": "Verification source",
+                    "excerpt": "The source confirms the launch.",
+                    "claim": "确认发布动作",
                 },
             )
-        repo.finish_stage(stage, status="succeeded")
-        session.commit()
-        return int(build.id), item_ids
-
-
-def _publish_prior_report(session_factory, *, edition_date: str, event_key: str, url: str, title: str) -> None:
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        repo.replace_published_daily_report(
-            edition_date=edition_date,
-            records=[
-                {
-                    "event_key": event_key,
-                    "title": title,
-                    "original_title": title,
-                    "summary_cn": title,
-                    "url": url,
-                    "display_score": 80,
-                    "topic": "model_release",
-                    "content_class": "official_model_company",
-                    "source_group": "official_blog",
-                    "source_ids": ["prior-source"],
-                    "source_refs": [],
-                }
-            ],
+        final = invoke("finalize_event_drafts", {})
+        assert final["ok"] is True
+        return AgentRunResult(
+            response_id="fixture-response",
+            turns=turn,
+            tool_calls=calls,
+            web_searches=1 if self.web_evidence else 0,
+            finalized=True,
+            last_response={"id": "fixture-response", "output": output},
         )
-        session.commit()
 
 
-def test_identity_helpers_are_stable():
-    assert normalize_event_title("  Model—Release  v1.0  ") == "model release v1 0"
-    assert canonical_event_key({"url": "https://example.test/a/?utm_medium=x"}) == "url:https://example.test/a"
-    assert canonical_event_key({"external_id": " GUID 42 "}) == "external:guid42"
+class _BudgetAgent:
+    model = "stage-c-budget-fixture"
+    transport = "responses"
+
+    def run(self, *, on_response, **_kwargs):
+        on_response(1, {"id": "budget-response", "output": []})
+        raise AgentBudgetExceeded("fixture budget exhausted")
 
 
-def test_stage_c_reads_score_eligible_stage_b_items_once_and_persists_sources():
+class _InvalidCoverageAgent:
+    model = "stage-c-invalid-fixture"
+    transport = "responses"
+
+    def run(self, *, function_tools, on_response, on_tool, **_kwargs):
+        tools = {tool.name: tool for tool in function_tools}
+        on_response(1, {"id": "invalid-response", "output": []})
+        call = {"name": "finalize_event_drafts", "call_id": "invalid-finalize", "arguments": "{}"}
+        result = dict(tools["finalize_event_drafts"].handler({}))
+        on_tool(1, call, result)
+        return AgentRunResult("invalid-response", 1, 1, 0, False, {"id": "invalid-response", "output": []})
+
+
+def test_stage_c_agent_reads_b_workbench_and_materializes_events():
     session_factory = _db()
-    run_id, item_ids = _seed_daily_build(
+    run_id, item_ids = _seed_build(
         session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {"source_id": "official-a", "external_id": "release-1", "url": "https://example.test/release-1", "title": "Model release"},
-            {"source_id": "official-b", "external_id": "release-1-copy", "url": "https://media.test/release-1", "title": "Model release recap"},
-        ],
+        rows=[("Acme Model 1 发布", 90, "active"), ("Acme SDK 更新", 82, "reserve")],
     )
-    client = _AggregationClient(_merge_all)
+    agent = _ToolAgent()
 
-    result = run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        now=NOW,
-        ai_client=client,
-    )
+    result = run_event_cluster_job(session_factory=session_factory, run_id=run_id, ai_client=agent, reference_time=NOW)
 
-    assert len(client.calls) == 1
-    assert {int(row["id"]) for row in client.calls[0]["current_items"]} == set(item_ids)
-    assert result.processed == 2
+    assert result.processed == 1
     assert result.events == 1
-    assert result.merged == 1
     assert result.candidate_event_ids == result.current_event_ids
+    assert "content_text" not in agent.contexts[0]
     with session_factory() as session:
-        event = session.scalar(select(IntelEvent))
-        assert event is not None and event.build_id == run_id
-        relations = session.scalars(select(IntelEventItem).order_by(IntelEventItem.item_id)).all()
-        assert [relation.item_id for relation in relations] == sorted(item_ids)
-        assert [relation.match_type for relation in relations] == ["primary", "related"]
-        assert [relation.is_primary for relation in relations] == [True, False]
-        assert {relation.source_id for relation in relations} == {"official-a", "official-b"}
+        events = session.scalars(select(IntelEvent).where(IntelEvent.build_id == run_id)).all()
+        assert len(events) == 1
+        assert events[0].primary_item_id == item_ids["Acme Model 1 发布"]
+        agent_session = session.scalar(select(IntelAgentSession).where(IntelAgentSession.run_id == run_id))
+        assert agent_session is not None
+        assert agent_session.tool_call_count >= 3
+        assert agent_session.finalization_requested is True
 
 
-def test_stage_c_partitions_candidates_and_validates_their_exact_union():
+def test_stage_c_budget_exhaustion_becomes_needs_review_not_data_loss():
     session_factory = _db()
-    run_id, item_ids = _seed_daily_build(
+    run_id, _ = _seed_build(
         session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {
-                "source_id": "official-a",
-                "external_id": f"release-{index}",
-                "url": f"https://example.test/release-{index}",
-                "title": f"Independent release {index}",
-            }
-            for index in range(1, 6)
-        ],
-    )
-    client = _AggregationClient(_new_clusters)
-
-    result = run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        now=NOW,
-        ai_client=client,
-        batch_item_limit=2,
-        batch_input_byte_limit=100_000,
+        rows=[("需要人工核查的事件", 90, "active"), ("另一个事件", 85, "active")],
     )
 
-    assert len(client.calls) == 3
-    assert {
-        int(item["id"])
-        for call in client.calls
-        for item in call["current_items"]
-    } == set(item_ids)
-    assert result.events == 5
-    assert result.candidate_event_ids == result.current_event_ids
+    result = run_event_cluster_job(session_factory=session_factory, run_id=run_id, ai_client=_BudgetAgent(), reference_time=NOW)
+
+    assert result.unresolved == 2
+    assert len(result.candidate_event_ids) == 2
     with session_factory() as session:
-        stage = session.scalar(
-            select(IntelRunStage).where(
-                IntelRunStage.run_id == run_id,
-                IntelRunStage.stage_name == "cluster",
-            )
-        )
-        task = session.scalar(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id))
-        assert task is not None
-        metadata = task.result["request_metadata"]
-        assert metadata["aggregation_mode"] == "ai_partitioned_calls_v2"
-        assert metadata["batch_count"] == 3
+        states = session.scalars(select(IntelEvent.review_state).where(IntelEvent.build_id == run_id)).all()
+        assert states == ["needs_review", "needs_review"]
 
 
-def test_stage_c_merges_same_history_link_across_partitions():
+def test_stage_c_binds_evidence_only_to_hosted_search_sources():
     session_factory = _db()
-    url = "https://example.test/release-1"
-    event_key = f"url:{url}"
-    _publish_prior_report(
-        session_factory,
-        edition_date="2026-08-18",
-        event_key=event_key,
-        url=url,
-        title="Yesterday model release",
-    )
-    run_id, item_ids = _seed_daily_build(
-        session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {
-                "source_id": "official-a",
-                "external_id": f"release-{index}",
-                "url": f"https://example.test/today-release-{index}",
-                "title": f"Today release detail {index}",
-            }
-            for index in range(1, 4)
-        ],
-    )
-    client = _AggregationClient(_repeat_all)
-
-    result = run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        now=NOW,
-        ai_client=client,
-        batch_item_limit=2,
-        batch_input_byte_limit=100_000,
-    )
-
-    assert len(client.calls) == 2
-    assert result.repeats == 1
-    assert len(result.current_event_ids) == 1
-    assert result.candidate_event_ids == []
-    with session_factory() as session:
-        relations = session.scalars(select(IntelEventItem).order_by(IntelEventItem.item_id)).all()
-        assert {relation.item_id for relation in relations} == set(item_ids)
-
-
-def test_stage_c_does_not_persist_a_partial_partition_result():
-    session_factory = _db()
-    run_id, _ = _seed_daily_build(
-        session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {
-                "source_id": "official-a",
-                "external_id": f"release-{index}",
-                "url": f"https://example.test/release-{index}",
-                "title": f"Independent release {index}",
-            }
-            for index in range(1, 4)
-        ],
-    )
-    client = _SecondBatchFailureClient()
-
-    with pytest.raises(RuntimeError, match="second partition"):
-        run_event_cluster_job(
-            session_factory=session_factory,
-            run_id=run_id,
-            now=NOW,
-            ai_client=client,
-            batch_item_limit=2,
-            batch_input_byte_limit=100_000,
-        )
-
-    assert client.calls == 2
-    with session_factory() as session:
-        assert session.scalar(select(IntelEvent)) is None
-
-
-def test_stage_c_applies_score_and_structural_input_guards():
-    session_factory = _db()
-    run_id, item_ids = _seed_daily_build(
-        session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {
-                "source_id": "official-a",
-                "external_id": "release-1",
-                "url": "https://example.test/release-1",
-                "title": "Event seed at threshold",
-                "score": 60,
-            },
-            {
-                "source_id": "official-a",
-                "external_id": "release-2",
-                "url": "https://example.test/release-2",
-                "title": "Supporting evidence at threshold",
-                "score": 60,
-            },
-            {
-                "source_id": "official-a",
-                "external_id": "release-3",
-                "url": "https://example.test/release-3",
-                "title": "Below threshold",
-                "score": 59,
-            },
-            {
-                "source_id": "official-a",
-                "external_id": "release-4",
-                "url": "https://example.test/release-4",
-                "title": "Another threshold event",
-                "score": 90,
-            },
-            {
-                "source_id": "official-a",
-                "external_id": "release-5",
-                "url": "https://example.test/release-5",
-                "title": "Structurally filtered",
-                "score": 90,
-                "task_filtered": True,
-            },
-        ],
-    )
-    client = _AggregationClient(_new_clusters)
-
-    result = run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        now=NOW,
-        ai_client=client,
-    )
-
-    assert result.processed == 3
-    assert {int(row["id"]) for row in client.calls[0]["current_items"]} == {item_ids[index] for index in (0, 1, 3)}
-    assert result.input_audit["min_score"] == 60
-    assert result.input_audit["excluded_counts"] == {
-        "analysis_filtered": 1,
-        "below_min_score": 1,
-        "missing_item": 0,
-        "missing_review": 0,
-    }
-
-
-def test_stage_c_threshold_change_invalidates_the_aggregation_task():
-    session_factory = _db()
-    run_id, _ = _seed_daily_build(
-        session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {
-                "source_id": "official-a",
-                "external_id": "release-1",
-                "url": "https://example.test/release-1",
-                "title": "Threshold-sensitive release",
-                "score": 80,
-            }
-        ],
-    )
-    client = _AggregationClient(_new_clusters)
+    run_id, _ = _seed_build(session_factory, rows=[("有核验的发布", 90, "active")])
 
     run_event_cluster_job(
         session_factory=session_factory,
         run_id=run_id,
-        now=NOW,
-        ai_client=client,
-        input_min_score=60,
+        ai_client=_ToolAgent(web_evidence=True),
+        reference_time=NOW,
     )
-    rerun = run_event_cluster_job(
+
+    with session_factory() as session:
+        evidence = session.scalars(select(IntelEventEvidence)).all()
+        assert len(evidence) == 1
+        assert evidence[0].status == "verified"
+        assert evidence[0].event_id is not None
+
+
+def test_stage_c_binds_evidence_to_a_page_opened_by_hosted_search():
+    session_factory = _db()
+    run_id, _ = _seed_build(session_factory, rows=[("打开页面后核验", 90, "active")])
+
+    run_event_cluster_job(
         session_factory=session_factory,
         run_id=run_id,
-        now=NOW,
-        ai_client=client,
-        input_min_score=70,
+        ai_client=_ToolAgent(web_evidence=True, opened_page_evidence=True),
+        reference_time=NOW,
     )
 
-    assert len(client.calls) == 2
-    assert rerun.input_audit["min_score"] == 70
     with session_factory() as session:
-        stage = session.scalar(
-            select(IntelRunStage).where(
-                IntelRunStage.run_id == run_id,
-                IntelRunStage.stage_name == "cluster",
-            )
-        )
-        task = session.scalar(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id))
-        assert stage is not None and stage.metadata_dict["input_min_score"] == 70
-        assert task is not None and task.result["input_audit"]["min_score"] == 70
+        evidence = session.scalars(select(IntelEventEvidence)).all()
+        assert len(evidence) == 1
+        assert evidence[0].url == "https://source.example/opened"
+        assert evidence[0].status == "verified"
 
 
-def test_stage_c_waits_for_incomplete_stage_b_items():
+def test_stage_c_rejects_unreturned_evidence_url_without_failing_aggregation():
     session_factory = _db()
-    run_id, item_ids = _seed_daily_build(
-        session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {"source_id": "official-a", "external_id": "release-1", "url": "https://example.test/release-1", "title": "Model release"}
-        ],
-    )
-    with session_factory() as session:
-        analyze = session.scalar(
-            select(IntelRunStage).where(
-                IntelRunStage.run_id == run_id,
-                IntelRunStage.stage_name == "analyze",
-            )
-        )
-        task = session.scalar(
-            select(IntelRunStageTask).where(
-                IntelRunStageTask.stage_id == analyze.id,
-                IntelRunStageTask.subject_type == "item",
-                IntelRunStageTask.item_id == item_ids[0],
-            )
-        )
-        assert task is not None
-        task.status = "pending"
-        analyze.status = "pending"
-        session.commit()
-
-    with pytest.raises(ValueError, match="Stage B analysis stage to finish"):
-        run_event_cluster_job(
-            session_factory=session_factory,
-            run_id=run_id,
-            now=NOW,
-            ai_client=_AggregationClient(_new_clusters),
-        )
-
-
-def test_stage_c_uses_ai_history_decision_and_creates_a_fresh_build_row():
-    session_factory = _db()
-    url = "https://example.test/release-1"
-    event_key = f"url:{url}"
-    _publish_prior_report(
-        session_factory,
-        edition_date="2026-08-18",
-        event_key=event_key,
-        url=url,
-        title="Yesterday model release",
-    )
-    run_id, _ = _seed_daily_build(
-        session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {"source_id": "official-a", "external_id": "release-1", "url": url, "title": "Today model release"}
-        ],
-    )
-    client = _AggregationClient(_repeat_first)
+    run_id, _ = _seed_build(session_factory, rows=[("无效核验地址", 90, "active")])
 
     result = run_event_cluster_job(
         session_factory=session_factory,
         run_id=run_id,
-        now=NOW,
-        ai_client=client,
+        ai_client=_ToolAgent(bad_evidence=True),
+        reference_time=NOW,
     )
 
-    assert client.calls[0]["recent_history"][0]["event_key"] == event_key
-    assert result.events == 0
-    assert result.repeats == 1
-    assert len(result.current_event_ids) == 1
-    assert result.candidate_event_ids == []
+    assert result.events == 1
     with session_factory() as session:
-        entry = session.scalar(select(DailyEditionReportEntry))
+        assert session.scalars(select(IntelEventEvidence)).all() == []
+
+
+def test_stage_c_marks_unbound_web_evidence_and_event_for_review_when_provider_omits_source_objects():
+    session_factory = _db()
+    run_id, _ = _seed_build(session_factory, rows=[("无来源列表的核验", 90, "active")])
+
+    run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=_ToolAgent(web_evidence=True, source_less_web=True),
+        reference_time=NOW,
+    )
+
+    with session_factory() as session:
+        evidence = session.scalars(select(IntelEventEvidence)).all()
+        assert len(evidence) == 1
+        assert evidence[0].status == "needs_review"
         event = session.scalar(select(IntelEvent).where(IntelEvent.build_id == run_id))
-        assert entry is not None and entry.event_key == event_key
-        assert event is not None and event.event_key == event_key
-        assert event.novelty_status == "repeat"
+        assert event is not None
+        assert event.review_state == "needs_review"
+        assert "unbound_web_evidence" in json.loads(event.risk_flags_json)
 
 
-def test_stage_c_includes_updated_events_but_excludes_repeats_from_candidates():
+def test_stage_c_batches_one_hundred_active_candidates_within_agent_tool_budget():
     session_factory = _db()
-    url = "https://example.test/release-update"
-    event_key = f"url:{url}"
-    _publish_prior_report(
+    run_id, _ = _seed_build(
         session_factory,
-        edition_date="2026-08-18",
-        event_key=event_key,
-        url=url,
-        title="Yesterday model release",
-    )
-    run_id, _ = _seed_daily_build(
-        session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {
-                "source_id": "official-a",
-                "external_id": "release-update",
-                "url": url,
-                "title": "Today model release update",
-            }
-        ],
+        rows=[(f"候选资讯 {index}", 90, "active") for index in range(100)],
     )
 
     result = run_event_cluster_job(
         session_factory=session_factory,
         run_id=run_id,
-        now=NOW,
-        ai_client=_AggregationClient(_updated_first),
+        ai_client=_ToolAgent(),
+        reference_time=NOW,
     )
 
-    assert result.events == 0
-    assert result.updated == 1
-    assert result.repeats == 0
-    assert result.candidate_event_ids == result.current_event_ids
+    assert result.processed == 100
+    assert result.events == 100
+    # 4 pages + 13 batches + finalization; remains comfortably below the
+    # configured 80-call ceiling and even the former 40-call budget.
+    assert result.tool_calls == 18
+
+
+def test_stage_c_renews_a_lease_sized_for_the_full_multi_turn_budget(monkeypatch):
+    session_factory = _db()
+    run_id, _ = _seed_build(session_factory, rows=[("租约续期事件", 90, "active")])
+    agent = _ToolAgent()
+    heartbeats: list[int] = []
+    claims: list[int] = []
+    original_heartbeat = IntelRepository.heartbeat_stage_task
+    original_claim = IntelRepository.claim_stage_task
+
+    def heartbeat(self, *args, **kwargs):
+        heartbeats.append(int(kwargs["lease_seconds"]))
+        return original_heartbeat(self, *args, **kwargs)
+
+    def claim(self, *args, **kwargs):
+        if kwargs.get("owner") == "stage-c-responses-agent":
+            claims.append(int(kwargs["lease_seconds"]))
+        return original_claim(self, *args, **kwargs)
+
+    monkeypatch.setattr(IntelRepository, "heartbeat_stage_task", heartbeat)
+    monkeypatch.setattr(IntelRepository, "claim_stage_task", claim)
+    result = run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=agent,
+        reference_time=NOW,
+        max_turns=24,
+    )
+
+    assert result.events == 1
+    assert _stage_c_lease_seconds(agent, max_turns=24) == 840
+    assert claims == [840]
+    assert heartbeats and set(heartbeats) == {840}
     with session_factory() as session:
         stage = IntelRepository(session).get_stage(run_id, "cluster")
         assert stage is not None
-        task = IntelRepository(session).get_task(stage, subject_type="run", subject_id=run_id)
-        assert task is not None
-        assert task.result["candidate_event_ids"] == result.current_event_ids
+        assert stage.metadata_dict["lease_seconds"] == 840
 
 
-def test_stage_c_force_replaces_the_previous_ai_partition():
+def test_stage_c_requires_agent_to_cover_all_active_candidates():
     session_factory = _db()
-    run_id, item_ids = _seed_daily_build(
-        session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {"source_id": "official-a", "external_id": "release-1", "url": "https://example.test/release-1", "title": "Model release"},
-            {"source_id": "official-b", "external_id": "release-2", "url": "https://example.test/release-2", "title": "Tool release"},
-        ],
-    )
+    run_id, _ = _seed_build(session_factory, rows=[("未覆盖候选", 90, "active")])
 
-    first = run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        now=NOW,
-        ai_client=_AggregationClient(_merge_all),
-    )
-    second = run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        now=NOW,
-        force=True,
-        ai_client=_AggregationClient(_new_clusters),
-    )
-
-    assert len(first.current_event_ids) == 1
-    assert len(second.current_event_ids) == 2
-    assert first.candidate_event_ids == first.current_event_ids
-    assert second.candidate_event_ids == second.current_event_ids
-    with session_factory() as session:
-        events = session.scalars(select(IntelEvent).order_by(IntelEvent.id)).all()
-        relations = session.scalars(select(IntelEventItem).order_by(IntelEventItem.item_id)).all()
-        assert len(events) == 2
-        assert {relation.item_id for relation in relations} == set(item_ids)
-        assert len({relation.event_id for relation in relations}) == 2
-
-
-def test_stage_c_provider_failure_is_not_repaired_or_fallbacked():
-    session_factory = _db()
-    run_id, _ = _seed_daily_build(
-        session_factory,
-        edition_date="2026-08-19",
-        rows=[
-            {"source_id": "official-a", "external_id": "release-1", "url": "https://example.test/release-1", "title": "Model release"}
-        ],
-    )
-
-    with pytest.raises(RuntimeError, match="provider unavailable"):
+    with pytest.raises(AgentProtocolError, match="did not finalize"):
         run_event_cluster_job(
             session_factory=session_factory,
             run_id=run_id,
-            now=NOW,
-            ai_client=_FailingAggregationClient(),
+            ai_client=_InvalidCoverageAgent(),
+            reference_time=NOW,
         )
-
     with session_factory() as session:
-        assert session.scalar(select(IntelEvent)) is None
-        cluster_stage = session.scalar(
-            select(IntelRunStage).where(
-                IntelRunStage.run_id == run_id,
-                IntelRunStage.stage_name == "cluster",
-            )
-        )
-        task = session.scalar(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == cluster_stage.id))
-        assert task is not None
-        assert task.status == "blocked"
-        assert task.error_code == "stage_c_ai_aggregation_failed"
-
-
-def test_stage_c_http_client_calls_provider_once_and_does_not_retry_schema_errors():
-    item = {
-        "id": 7,
-        "title": "Model release",
-        "summary_cn": "A model was released.",
-    }
-    invalid_http = _HttpClient({"schema_version": STAGE_C_SCHEMA_VERSION, "clusters": []})
-    client = StageCAggregationClient(
-        api_url="https://ai.example.test",
-        api_key="secret",
-        model="test-model",
-        api_style="generic_json",
-        timeout_seconds=30,
-        http_client=invalid_http,
-    )
-
-    with pytest.raises(StageCAggregationProviderError, match="missing item_ids"):
-        client.aggregate([item], recent_history=[], edition={"edition_date": "2026-08-19"})
-
-    assert invalid_http.calls == 1
-
-
-def test_stage_c_http_client_retries_transport_failure_for_a_bounded_batch():
-    item = {
-        "id": 7,
-        "title": "Model release",
-        "summary_cn": "A model was released.",
-    }
-    valid_payload = _new_clusters([item], [])
-    flaky_http = _FlakyHttpClient(valid_payload)
-    client = StageCAggregationClient(
-        api_url="https://ai.example.test",
-        api_key="secret",
-        model="test-model",
-        api_style="generic_json",
-        timeout_seconds=30,
-        max_retries=1,
-        http_client=flaky_http,
-    )
-
-    result = client.aggregate([item], recent_history=[], edition={"edition_date": "2026-08-19"})
-
-    assert flaky_http.calls == 2
-    assert result.request_metadata["provider_attempts"] == 2
+        repo = IntelRepository(session)
+        stage = repo.get_stage(run_id, "cluster")
+        task = repo.get_task(stage, subject_type="run", subject_id=run_id) if stage else None
+        assert task is not None and task.status in {"failed", "retry_waiting"}

@@ -29,6 +29,7 @@ Stage B 已完成单条资讯的标题、摘要、分类、实体和价值评分
 最多选择 edition.max_selected 条。selected 数组顺序就是最终展示顺序。
 只返回被选中的 event_id；未选事件不要返回，也不要为其生成逐条决策。
 每条选择必须给出一个简短 snake_case reason_code 和一条中文选稿理由。
+review_state=needs_review 的事件不允许入选；它们需要人工复核后才能重新进入自动选稿池。
 优先考虑本期整体的信息价值、影响、可行动性、读者相关性和内容互补性。
 </selection_rules>
 <output_rules>
@@ -88,10 +89,9 @@ def build_stage_d_provider_payload(
     *,
     edition: Mapping[str, Any] | None = None,
     model: str | None = None,
-    api_style: str = "generic_json",
     max_selected: int,
 ) -> dict[str, Any]:
-    """Build one strict Stage-D request for a supported API style."""
+    """Build the sole supported strict request: OpenAI Responses."""
 
     preflight_stage_d_selection_schema()
     semantic_input = build_stage_d_selection_input(
@@ -106,46 +106,20 @@ def build_stage_d_provider_payload(
         + json.dumps(semantic_input["events"], ensure_ascii=False, sort_keys=True, default=str)
         + "\n</events>"
     )
-    style = _normalize_api_style(api_style)
-    if style == "openai_chat":
-        payload: dict[str, Any] = {
-            "messages": [
-                {"role": "system", "content": STAGE_D_SELECTION_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            "response_format": {
+    payload: dict[str, Any] = {
+        "input": [
+            {"role": "system", "content": STAGE_D_SELECTION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        "text": {
+            "format": {
                 "type": "json_schema",
-                "json_schema": {
-                    "name": STAGE_D_SELECTION_TASK,
-                    "strict": True,
-                    "schema": STAGE_D_SELECTION_JSON_SCHEMA,
-                },
-            },
-        }
-    elif style == "openai_responses":
-        payload = {
-            "input": [
-                {"role": "system", "content": STAGE_D_SELECTION_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": STAGE_D_SELECTION_TASK,
-                    "strict": True,
-                    "schema": STAGE_D_SELECTION_JSON_SCHEMA,
-                }
-            },
-        }
-    elif style == "generic_json":
-        payload = {
-            "task": STAGE_D_SELECTION_TASK,
-            "system": STAGE_D_SELECTION_SYSTEM_PROMPT,
-            "input": semantic_input,
-            "response_schema": STAGE_D_SELECTION_JSON_SCHEMA,
-        }
-    else:  # pragma: no cover - normalized above.
-        raise ValueError("api_style must be generic_json, openai_chat, or openai_responses")
+                "name": STAGE_D_SELECTION_TASK,
+                "strict": True,
+                "schema": STAGE_D_SELECTION_JSON_SCHEMA,
+            }
+        },
+    }
     if model:
         payload["model"] = model
     return payload
@@ -170,6 +144,10 @@ def _compact_event(value: Mapping[str, Any]) -> dict[str, Any]:
         "source_groups": _strings(event.get("source_groups"), limit=16, max_chars=64),
         "novelty_status": event.get("novelty_status"),
         "risk_flags": _strings(event.get("risk_flags"), limit=16, max_chars=128),
+        "resolution_confidence": event.get("resolution_confidence"),
+        "review_state": _text(event.get("review_state"), 48),
+        "verification_count": event.get("verification_count"),
+        "verification_status": _text(event.get("verification_status"), 48),
     }
 
 
@@ -206,19 +184,6 @@ def _strings(value: Any, *, limit: int, max_chars: int) -> list[str]:
 
 def _text(value: Any, limit: int) -> str:
     return str(value or "").strip()[:limit]
-
-
-def _normalize_api_style(value: Any) -> str:
-    style = str(value or "generic_json").strip().casefold().replace("-", "_")
-    style = {
-        "responses": "openai_responses",
-        "openai_response": "openai_responses",
-        "chat": "openai_chat",
-        "chat_completions": "openai_chat",
-    }.get(style, style)
-    if style not in {"generic_json", "openai_chat", "openai_responses"}:
-        raise ValueError("api_style must be generic_json, openai_chat, or openai_responses")
-    return style
 
 
 __all__ = [

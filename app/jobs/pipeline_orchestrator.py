@@ -26,7 +26,7 @@ from app.config.limits import (
     DEFAULT_AI_REVIEW_LIMIT,
     DEFAULT_DAILY_REPORT_LIMIT,
     DEFAULT_FETCH_LIMIT_PER_SOURCE,
-    STAGE_C_INPUT_POLICY_VERSION,
+    STAGE_C_AGENT_VERSION,
 )
 from app.config.settings import Settings
 from app.config.source_registry import DEFAULT_REGISTRY_PATH, load_source_registry
@@ -688,6 +688,7 @@ def run_pipeline_stage_b_from_settings(
             item_ids=item_ids,
             task_ids=task_ids,
             analysis_min_score=settings.ai_analysis_min_score,
+            reserve_limit=settings.stage_b_reserve_limit,
             concurrency=settings.ai_review_concurrency,
         )
     _sync_pipeline_run_status(
@@ -821,6 +822,7 @@ def publish_daily_draft_from_settings(
         # Close this process's connection pool before moving SQLite files.
         # The exporter has completed all writes at this point, so the retained
         # audit is a complete snapshot of raw fetches and every A-D decision.
+        candidate_count = _draft_stage_d_candidate_count(draft_factory, int(run_id))
         draft_engine.dispose()
         audit_promotion = promote_daily_draft_to_audit(settings, normalized)
         bundle_promotion = promote_daily_bundle(staging_dir=staging_dir, final_dir=final_dir)
@@ -834,6 +836,7 @@ def publish_daily_draft_from_settings(
                 IntelRepository(session).replace_published_daily_report(
                     edition_date=normalized,
                     records=result.records,
+                    candidate_count=candidate_count,
                 )
                 session.commit()
         finally:
@@ -1110,9 +1113,7 @@ def _stage_needs_resume(
             if stage.status == "succeeded":
                 metadata = stage.metadata_dict
                 if stage_name == "cluster":
-                    if metadata.get("input_policy_version") != STAGE_C_INPUT_POLICY_VERSION:
-                        return True
-                    if settings is not None and metadata.get("input_min_score") != settings.ai_stage_c_input_min_score:
+                    if metadata.get("agent_version") != STAGE_C_AGENT_VERSION:
                         return True
                 if stage_name == "stage_d" and str(metadata.get("stage_d_version") or "") != STAGE_D_VERSION:
                     return True
@@ -1314,6 +1315,18 @@ def _summary_dict(summary: StageStateSummary) -> dict[str, Any]:
         "retry_waiting": summary.retry_waiting,
         "blocked": summary.blocked,
     }
+
+
+def _draft_stage_d_candidate_count(session_factory, run_id: int) -> int:
+    """Read the final C candidate pool size before the draft is promoted."""
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        stage = repo.get_stage(int(run_id), "stage_d")
+        task = repo.get_task(stage, subject_type="run", subject_id=int(run_id)) if stage else None
+        result = task.result if task is not None and isinstance(task.result, dict) else {}
+        candidate_ids = result.get("candidate_event_ids") if isinstance(result, dict) else None
+        return len(candidate_ids) if isinstance(candidate_ids, list) else 0
 
 
 def _normalize_edition_date(value: date | str | None) -> str | None:

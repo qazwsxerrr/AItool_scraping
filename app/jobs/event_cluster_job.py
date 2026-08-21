@@ -1,59 +1,81 @@
-"""Stage C: bounded AI aggregation of successful Stage-B projections."""
+"""Stage C: stateful Responses agent for event-level aggregation.
+
+Unlike the removed batch prompt, this job gives the model a bounded workbench
+and durable tools.  The model investigates on demand; deterministic code owns
+score admission, coverage validation, persistence, and downstream contracts.
+"""
 
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import math
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
+from app.ai.responses import AgentBudgetExceeded, AgentProtocolError, FunctionTool
 from app.ai.skills.intel_triage import normalize_url
-from app.ai.skills.stage_c_aggregation import (
-    STAGE_C_PROMPT_VERSION,
-    STAGE_C_SCHEMA_VERSION,
-    StageCAggregationCallResult,
-    StageCAggregationClient,
-    StageCAggregationProviderError,
-    StageCStoryCluster,
-    strict_parse_stage_c_aggregation,
+from app.ai.skills.stage_c_agent import StageCAgentClient
+from app.ai.skills.stage_c_agent.prompts import (
+    FINALIZE_DRAFTS_SCHEMA,
+    LIST_CANDIDATES_SCHEMA,
+    LIST_DRAFTS_SCHEMA,
+    MARK_UNRESOLVED_SCHEMA,
+    READ_HISTORY_SCHEMA,
+    READ_ITEMS_SCHEMA,
+    RECORD_EVIDENCE_SCHEMA,
+    SAVE_DRAFTS_SCHEMA,
+    SEARCH_CANDIDATES_SCHEMA,
+    STAGE_C_AGENT_PROMPT_VERSION,
 )
 from app.config.limits import (
-    DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE,
-    STAGE_C_AGGREGATION_MODE,
-    STAGE_C_BATCH_INPUT_BYTE_LIMIT,
-    STAGE_C_BATCH_ITEM_LIMIT,
-    STAGE_C_INPUT_POLICY_VERSION,
+    DEFAULT_STAGE_C_AGENT_HISTORY_DAYS,
+    DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS,
+    DEFAULT_STAGE_C_AGENT_MAX_TURNS,
+    DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES,
+    STAGE_C_AGENT_VERSION,
 )
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import (
-    DailyEdition,
     DailyEditionReportEntry,
+    IntelAgentSession,
+    IntelCandidateAdmission,
     IntelEvent,
+    IntelEventDraft,
+    IntelEventEvidence,
     IntelItem,
     IntelRun,
-    IntelRunItem,
     IntelRunStage,
     IntelRunStageTask,
 )
 from app.storage.repository import IntelRepository
 
 
-DAILY_HISTORY_DAYS = 3
-STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_candidate_events_v1"
+DAILY_HISTORY_DAYS = DEFAULT_STAGE_C_AGENT_HISTORY_DAYS
+STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_agent_candidates_v1"
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
-_STAGE_C_PRIMARY_POLICY_VERSION = "source_then_b1_priority_v1"
+_PRIMARY_POLICY_VERSION = "source_then_b1_priority_v2"
 
 
 class StageCDownstreamBusyError(RuntimeError):
     """A live Stage-D/export worker prevents safe Stage-C replacement."""
+
+
+class StageCAgentContractError(RuntimeError):
+    """The model tried to finalize an invalid event projection."""
+
+
+class StageCLeaseLostError(RuntimeError):
+    """The durable C-task lease expired before its agent state could be saved."""
 
 
 @dataclass
@@ -64,17 +86,15 @@ class EventClusterResult:
     merged: int = 0
     repeats: int = 0
     updated: int = 0
+    unresolved: int = 0
+    turns: int = 0
+    tool_calls: int = 0
+    web_searches: int = 0
     event_ids: list[int] = field(default_factory=list)
     current_event_ids: list[int] = field(default_factory=list)
     candidate_event_ids: list[int] = field(default_factory=list)
     reference_time: datetime | None = None
     input_audit: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class _StageCInputSelection:
-    items: list[IntelItem]
-    audit: dict[str, Any]
 
 
 def normalize_event_title(value: Any) -> str:
@@ -121,19 +141,12 @@ def canonical_event_url(value: Any) -> str | None:
     return urlunsplit((scheme, netloc, path, urlencode(query_items, doseq=True), ""))
 
 
-def _normalize_external_id(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = re.sub(r"\s+", "", str(value).strip()).casefold()
-    return text or None
-
-
 def exact_identity_keys(value: Any) -> tuple[str, ...]:
     values = _mapping(value)
     url = canonical_event_url(values.get("canonical_url") or values.get("url") or values.get("source_url"))
     external_id = _normalize_external_id(values.get("external_id") or values.get("guid"))
-    keys = [value for value in (f"url:{url}" if url else None, f"external:{external_id}" if external_id else None) if value]
-    return tuple(dict.fromkeys(keys))
+    values = [value for value in (f"url:{url}" if url else None, f"external:{external_id}" if external_id else None) if value]
+    return tuple(dict.fromkeys(values))
 
 
 def canonical_event_key(value: Any) -> str:
@@ -160,29 +173,20 @@ def run_event_cluster_job(
     force: bool = False,
     now: datetime | None = None,
     reference_time: datetime | None = None,
-    input_min_score: int = DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE,
-    batch_item_limit: int = STAGE_C_BATCH_ITEM_LIMIT,
-    batch_input_byte_limit: int = STAGE_C_BATCH_INPUT_BYTE_LIMIT,
+    max_turns: int = DEFAULT_STAGE_C_AGENT_MAX_TURNS,
+    max_tool_calls: int = DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS,
+    max_web_searches: int = DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES,
+    trusted_domains: Sequence[str] = (),
 ) -> EventClusterResult:
-    """Aggregate the current Stage-B item set through bounded AI requests."""
+    """Run C as an auditable multi-turn tool session for one daily build."""
 
     result = EventClusterResult(run_id=int(run_id))
-    owner = "stage-c-ai-aggregation"
-    raw_response: Any | None = None
-    request_metadata: Mapping[str, Any] | None = None
-    min_score = _bounded_score(input_min_score, DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE)
-    resolved_batch_item_limit = _positive_int(batch_item_limit, STAGE_C_BATCH_ITEM_LIMIT)
-    resolved_batch_input_byte_limit = _positive_int(
-        batch_input_byte_limit,
-        STAGE_C_BATCH_INPUT_BYTE_LIMIT,
-    )
-    model_name = str(getattr(ai_client, "model", None) or "custom")
-    config_fingerprint = _stage_c_config_fingerprint(
-        model_name=model_name,
-        input_min_score=min_score,
-        batch_item_limit=resolved_batch_item_limit,
-        batch_input_byte_limit=resolved_batch_input_byte_limit,
-    )
+    owner = "stage-c-responses-agent"
+    max_turns = _positive_int(max_turns, DEFAULT_STAGE_C_AGENT_MAX_TURNS)
+    max_tool_calls = _positive_int(max_tool_calls, DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS)
+    max_web_searches = _nonnegative_int(max_web_searches, DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES)
+    model_name = str(getattr(ai_client, "model", None) or "responses-agent")
+    lease_seconds = _stage_c_lease_seconds(ai_client, max_turns=max_turns)
 
     with session_factory() as session:
         repo = IntelRepository(session)
@@ -190,38 +194,50 @@ def run_event_cluster_job(
         if run is None or run.edition_id is None:
             raise ValueError("Stage C requires the current daily edition build")
         _assert_downstream_idle(repo, int(run_id))
-        frozen_reference = _as_utc(reference_time) or _as_utc(run.reference_time) or _as_utc(now)
-        frozen_reference = frozen_reference or datetime.now(timezone.utc)
+        current = _as_utc(reference_time) or _as_utc(run.reference_time) or _as_utc(now) or datetime.now(timezone.utc)
+        result.reference_time = current
+        admissions = _load_admissions(session, repo=repo, run_id=int(run_id))
+        history = _load_published_daily_history(repo, run=run, days=DAILY_HISTORY_DAYS)
+        result.processed = len(admissions["active"])
+        result.input_audit = {
+            "active": len(admissions["active"]),
+            "reserve": len(admissions["reserve"]),
+            "history": len(history),
+            "admission_policy_fingerprints": sorted(
+                {row.policy_fingerprint for row in [*admissions["active"], *admissions["reserve"]] if row.policy_fingerprint}
+            ),
+        }
+        input_fingerprint = _cluster_input_fingerprint(admissions, history)
+        allowed_domains = _allowed_domains(
+            admissions=[*admissions["active"], *admissions["reserve"]],
+            configured=trusted_domains,
+        )
+        config_fingerprint = _stage_c_config_fingerprint(
+            model=model_name,
+            max_turns=max_turns,
+            max_tool_calls=max_tool_calls,
+            max_web_searches=max_web_searches,
+            lease_seconds=lease_seconds,
+            allowed_domains=allowed_domains,
+        )
         stage = repo.ensure_stage(
             int(run_id),
             "cluster",
             config_fingerprint=config_fingerprint,
-            reference_time=frozen_reference,
+            reference_time=current,
             metadata={
-                "aggregation_mode": STAGE_C_AGGREGATION_MODE,
-                "history_mode": "prior_published_daily_reports",
-                "daily_history_days": DAILY_HISTORY_DAYS,
-                "prompt_version": STAGE_C_PROMPT_VERSION,
+                "aggregation_mode": "responses_agent_tools_v2",
+                "agent_version": STAGE_C_AGENT_VERSION,
+                "prompt_version": STAGE_C_AGENT_PROMPT_VERSION,
                 "candidate_contract_version": STAGE_C_CANDIDATE_CONTRACT_VERSION,
-                "input_policy_version": STAGE_C_INPUT_POLICY_VERSION,
-                "input_min_score": min_score,
-                "batch_item_limit": resolved_batch_item_limit,
-                "batch_input_byte_limit": resolved_batch_input_byte_limit,
-                "primary_policy_version": _STAGE_C_PRIMARY_POLICY_VERSION,
+                "history_days": DAILY_HISTORY_DAYS,
+                "max_turns": max_turns,
+                "max_tool_calls": max_tool_calls,
+                "max_web_searches": max_web_searches,
+                "lease_seconds": lease_seconds,
+                "allowed_domain_count": len(allowed_domains),
             },
         )
-        current = _as_utc(stage.reference_time) or frozen_reference
-        result.reference_time = current
-        selection = _load_cluster_items(
-            session,
-            run_id=int(run_id),
-            input_min_score=min_score,
-        )
-        result.input_audit = selection.audit
-        candidates = [_item_candidate(item) for item in selection.items]
-        history = _load_published_daily_history(session, run=run, days=DAILY_HISTORY_DAYS)
-        result.processed = len(candidates)
-        input_fingerprint = _cluster_input_fingerprint(candidates, history)
         task = repo.ensure_stage_task(
             stage,
             subject_type="run",
@@ -235,22 +251,13 @@ def run_event_cluster_job(
             task_id=task.id,
             owner=owner,
             force=force,
+            lease_seconds=lease_seconds,
             input_fingerprint=input_fingerprint,
             config_fingerprint=config_fingerprint,
         )
         if claimed is None:
-            if repo.task_is_reusable(
-                task,
-                input_fingerprint=input_fingerprint,
-                config_fingerprint=config_fingerprint,
-            ):
-                stored = _mapping(task.result)
-                result.event_ids = _event_id_list(stored.get("event_ids"))
-                result.current_event_ids = _event_id_list(stored.get("current_event_ids"))
-                result.candidate_event_ids = _event_id_list(stored.get("candidate_event_ids"))
-                result.input_audit = _mapping(stored.get("input_audit"))
-                result.processed = 0
-                return result
+            if repo.task_is_reusable(task, input_fingerprint=input_fingerprint, config_fingerprint=config_fingerprint):
+                return _result_from_task(result, task)
             raise RuntimeError("Stage C task is already running")
         task = claimed
         try:
@@ -267,129 +274,201 @@ def run_event_cluster_job(
         session.commit()
 
         try:
-            if not candidates:
+            if not admissions["active"]:
                 _clear_build_events(session, run_id=int(run_id))
-                repo.complete_stage_task(
+                completed = repo.complete_stage_task(
                     task,
                     owner=owner,
                     result={
-                        "schema_version": STAGE_C_SCHEMA_VERSION,
+                        "schema_version": STAGE_C_CANDIDATE_CONTRACT_VERSION,
                         "event_ids": [],
                         "current_event_ids": [],
                         "candidate_event_ids": [],
                         "processed": 0,
-                        "clusters": 0,
                         "input_audit": result.input_audit,
                     },
                     metadata={"input_audit": result.input_audit},
                 )
+                if completed is None:
+                    raise StageCLeaseLostError("Stage C task lease was lost before empty-result completion")
                 session.commit()
                 return result
+            if ai_client is None or not callable(getattr(ai_client, "run", None)):
+                raise TypeError("Stage C requires a Responses agent client with run()")
 
-            if ai_client is None or not callable(getattr(ai_client, "aggregate", None)):
-                raise TypeError("Stage C requires an AI client with aggregate()")
-            call = _aggregate_stage_c_batches(
-                ai_client=ai_client,
-                candidates=candidates,
-                recent_history=history,
-                edition={
-                    "edition_date": run.edition_date,
+            existing_session = repo.get_agent_session(int(run_id), stage_name="cluster")
+            reset_agent = bool(
+                force
+                or existing_session is None
+                or existing_session.state.get("input_fingerprint") != input_fingerprint
+                or existing_session.prompt_version != STAGE_C_AGENT_PROMPT_VERSION
+            )
+            agent_session = repo.start_agent_session(
+                run_id=int(run_id),
+                stage_id=int(stage.id),
+                stage_name="cluster",
+                model=model_name,
+                prompt_version=STAGE_C_AGENT_PROMPT_VERSION,
+                max_turns=max_turns,
+                max_tool_calls=max_tool_calls,
+                max_web_searches=max_web_searches,
+                state={
+                    "input_fingerprint": input_fingerprint,
+                    "config_fingerprint": config_fingerprint,
+                    "allowed_domains": allowed_domains,
                     "reference_time": current.isoformat(),
+                    "lease_seconds": lease_seconds,
                 },
-                batch_item_limit=resolved_batch_item_limit,
-                batch_input_byte_limit=resolved_batch_input_byte_limit,
+                reset=reset_agent,
             )
-            raw_response = call.raw_response
-            request_metadata = call.request_metadata
-            parsed = strict_parse_stage_c_aggregation(
-                call.parsed.model_dump(mode="json"),
-                item_ids=[int(row["id"]) for row in candidates],
-                prior_event_keys=[str(row["event_key"]) for row in history],
-            )
-            _clear_build_events(session, run_id=int(run_id))
-            by_id = {int(row["id"]): row for row in candidates}
-            event_keys: set[str] = set()
-            for cluster in parsed.clusters:
-                primary_item_id = _select_primary_item_id(cluster.item_ids, candidates=by_id)
-                event_key = cluster.prior_event_key or canonical_event_key(by_id[primary_item_id])
-                if event_key in event_keys:
-                    raise ValueError(f"Stage C response produces duplicate event_key: {event_key}")
-                event_keys.add(event_key)
-                event = _persist_ai_cluster(
-                    session,
-                    run_id=int(run_id),
-                    current=current,
-                    cluster=cluster,
-                    candidates=by_id,
-                    request_metadata=request_metadata,
-                )
-                result.current_event_ids.append(int(event.id))
-                result.merged += max(0, len(cluster.item_ids) - 1)
-                if cluster.novelty_status == "new":
-                    result.events += 1
-                    result.event_ids.append(int(event.id))
-                    result.candidate_event_ids.append(int(event.id))
-                elif cluster.novelty_status == "updated":
-                    result.updated += 1
-                    result.candidate_event_ids.append(int(event.id))
-                else:
-                    result.repeats += 1
+            agent_session.status = "running"
+            agent_session.started_at = agent_session.started_at or datetime.now(timezone.utc)
+            agent_session.error_code = None
+            agent_session.error_message = None
+            session.commit()
 
-            repo.complete_stage_task(
+            tools = _StageCAgentTools(
+                session=session,
+                repo=repo,
+                run=run,
+                agent_session=agent_session,
+                admissions=admissions,
+                history=history,
+                allowed_domains=allowed_domains,
+            )
+
+            def on_response(turn: int, response: Mapping[str, Any]) -> None:
+                if repo.heartbeat_stage_task(task, owner=owner, lease_seconds=lease_seconds) is None:
+                    raise StageCLeaseLostError("Stage C task lease was lost while saving an agent response")
+                tools.record_web_search_observations(response)
+                repo.append_agent_step(
+                    int(agent_session.id),
+                    turn=turn,
+                    kind="response",
+                    raw_response=response,
+                )
+                agent_session.response_id = _text(response.get("id")) or agent_session.response_id
+                agent_session.turn_count = max(agent_session.turn_count, int(turn))
+                agent_session.web_search_count += _web_search_count(response)
+                session.commit()
+
+            def on_tool(turn: int, call: Mapping[str, Any], output: Mapping[str, Any]) -> None:
+                if repo.heartbeat_stage_task(task, owner=owner, lease_seconds=lease_seconds) is None:
+                    raise StageCLeaseLostError("Stage C task lease was lost while saving an agent tool call")
+                repo.append_agent_step(
+                    int(agent_session.id),
+                    turn=turn,
+                    kind="tool_call",
+                    tool_name=_text(call.get("name")),
+                    call_id=_text(call.get("call_id")),
+                    input_value=_parse_call_arguments(call.get("arguments")),
+                    output_value=output,
+                    status="success" if output.get("ok", True) else "error",
+                    error_message=_text(output.get("error")),
+                )
+                agent_session.tool_call_count += 1
+                session.commit()
+
+            if not agent_session.finalization_requested:
+                agent_result = ai_client.run(
+                    initial_context={
+                        "run_id": int(run_id),
+                        "reference_time": current.isoformat(),
+                        "active_candidate_count": len(admissions["active"]),
+                        "reserve_candidate_count": len(admissions["reserve"]),
+                        "history_window_days": DAILY_HISTORY_DAYS,
+                        "instructions": "Use tools to investigate and call finalize_event_drafts only after all active candidates are covered.",
+                    },
+                    function_tools=tools.function_tools,
+                    allowed_domains=allowed_domains,
+                    max_turns=max_turns,
+                    max_tool_calls=max_tool_calls,
+                    max_web_searches=max_web_searches,
+                    # A retry starts a fresh model turn but reads persisted
+                    # drafts/tools; this avoids replaying an interrupted call.
+                    previous_response_id=None,
+                    on_response=on_response,
+                    on_tool=on_tool,
+                )
+                result.turns = agent_result.turns
+                result.tool_calls = agent_result.tool_calls
+                result.web_searches = agent_result.web_searches
+            if repo.heartbeat_stage_task(task, owner=owner, lease_seconds=lease_seconds) is None:
+                raise StageCLeaseLostError("Stage C task lease was lost before event materialization")
+            if not agent_session.finalization_requested:
+                raise AgentProtocolError("C agent did not finalize its event drafts")
+
+            _materialize_agent_events(
+                session=session,
+                repo=repo,
+                run_id=int(run_id),
+                current=current,
+                agent_session=agent_session,
+                admissions=admissions,
+                result=result,
+            )
+            agent_session.status = "succeeded"
+            agent_session.finished_at = datetime.now(timezone.utc)
+            completed = repo.complete_stage_task(
                 task,
                 owner=owner,
-                result={
-                    "schema_version": STAGE_C_SCHEMA_VERSION,
-                    "event_ids": result.event_ids,
-                    "current_event_ids": result.current_event_ids,
-                    "candidate_event_ids": result.candidate_event_ids,
-                    "processed": result.processed,
-                    "clusters": len(parsed.clusters),
-                    "input_audit": result.input_audit,
-                    "request_metadata": dict(request_metadata or {}),
-                },
-                raw_response=raw_response,
+                result=_task_result(result, agent_session),
+                raw_response={"agent_session_id": int(agent_session.id), "response_id": agent_session.response_id},
                 metadata={
-                    **dict(request_metadata or {}),
                     "input_audit": result.input_audit,
+                    "agent_session_id": int(agent_session.id),
+                    "turns": result.turns or agent_session.turn_count,
+                    "tool_calls": result.tool_calls or agent_session.tool_call_count,
+                    "web_searches": result.web_searches or agent_session.web_search_count,
                 },
             )
+            if completed is None:
+                raise StageCLeaseLostError("Stage C task lease was lost before completion")
+            session.commit()
+            return result
+        except AgentBudgetExceeded as exc:
+            # Budget exhaustion is uncertainty, not a reason to lose a
+            # qualified source. Close the uncovered active set into explicit
+            # needs-review singleton drafts, then commit a valid projection.
+            _ensure_unresolved_drafts(
+                repo=repo,
+                agent_session=agent_session,
+                admissions=admissions,
+                reason="agent_budget_exhausted",
+            )
+            _materialize_agent_events(
+                session=session,
+                repo=repo,
+                run_id=int(run_id),
+                current=current,
+                agent_session=agent_session,
+                admissions=admissions,
+                result=result,
+            )
+            agent_session.status = "succeeded"
+            agent_session.finished_at = datetime.now(timezone.utc)
+            agent_session.error_code = "agent_budget_exhausted"
+            agent_session.error_message = str(exc)
+            result.input_audit["budget_exhausted"] = True
+            completed = repo.complete_stage_task(
+                task,
+                owner=owner,
+                result=_task_result(result, agent_session),
+                raw_response={"agent_session_id": int(agent_session.id), "error": str(exc)},
+                metadata={"input_audit": result.input_audit, "agent_session_id": int(agent_session.id)},
+            )
+            if completed is None:
+                raise StageCLeaseLostError("Stage C task lease was lost before budget-fallback completion")
             session.commit()
             return result
         except Exception as exc:
             session.rollback()
-            raw_response = getattr(exc, "raw_response", raw_response)
-            request_metadata = getattr(exc, "request_metadata", request_metadata)
-            with session_factory() as failure_session:
-                failure_repo = IntelRepository(failure_session)
-                failure_stage = failure_repo.get_stage(int(run_id), "cluster")
-                failure_task = (
-                    failure_repo.get_task(
-                        failure_stage,
-                        subject_type="run",
-                        subject_id=int(run_id),
-                    )
-                    if failure_stage is not None
-                    else None
-                )
-                if failure_task is not None and failure_task.status == "running":
-                    failure_repo.fail_stage_task(
-                        failure_task,
-                        error_category="provider",
-                        error_code="stage_c_ai_aggregation_failed",
-                        error_message=str(exc),
-                        retryable=(
-                            bool(getattr(exc, "retryable", False))
-                            or isinstance(exc, StageCDownstreamBusyError)
-                            or str(exc).startswith("downstream_stage_busy:")
-                        ),
-                        raw_response={
-                            "provider_response": raw_response,
-                            "request_metadata": dict(request_metadata or {}),
-                        },
-                        owner=owner,
-                    )
-                failure_session.commit()
+            _fail_agent_run(
+                session_factory=session_factory,
+                run_id=int(run_id),
+                owner=owner,
+                error=exc,
+            )
             raise
 
 
@@ -404,493 +483,680 @@ def run_event_cluster_from_settings(
 ) -> EventClusterResult:
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
-    client = ai_client or StageCAggregationClient.from_settings(settings)
     return run_event_cluster_job(
         session_factory=create_session_factory(engine),
-        ai_client=client,
+        ai_client=ai_client or StageCAgentClient.from_settings(settings),
         run_id=run_id,
         force=force,
         now=now,
         reference_time=reference_time,
-        input_min_score=settings.ai_stage_c_input_min_score,
+        max_turns=settings.stage_c_agent_max_turns,
+        max_tool_calls=settings.stage_c_agent_max_tool_calls,
+        max_web_searches=settings.stage_c_agent_max_web_searches,
+        trusted_domains=settings.stage_c_trusted_domains,
     )
 
 
-def _load_cluster_items(
-    session: Session,
-    *,
-    run_id: int,
-    input_min_score: int,
-) -> _StageCInputSelection:
-    """Build Stage C's auditable, deterministic input set from Stage-B items."""
+class _StageCAgentTools:
+    def __init__(
+        self,
+        *,
+        session: Session,
+        repo: IntelRepository,
+        run: IntelRun,
+        agent_session: IntelAgentSession,
+        admissions: Mapping[str, Sequence[IntelCandidateAdmission]],
+        history: Sequence[Mapping[str, Any]],
+        allowed_domains: Sequence[str],
+    ) -> None:
+        self.session = session
+        self.repo = repo
+        self.run = run
+        self.agent_session = agent_session
+        self.history = list(history)
+        self.allowed_domains = set(allowed_domains)
+        self.web_search_observed_urls: set[str] = set()
+        self.web_search_calls_seen = 0
+        self.admissions = {key: list(value) for key, value in admissions.items()}
+        self.by_item_id = {
+            int(row.item_id): row
+            for rows in self.admissions.values()
+            for row in rows
+        }
+        self.active_ids = {int(row.item_id) for row in self.admissions.get("active", ())}
 
-    stage = session.scalar(
-        select(IntelRunStage).where(
-            IntelRunStage.run_id == int(run_id),
-            IntelRunStage.stage_name == "analyze",
-        )
-    )
-    if stage is None:
-        raise ValueError("Stage C requires the Stage B analysis stage")
-    if str(stage.status) in {"pending", "running", "retry_waiting"}:
-        raise ValueError("Stage C requires the Stage B analysis stage to finish before aggregation")
-    if str(stage.status) not in {"succeeded", "failed", "blocked"}:
-        raise ValueError("Stage C requires a terminal Stage B analysis stage")
+    @property
+    def function_tools(self) -> list[FunctionTool]:
+        return [
+            FunctionTool("list_candidates", "分页列出 B 已准入的 active 或 reserve 候选概要。", LIST_CANDIDATES_SCHEMA, self.list_candidates),
+            FunctionTool("list_event_drafts", "列出当前会话已持久化的事件草稿，供失败恢复时继续。", LIST_DRAFTS_SCHEMA, self.list_event_drafts),
+            FunctionTool("read_items", "读取候选的完整原文、B 分析和来源元数据。", READ_ITEMS_SCHEMA, self.read_items),
+            FunctionTool("search_candidates", "在 B 准入候选内按词检索相关内容。", SEARCH_CANDIDATES_SCHEMA, self.search_candidates),
+            FunctionTool("read_recent_history", "查询过去三天的已发布日报事件，判断重复或更新。", READ_HISTORY_SCHEMA, self.read_recent_history),
+            FunctionTool("save_event_drafts", "批量保存或更新 1–8 个事件聚合草稿。", SAVE_DRAFTS_SCHEMA, self.save_event_drafts),
+            FunctionTool("record_verification_evidence", "记录网页搜索得到的允许域名核验证据。", RECORD_EVIDENCE_SCHEMA, self.record_verification_evidence),
+            FunctionTool("mark_unresolved", "把无法可靠聚合的 active 候选显式放入待审事件。", MARK_UNRESOLVED_SCHEMA, self.mark_unresolved),
+            FunctionTool("finalize_event_drafts", "检查 active 覆盖并提交事件草稿。", FINALIZE_DRAFTS_SCHEMA, self.finalize_event_drafts),
+        ]
 
-    item_tasks = list(
-        session.scalars(
-            select(IntelRunStageTask)
-            .where(
-                IntelRunStageTask.stage_id == stage.id,
-                IntelRunStageTask.subject_type == "item",
-            )
-            .order_by(IntelRunStageTask.id.asc())
-        ).all()
-    )
-    active_statuses = {"pending", "running", "retry_waiting"}
-    if any(str(task.status) in active_statuses for task in item_tasks):
-        raise ValueError("Stage C requires Stage B item tasks to finish before aggregation")
-
-    status_counts: dict[str, int] = {}
-    succeeded_item_ids: list[int] = []
-    succeeded_tasks_by_item: dict[int, IntelRunStageTask] = {}
-    for task in item_tasks:
-        status = str(task.status)
-        status_counts[status] = status_counts.get(status, 0) + 1
-        if status != "succeeded":
-            continue
-        item_id = task.item_id
-        if item_id is None and str(task.subject_id).isdigit():
-            item_id = int(task.subject_id)
-        if item_id is not None and int(item_id) > 0 and int(item_id) not in succeeded_item_ids:
-            succeeded_item_ids.append(int(item_id))
-            succeeded_tasks_by_item[int(item_id)] = task
-
-    items_by_id: dict[int, IntelItem] = {}
-    if succeeded_item_ids:
-        stmt = (
-            select(IntelItem)
-            .join(IntelRunItem, IntelRunItem.item_id == IntelItem.id)
-            .where(
-                IntelRunItem.run_id == int(run_id),
-                IntelItem.id.in_(succeeded_item_ids),
-            )
-            .options(
-                joinedload(IntelItem.source),
-                joinedload(IntelItem.ai_review),
-            )
-        )
-        items_by_id = {
-            int(item.id): item
-            for item in session.scalars(stmt).unique().all()
+    def list_candidates(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        bucket = str(args.get("bucket") or "active")
+        if bucket not in {"active", "reserve"}:
+            raise ValueError("bucket must be active or reserve")
+        offset = max(0, int(args.get("offset") or 0))
+        limit = max(1, min(30, int(args.get("limit") or 20)))
+        rows = self.admissions[bucket]
+        return {
+            "ok": True,
+            "bucket": bucket,
+            "total": len(rows),
+            "offset": offset,
+            "items": [_compact_admission(row) for row in rows[offset : offset + limit]],
         }
 
-    excluded: dict[str, list[int]] = {
-        "analysis_filtered": [],
-        "below_min_score": [],
-        "missing_item": [],
-        "missing_review": [],
-    }
-    selected: list[IntelItem] = []
-    for item_id in succeeded_item_ids:
-        item = items_by_id.get(item_id)
-        if item is None:
-            excluded["missing_item"].append(item_id)
-            continue
-        review = item.ai_review
-        if (
-            item.status == "analysis_filtered"
-            or _stage_b_task_is_structurally_filtered(succeeded_tasks_by_item[item_id])
-            or _review_is_structurally_filtered(review)
-        ):
-            excluded["analysis_filtered"].append(item_id)
-            continue
-        if review is None or review.status != "success":
-            excluded["missing_review"].append(item_id)
-            continue
-        if int(review.b1_priority or 0) < input_min_score:
-            excluded["below_min_score"].append(item_id)
-            continue
-        selected.append(item)
+    def list_event_drafts(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        del args
+        drafts = self.repo.list_agent_drafts(int(self.agent_session.id))
+        return {
+            "ok": True,
+            "drafts": [
+                {
+                    "draft_key": draft.draft_key,
+                    "title": draft.title,
+                    "item_ids": [int(member.item_id) for member in draft.members],
+                    "novelty_status": draft.novelty_status,
+                    "review_state": draft.review_state,
+                    "confidence": int(draft.confidence),
+                }
+                for draft in drafts
+            ],
+        }
 
-    audit = {
-        "policy_version": STAGE_C_INPUT_POLICY_VERSION,
-        "min_score": input_min_score,
-        "stage_b_task_statuses": status_counts,
-        "stage_b_succeeded": len(succeeded_item_ids),
-        "selected_count": len(selected),
-        "selected_item_ids": [int(item.id) for item in selected],
-        "excluded_item_ids": excluded,
-        "excluded_counts": {reason: len(item_ids) for reason, item_ids in excluded.items()},
-    }
-    return _StageCInputSelection(items=selected, audit=audit)
+    def read_items(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        ids = _unique_positive_ids(args.get("item_ids"), limit=10)
+        unknown = [item_id for item_id in ids if item_id not in self.by_item_id]
+        if unknown:
+            return {"ok": False, "error": f"item ids are outside the C workbench: {unknown}"}
+        return {"ok": True, "items": [_full_admission(self.by_item_id[item_id]) for item_id in ids]}
+
+    def search_candidates(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        query = str(args.get("query") or "").strip().casefold()
+        bucket = str(args.get("bucket") or "all")
+        limit = max(1, min(30, int(args.get("limit") or 20)))
+        if not query:
+            return {"ok": False, "error": "query is required"}
+        if bucket not in {"active", "reserve", "all"}:
+            return {"ok": False, "error": "bucket must be active, reserve, or all"}
+        tokens = [token for token in re.split(r"\s+", query) if token]
+        rows = self.admissions["active"] + self.admissions["reserve"] if bucket == "all" else self.admissions[bucket]
+        matched = [row for row in rows if _candidate_matches(row.item, tokens)]
+        return {"ok": True, "query": query, "total": len(matched), "items": [_compact_admission(row) for row in matched[:limit]]}
+
+    def read_recent_history(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        query = str(args.get("query") or "").strip().casefold()
+        limit = max(1, min(20, int(args.get("limit") or 10)))
+        tokens = [token for token in re.split(r"\s+", query) if token]
+        rows = [row for row in self.history if _history_matches(row, tokens)] if tokens else self.history
+        return {"ok": True, "total": len(rows), "events": rows[:limit]}
+
+    def save_event_drafts(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        raw_drafts = args.get("drafts")
+        if not isinstance(raw_drafts, list) or not 1 <= len(raw_drafts) <= 8:
+            return {"ok": False, "error": "drafts must contain between 1 and 8 objects"}
+        if not all(isinstance(value, Mapping) for value in raw_drafts):
+            return {"ok": False, "error": "every draft must be an object"}
+
+        prepared: list[tuple[dict[str, Any], list[int]]] = []
+        assigned: dict[int, str] = {}
+        keys: set[str] = set()
+        for raw_value in raw_drafts:
+            draft_args = dict(raw_value)
+            draft_key = str(draft_args.get("draft_key") or "").strip()
+            if not draft_key:
+                return {"ok": False, "error": "draft_key is required"}
+            if draft_key in keys:
+                return {"ok": False, "error": f"duplicate draft_key in batch: {draft_key}"}
+            keys.add(draft_key)
+            ids = _unique_positive_ids(draft_args.get("item_ids"), limit=40)
+            if not ids:
+                return {"ok": False, "error": f"item_ids are required for draft: {draft_key}"}
+            unknown = [item_id for item_id in ids if item_id not in self.by_item_id]
+            if unknown:
+                return {"ok": False, "error": f"item ids are outside the C workbench: {unknown}"}
+            for item_id in ids:
+                prior_key = assigned.get(item_id)
+                if prior_key is not None:
+                    return {"ok": False, "error": f"item {item_id} appears in both {prior_key} and {draft_key}"}
+                assigned[item_id] = draft_key
+            prepared.append((draft_args, ids))
+
+        for existing in self.repo.list_agent_drafts(int(self.agent_session.id)):
+            for member in existing.members:
+                new_key = assigned.get(int(member.item_id))
+                if new_key is not None and new_key != existing.draft_key:
+                    return {
+                        "ok": False,
+                        "error": f"item {member.item_id} is already assigned to existing draft {existing.draft_key}",
+                    }
+
+        saved: list[dict[str, Any]] = []
+        try:
+            with self.session.begin_nested():
+                for draft_args, ids in prepared:
+                    draft = self.repo.upsert_agent_draft(
+                        int(self.agent_session.id),
+                        draft_key=str(draft_args.get("draft_key") or ""),
+                        item_ids=ids,
+                        title=str(draft_args.get("title") or ""),
+                        summary_cn=_text(draft_args.get("summary_cn")),
+                        topic=str(draft_args.get("topic") or "technology_insight"),
+                        topics=_strings(draft_args.get("topics")),
+                        keywords=_strings(draft_args.get("keywords")),
+                        entities=[
+                            dict(value)
+                            for value in draft_args.get("entities", [])
+                            if isinstance(value, Mapping)
+                        ],
+                        novelty_status=str(draft_args.get("novelty_status") or "uncertain"),
+                        prior_event_key=_text(draft_args.get("prior_event_key")),
+                        review_state=str(draft_args.get("review_state") or "candidate"),
+                        confidence=_bounded_score(draft_args.get("confidence"), 0),
+                        risk_flags=_strings(draft_args.get("risk_flags")),
+                        metadata={"saved_by": "responses_agent_batch", "batch_size": len(prepared)},
+                    )
+                    saved.append(
+                        {"draft_key": draft.draft_key, "draft_id": int(draft.id), "item_ids": ids}
+                    )
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        self.session.commit()
+        return {"ok": True, "drafts": saved}
+
+    def record_verification_evidence(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        url = str(args.get("url") or "").strip()
+        host = _safe_evidence_host(url)
+        if host is None:
+            return {"ok": False, "error": "evidence URL must be a public http(s) URL"}
+        if not _host_is_allowed(host, self.allowed_domains):
+            return {"ok": False, "error": f"evidence host is not allowed: {host}"}
+        canonical = canonical_event_url(url)
+        if canonical is None:
+            return {"ok": False, "error": "evidence URL is invalid"}
+        if canonical in self.web_search_observed_urls:
+            evidence_status = "verified"
+        elif self.web_search_calls_seen and not self.web_search_observed_urls:
+            # Some compatible Responses providers execute hosted search but
+            # omit returned source objects even when requested. Preserve the
+            # lead for an operator, but never let it masquerade as verified
+            # evidence or an automatically publishable event.
+            evidence_status = "needs_review"
+        else:
+            return {"ok": False, "error": "evidence URL was not observed in this session's hosted web-search actions"}
+        try:
+            evidence = self.repo.record_agent_evidence(
+                int(self.agent_session.id),
+                draft_key=str(args.get("draft_key") or ""),
+                url=url,
+                title=_text(args.get("title")),
+                excerpt=_text(args.get("excerpt")),
+                verification_claim=_text(args.get("claim")),
+                status=evidence_status,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        if evidence_status == "needs_review" and evidence.draft_id is not None:
+            draft = self.session.get(IntelEventDraft, int(evidence.draft_id))
+            if draft is not None:
+                flags = _json_strings(draft.risk_flags_json)
+                if "unbound_web_evidence" not in flags:
+                    flags.append("unbound_web_evidence")
+                draft.risk_flags_json = json.dumps(flags, ensure_ascii=False)
+                draft.review_state = "needs_review"
+        self.session.commit()
+        return {"ok": True, "evidence_id": int(evidence.id), "host": host, "status": evidence_status}
+
+    def record_web_search_observations(self, response: Mapping[str, Any]) -> None:
+        """Bind evidence only to URLs actually observed in hosted search actions."""
+
+        calls = _web_search_count(response)
+        self.web_search_calls_seen += calls
+        self.web_search_observed_urls.update(_web_search_observed_urls(response))
+
+    def mark_unresolved(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        ids = _unique_positive_ids(args.get("item_ids"), limit=40)
+        unknown = [item_id for item_id in ids if item_id not in self.active_ids]
+        if unknown:
+            return {"ok": False, "error": f"unresolved items must be active candidates: {unknown}"}
+        return _save_unresolved_draft(self.repo, self.agent_session, self.by_item_id, ids, str(args.get("reason") or "needs_review"))
+
+    def finalize_event_drafts(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        del args
+        validation = _validate_agent_drafts(self.repo, self.agent_session, self.active_ids)
+        if validation["errors"]:
+            return {"ok": False, "errors": validation["errors"], "missing_active_ids": validation["missing_active_ids"]}
+        self.agent_session.finalization_requested = True
+        self.agent_session.status = "finalizing"
+        self.session.commit()
+        return {"ok": True, "draft_count": validation["draft_count"], "_finalized": True}
 
 
-def _stage_b_task_is_structurally_filtered(task: IntelRunStageTask) -> bool:
-    result = task.result
-    if not isinstance(result, Mapping):
-        return False
-    if bool(result.get("filtered")):
-        return True
-    return bool(result.get("analysis_filtered_reason"))
-
-
-def _review_is_structurally_filtered(review: Any) -> bool:
-    # Structural filtering is recorded on the Stage-B task result.  The B1
-    # review projection no longer has a free-form reason field.
-    del review
-    return False
+def _load_admissions(
+    session: Session,
+    *,
+    repo: IntelRepository,
+    run_id: int,
+) -> dict[str, list[IntelCandidateAdmission]]:
+    stage = repo.get_stage(int(run_id), "analyze")
+    if stage is None:
+        raise ValueError("Stage C requires the Stage B analysis stage")
+    item_tasks = repo.list_stage_tasks(stage, subject_type="item", include_expired=True)
+    if any(task.status in {"pending", "running", "retry_waiting"} for task in item_tasks):
+        raise ValueError("Stage C requires Stage B item tasks to finish before aggregation")
+    rows = repo.list_candidate_admissions(int(run_id), decisions=("active", "reserve"))
+    if item_tasks and not rows:
+        raise ValueError("Stage C requires the completed Stage B admission projection")
+    active = [row for row in rows if row.decision == "active"]
+    reserve = [row for row in rows if row.decision == "reserve"]
+    return {"active": active, "reserve": reserve}
 
 
 def _load_published_daily_history(
-    session: Session,
+    repo: IntelRepository,
     *,
     run: IntelRun,
     days: int,
 ) -> list[dict[str, Any]]:
-    if days <= 0 or run.edition_id is None or not run.edition_date:
+    if run.edition is None:
         return []
-    current_edition = date.fromisoformat(run.edition_date)
-    earliest = current_edition - timedelta(days=days)
-    rows = session.execute(
-        select(DailyEditionReportEntry, DailyEdition)
-        .join(DailyEdition, DailyEdition.id == DailyEditionReportEntry.edition_id)
-        .where(
-            DailyEdition.edition_date >= earliest,
-            DailyEdition.edition_date < current_edition,
-            DailyEdition.published_at.is_not(None),
-        )
-        .order_by(DailyEdition.edition_date.desc(), DailyEditionReportEntry.display_order.asc())
-    ).all()
-    return [
-        {
-            "event_key": entry.event_key,
-            "edition_date": edition.edition_date.isoformat(),
-            "title": entry.original_title or entry.title,
-            "summary_cn": entry.summary,
-            "url": canonical_event_url(entry.url),
-            "topic": entry.topic,
-            "content_class": entry.content_class,
-            "source_ids": entry.source_ids,
-            "keywords": entry.keywords,
-            "entities": entry.entities,
-            "metadata": entry.metadata_dict,
-        }
-        for entry, edition in rows
-    ]
-
-
-def _item_candidate(item: IntelItem) -> dict[str, Any]:
-    review = item.ai_review
-    source = item.source
-    topics = list(review.topics) if review is not None else []
-    if review is not None and review.topic and review.topic not in topics:
-        topics.insert(0, review.topic)
-    return {
-        "id": int(item.id),
-        "source_id": item.source_id,
-        "source_group": source.source_group if source else None,
-        "source_role": source.source_role if source else None,
-        "source_subtype": source.source_subtype if source else None,
-        "primary_eligible": bool(source.primary_eligible) if source else False,
-        "content_class": (review.content_class if review else None) or item.content_class,
-        "canonical_url": canonical_event_url(item.canonical_url),
-        "external_id": _normalize_external_id(item.external_id),
-        "title": item.title,
-        "summary_cn": (review.summary_cn if review else None) or item.summary,
-        "topic": (review.topic if review else None) or (topics[0] if topics else None),
-        "topics": _clean_strings(topics),
-        "keywords": list(review.keywords) if review is not None else [],
-        "entities": list(review.entities) if review is not None else [],
-        "b1_priority": _number(review.b1_priority if review else item.b1_priority),
-        "published_at": _iso_datetime(item.published_at or item.discovered_at or item.captured_at),
-        "captured_at": _iso_datetime(item.captured_at),
-        "identity_keys": exact_identity_keys(item),
-    }
-
-
-def _aggregate_stage_c_batches(
-    *,
-    ai_client: Any,
-    candidates: Sequence[Mapping[str, Any]],
-    recent_history: Sequence[Mapping[str, Any]],
-    edition: Mapping[str, Any],
-    batch_item_limit: int,
-    batch_input_byte_limit: int,
-) -> StageCAggregationCallResult:
-    """Run independently valid bounded calls, then validate their exact union."""
-
-    # History is repeated in every request. Reserve its conservative serialized
-    # footprint before packing current candidates, rather than letting a large
-    # three-day history silently defeat the request budget.
-    current_item_byte_budget = max(1, batch_input_byte_limit - _serialized_size(recent_history))
-    batches = _partition_stage_c_candidates(
-        candidates,
-        item_limit=batch_item_limit,
-        input_byte_limit=current_item_byte_budget,
-    )
-    batch_records: list[dict[str, Any]] = []
-    raw_batches: list[dict[str, Any]] = []
-    clusters: list[StageCStoryCluster] = []
-    expected_history_keys = [str(row["event_key"]) for row in recent_history]
-
-    for batch_index, batch in enumerate(batches, start=1):
-        item_ids = [int(row["id"]) for row in batch]
-        try:
-            call = ai_client.aggregate(
-                batch,
-                recent_history=recent_history,
-                edition=edition,
-            )
-            if not isinstance(call, StageCAggregationCallResult):
-                raise TypeError("Stage C aggregate() must return StageCAggregationCallResult")
-            parsed = strict_parse_stage_c_aggregation(
-                call.parsed.model_dump(mode="json"),
-                item_ids=item_ids,
-                prior_event_keys=expected_history_keys,
-            )
-        except Exception as exc:
-            failed_metadata = _stage_c_batch_request_metadata(
-                batch_records,
-                candidate_count=len(candidates),
-                history_count=len(recent_history),
-                batch_item_limit=batch_item_limit,
-                batch_input_byte_limit=batch_input_byte_limit,
-                history_link_merges=(),
-                failed_batch_index=batch_index,
-            )
-            failed_raw_response = getattr(exc, "raw_response", None)
-            raise StageCAggregationProviderError(
-                str(exc),
-                status_code=getattr(exc, "status_code", None),
-                error_code=getattr(exc, "error_code", None) or "batch_aggregation_failed",
-                raw_response={
-                    "batch_responses": raw_batches,
-                    "failed_batch": {
-                        "batch_index": batch_index,
-                        "item_ids": item_ids,
-                        "provider_response": failed_raw_response,
-                    },
-                },
-                request_metadata=failed_metadata,
-                cause=exc,
-            ) from exc
-
-        request_metadata = dict(call.request_metadata)
-        batch_records.append(
+    entries = repo.list_prior_daily_report_entries(edition_date=run.edition.edition_date, days=days)
+    result: list[dict[str, Any]] = []
+    for entry in entries:
+        result.append(
             {
-                "batch_index": batch_index,
-                "item_ids": item_ids,
-                "item_count": len(item_ids),
-                "request_metadata": request_metadata,
+                "event_key": entry.event_key,
+                "edition_date": entry.edition.edition_date.isoformat() if entry.edition is not None else None,
+                "title": entry.title,
+                "summary": entry.summary,
+                "topic": entry.topic,
+                "keywords": entry.keywords,
+                "entities": entry.entities,
+                "risk_flags": entry.risk_flags,
+                "source_refs": entry.source_refs,
+                "verification_refs": entry.verification_refs,
             }
         )
-        raw_batches.append(
-            {
-                "batch_index": batch_index,
-                "item_ids": item_ids,
-                "provider_response": call.raw_response,
-            }
-        )
-        clusters.extend(parsed.clusters)
-
-    candidates_by_id = {int(row["id"]): row for row in candidates}
-    merged_clusters, history_link_merges = _merge_history_linked_clusters(
-        clusters,
-        candidates=candidates_by_id,
-    )
-    combined = strict_parse_stage_c_aggregation(
-        {
-            "schema_version": STAGE_C_SCHEMA_VERSION,
-            "clusters": [cluster.model_dump(mode="json") for cluster in merged_clusters],
-        },
-        item_ids=[int(row["id"]) for row in candidates],
-        prior_event_keys=expected_history_keys,
-    )
-    aggregate_metadata = _stage_c_batch_request_metadata(
-        batch_records,
-        candidate_count=len(candidates),
-        history_count=len(recent_history),
-        batch_item_limit=batch_item_limit,
-        batch_input_byte_limit=batch_input_byte_limit,
-        history_link_merges=history_link_merges,
-    )
-    return StageCAggregationCallResult(
-        parsed=combined,
-        raw_response={"batch_responses": raw_batches},
-        request_metadata=aggregate_metadata,
-    )
-
-
-def _partition_stage_c_candidates(
-    candidates: Sequence[Mapping[str, Any]],
-    *,
-    item_limit: int,
-    input_byte_limit: int,
-) -> list[list[Mapping[str, Any]]]:
-    """Co-locate likely related records without deciding their final grouping."""
-
-    ordered = sorted(candidates, key=_stage_c_batch_key)
-    batches: list[list[Mapping[str, Any]]] = []
-    current: list[Mapping[str, Any]] = []
-    current_bytes = 0
-    for candidate in ordered:
-        candidate_bytes = _serialized_size(candidate)
-        would_exceed_item_limit = len(current) >= item_limit
-        would_exceed_byte_limit = bool(current) and current_bytes + candidate_bytes > input_byte_limit
-        if current and (would_exceed_item_limit or would_exceed_byte_limit):
-            batches.append(current)
-            current = []
-            current_bytes = 0
-        current.append(candidate)
-        current_bytes += candidate_bytes
-    if current:
-        batches.append(current)
-    return batches
-
-
-def _stage_c_batch_key(candidate: Mapping[str, Any]) -> tuple[str, str, int]:
-    typed_entities: list[tuple[int, str]] = []
-    entity_rank = {
-        "model": 0,
-        "product": 1,
-        "project": 2,
-        "organization": 3,
-        "company": 4,
-    }
-    entities = candidate.get("entities")
-    if isinstance(entities, Iterable) and not isinstance(entities, (str, bytes, Mapping)):
-        for entity in entities:
-            if not isinstance(entity, Mapping):
-                continue
-            name = normalize_event_title(entity.get("name"))
-            if not name:
-                continue
-            entity_type = str(entity.get("type") or "").strip().casefold()
-            typed_entities.append((entity_rank.get(entity_type, 9), name))
-    if typed_entities:
-        rank, name = min(typed_entities)
-        anchor = f"entity:{rank}:{name}"
-    else:
-        keyword_values = candidate.get("keywords")
-        keywords = (
-            [normalize_event_title(value) for value in keyword_values]
-            if isinstance(keyword_values, Iterable) and not isinstance(keyword_values, (str, bytes, Mapping))
-            else []
-        )
-        keywords = [value for value in keywords if value]
-        if keywords:
-            anchor = f"keyword:{min(keywords, key=lambda value: (-len(value), value))}"
-        else:
-            anchor = f"topic:{normalize_event_title(candidate.get('topic'))}"
-    title = normalize_event_title(candidate.get("title"))
-    return anchor, title, int(candidate["id"])
-
-
-def _merge_history_linked_clusters(
-    clusters: Sequence[StageCStoryCluster],
-    *,
-    candidates: Mapping[int, Mapping[str, Any]],
-) -> tuple[list[StageCStoryCluster], list[dict[str, Any]]]:
-    """Merge only clusters whose model output names the same published event."""
-
-    by_history_key: dict[str, list[StageCStoryCluster]] = {}
-    for cluster in clusters:
-        if cluster.prior_event_key:
-            by_history_key.setdefault(cluster.prior_event_key, []).append(cluster)
-
-    merged: list[StageCStoryCluster] = []
-    audit: list[dict[str, Any]] = []
-    processed_history_keys: set[str] = set()
-    for cluster in clusters:
-        history_key = cluster.prior_event_key
-        if not history_key:
-            merged.append(cluster)
-            continue
-        if history_key in processed_history_keys:
-            continue
-        processed_history_keys.add(history_key)
-        linked = by_history_key[history_key]
-        if len(linked) == 1:
-            merged.append(cluster)
-            continue
-        item_ids = [item_id for current in linked for item_id in current.item_ids]
-        primary_item_id = _select_primary_item_id(item_ids, candidates=candidates)
-        representative = next(current for current in linked if primary_item_id in current.item_ids)
-        novelty_status = "updated" if any(current.novelty_status == "updated" for current in linked) else "repeat"
-        merged.append(
-            StageCStoryCluster(
-                title_zh=representative.title_zh,
-                summary_zh=representative.summary_zh,
-                item_ids=item_ids,
-                novelty_status=novelty_status,
-                prior_event_key=history_key,
-            )
-        )
-        audit.append(
-            {
-                "prior_event_key": history_key,
-                "source_cluster_count": len(linked),
-                "item_ids": item_ids,
-                "novelty_status": novelty_status,
-            }
-        )
-    return merged, audit
-
-
-def _stage_c_batch_request_metadata(
-    batch_records: Sequence[Mapping[str, Any]],
-    *,
-    candidate_count: int,
-    history_count: int,
-    batch_item_limit: int,
-    batch_input_byte_limit: int,
-    history_link_merges: Sequence[Mapping[str, Any]],
-    failed_batch_index: int | None = None,
-) -> dict[str, Any]:
-    normalized_records = [dict(row) for row in batch_records]
-    request_bytes = sum(
-        int(_number(_mapping(row.get("request_metadata")).get("request_bytes")))
-        for row in normalized_records
-    )
-    digest_payload = [
-        _mapping(row.get("request_metadata")).get("request_sha256")
-        for row in normalized_records
-    ]
-    request_sha256 = hashlib.sha256(
-        json.dumps(digest_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
-    result: dict[str, Any] = {
-        "aggregation_mode": STAGE_C_AGGREGATION_MODE,
-        "item_count": int(candidate_count),
-        "history_count": int(history_count),
-        "batch_count": len(normalized_records),
-        "batch_item_limit": int(batch_item_limit),
-        "batch_input_byte_limit": int(batch_input_byte_limit),
-        "request_bytes": request_bytes,
-        "request_sha256": request_sha256,
-        "batches": normalized_records,
-        "history_link_merges": [dict(row) for row in history_link_merges],
-    }
-    if failed_batch_index is not None:
-        result["failed_batch_index"] = int(failed_batch_index)
     return result
 
 
-def _select_primary_item_id(
-    item_ids: Iterable[int],
+def _materialize_agent_events(
     *,
-    candidates: Mapping[int, Mapping[str, Any]],
-) -> int:
-    rows = [candidates[int(item_id)] for item_id in item_ids]
-    if not rows:
-        raise ValueError("Stage C cluster must contain at least one item_id")
-    return int(min(rows, key=_primary_sort_key)["id"])
+    session: Session,
+    repo: IntelRepository,
+    run_id: int,
+    current: datetime,
+    agent_session: IntelAgentSession,
+    admissions: Mapping[str, Sequence[IntelCandidateAdmission]],
+    result: EventClusterResult,
+) -> None:
+    active_ids = {int(row.item_id) for row in admissions["active"]}
+    validation = _validate_agent_drafts(repo, agent_session, active_ids)
+    if validation["errors"]:
+        raise StageCAgentContractError("; ".join(validation["errors"]))
+    all_admissions = {int(row.item_id): row for rows in admissions.values() for row in rows}
+    _clear_build_events(session, run_id=run_id)
+    result.event_ids.clear()
+    result.current_event_ids.clear()
+    result.candidate_event_ids.clear()
+    seen_keys: set[str] = set()
+    for draft in repo.list_agent_drafts(int(agent_session.id)):
+        member_ids = [int(member.item_id) for member in draft.members]
+        members = [all_admissions[item_id].item for item_id in member_ids]
+        primary = _select_primary_item(members)
+        event_key = draft.prior_event_key or canonical_event_key(_item_mapping(primary))
+        if event_key in seen_keys:
+            event_key = f"agent:{int(agent_session.id)}:{int(draft.id)}"
+        seen_keys.add(event_key)
+        source_ids = _unique_strings(item.source_id for item in members)
+        source_groups = _unique_strings(getattr(item.source, "source_group", None) for item in members)
+        review_topics = [item.ai_review.topic for item in members if item.ai_review is not None and item.ai_review.topic]
+        review_keywords = [keyword for item in members if item.ai_review is not None for keyword in item.ai_review.keywords]
+        review_entities = [entity for item in members if item.ai_review is not None for entity in item.ai_review.entities]
+        risk_flags = _json_strings(draft.risk_flags_json)
+        if draft.review_state == "needs_review" and "needs_review" not in risk_flags:
+            risk_flags.append("needs_review")
+        event = repo.upsert_event(
+            run_id=run_id,
+            event_key=event_key,
+            canonical_url=primary.canonical_url or primary.source_url,
+            external_id=primary.external_id,
+            normalized_title=normalize_event_title(draft.title),
+            title=draft.title,
+            summary_cn=draft.summary_cn,
+            topic=draft.topic or (review_topics[0] if review_topics else "technology_insight"),
+            topics=_unique_strings([*_json_strings(draft.topics_json), *review_topics]),
+            keywords=_unique_strings([*_json_strings(draft.keywords_json), *review_keywords]),
+            entities=_unique_json_objects([*_json_objects(draft.entities_json), *review_entities]),
+            content_class=primary.content_class,
+            source_group=getattr(primary.source, "source_group", None),
+            source_ids=source_ids,
+            source_groups=source_groups,
+            identity_keys=[key for item in members for key in exact_identity_keys(_item_mapping(item))],
+            display_score=max((int(item.b1_priority or 0) for item in members), default=0),
+            novelty_status=draft.novelty_status,
+            state="candidate",
+            review_state=draft.review_state,
+            resolution_method="responses_agent",
+            resolution_confidence=max(0, min(100, int(draft.confidence))),
+            resolution_raw={
+                "agent_session_id": int(agent_session.id),
+                "draft_key": draft.draft_key,
+                "prompt_version": agent_session.prompt_version,
+            },
+            risk_flags=risk_flags,
+            primary_item_id=int(primary.id),
+            first_seen_at=min((_as_utc(item.published_at or item.captured_at) for item in members), default=current),
+            last_seen_at=max((_as_utc(item.published_at or item.captured_at) for item in members), default=current),
+        )
+        event.primary_item_id = int(primary.id)
+        for item in members:
+            relation = "primary" if int(item.id) == int(primary.id) else _member_relation(item, primary)
+            repo.upsert_event_item(
+                int(event.id),
+                int(item.id),
+                source_id=item.source_id,
+                source_group=getattr(item.source, "source_group", None),
+                identity_key=next(iter(exact_identity_keys(_item_mapping(item))), None),
+                match_type=relation,
+                match_confidence=max(0, min(100, int(draft.confidence))),
+                is_primary=relation == "primary",
+                lineage={"agent_session_id": int(agent_session.id), "draft_key": draft.draft_key, "relation": relation},
+            )
+        for evidence in session.scalars(
+            select(IntelEventEvidence).where(
+                IntelEventEvidence.session_id == int(agent_session.id),
+                IntelEventEvidence.draft_id == int(draft.id),
+            )
+        ).all():
+            evidence.event_id = int(event.id)
+        result.current_event_ids.append(int(event.id))
+        result.merged += max(0, len(members) - 1)
+        novelty = str(draft.novelty_status or "uncertain")
+        if novelty == "repeat":
+            result.repeats += 1
+        else:
+            result.candidate_event_ids.append(int(event.id))
+            if novelty == "updated":
+                result.updated += 1
+            else:
+                result.events += 1
+                result.event_ids.append(int(event.id))
+        if draft.review_state == "needs_review":
+            result.unresolved += 1
+    session.flush()
 
 
-def _primary_sort_key(candidate: Mapping[str, Any]) -> tuple[int, int, float, float, int]:
-    source_role = str(candidate.get("source_role") or "").strip().casefold()
-    source_role_rank = {
+def _ensure_unresolved_drafts(
+    *,
+    repo: IntelRepository,
+    agent_session: IntelAgentSession,
+    admissions: Mapping[str, Sequence[IntelCandidateAdmission]],
+    reason: str,
+) -> None:
+    all_rows = {int(row.item_id): row for rows in admissions.values() for row in rows}
+    active_ids = {int(row.item_id) for row in admissions["active"]}
+    validation = _validate_agent_drafts(repo, agent_session, active_ids)
+    for item_id in validation["missing_active_ids"]:
+        _save_unresolved_draft(repo, agent_session, all_rows, [item_id], reason)
+
+
+def _save_unresolved_draft(
+    repo: IntelRepository,
+    agent_session: IntelAgentSession,
+    rows_by_item: Mapping[int, IntelCandidateAdmission],
+    item_ids: Sequence[int],
+    reason: str,
+) -> Mapping[str, Any]:
+    ids = [int(value) for value in item_ids]
+    primary = rows_by_item[ids[0]].item
+    key = "unresolved-" + "-".join(str(value) for value in ids)
+    try:
+        draft = repo.upsert_agent_draft(
+            int(agent_session.id),
+            draft_key=key,
+            item_ids=ids,
+            title=primary.title,
+            summary_cn=(primary.ai_review.summary_cn if primary.ai_review is not None else primary.summary) or primary.title,
+            topic=(primary.ai_review.topic if primary.ai_review is not None else "technology_insight") or "technology_insight",
+            topics=(primary.ai_review.topics if primary.ai_review is not None else ()),
+            keywords=(primary.ai_review.keywords if primary.ai_review is not None else ()),
+            entities=(primary.ai_review.entities if primary.ai_review is not None else ()),
+            novelty_status="uncertain",
+            prior_event_key=None,
+            review_state="needs_review",
+            confidence=0,
+            risk_flags=["needs_review", reason],
+            metadata={"reason": reason},
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "draft_key": draft.draft_key, "draft_id": int(draft.id), "_finalized": False}
+
+
+def _validate_agent_drafts(
+    repo: IntelRepository,
+    agent_session: IntelAgentSession,
+    active_ids: set[int],
+) -> dict[str, Any]:
+    drafts = repo.list_agent_drafts(int(agent_session.id))
+    seen: set[int] = set()
+    errors: list[str] = []
+    for draft in drafts:
+        if not draft.members:
+            errors.append(f"draft {draft.draft_key} has no members")
+        for member in draft.members:
+            item_id = int(member.item_id)
+            if item_id in seen:
+                errors.append(f"item {item_id} appears in more than one draft")
+            seen.add(item_id)
+    missing = sorted(active_ids - seen)
+    if missing:
+        errors.append("active candidates are not covered")
+    return {"errors": errors, "missing_active_ids": missing, "draft_count": len(drafts)}
+
+
+def _clear_build_events(session: Session, *, run_id: int) -> None:
+    events = list(session.scalars(select(IntelEvent).where(IntelEvent.build_id == int(run_id))).all())
+    if not events:
+        return
+    ids = [int(event.id) for event in events]
+    for evidence in session.scalars(select(IntelEventEvidence).where(IntelEventEvidence.event_id.in_(ids))).all():
+        evidence.event_id = None
+    for event in events:
+        session.delete(event)
+    session.flush()
+
+
+def _fail_agent_run(
+    *,
+    session_factory: sessionmaker[Session],
+    run_id: int,
+    owner: str,
+    error: Exception,
+) -> None:
+    with session_factory() as failure_session:
+        repo = IntelRepository(failure_session)
+        stage = repo.get_stage(int(run_id), "cluster")
+        if stage is None:
+            return
+        agent = repo.get_agent_session(int(run_id), stage_name="cluster")
+        if agent is not None:
+            agent.status = "failed"
+            agent.error_code = getattr(error, "error_code", None) or error.__class__.__name__
+            agent.error_message = str(error)[:4_000]
+            agent.finished_at = datetime.now(timezone.utc)
+        task = repo.get_task(stage, subject_type="run", subject_id=int(run_id))
+        if task is not None and task.status == "running":
+            repo.fail_stage_task(
+                task,
+                owner=owner,
+                error_category="provider" if not isinstance(error, StageCAgentContractError) else "contract",
+                error_code=getattr(error, "error_code", None) or "stage_c_agent_failed",
+                error_message=str(error),
+                retryable=not isinstance(error, StageCAgentContractError),
+                raw_response={"agent_session_id": int(agent.id) if agent is not None else None},
+            )
+        failure_session.commit()
+
+
+def _assert_downstream_idle(repo: IntelRepository, run_id: int) -> None:
+    try:
+        repo.assert_stages_idle(int(run_id), stage_names=("stage_d", "export"), upstream_stage="cluster")
+    except RuntimeError as exc:
+        if str(exc).startswith("downstream_stage_busy:"):
+            raise StageCDownstreamBusyError(str(exc)) from exc
+        raise
+
+
+def _result_from_task(result: EventClusterResult, task: IntelRunStageTask) -> EventClusterResult:
+    stored = _mapping(task.result)
+    result.event_ids = _event_id_list(stored.get("event_ids"))
+    result.current_event_ids = _event_id_list(stored.get("current_event_ids"))
+    result.candidate_event_ids = _event_id_list(stored.get("candidate_event_ids"))
+    result.input_audit = _mapping(stored.get("input_audit"))
+    result.turns = _bounded_int(stored.get("turns"))
+    result.tool_calls = _bounded_int(stored.get("tool_calls"))
+    result.web_searches = _bounded_int(stored.get("web_searches"))
+    result.unresolved = _bounded_int(stored.get("unresolved"))
+    return result
+
+
+def _task_result(result: EventClusterResult, agent_session: IntelAgentSession) -> dict[str, Any]:
+    return {
+        "schema_version": STAGE_C_CANDIDATE_CONTRACT_VERSION,
+        "event_ids": result.event_ids,
+        "current_event_ids": result.current_event_ids,
+        "candidate_event_ids": result.candidate_event_ids,
+        "processed": result.processed,
+        "input_audit": result.input_audit,
+        "agent_session_id": int(agent_session.id),
+        "turns": result.turns or int(agent_session.turn_count),
+        "tool_calls": result.tool_calls or int(agent_session.tool_call_count),
+        "web_searches": result.web_searches or int(agent_session.web_search_count),
+        "unresolved": result.unresolved,
+    }
+
+
+def _compact_admission(admission: IntelCandidateAdmission) -> dict[str, Any]:
+    item = admission.item
+    review = item.ai_review
+    return {
+        "id": int(item.id),
+        "bucket": admission.decision,
+        "rank": admission.rank,
+        "guarded_score": int(admission.guarded_score),
+        "title": item.title,
+        "summary_cn": review.summary_cn if review is not None else item.summary,
+        "topic": review.topic if review is not None else None,
+        "keywords": review.keywords if review is not None else [],
+        "entities": review.entities if review is not None else [],
+        "canonical_url": item.canonical_url or item.source_url,
+        "published_at": _iso_datetime(item.published_at or item.captured_at),
+        "source": {
+            "id": item.source_id,
+            "group": getattr(item.source, "source_group", None),
+            "role": getattr(item.source, "source_role", None),
+            "tier": getattr(item.source, "tier", None),
+        },
+    }
+
+
+def _full_admission(admission: IntelCandidateAdmission) -> dict[str, Any]:
+    compact = _compact_admission(admission)
+    item = admission.item
+    compact["content_text"] = (item.content_text or item.summary or item.title or "")[:16_000]
+    compact["source_url"] = item.source_url
+    compact["external_id"] = item.external_id
+    compact["content_class"] = item.content_class
+    compact["metrics"] = _json_mapping(item.metrics_json)
+    return compact
+
+
+def _candidate_matches(item: IntelItem, tokens: Sequence[str]) -> bool:
+    review = item.ai_review
+    haystack = " ".join(
+        [
+            item.title or "",
+            item.summary or "",
+            item.content_text or "",
+            review.summary_cn if review is not None else "",
+            " ".join(review.keywords) if review is not None else "",
+            " ".join(str(entity.get("name") or "") for entity in review.entities) if review is not None else "",
+        ]
+    ).casefold()
+    return all(token in haystack for token in tokens)
+
+
+def _history_matches(row: Mapping[str, Any], tokens: Sequence[str]) -> bool:
+    haystack = " ".join(
+        [
+            str(row.get("title") or ""),
+            str(row.get("summary") or ""),
+            " ".join(_strings(row.get("keywords"))),
+            " ".join(str(entity.get("name") or "") for entity in row.get("entities", []) if isinstance(entity, Mapping)),
+        ]
+    ).casefold()
+    return all(token in haystack for token in tokens)
+
+
+def _allowed_domains(
+    *,
+    admissions: Iterable[IntelCandidateAdmission],
+    configured: Sequence[str],
+) -> list[str]:
+    hosts: set[str] = set()
+    for raw in configured:
+        host = _safe_evidence_host("https://" + str(raw).strip().removeprefix("https://").removeprefix("http://"))
+        if host:
+            hosts.add(host)
+    for admission in admissions:
+        item = admission.item
+        source = item.source
+        for value in (item.canonical_url, item.source_url, getattr(source, "url", None), getattr(source, "account_url", None)):
+            host = _safe_evidence_host(value)
+            if host:
+                hosts.add(host)
+    return sorted(hosts)[:100]
+
+
+def _safe_evidence_host(value: Any) -> str | None:
+    try:
+        parsed = urlsplit(str(value or "").strip())
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme not in {"http", "https"} or not host or host in {"localhost", "localhost.localdomain"}:
+        return None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    return None if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved else host
+
+
+def _host_is_allowed(host: str, allowed_domains: Iterable[str]) -> bool:
+    return any(host == allowed or host.endswith("." + allowed) for allowed in allowed_domains)
+
+
+def _select_primary_item(items: Sequence[IntelItem]) -> IntelItem:
+    if not items:
+        raise ValueError("agent draft has no items")
+    return min(items, key=_primary_sort_key)
+
+
+def _primary_sort_key(item: IntelItem) -> tuple[int, int, int, float, int]:
+    source = item.source
+    role = str(getattr(source, "source_role", "") or "").casefold()
+    role_rank = {
         "official": 0,
         "first_party_official": 0,
         "publisher": 1,
@@ -899,196 +1165,191 @@ def _primary_sort_key(candidate: Mapping[str, Any]) -> tuple[int, int, float, fl
         "code_hosting": 4,
         "community": 5,
         "social": 6,
-    }.get(source_role, 7)
-    published_at = _as_utc(candidate.get("published_at") or candidate.get("captured_at"))
-    published_rank = -(published_at.timestamp() if published_at is not None else 0.0)
+    }.get(role, 7)
+    timestamp = _as_utc(item.published_at or item.captured_at)
     return (
-        0 if bool(candidate.get("primary_eligible")) else 1,
-        source_role_rank,
-        -_number(candidate.get("b1_priority")),
-        published_rank,
-        int(candidate["id"]),
+        0 if bool(getattr(source, "primary_eligible", False)) else 1,
+        role_rank,
+        -int(item.b1_priority or 0),
+        -(timestamp.timestamp() if timestamp is not None else 0.0),
+        int(item.id),
     )
 
 
-def _materialize_member_relations(
-    item_ids: Iterable[int],
-    *,
-    primary_item_id: int,
-    candidates: Mapping[int, Mapping[str, Any]],
-) -> dict[int, str]:
-    primary_keys = set(candidates[primary_item_id].get("identity_keys", ()))
-    relations: dict[int, str] = {}
-    for item_id in item_ids:
-        item_id = int(item_id)
-        if item_id == primary_item_id:
-            relations[item_id] = "primary"
-            continue
-        item_keys = set(candidates[item_id].get("identity_keys", ()))
-        relations[item_id] = "duplicate" if primary_keys and primary_keys & item_keys else "related"
-    return relations
-
-
-def _serialized_size(value: Any) -> int:
-    return len(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8"))
-
-
-def _persist_ai_cluster(
-    session: Session,
-    *,
-    run_id: int,
-    current: datetime,
-    cluster: StageCStoryCluster,
-    candidates: Mapping[int, Mapping[str, Any]],
-    request_metadata: Mapping[str, Any],
-):
-    repo = IntelRepository(session)
-    primary_item_id = _select_primary_item_id(cluster.item_ids, candidates=candidates)
-    member_relations = _materialize_member_relations(
-        cluster.item_ids,
-        primary_item_id=primary_item_id,
-        candidates=candidates,
-    )
-    members = [candidates[item_id] for item_id in cluster.item_ids]
-    primary = candidates[primary_item_id]
-    times = [_as_utc(row.get("published_at") or row.get("captured_at")) for row in members]
-    times = [value for value in times if value is not None]
-    event_key = cluster.prior_event_key or canonical_event_key(primary)
-    resolution_raw = {
-        "schema_version": STAGE_C_SCHEMA_VERSION,
-        "cluster": cluster.model_dump(mode="json"),
-        "request_metadata": dict(request_metadata),
-        "local_materialization": {
-            "primary_item_id": primary_item_id,
-            "member_relations": member_relations,
-            "primary_policy_version": _STAGE_C_PRIMARY_POLICY_VERSION,
-        },
-    }
-    event = repo.upsert_event(
-        run_id=run_id,
-        event_key=event_key,
-        canonical_url=primary.get("canonical_url"),
-        external_id=primary.get("external_id"),
-        normalized_title=normalize_event_title(cluster.title_zh),
-        title=cluster.title_zh,
-        summary_cn=cluster.summary_zh,
-        topic=primary.get("topic") or "technology_insight",
-        topics=_clean_strings(topic for row in members for topic in [row.get("topic"), *row.get("topics", [])]),
-        keywords=_unique_strings(keyword for row in members for keyword in row.get("keywords", [])),
-        entities=_unique_json_objects(entity for row in members for entity in row.get("entities", [])),
-        content_class=primary.get("content_class"),
-        source_group=primary.get("source_group"),
-        source_ids=_unique_strings(row.get("source_id") for row in members),
-        source_groups=_unique_strings(row.get("source_group") for row in members),
-        identity_keys=_unique_strings(key for row in members for key in row.get("identity_keys", ())),
-        display_score=max((_number(row.get("b1_priority")) for row in members), default=0.0),
-        novelty_status=cluster.novelty_status,
-        state="candidate",
-        resolution_method="ai_story_aggregation",
-        resolution_confidence=100,
-        resolution_raw=resolution_raw,
-        primary_item_id=primary_item_id,
-        first_seen_at=min(times) if times else current,
-        last_seen_at=max(times) if times else current,
-    )
-    event.primary_item_id = primary_item_id
-    for item_id, relation in member_relations.items():
-        row = candidates[item_id]
-        repo.upsert_event_item(
-            int(event.id),
-            item_id,
-            source_id=str(row.get("source_id") or ""),
-            source_group=_text(row.get("source_group")),
-            identity_key=next(iter(row.get("identity_keys", ())), None),
-            match_type=relation,
-            match_confidence=100,
-            is_primary=relation == "primary",
-            lineage={
-                "run_id": run_id,
-                "relation": relation,
-                "source_id": row.get("source_id"),
-                "source_group": row.get("source_group"),
-                "canonical_url": row.get("canonical_url"),
-                "external_id": row.get("external_id"),
-                "title": row.get("title"),
-            },
-        )
-    session.flush()
-    return event
-
-
-def _clear_build_events(session: Session, *, run_id: int) -> None:
-    """Replace the draft's prior Stage-C projection only after AI validation."""
-
-    events = session.scalars(
-        select(IntelEvent).where(IntelEvent.build_id == int(run_id))
-    ).all()
-    for event in events:
-        session.delete(event)
-    session.flush()
-
-
-def _cluster_input_fingerprint(
-    candidates: Sequence[Mapping[str, Any]],
-    history: Sequence[Mapping[str, Any]],
-) -> str:
-    payload = {"candidates": list(candidates), "history": list(history)}
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+def _member_relation(item: IntelItem, primary: IntelItem) -> str:
+    return "duplicate" if set(exact_identity_keys(_item_mapping(item))) & set(exact_identity_keys(_item_mapping(primary))) else "related"
 
 
 def _stage_c_config_fingerprint(
     *,
-    model_name: str,
-    input_min_score: int,
-    batch_item_limit: int,
-    batch_input_byte_limit: int,
+    model: str,
+    max_turns: int,
+    max_tool_calls: int,
+    max_web_searches: int,
+    lease_seconds: int,
+    allowed_domains: Sequence[str],
 ) -> str:
     payload = {
-        "prompt_version": STAGE_C_PROMPT_VERSION,
-        "aggregation_mode": STAGE_C_AGGREGATION_MODE,
+        "agent_version": STAGE_C_AGENT_VERSION,
+        "prompt_version": STAGE_C_AGENT_PROMPT_VERSION,
         "candidate_contract_version": STAGE_C_CANDIDATE_CONTRACT_VERSION,
-        "primary_policy_version": _STAGE_C_PRIMARY_POLICY_VERSION,
-        "model": model_name,
-        "input_policy_version": STAGE_C_INPUT_POLICY_VERSION,
-        "input_min_score": input_min_score,
-        "batch_item_limit": batch_item_limit,
-        "batch_input_byte_limit": batch_input_byte_limit,
+        "primary_policy_version": _PRIMARY_POLICY_VERSION,
+        "model": model,
+        "max_turns": max_turns,
+        "max_tool_calls": max_tool_calls,
+        "max_web_searches": max_web_searches,
+        "lease_seconds": lease_seconds,
+        "allowed_domains": list(allowed_domains),
     }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def _assert_downstream_idle(repo: IntelRepository, run_id: int) -> None:
-    try:
-        repo.assert_stages_idle(
-            int(run_id),
-            stage_names=("stage_d", "export"),
-            upstream_stage="cluster",
-        )
-    except RuntimeError as exc:
-        if str(exc).startswith("downstream_stage_busy:"):
-            raise StageCDownstreamBusyError(str(exc)) from exc
-        raise
+def _cluster_input_fingerprint(
+    admissions: Mapping[str, Sequence[IntelCandidateAdmission]],
+    history: Sequence[Mapping[str, Any]],
+) -> str:
+    payload = {
+        key: [
+            {
+                "item_id": int(row.item_id),
+                "score": int(row.guarded_score),
+                "rank": row.rank,
+                "policy": row.policy_fingerprint,
+            }
+            for row in value
+        ]
+        for key, value in admissions.items()
+    }
+    payload["history"] = list(history)
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _item_mapping(item: IntelItem) -> dict[str, Any]:
+    return {
+        "id": int(item.id),
+        "canonical_url": item.canonical_url,
+        "source_url": item.source_url,
+        "external_id": item.external_id,
+        "title": item.title,
+    }
+
+
+def _normalize_external_id(value: Any) -> str | None:
+    text = re.sub(r"\s+", "", str(value).strip()).casefold() if value is not None else ""
+    return text or None
+
+
+def _parse_call_arguments(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"raw_arguments": value}
+        return dict(parsed) if isinstance(parsed, Mapping) else {"raw_arguments": value}
+    return {}
+
+
+def _web_search_count(response: Mapping[str, Any]) -> int:
+    output = response.get("output")
+    return sum(1 for item in output if isinstance(item, Mapping) and item.get("type") == "web_search_call") if isinstance(output, list) else 0
+
+
+def _web_search_observed_urls(response: Mapping[str, Any]) -> set[str]:
+    """Extract URLs from provider-returned hosted-search source and page actions."""
+
+    result: set[str] = set()
+    output = response.get("output")
+    if not isinstance(output, list):
+        return result
+    for item in output:
+        if not isinstance(item, Mapping) or item.get("type") != "web_search_call":
+            continue
+        action = item.get("action")
+        for url in _urls_from_search_action(action):
+            canonical = canonical_event_url(url)
+            if canonical:
+                result.add(canonical)
+    return result
+
+
+def _urls_from_search_action(value: Any) -> list[str]:
+    urls: list[str] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, Mapping):
+            for key, raw_value in node.items():
+                if str(key).casefold() in {"url", "link", "final_url", "canonical_url"}:
+                    url = _text(raw_value)
+                    if url and url not in urls:
+                        urls.append(url)
+                if isinstance(raw_value, (Mapping, list, tuple)):
+                    visit(raw_value)
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return urls
+
+
+def _unique_positive_ids(value: Any, *, limit: int) -> list[int]:
+    values = value if isinstance(value, Iterable) and not isinstance(value, (str, bytes, Mapping)) else ()
+    result: list[int] = []
+    for raw in values:
+        try:
+            item_id = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if item_id > 0 and item_id not in result:
+            result.append(item_id)
+        if len(result) >= limit:
+            break
+    return result
 
 
 def _event_id_list(value: Any) -> list[int]:
-    values = value if isinstance(value, Iterable) and not isinstance(value, (str, bytes, Mapping)) else ()
-    result: list[int] = []
-    for item in values:
+    return _unique_positive_ids(value, limit=10_000)
+
+
+def _json_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
         try:
-            event_id = int(item)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if event_id > 0 and event_id not in result:
-            result.append(event_id)
-    return result
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        value = parsed
+    return _strings(value)
+
+
+def _json_objects(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    return [dict(row) for row in value if isinstance(row, Mapping)] if isinstance(value, list) else []
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _strings(value: Any) -> list[str]:
+    values = value if isinstance(value, Iterable) and not isinstance(value, (str, bytes, Mapping)) else ()
+    return _unique_strings(values)
 
 
 def _unique_strings(values: Iterable[Any]) -> list[str]:
     result: list[str] = []
     for value in values:
-        text = str(value).strip() if value is not None else ""
+        text = _text(value)
         if text and text not in result:
             result.append(text)
     return result
@@ -1108,38 +1369,17 @@ def _unique_json_objects(values: Iterable[Any]) -> list[dict[str, Any]]:
     return result
 
 
-def _clean_strings(values: Iterable[Any] | Any) -> list[str]:
-    if values is None:
-        return []
-    if isinstance(values, str):
-        values = re.split(r"[,，;；|]+", values)
-    elif not isinstance(values, Iterable):
-        values = [values]
-    return _unique_strings(values)
-
-
 def _mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     if hasattr(value, "model_dump"):
         return dict(value.model_dump(mode="python"))
-    if hasattr(value, "__dict__"):
-        return dict(vars(value))
     return {}
 
 
 def _text(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
+    text = str(value).strip() if value is not None else ""
     return text or None
-
-
-def _number(value: Any) -> float:
-    try:
-        return max(0.0, float(str(value).replace(",", "")))
-    except (TypeError, ValueError, OverflowError):
-        return 0.0
 
 
 def _bounded_score(value: Any, default: int) -> int:
@@ -1149,21 +1389,48 @@ def _bounded_score(value: Any, default: int) -> int:
         return default
 
 
+def _bounded_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _positive_int(value: Any, default: int) -> int:
     try:
-        result = int(value)
+        parsed = int(value)
     except (TypeError, ValueError, OverflowError):
         return default
-    return result if result > 0 else default
+    return parsed if parsed > 0 else default
+
+
+def _stage_c_lease_seconds(ai_client: Any, *, max_turns: int) -> int:
+    """Keep C leased for its full multi-turn model budget plus persistence slack."""
+
+    try:
+        timeout_seconds = float(getattr(ai_client, "timeout_seconds", 30.0))
+    except (TypeError, ValueError, OverflowError):
+        timeout_seconds = 30.0
+    timeout_seconds = max(1.0, timeout_seconds)
+    estimated = int(math.ceil(timeout_seconds * max(1, int(max_turns)) + 120.0))
+    return max(600, min(7_200, estimated))
+
+
+def _nonnegative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, parsed)
 
 
 def _as_utc(value: Any) -> datetime | None:
     if isinstance(value, str):
         try:
-            value = datetime.fromisoformat(value)
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
-    if value is None or not isinstance(value, datetime):
+    if not isinstance(value, datetime):
         return None
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
@@ -1175,6 +1442,8 @@ def _iso_datetime(value: Any) -> str | None:
 
 __all__ = [
     "EventClusterResult",
+    "StageCAgentContractError",
+    "StageCDownstreamBusyError",
     "canonical_event_key",
     "canonical_event_url",
     "exact_identity_keys",

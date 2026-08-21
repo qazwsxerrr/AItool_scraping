@@ -31,6 +31,17 @@
             </li>
           {% else %}<li class="muted-text">暂无可展示来源。</li>{% endfor %}
         </ul>
+        <h3>独立核验来源</h3>
+        <ul class="plain-list">
+          {% for source in detail.event.verification_refs %}
+            <li>
+              {% set verification_url = source.final_url or source.url %}
+              {% if verification_url %}<a class="text-link" href="{{ verification_url }}" target="_blank" rel="noopener noreferrer">{{ source.title or source.host or '核验来源' }} ↗</a>{% else %}{{ source.title or source.host or '核验来源' }}{% endif %}
+              {% if source.status %}<small>{{ source.status }}</small>{% endif %}
+              {% if source.claim %}<small> · {{ source.claim }}</small>{% endif %}
+            </li>
+          {% else %}<li class="muted-text">本事件未使用额外网页核验。</li>{% endfor %}
+        </ul>
       </div>
       <div>
         <h3>风险提示</h3>

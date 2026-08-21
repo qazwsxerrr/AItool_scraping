@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
 from .models import ENTITY_TYPES, INTEL_TOPICS, RawIntelEnvelope
 
@@ -178,32 +178,6 @@ def _coerce_envelope(envelope: RawIntelEnvelope | dict[str, Any]) -> RawIntelEnv
     return envelope if isinstance(envelope, RawIntelEnvelope) else RawIntelEnvelope.model_validate(envelope)
 
 
-def _generic_payload(envelope: RawIntelEnvelope, *, model: str | None, task: str, instructions: str, schema: dict[str, str]) -> dict[str, Any]:
-    item = envelope.to_provider_dict()
-    return {
-        "model": model,
-        "task": task,
-        "item": item,
-        "input": item,
-        "envelope": item,
-        "raw_intel": item,
-        "response_schema": dict(schema),
-        "instructions": instructions,
-    }
-
-
-def _openai_chat_payload(envelope: RawIntelEnvelope, *, model: str | None, name: str, instructions: str, schema: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(envelope.to_provider_dict(), ensure_ascii=False, default=str)},
-        ],
-        "response_format": {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}},
-        "temperature": 0.0,
-    }
-
-
 def _openai_responses_payload(envelope: RawIntelEnvelope, *, model: str | None, name: str, instructions: str, schema: dict[str, Any]) -> dict[str, Any]:
     return {
         "model": model,
@@ -215,59 +189,31 @@ def _openai_responses_payload(envelope: RawIntelEnvelope, *, model: str | None, 
     }
 
 
-def build_generic_screen_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
-    return _generic_payload(_coerce_envelope(envelope), model=model, task=INTEL_SCREEN_TASK, instructions=INTEL_SCREEN_SYSTEM_PROMPT, schema=INTEL_SCREEN_RESPONSE_SCHEMA)
-
-
-def build_openai_chat_screen_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
-    return _openai_chat_payload(_coerce_envelope(envelope), model=model, name=INTEL_SCREEN_TASK, instructions=INTEL_SCREEN_SYSTEM_PROMPT, schema=INTEL_SCREEN_JSON_SCHEMA)
-
-
 def build_openai_responses_screen_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
     return _openai_responses_payload(_coerce_envelope(envelope), model=model, name=INTEL_SCREEN_TASK, instructions=INTEL_SCREEN_SYSTEM_PROMPT, schema=INTEL_SCREEN_JSON_SCHEMA)
-
-
-def build_generic_analysis_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
-    return _generic_payload(_coerce_envelope(envelope), model=model, task=INTEL_ANALYSIS_TASK, instructions=INTEL_ANALYSIS_SYSTEM_PROMPT, schema=INTEL_ANALYSIS_RESPONSE_SCHEMA)
-
-
-def build_openai_chat_analysis_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
-    return _openai_chat_payload(_coerce_envelope(envelope), model=model, name=INTEL_ANALYSIS_TASK, instructions=INTEL_ANALYSIS_SYSTEM_PROMPT, schema=INTEL_ANALYSIS_JSON_SCHEMA)
 
 
 def build_openai_responses_analysis_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
     return _openai_responses_payload(_coerce_envelope(envelope), model=model, name=INTEL_ANALYSIS_TASK, instructions=INTEL_ANALYSIS_SYSTEM_PROMPT, schema=INTEL_ANALYSIS_JSON_SCHEMA)
 
 
-def _style(value: str | None) -> str:
-    style = str(value or "generic_json").strip().casefold().replace("-", "_")
-    return {"chat": "openai_chat", "chat_completions": "openai_chat", "responses": "openai_responses", "openai_response": "openai_responses"}.get(style, style)
+def build_screen_provider_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
+    """Build the sole supported transport payload: OpenAI Responses."""
+
+    return build_openai_responses_screen_payload(envelope, model=model)
 
 
-def _build_stage_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None, api_style: str, stage: str) -> dict[str, Any]:
-    style = _style(api_style)
-    builders: dict[str, dict[str, Callable[..., dict[str, Any]]]] = {
-        "screen": {"generic_json": build_generic_screen_payload, "openai_chat": build_openai_chat_screen_payload, "openai_responses": build_openai_responses_screen_payload},
-        "analysis": {"generic_json": build_generic_analysis_payload, "openai_chat": build_openai_chat_analysis_payload, "openai_responses": build_openai_responses_analysis_payload},
-    }
-    if stage not in builders or style not in builders[stage]:
-        raise ValueError("api_style must be generic_json, openai_chat, or openai_responses")
-    return builders[stage][style](envelope, model=model)
+def build_analysis_provider_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
+    """Build the sole supported transport payload: OpenAI Responses."""
 
-
-def build_screen_provider_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None, api_style: str = "generic_json") -> dict[str, Any]:
-    return _build_stage_payload(envelope, model=model, api_style=api_style, stage="screen")
-
-
-def build_analysis_provider_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None, api_style: str = "generic_json") -> dict[str, Any]:
-    return _build_stage_payload(envelope, model=model, api_style=api_style, stage="analysis")
+    return build_openai_responses_analysis_payload(envelope, model=model)
 
 
 __all__ = [
     "INTEL_ANALYSIS_JSON_SCHEMA", "INTEL_ANALYSIS_RESPONSE_SCHEMA", "INTEL_ANALYSIS_SYSTEM_PROMPT", "INTEL_ANALYSIS_TASK",
     "INTEL_SCREEN_JSON_SCHEMA", "INTEL_SCREEN_RESPONSE_SCHEMA", "INTEL_SCREEN_SYSTEM_PROMPT", "INTEL_SCREEN_TASK",
-    "build_analysis_provider_payload", "build_generic_analysis_payload", "build_generic_screen_payload",
-    "build_openai_chat_analysis_payload", "build_openai_chat_screen_payload", "build_openai_responses_analysis_payload",
+    "build_analysis_provider_payload",
+    "build_openai_responses_analysis_payload",
     "build_openai_responses_screen_payload", "build_screen_provider_payload",
     "preflight_intel_triage_schemas", "preflight_strict_schema",
 ]

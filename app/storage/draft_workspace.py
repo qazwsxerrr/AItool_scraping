@@ -180,6 +180,8 @@ def create_daily_draft(settings: Settings, edition_date: date | str) -> Settings
                 status="published",
                 published_at=source_edition.published_at,
                 error=None,
+                candidate_count=source_edition.candidate_count,
+                selected_count=source_edition.selected_count,
                 created_at=source_edition.created_at,
                 updated_at=source_edition.updated_at,
             )
@@ -352,6 +354,7 @@ def _copy_report_entries(
                 source_group=entry.source_group,
                 source_ids_json=entry.source_ids_json,
                 source_refs_json=entry.source_refs_json,
+                verification_refs_json=entry.verification_refs_json,
                 risk_flags_json=entry.risk_flags_json,
                 keywords_json=entry.keywords_json,
                 entities_json=entry.entities_json,

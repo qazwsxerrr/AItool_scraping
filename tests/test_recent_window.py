@@ -1,15 +1,12 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sqlalchemy import select
 
-from app.ai.skills.stage_c_aggregation import (
-    STAGE_C_SCHEMA_VERSION,
-    StageCAggregationCallResult,
-    StageCAggregationResponse,
-)
+from app.ai.responses import AgentRunResult
 from app.ai.skills.intel_triage import ScreenResult
 from app.ai.skills.stage_d_selection import STAGE_D_SELECTION_SCHEMA_VERSION
 from app.domain.models import FetchItem, SourceSpec
@@ -111,26 +108,34 @@ class _ScreenProvider:
 
 class _StageCClient:
     model = "recent-window-stage-c"
+    transport = "responses"
 
-    def aggregate(self, current_items, *, recent_history, edition):
-        raw = {
-            "schema_version": STAGE_C_SCHEMA_VERSION,
-            "clusters": [
-                {
-                    "title_zh": str(item["title"]),
-                    "summary_zh": str(item.get("summary_cn") or item["title"]),
-                    "item_ids": [int(item["id"])],
-                    "novelty_status": "new",
-                    "prior_event_key": None,
-                }
-                for item in current_items
-            ],
-        }
-        return StageCAggregationCallResult(
-            parsed=StageCAggregationResponse.model_validate(raw),
-            raw_response=raw,
-            request_metadata={"model": self.model},
-        )
+    def run(self, *, function_tools, on_response, on_tool, **_kwargs):
+        tools = {tool.name: tool for tool in function_tools}
+        on_response(1, {"id": "recent-c", "output": []})
+        calls = 0
+
+        def invoke(name, args):
+            nonlocal calls
+            calls += 1
+            call = {"name": name, "call_id": f"call-{calls}", "arguments": json.dumps(args)}
+            output = dict(tools[name].handler(args))
+            on_tool(1, call, output)
+            return output
+
+        rows = invoke("list_candidates", {"bucket": "active", "offset": 0, "limit": 30})["items"]
+        invoke("save_event_drafts", {"drafts": [
+            {
+                "draft_key": f"recent-{item['id']}", "item_ids": [item["id"]], "title": item["title"],
+                "summary_cn": item.get("summary_cn") or item["title"], "topic": item.get("topic") or "technology_insight",
+                "topics": [item.get("topic") or "technology_insight"], "keywords": item.get("keywords") or [],
+                "entities": item.get("entities") or [], "novelty_status": "new", "prior_event_key": None,
+                "review_state": "candidate", "confidence": 90, "risk_flags": [],
+            }
+            for item in rows
+        ]})
+        assert invoke("finalize_event_drafts", {})["ok"] is True
+        return AgentRunResult("recent-c", 1, calls, 0, True, {"id": "recent-c", "output": []})
 
 
 def test_stage_a_does_not_time_filter_github_trending_projects(tmp_path):
@@ -316,6 +321,24 @@ def test_stage_c_uses_successful_stage_b_items_without_reapplying_recency(tmp_pa
                 item_id=item.id,
             )
             repo.complete_stage_task(task, result={"item_id": item.id, "reason": "candidate"})
+            # C consumes B's persisted active/reserve projection rather than
+            # inferring an input set from legacy item statuses.
+        repo.replace_candidate_admissions(
+            run.id,
+            [
+                {
+                    "item_id": item_id,
+                    "decision": "active",
+                    "rank": position,
+                    "guarded_score": 80,
+                    "reason_code": "fixture",
+                    "reason": "fixture",
+                    "policy_version": "fixture",
+                    "policy_fingerprint": "fixture",
+                }
+                for position, item_id in enumerate(item_ids.values(), start=1)
+            ],
+        )
         repo.freeze_run_scope(run.id)
         repo.finish_stage(analyze_stage, status="succeeded")
         session.commit()

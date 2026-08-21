@@ -55,6 +55,15 @@ def _publish(session_factory, *, edition_date: str, title: str, event_key: str) 
                             "match_confidence": 100,
                         }
                     ],
+                    "verification_refs": [
+                        {
+                            "url": "https://verify.example/proof",
+                            "host": "verify.example",
+                            "title": "Verification proof",
+                            "status": "verified",
+                            "claim": "确认发布动作",
+                        }
+                    ],
                     "risk_flags": ["needs_review"],
                     "keywords": ["model_release"],
                     "entities": [{"type": "company", "name": "Example"}],
@@ -87,6 +96,7 @@ def test_read_repository_maps_final_report_provenance_and_source_refs():
 
     assert cards and cards[0].provenance == "new"
     assert cards[0].source_refs[0]["match_type"] == "exact_url_or_external"
+    assert cards[0].verification_refs[0]["status"] == "verified"
     assert cards[0].risk_flags == ["needs_review"]
     assert stats.selected_items == 1
     assert detail is not None

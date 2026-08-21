@@ -470,6 +470,7 @@ def _list_export_events(
             joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.ai_review),
             joinedload(IntelEvent.event_items).joinedload(IntelEventItem.item).joinedload(IntelItem.source),
             joinedload(IntelEvent.event_items).joinedload(IntelEventItem.source),
+            joinedload(IntelEvent.evidence),
         )
         .where(
             IntelEvent.build_id == int(run_id),
@@ -555,6 +556,7 @@ def _serialize_event(
             }
         )
     risk_flags = _json_list(event.risk_flags_json)
+    verification_refs = _verification_refs(event)
     novelty = str(event.novelty_status or "unknown").casefold()
     provenance_kind = novelty if novelty in {"new", "updated", "repeat", "unknown"} else "unknown"
     reason_code = str(decision.get("reason_code") or "selected")
@@ -598,6 +600,12 @@ def _serialize_event(
         "keywords": _json_list(event.keywords_json),
         "entities": _public_value(_json(event.entities_json, [])),
         "source_refs": source_refs,
+        # These are deliberately separate from original input sources: they
+        # document optional C-agent web verification and never replace source
+        # attribution for the event itself.
+        "verification_refs": verification_refs,
+        "review_state": event.review_state,
+        "resolution_confidence": int(event.resolution_confidence or 0),
         "member_statuses": sorted(set(member_statuses)),
         "screen_audit": screen_audit,
         "first_seen_at": _date(event.first_seen_at),
@@ -674,6 +682,7 @@ def _markdown(
                     f"- 选稿依据：{record.get('reason') or '未记录'}",
                     f"- 风险：{', '.join(record.get('risk_flags') or []) or '无'}",
                     f"- 链接：{record.get('url') or '无'}",
+                    _verification_markdown_line(record),
                     "",
                 ]
             )
@@ -692,6 +701,54 @@ def _event_time_line(record: dict[str, Any]) -> str:
         f"- 时间：published_at=`{record.get('published_at') or '-'}` | "
         f"basis=`{freshness.get('time_basis') or '-'}` | age=`{age_text}`"
     )
+
+
+def _verification_refs(event: IntelEvent) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for evidence in list(getattr(event, "evidence", ()) or ()):
+        url = str(evidence.final_url or evidence.url or "").strip()
+        host = str(evidence.host or "").strip()
+        claim = str(evidence.verification_claim or "").strip()
+        key = (url, host, claim)
+        if not url or key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "url": url,
+                "host": host or None,
+                "title": str(evidence.title or "").strip() or None,
+                "excerpt": str(evidence.excerpt or "").strip()[:600] or None,
+                "claim": claim or None,
+                "status": str(evidence.status or "recorded").strip(),
+                "fetched_at": _date(evidence.fetched_at),
+            }
+        )
+    return rows
+
+
+def _verification_markdown_line(record: dict[str, Any]) -> str:
+    refs = record.get("verification_refs")
+    if not isinstance(refs, list) or not refs:
+        return "- 核验来源：无"
+    verified_labels: list[str] = []
+    review_labels: list[str] = []
+    for ref in refs[:6]:
+        if not isinstance(ref, dict):
+            continue
+        label = str(ref.get("title") or ref.get("host") or ref.get("url") or "核验来源").strip()
+        url = str(ref.get("url") or "").strip()
+        value = f"[{label}]({url})" if url else label
+        status = str(ref.get("status") or "needs_review").strip().casefold()
+        if status == "verified":
+            verified_labels.append(value)
+        else:
+            review_labels.append(f"{value}（{status or 'needs_review'}）")
+    lines = ["- 核验来源：" + ("；".join(verified_labels) if verified_labels else "无")]
+    if review_labels:
+        lines.append("- 待人工核验链接：" + "；".join(review_labels))
+    return "\n".join(lines)
 
 
 def _json(value: str | None, default: Any) -> Any:

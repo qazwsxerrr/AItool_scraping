@@ -163,6 +163,10 @@ class DailyEdition(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="empty")
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Persisted calibration telemetry keeps B's dynamic admission budget
+    # available after the private daily build is discarded.
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    selected_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
@@ -198,6 +202,7 @@ class DailyEditionReportEntry(Base):
     source_group: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     source_refs_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    verification_refs_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     keywords_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     entities_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -214,6 +219,11 @@ class DailyEditionReportEntry(Base):
     @property
     def source_refs(self) -> list[dict[str, object]]:
         value = _decode_json(self.source_refs_json, [])
+        return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+    @property
+    def verification_refs(self) -> list[dict[str, object]]:
+        value = _decode_json(self.verification_refs_json, [])
         return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
     @property
@@ -284,6 +294,12 @@ class IntelRun(Base):
     )
     run_stages: Mapped[list["IntelRunStage"]] = relationship(
         back_populates="run", cascade="all, delete-orphan", order_by="IntelRunStage.id"
+    )
+    candidate_admissions: Mapped[list["IntelCandidateAdmission"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="IntelCandidateAdmission.rank"
+    )
+    agent_sessions: Mapped[list["IntelAgentSession"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="IntelAgentSession.id"
     )
     edition: Mapped[DailyEdition] = relationship(foreign_keys=[edition_id], lazy="joined")
 
@@ -651,6 +667,9 @@ class IntelItem(Base):
         back_populates="item",
         cascade="all, delete-orphan",
     )
+    candidate_admissions: Mapped[list["IntelCandidateAdmission"]] = relationship(
+        back_populates="item", cascade="all, delete-orphan"
+    )
 
 
 class AIItemScreen(Base):
@@ -769,6 +788,175 @@ class AIItemReview(Base):
         return self.raw_response
 
 
+class IntelCandidateAdmission(Base):
+    """Run-local Stage-B decision that controls the C-agent workbench."""
+
+    __tablename__ = "intel_candidate_admissions"
+    __table_args__ = (
+        UniqueConstraint("run_id", "item_id", name="uq_intel_candidate_admissions_run_item"),
+        Index("ix_intel_candidate_admissions_run_decision_rank", "run_id", "decision", "rank"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id"), nullable=False)
+    item_id: Mapped[int] = mapped_column(ForeignKey("intel_items.id"), nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    guarded_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    run: Mapped[IntelRun] = relationship(back_populates="candidate_admissions")
+    item: Mapped[IntelItem] = relationship(back_populates="candidate_admissions")
+
+
+class IntelAgentSession(Base):
+    """Persistent C-agent conversation state separate from the stage lease."""
+
+    __tablename__ = "intel_agent_sessions"
+    __table_args__ = (
+        UniqueConstraint("run_id", "stage_name", name="uq_intel_agent_sessions_run_stage"),
+        Index("ix_intel_agent_sessions_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("intel_runs.id"), nullable=False)
+    stage_id: Mapped[int] = mapped_column(ForeignKey("intel_run_stages.id"), nullable=False)
+    stage_name: Mapped[str] = mapped_column(String(32), nullable=False, default="cluster")
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    max_turns: Mapped[int] = mapped_column(Integer, nullable=False, default=16)
+    max_tool_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=40)
+    max_web_searches: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
+    turn_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_call_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    web_search_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    response_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    finalization_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    state_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    run: Mapped[IntelRun] = relationship(back_populates="agent_sessions")
+    steps: Mapped[list["IntelAgentStep"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", order_by="IntelAgentStep.sequence"
+    )
+    drafts: Mapped[list["IntelEventDraft"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", order_by="IntelEventDraft.id"
+    )
+    evidence: Mapped[list["IntelEventEvidence"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", order_by="IntelEventEvidence.id"
+    )
+
+    @property
+    def state(self) -> dict[str, object]:
+        value = _decode_json(self.state_json, {})
+        return dict(value) if isinstance(value, dict) else {}
+
+
+class IntelAgentStep(Base):
+    """Append-only Responses and tool-call audit record for one agent session."""
+
+    __tablename__ = "intel_agent_steps"
+    __table_args__ = (
+        UniqueConstraint("session_id", "sequence", name="uq_intel_agent_steps_session_sequence"),
+        Index("ix_intel_agent_steps_session", "session_id", "sequence"),
+        Index("ix_intel_agent_steps_kind", "kind"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("intel_agent_sessions.id"), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    turn: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    tool_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    call_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    input_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    output_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    raw_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_response_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="success")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    session: Mapped[IntelAgentSession] = relationship(back_populates="steps")
+
+
+class IntelEventDraft(Base):
+    """Agent-owned event proposal; final events are materialized atomically."""
+
+    __tablename__ = "intel_event_drafts"
+    __table_args__ = (
+        UniqueConstraint("session_id", "draft_key", name="uq_intel_event_drafts_session_key"),
+        Index("ix_intel_event_drafts_session", "session_id"),
+        Index("ix_intel_event_drafts_state", "state"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("intel_agent_sessions.id"), nullable=False)
+    draft_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False, default="(untitled)")
+    summary_cn: Mapped[str | None] = mapped_column(Text, nullable=True)
+    topic: Mapped[str] = mapped_column(String(32), nullable=False, default="technology_insight")
+    topics_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    keywords_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    entities_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    novelty_status: Mapped[str] = mapped_column(String(16), nullable=False, default="uncertain")
+    prior_event_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    review_state: Mapped[str] = mapped_column(String(32), nullable=False, default="candidate")
+    confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    risk_flags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    session: Mapped[IntelAgentSession] = relationship(back_populates="drafts")
+    members: Mapped[list["IntelEventDraftItem"]] = relationship(
+        back_populates="draft", cascade="all, delete-orphan", order_by="IntelEventDraftItem.id"
+    )
+    evidence: Mapped[list["IntelEventEvidence"]] = relationship(back_populates="draft")
+
+    @property
+    def risk_flags(self) -> list[str]:
+        return _decode_list(self.risk_flags_json)
+
+
+class IntelEventDraftItem(Base):
+    __tablename__ = "intel_event_draft_items"
+    __table_args__ = (
+        UniqueConstraint("draft_id", "item_id", name="uq_intel_event_draft_items_draft_item"),
+        UniqueConstraint("session_id", "item_id", name="uq_intel_event_draft_items_session_item"),
+        Index("ix_intel_event_draft_items_draft", "draft_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("intel_agent_sessions.id"), nullable=False)
+    draft_id: Mapped[int] = mapped_column(ForeignKey("intel_event_drafts.id"), nullable=False)
+    item_id: Mapped[int] = mapped_column(ForeignKey("intel_items.id"), nullable=False)
+    relation: Mapped[str] = mapped_column(String(32), nullable=False, default="related")
+    confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    draft: Mapped[IntelEventDraft] = relationship(back_populates="members")
+    item: Mapped[IntelItem] = relationship()
+
+
 class IntelEvent(Base):
     """Canonical event assembled from one or more normalized items.
 
@@ -812,6 +1000,7 @@ class IntelEvent(Base):
     display_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     novelty_status: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="candidate")
+    review_state: Mapped[str] = mapped_column(String(32), nullable=False, default="candidate")
     resolution_method: Mapped[str] = mapped_column(String(32), nullable=False, default="deterministic")
     resolution_confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     resolution_raw_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
@@ -828,6 +1017,9 @@ class IntelEvent(Base):
         back_populates="event",
         cascade="all, delete-orphan",
         order_by="IntelEventItem.id",
+    )
+    evidence: Mapped[list["IntelEventEvidence"]] = relationship(
+        back_populates="event", order_by="IntelEventEvidence.id"
     )
 
     @property
@@ -876,3 +1068,36 @@ class IntelEventItem(Base):
     event: Mapped[IntelEvent] = relationship(back_populates="event_items")
     item: Mapped[IntelItem] = relationship(back_populates="event_items")
     source: Mapped[Source] = relationship()
+
+
+class IntelEventEvidence(Base):
+    """Auditable external evidence collected by the bounded C agent."""
+
+    __tablename__ = "intel_event_evidence"
+    __table_args__ = (
+        Index("ix_intel_event_evidence_event", "event_id"),
+        Index("ix_intel_event_evidence_session", "session_id"),
+        Index("ix_intel_event_evidence_draft", "draft_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("intel_agent_sessions.id"), nullable=False)
+    event_id: Mapped[int | None] = mapped_column(ForeignKey("intel_events.id"), nullable=True)
+    draft_id: Mapped[int | None] = mapped_column(ForeignKey("intel_event_drafts.id"), nullable=True)
+    item_id: Mapped[int | None] = mapped_column(ForeignKey("intel_items.id"), nullable=True)
+    source_scope: Mapped[str] = mapped_column(String(32), nullable=False, default="verification")
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    final_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    host: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    verification_claim: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="recorded")
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    session: Mapped[IntelAgentSession] = relationship(back_populates="evidence")
+    event: Mapped[IntelEvent | None] = relationship(back_populates="evidence")
+    draft: Mapped[IntelEventDraft | None] = relationship(back_populates="evidence")
+    item: Mapped[IntelItem | None] = relationship()

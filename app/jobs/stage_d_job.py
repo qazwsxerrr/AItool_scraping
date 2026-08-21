@@ -71,6 +71,7 @@ class StageDProfile:
 class StageDResult:
     run_id: int
     candidates: int = 0
+    withheld_needs_review: int = 0
     selected: int = 0
     unselected: int = 0
     provider_attempts: int = 0
@@ -127,20 +128,38 @@ def run_stage_d_job(
                 run_id=int(run_id),
                 event_ids=candidate_event_ids,
             )
-            event_payload = [_selection_event(event) for event in events]
+            withheld_needs_review_ids = [
+                int(event.id)
+                for event in events
+                if str(event.review_state or "").casefold() == "needs_review"
+            ]
+            withheld_needs_review_id_set = set(withheld_needs_review_ids)
+            selectable_events = [
+                event
+                for event in events
+                if int(event.id) not in withheld_needs_review_id_set
+            ]
+            selectable_event_ids = [int(event.id) for event in selectable_events]
+            event_payload = [_selection_event(event) for event in selectable_events]
             result.candidates = len(event_payload)
+            result.withheld_needs_review = len(withheld_needs_review_ids)
             edition = {
                 "edition_date": run.edition_date,
                 "candidate_count": len(event_payload),
+                "withheld_needs_review_count": result.withheld_needs_review,
             }
             provider_payload = build_stage_d_provider_payload(
                 event_payload,
                 edition=edition,
                 model=getattr(ai_client, "model", None),
-                api_style=getattr(ai_client, "api_style", "generic_json"),
                 max_selected=policy.max_selected,
             )
-            input_fingerprint = _response_hash(provider_payload)
+            input_fingerprint = _response_hash(
+                {
+                    "provider_payload": provider_payload,
+                    "withheld_needs_review_event_ids": withheld_needs_review_ids,
+                }
+            )
             config_fingerprint = _stage_d_config_fingerprint(policy, ai_client)
             stage = repo.ensure_stage(
                 int(run_id),
@@ -159,7 +178,9 @@ def run_stage_d_job(
                 config_fingerprint=config_fingerprint,
                 metadata={
                     "phase": "selection",
-                    "candidate_event_ids": candidate_event_ids,
+                    "candidate_event_ids": selectable_event_ids,
+                    "withheld_needs_review_event_ids": withheld_needs_review_ids,
+                    "all_stage_c_candidate_event_ids": candidate_event_ids,
                 },
                 force=bool(force),
             )
@@ -167,7 +188,7 @@ def run_stage_d_job(
             if not force:
                 stored = _stored_selection(
                     task,
-                    candidate_event_ids=candidate_event_ids,
+                    candidate_event_ids=selectable_event_ids,
                     max_selected=policy.max_selected,
                     input_fingerprint=input_fingerprint,
                     config_fingerprint=config_fingerprint,
@@ -175,6 +196,7 @@ def run_stage_d_job(
                 if stored is not None:
                     result.selected = len(stored.selected)
                     result.unselected = result.candidates - result.selected
+                    result.withheld_needs_review = len(withheld_needs_review_ids)
                     result.provider_attempts = int(
                         (_mapping(task.result)).get("provider_attempts") or 0
                     )
@@ -224,7 +246,9 @@ def run_stage_d_job(
                     },
                     result={
                         "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
-                        "candidate_event_ids": candidate_event_ids,
+                        "candidate_event_ids": selectable_event_ids,
+                        "withheld_needs_review_event_ids": withheld_needs_review_ids,
+                        "all_stage_c_candidate_event_ids": candidate_event_ids,
                         "selected": selected_rows,
                         "input_fingerprint": input_fingerprint,
                         "config_fingerprint": config_fingerprint,
@@ -253,6 +277,7 @@ def run_stage_d_job(
                         policy,
                         ai_client,
                         candidate_count=result.candidates,
+                        withheld_needs_review_count=result.withheld_needs_review,
                         selected_count=result.selected,
                         unselected_count=result.unselected,
                         provider_attempts=result.provider_attempts,
@@ -379,6 +404,8 @@ def _selection_event(event: IntelEvent) -> dict[str, Any]:
     source_groups = _json_strings(event.source_groups_json)
     if not source_groups and event.source_group:
         source_groups = [event.source_group]
+    evidence = list(getattr(event, "evidence", ()) or ())
+    verified = [row for row in evidence if str(row.status or "").casefold() == "verified"]
     return {
         "event_id": int(event.id),
         "title": str(event.title or ""),
@@ -392,6 +419,10 @@ def _selection_event(event: IntelEvent) -> dict[str, Any]:
         "source_groups": source_groups,
         "novelty_status": event.novelty_status,
         "risk_flags": _json_strings(event.risk_flags_json),
+        "resolution_confidence": int(event.resolution_confidence or 0),
+        "review_state": event.review_state,
+        "verification_count": len(evidence),
+        "verification_status": "verified" if verified else ("unverified" if evidence else "not_checked"),
     }
 
 
@@ -490,7 +521,7 @@ def _stage_d_config_fingerprint(policy: StageDProfile, ai_client: Any | None) ->
             "prompt_version": STAGE_D_SELECTION_PROMPT_VERSION,
             "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
             "model": getattr(ai_client, "model", None),
-            "api_style": getattr(ai_client, "api_style", "generic_json"),
+            "transport": "responses",
             "max_selected": policy.max_selected,
         }
     )

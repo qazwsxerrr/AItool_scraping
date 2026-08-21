@@ -1,12 +1,11 @@
-"""Transport adapter and per-item failure isolation for Stage A and B."""
+"""Responses-only client and per-item failure isolation for Stage A/B."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Mapping
 
-import httpx
-
+from app.ai.responses import ResponsesClient, SupportsPost
 from app.config.settings import Settings
 
 from .guards import apply_analysis_guards, apply_screen_guard
@@ -20,12 +19,18 @@ SCREEN_FAILURE_STATUS = "screen_failed"
 ANALYSIS_FAILURE_STATUS = "analysis_failed"
 
 
-class SupportsPost(Protocol):
-    def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any], **kwargs: Any): ...
+class IntelTriageResponseParseError(ValueError):
+    """A provider returned a response that failed local schema parsing."""
+
+    def __init__(self, message: str, *, raw_response: Mapping[str, Any] | None) -> None:
+        self.raw_response = dict(raw_response) if isinstance(raw_response, Mapping) else None
+        super().__init__(message)
 
 
 class IntelTriageClient:
-    """Provider client exposing exactly the Stage A ``screen`` and Stage B ``analyze`` APIs."""
+    """The sole Responses transport used by Stage A and Stage B."""
+
+    transport = "responses"
 
     def __init__(
         self,
@@ -33,16 +38,17 @@ class IntelTriageClient:
         api_url: str | None,
         api_key: str | None,
         model: str | None = None,
-        api_style: str = "generic_json",
         timeout_seconds: float = 30.0,
         http_client: SupportsPost | None = None,
     ) -> None:
-        self.api_url = api_url.rstrip("/") if api_url else None
-        self.api_key = api_key
         self.model = model
-        self.api_style = _normalize_api_style(api_style)
-        self.timeout_seconds = timeout_seconds
-        self._http_client = http_client
+        self._responses = ResponsesClient(
+            api_url=api_url,
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            http_client=http_client,
+        )
 
     @classmethod
     def from_settings(cls, settings: Settings, http_client: SupportsPost | None = None) -> "IntelTriageClient":
@@ -50,73 +56,43 @@ class IntelTriageClient:
             api_url=settings.ai_review_api_url,
             api_key=settings.ai_review_api_key,
             model=settings.ai_review_model,
-            api_style=settings.ai_review_api_style,
             timeout_seconds=settings.ai_review_timeout_seconds,
             http_client=http_client,
         )
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.api_url and self.api_key)
+        return self._responses.is_configured
 
     def screen(self, envelope: RawIntelEnvelope | dict[str, Any]) -> ScreenResult:
         item = _as_envelope(envelope)
-        if not self.is_configured:
-            raise RuntimeError("Intel screen API is not configured")
         preflight_intel_triage_schemas()
-        response = self._post_once(self._endpoint_url(), build_screen_provider_payload(item, model=self.model, api_style=self.api_style))
-        data = _response_json(response, stage="screen")
-        return strict_parse_screen(data, envelope=item)
+        response = self._responses.create(build_screen_provider_payload(item, model=self.model))
+        try:
+            return strict_parse_screen(response, envelope=item)
+        except Exception as exc:
+            raise IntelTriageResponseParseError(
+                f"Stage A response failed schema validation: {exc}",
+                raw_response=response,
+            ) from exc
 
     def analyze(self, envelope: RawIntelEnvelope | dict[str, Any]) -> AnalysisResult:
         item = _as_envelope(envelope)
-        if not self.is_configured:
-            raise RuntimeError("Intel analysis API is not configured")
         preflight_intel_triage_schemas()
-        response = self._post_once(self._endpoint_url(), build_analysis_provider_payload(item, model=self.model, api_style=self.api_style))
-        data = _response_json(response, stage="analysis")
-        return strict_parse_analysis(data, envelope=item)
+        response = self._responses.create(build_analysis_provider_payload(item, model=self.model))
+        try:
+            return strict_parse_analysis(response, envelope=item)
+        except Exception as exc:
+            raise IntelTriageResponseParseError(
+                f"Stage B response failed schema validation: {exc}",
+                raw_response=response,
+            ) from exc
 
     def screen_batch(self, envelopes: Iterable[RawIntelEnvelope | dict[str, Any]]) -> list[ScreenResult]:
         return run_screen_isolated(self, envelopes)
 
     def analyze_batch(self, envelopes: Iterable[RawIntelEnvelope | dict[str, Any]]) -> list[AnalysisResult]:
         return run_analysis_isolated(self, envelopes)
-
-    def _post_once(self, url: str, payload: dict[str, Any]):
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        if self._http_client is not None:
-            try:
-                response = self._http_client.post(url, headers=headers, json=payload, timeout=self.timeout_seconds)
-            except TypeError:
-                response = self._http_client.post(url, headers=headers, json=payload)
-        else:
-            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True, http2=True, trust_env=True) as client:
-                response = client.post(url, headers=headers, json=payload)
-        raise_for_status = getattr(response, "raise_for_status", None)
-        if callable(raise_for_status):
-            raise_for_status()
-        return response
-
-    def _endpoint_url(self) -> str:
-        if self.api_url is None:  # pragma: no cover - guarded by is_configured
-            raise RuntimeError("Intel API is not configured")
-        if self.api_style == "openai_chat" and not self.api_url.casefold().endswith("/chat/completions"):
-            return f"{self.api_url}/chat/completions"
-        if self.api_style == "openai_responses" and not self.api_url.casefold().endswith("/responses"):
-            return f"{self.api_url}/responses"
-        return self.api_url
-
-
-def _response_json(response: Any, *, stage: str) -> Any:
-    try:
-        return response.json()
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Intel {stage} API returned invalid JSON") from exc
 
 
 def _as_envelope(value: RawIntelEnvelope | dict[str, Any] | Any) -> RawIntelEnvelope:
@@ -142,7 +118,7 @@ def _screen_failure(item: RawIntelEnvelope, exc: BaseException) -> ScreenResult:
         status=SCREEN_FAILURE_STATUS,
         error_code=exc.__class__.__name__,
         error_message=message,
-        raw_response=None,
+        raw_response=_raw_response_from_exception(exc),
     )
 
 
@@ -160,7 +136,7 @@ def _analysis_failure(item: RawIntelEnvelope, exc: BaseException) -> AnalysisRes
         status=ANALYSIS_FAILURE_STATUS,
         error_code=exc.__class__.__name__,
         error_message=message,
-        raw_response=None,
+        raw_response=_raw_response_from_exception(exc),
     )
 
 
@@ -171,7 +147,13 @@ def screen_item(client: Any, envelope: RawIntelEnvelope | dict[str, Any]) -> Scr
         if not callable(method):
             raise TypeError("AI client does not expose screen")
         value = method(item)
-        result = value if isinstance(value, ScreenResult) else strict_parse_screen(value, envelope=item)
+        try:
+            result = value if isinstance(value, ScreenResult) else strict_parse_screen(value, envelope=item)
+        except Exception as exc:
+            raise IntelTriageResponseParseError(
+                f"Stage A response failed schema validation: {exc}",
+                raw_response=value if isinstance(value, Mapping) else None,
+            ) from exc
         return apply_screen_guard(result.with_item(item), item)
     except Exception as exc:
         LOGGER.warning("AI screen failed for item %s: %s", item.item_id, exc)
@@ -185,7 +167,13 @@ def analyze_item(client: Any, envelope: RawIntelEnvelope | dict[str, Any]) -> An
         if not callable(method):
             raise TypeError("AI client does not expose analyze")
         value = method(item)
-        result = value if isinstance(value, AnalysisResult) else strict_parse_analysis(value, envelope=item)
+        try:
+            result = value if isinstance(value, AnalysisResult) else strict_parse_analysis(value, envelope=item)
+        except Exception as exc:
+            raise IntelTriageResponseParseError(
+                f"Stage B response failed schema validation: {exc}",
+                raw_response=value if isinstance(value, Mapping) else None,
+            ) from exc
         return apply_analysis_guards(result.with_item(item), item)
     except Exception as exc:
         LOGGER.warning("AI analysis failed for item %s: %s", item.item_id, exc)
@@ -193,31 +181,26 @@ def analyze_item(client: Any, envelope: RawIntelEnvelope | dict[str, Any]) -> An
 
 
 def run_screen_isolated(client: Any, envelopes: Iterable[RawIntelEnvelope | dict[str, Any]]) -> list[ScreenResult]:
-    results: list[ScreenResult] = []
-    for envelope in envelopes:
-        results.append(screen_item(client, envelope))
-    return results
+    return [screen_item(client, envelope) for envelope in envelopes]
 
 
 def run_analysis_isolated(client: Any, envelopes: Iterable[RawIntelEnvelope | dict[str, Any]]) -> list[AnalysisResult]:
-    results: list[AnalysisResult] = []
-    for envelope in envelopes:
-        results.append(analyze_item(client, envelope))
-    return results
+    return [analyze_item(client, envelope) for envelope in envelopes]
 
 
-def _normalize_api_style(value: Any) -> str:
-    style = str(value or "generic_json").strip().casefold().replace("-", "_")
-    style = {
-        "responses": "openai_responses", "openai_response": "openai_responses", "openai_responses_api": "openai_responses",
-        "chat": "openai_chat", "chat_completions": "openai_chat",
-    }.get(style, style)
-    if style not in {"generic_json", "openai_chat", "openai_responses"}:
-        raise ValueError("api_style must be generic_json, openai_chat, or openai_responses")
-    return style
+def _raw_response_from_exception(exc: BaseException) -> dict[str, Any] | None:
+    value = getattr(exc, "raw_response", None)
+    return dict(value) if isinstance(value, Mapping) else None
 
 
 __all__ = [
-    "ANALYSIS_FAILURE_STATUS", "IntelTriageClient", "SCREEN_FAILURE_STATUS", "SupportsPost",
-    "analyze_item", "run_analysis_isolated", "run_screen_isolated", "screen_item",
+    "ANALYSIS_FAILURE_STATUS",
+    "IntelTriageClient",
+    "IntelTriageResponseParseError",
+    "SCREEN_FAILURE_STATUS",
+    "SupportsPost",
+    "analyze_item",
+    "run_analysis_isolated",
+    "run_screen_isolated",
+    "screen_item",
 ]

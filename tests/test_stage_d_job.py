@@ -29,6 +29,7 @@ def _build(
     *,
     event_count: int = 3,
     candidate_indexes: list[int] | None = None,
+    needs_review_indexes: list[int] | None = None,
     with_cluster: bool = True,
 ) -> tuple[int, list[int]]:
     with session_factory() as session:
@@ -38,6 +39,7 @@ def _build(
             reference_time=REFERENCE,
         )
         event_ids: list[int] = []
+        needs_review = set(needs_review_indexes or ())
         for index in range(event_count):
             event = repo.upsert_event(
                 run_id=build.id,
@@ -56,6 +58,7 @@ def _build(
                 display_score=90 - index,
                 novelty_status="new",
                 state="candidate",
+                review_state="needs_review" if index in needs_review else "candidate",
                 first_seen_at=REFERENCE,
                 last_seen_at=REFERENCE,
             )
@@ -87,7 +90,7 @@ def _build(
 
 class _SelectionClient:
     model = "stage-d-selection-test"
-    api_style = "generic_json"
+    transport = "responses"
     max_retries = 0
     timeout_seconds = 1
 
@@ -227,6 +230,8 @@ def test_empty_stage_c_candidates_finish_without_calling_the_provider():
         assert task.result == {
             "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
             "candidate_event_ids": [],
+            "withheld_needs_review_event_ids": [],
+            "all_stage_c_candidate_event_ids": [],
             "selected": [],
             "input_fingerprint": task.input_fingerprint,
             "config_fingerprint": task.config_fingerprint,
@@ -267,6 +272,8 @@ def test_stage_d_persists_only_the_ordered_selection_task_result():
         assert set(task.result) == {
             "schema_version",
             "candidate_event_ids",
+            "withheld_needs_review_event_ids",
+            "all_stage_c_candidate_event_ids",
             "selected",
             "input_fingerprint",
             "config_fingerprint",
@@ -278,6 +285,34 @@ def test_stage_d_persists_only_the_ordered_selection_task_result():
         assert len(attempts) == 1
         assert isinstance(attempts[0], IntelRunStageAttempt)
         assert attempts[0].raw_response["schema_version"] == STAGE_D_SELECTION_SCHEMA_VERSION
+
+
+def test_stage_d_withholds_needs_review_events_from_the_provider_and_selection():
+    _engine, session_factory = _db()
+    run_id, event_ids = _build(
+        session_factory,
+        event_count=2,
+        needs_review_indexes=[1],
+    )
+    client = _SelectionClient()
+
+    result = run_stage_d_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=client,
+    )
+
+    assert (result.candidates, result.withheld_needs_review, result.selected) == (1, 1, 1)
+    assert [row["event_id"] for row in client.calls[0]["events"]] == [event_ids[0]]
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        stage = repo.get_stage(run_id, "stage_d")
+        assert stage is not None
+        task = repo.get_task(stage, subject_type="run", subject_id=run_id)
+        assert task is not None
+        assert task.result["candidate_event_ids"] == [event_ids[0]]
+        assert task.result["withheld_needs_review_event_ids"] == [event_ids[1]]
+        assert task.result["all_stage_c_candidate_event_ids"] == event_ids
 
 
 def test_invalid_selection_is_blocked_without_local_fallback():

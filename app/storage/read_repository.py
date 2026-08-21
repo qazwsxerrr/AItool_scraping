@@ -43,6 +43,7 @@ class DashboardStats:
 class DailyEditionView:
     edition_date: str
     selected_items: int
+    candidate_items: int
     status: str
     published_at: datetime | None
     updated_at: datetime | None
@@ -101,6 +102,7 @@ class FeaturedEventRow:
     entities: tuple[dict[str, object], ...] = ()
     provenance: str = "published"
     source_refs: tuple[dict[str, object], ...] = ()
+    verification_refs: tuple[dict[str, object], ...] = ()
 
     @property
     def id(self) -> int:
@@ -261,7 +263,11 @@ class UIReadRepository:
             return None
         return {
             "edition_date": edition.edition_date,
-            "funnel": {"published": edition.selected_items, "selected": edition.selected_items},
+            "funnel": {
+                "candidate": edition.candidate_items,
+                "published": edition.selected_items,
+                "selected": edition.selected_items,
+            },
             "stages": {"publication": {"status": edition.status, "selected": edition.selected_items}},
             "failure_reasons": [],
         }
@@ -478,7 +484,8 @@ class UIReadRepository:
     @staticmethod
     def _edition_view(edition: DailyEdition, selected: int) -> DailyEditionView:
         return DailyEditionView(
-            edition_date=edition.edition_date.isoformat(), selected_items=int(selected), status="published",
+            edition_date=edition.edition_date.isoformat(), selected_items=int(selected),
+            candidate_items=int(edition.candidate_count or 0), status="published",
             published_at=edition.published_at, updated_at=edition.updated_at,
         )
 
@@ -491,6 +498,7 @@ class UIReadRepository:
     def _event_from_entry(self, entry: DailyEditionReportEntry, sources: dict[str, Source]) -> FeaturedEventRow:
         metadata = entry.metadata_dict
         refs = tuple(_public_source_ref(value) for value in entry.source_refs)
+        verification_refs = tuple(_public_verification_ref(value) for value in entry.verification_refs)
         primary = _primary_ref(refs)
         source = sources.get(_text(primary.get("source_id")) if primary else "")
         provenance = metadata.get("provenance")
@@ -506,6 +514,7 @@ class UIReadRepository:
             source_ids=tuple(entry.source_ids), risk_flags=list(entry.risk_flags), published_at=entry.published_at,
             keywords=tuple(entry.keywords), entities=tuple(value for value in entry.entities if isinstance(value, dict)),
             provenance=_text(provenance) or "published", source_refs=refs,
+            verification_refs=verification_refs,
         )
 
     def _card_from_entry(self, entry: DailyEditionReportEntry, sources: dict[str, Source]) -> FeaturedItemRow:
@@ -560,6 +569,13 @@ def _primary_ref(refs: Sequence[dict[str, object]]) -> dict[str, object] | None:
 def _public_source_ref(value: dict[str, object]) -> dict[str, object]:
     ref = dict(value)
     ref["source_url"] = _safe_url(_text(ref.get("source_url")))
+    return ref
+
+
+def _public_verification_ref(value: dict[str, object]) -> dict[str, object]:
+    ref = dict(value)
+    ref["url"] = _safe_url(_text(ref.get("url")))
+    ref["final_url"] = _safe_url(_text(ref.get("final_url")))
     return ref
 
 

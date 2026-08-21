@@ -65,7 +65,7 @@ def _run_with_events(session_factory, *, count: int = 3) -> tuple[int, list[int]
 
 class _Client:
     model = "selection-test"
-    api_style = "generic_json"
+    transport = "responses"
     max_retries = 0
     timeout_seconds = 1
 

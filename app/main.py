@@ -311,6 +311,7 @@ def pipeline_stage_b1(
     typer.echo(
         f"stage-b1: processed={result.processed} analyzed={result.analyzed} "
         f"structurally_filtered={result.analysis_filtered} "
+        f"active={result.candidate} reserve={result.reserve} target={result.admission_target or 0} "
         f"failed={result.analysis_failed} skipped={result.skipped}"
     )
 
@@ -320,7 +321,7 @@ def pipeline_stage_c(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to process."),
     force: bool = typer.Option(False, "--force", help="Re-run Stage C only."),
 ) -> None:
-    """Run the single-call Stage C story aggregation for the current draft."""
+    """Run the stateful Stage C event-aggregation agent for the current draft."""
 
     configure_logging()
     settings = Settings.from_env()
@@ -332,7 +333,8 @@ def pipeline_stage_c(
     )
     typer.echo(
         f"stage-c: processed={result.processed} events={result.events} "
-        f"merged={result.merged} repeats={result.repeats} updated={result.updated}"
+        f"merged={result.merged} repeats={result.repeats} updated={result.updated} "
+        f"needs_review={result.unresolved} turns={result.turns} tools={result.tool_calls} web={result.web_searches}"
     )
 
 

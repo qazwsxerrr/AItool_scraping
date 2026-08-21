@@ -9,7 +9,10 @@ from app.config.limits import (
     DEFAULT_AI_ANALYSIS_MIN_SCORE,
     DEFAULT_AI_REVIEW_CONCURRENCY,
     DEFAULT_AI_SCREEN_REJECT_THRESHOLD,
-    DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE,
+    DEFAULT_STAGE_B_RESERVE_LIMIT,
+    DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS,
+    DEFAULT_STAGE_C_AGENT_MAX_TURNS,
+    DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES,
 )
 
 
@@ -48,13 +51,16 @@ class Settings:
     ai_review_api_url: str | None = None
     ai_review_api_key: str | None = field(default=None, repr=False)
     ai_review_model: str | None = None
-    ai_review_api_style: str = "generic_json"
     ai_review_timeout_seconds: float = 30.0
     ai_screen_reject_threshold: int = DEFAULT_AI_SCREEN_REJECT_THRESHOLD
     ai_analysis_min_score: int = DEFAULT_AI_ANALYSIS_MIN_SCORE
-    ai_stage_c_input_min_score: int = DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE
     ai_review_concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY
     ai_review_categories: tuple[str, ...] = DEFAULT_AI_REVIEW_CATEGORIES
+    stage_b_reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT
+    stage_c_agent_max_turns: int = DEFAULT_STAGE_C_AGENT_MAX_TURNS
+    stage_c_agent_max_tool_calls: int = DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS
+    stage_c_agent_max_web_searches: int = DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES
+    stage_c_trusted_domains: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, dotenv_path: str | Path = ".env") -> "Settings":
@@ -62,6 +68,7 @@ class Settings:
         rsshub_base_url = _env_value("RSSHUB_BASE_URL")
         ai_review_model = os.getenv("AI_REVIEW_MODEL") or None
         categories = _parse_categories(os.getenv("AI_REVIEW_CATEGORIES"))
+        trusted_domains = _parse_domains(os.getenv("AI_STAGE_C_TRUSTED_DOMAINS"))
         return cls(
             database_url=os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL),
             rsshub_base_url=rsshub_base_url.rstrip("/") if rsshub_base_url else None,
@@ -75,7 +82,6 @@ class Settings:
             ai_review_api_url=os.getenv("AI_REVIEW_API_URL") or None,
             ai_review_api_key=os.getenv("AI_REVIEW_API_KEY") or None,
             ai_review_model=ai_review_model,
-            ai_review_api_style=os.getenv("AI_REVIEW_API_STYLE", "generic_json"),
             ai_review_timeout_seconds=float(os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "30")),
             ai_screen_reject_threshold=_bounded_int(
                 os.getenv("AI_SCREEN_REJECT_THRESHOLD"), DEFAULT_AI_SCREEN_REJECT_THRESHOLD
@@ -83,15 +89,24 @@ class Settings:
             ai_analysis_min_score=_bounded_int(
                 os.getenv("AI_ANALYSIS_MIN_SCORE"), DEFAULT_AI_ANALYSIS_MIN_SCORE
             ),
-            ai_stage_c_input_min_score=_bounded_int(
-                os.getenv("AI_STAGE_C_INPUT_MIN_SCORE"),
-                DEFAULT_AI_STAGE_C_INPUT_MIN_SCORE,
-            ),
             ai_review_concurrency=max(
                 1,
                 _bounded_int(os.getenv("AI_REVIEW_CONCURRENCY"), DEFAULT_AI_REVIEW_CONCURRENCY),
             ),
             ai_review_categories=categories,
+            stage_b_reserve_limit=_positive_int(
+                os.getenv("AI_STAGE_B_RESERVE_LIMIT"), DEFAULT_STAGE_B_RESERVE_LIMIT, maximum=100
+            ),
+            stage_c_agent_max_turns=_positive_int(
+                os.getenv("AI_STAGE_C_AGENT_MAX_TURNS"), DEFAULT_STAGE_C_AGENT_MAX_TURNS, maximum=64
+            ),
+            stage_c_agent_max_tool_calls=_positive_int(
+                os.getenv("AI_STAGE_C_AGENT_MAX_TOOL_CALLS"), DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS, maximum=200
+            ),
+            stage_c_agent_max_web_searches=_nonnegative_int(
+                os.getenv("AI_STAGE_C_AGENT_MAX_WEB_SEARCHES"), DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES, maximum=50
+            ),
+            stage_c_trusted_domains=trusted_domains,
         )
 
 
@@ -116,3 +131,30 @@ def _bounded_int(value: str | None, default: int) -> int:
         return max(0, min(100, int(str(value).strip()))) if value is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def _positive_int(value: str | None, default: int, *, maximum: int) -> int:
+    try:
+        parsed = int(str(value).strip()) if value is not None else default
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(maximum, parsed))
+
+
+def _nonnegative_int(value: str | None, default: int, *, maximum: int) -> int:
+    try:
+        parsed = int(str(value).strip()) if value is not None else default
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0, min(maximum, parsed))
+
+
+def _parse_domains(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    values: list[str] = []
+    for raw in value.replace("，", ",").split(","):
+        host = raw.strip().casefold().removeprefix("https://").removeprefix("http://").split("/", 1)[0]
+        if host and host not in values:
+            values.append(host)
+    return tuple(values)

@@ -164,16 +164,14 @@ def test_stage_b_uses_juya_six_topic_taxonomy_only():
         "技术与洞察",
         "前瞻与传闻",
     )
-    schema = build_analysis_provider_payload(envelope())[
-        "response_schema"
-    ]
-    assert "developer_ecosystem" in schema["topic"]
+    schema = build_analysis_provider_payload(envelope())["text"]["format"]["schema"]
+    assert "developer_ecosystem" in schema["properties"]["topic"]["enum"]
     with pytest.raises(ValueError, match="topic must be one of"):
         parse_analysis_result(analysis_payload(topic="paper", topics=["paper"]))
 
 
 def test_stage_b_removed_contract_fields_are_not_in_schema():
-    schema = build_analysis_provider_payload(envelope(), api_style="openai_chat")["response_format"]["json_schema"]["schema"]
+    schema = build_analysis_provider_payload(envelope())["text"]["format"]["schema"]
     for field in (
         "candidate_role",
         "role_confidence",
@@ -238,11 +236,12 @@ def test_analysis_keeps_source_metadata_out_of_the_b1_result_and_prompt_is_minim
     )
     result = parse_analysis_result(analysis_payload(), envelope=item)
     assert not hasattr(result, "source_content_class")
-    assert build_analysis_provider_payload(item)["item"]["source_group"] == "x_official"
+    payload = build_analysis_provider_payload(item)
+    assert '"source_group": "x_official"' in payload["input"][1]["content"]
     assert not hasattr(result, "risk_flags")
 
-    analysis_instructions = build_analysis_provider_payload(item)["instructions"]
-    screen_instructions = build_screen_provider_payload(item)["instructions"]
+    analysis_instructions = payload["input"][0]["content"]
+    screen_instructions = build_screen_provider_payload(item)["input"][0]["content"]
     assert "summary_cn" in analysis_instructions
     assert "keywords" in analysis_instructions
     assert "b1_priority" in analysis_instructions
@@ -256,13 +255,11 @@ def test_analysis_keeps_source_metadata_out_of_the_b1_result_and_prompt_is_minim
     assert "low_information、insufficient_content" in screen_instructions
 
 
-def test_payloads_are_stage_specific_and_provider_styles_are_supported():
+def test_payloads_are_stage_specific_and_responses_only():
     item = envelope()
-    assert build_screen_provider_payload(item)["task"] == "intel_screen"
-    assert build_analysis_provider_payload(item)["task"] == "intel_analysis"
-    chat = build_screen_provider_payload(item, api_style="openai_chat")
-    assert chat["response_format"]["json_schema"]["name"] == "intel_screen"
-    responses = build_analysis_provider_payload(item, api_style="openai_responses")
+    screen = build_screen_provider_payload(item)
+    assert screen["text"]["format"]["name"] == "intel_screen"
+    responses = build_analysis_provider_payload(item)
     assert responses["text"]["format"]["name"] == "intel_analysis"
     entity_schema = responses["text"]["format"]["schema"]["properties"]["entities"]["items"]
     assert entity_schema["required"] == ["name", "type", "aliases"]
@@ -271,16 +268,17 @@ def test_payloads_are_stage_specific_and_provider_styles_are_supported():
 def test_client_calls_independent_stage_endpoints_and_isolates_failures():
     item = envelope()
     screen_http = FakeHttp({"decision": "pass", "reason_code": "relevant", "reason": "ok", "confidence": 90, "risk_flags": []})
-    client = IntelTriageClient(api_url="https://ai.example.test", api_key="secret", http_client=screen_http)
+    client = IntelTriageClient(api_url="https://ai.example.test", api_key="secret", model="test", http_client=screen_http)
     screen = client.screen(item)
     assert screen.decision == "pass"
-    assert screen_http.calls[0]["json"]["task"] == "intel_screen"
+    assert screen_http.calls[0]["url"].endswith("/responses")
+    assert screen_http.calls[0]["json"]["text"]["format"]["name"] == "intel_screen"
 
     analysis_http = FakeHttp(analysis_payload())
-    analysis_client = IntelTriageClient(api_url="https://ai.example.test", api_key="secret", http_client=analysis_http)
+    analysis_client = IntelTriageClient(api_url="https://ai.example.test", api_key="secret", model="test", http_client=analysis_http)
     analysis = analysis_client.analyze(item)
     assert analysis.b1_priority == 85
-    assert analysis_http.calls[0]["json"]["task"] == "intel_analysis"
+    assert analysis_http.calls[0]["json"]["text"]["format"]["name"] == "intel_analysis"
 
     class Failing:
         def screen(self, _):
@@ -293,3 +291,32 @@ def test_client_calls_independent_stage_endpoints_and_isolates_failures():
     analysis_failed = run_analysis_isolated(Failing(), [item])[0]
     assert screen_failed.status == "screen_failed"
     assert analysis_failed.status == "analysis_failed"
+
+
+def test_schema_failures_keep_the_full_responses_payload_for_stage_a_and_b_audit():
+    item = envelope()
+    screen_raw = {"id": "screen-invalid", "output_text": '{"decision":"pass"}'}
+    screen_result = run_screen_isolated(
+        IntelTriageClient(
+            api_url="https://ai.example.test",
+            api_key="secret",
+            model="test",
+            http_client=FakeHttp(screen_raw),
+        ),
+        [item],
+    )[0]
+    assert screen_result.status == "screen_failed"
+    assert screen_result.raw_response == screen_raw
+
+    analysis_raw = {"id": "analysis-invalid", "output_text": '{"topic":"model_release"}'}
+    analysis_result = run_analysis_isolated(
+        IntelTriageClient(
+            api_url="https://ai.example.test",
+            api_key="secret",
+            model="test",
+            http_client=FakeHttp(analysis_raw),
+        ),
+        [item],
+    )[0]
+    assert analysis_result.status == "analysis_failed"
+    assert analysis_result.raw_response == analysis_raw

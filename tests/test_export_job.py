@@ -7,7 +7,7 @@ import pytest
 
 from app.ai.skills.stage_d_selection import STAGE_D_SELECTION_SCHEMA_VERSION
 from app.domain.models import FetchItem
-from app.jobs.export_job import run_intel_export_job
+from app.jobs.export_job import _verification_markdown_line, run_intel_export_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import AIItemReview, IntelItem, Source
 from app.storage.repository import IntelRepository
@@ -229,3 +229,25 @@ def test_export_rejects_an_invalid_or_legacy_stage_d_result(tmp_path):
             artifact_dir=tmp_path / "draft-artifacts",
             run_id=run_id,
         )
+
+
+def test_markdown_never_labels_needs_review_evidence_as_verified():
+    line = _verification_markdown_line(
+        {
+            "verification_refs": [
+                {
+                    "url": "https://verify.example/review",
+                    "title": "待复核页面",
+                    "status": "needs_review",
+                },
+                {
+                    "url": "https://verify.example/confirmed",
+                    "title": "已核验页面",
+                    "status": "verified",
+                },
+            ]
+        }
+    )
+
+    assert "核验来源：[已核验页面](https://verify.example/confirmed)" in line
+    assert "待人工核验链接：[待复核页面](https://verify.example/review)（needs_review）" in line

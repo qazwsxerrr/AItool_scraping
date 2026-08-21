@@ -50,6 +50,17 @@ def _app(tmp_path):
                         }
                     ]
                 ),
+                verification_refs_json=json.dumps(
+                    [
+                        {
+                            "url": "https://verify.example/proof",
+                            "host": "verify.example",
+                            "title": "Verification proof",
+                            "status": "verified",
+                            "claim": "确认发布动作",
+                        }
+                    ]
+                ),
                 metadata_json='{"reason_code":"material_change","reason":"变化明确"}',
             )
         )
@@ -80,6 +91,8 @@ def test_event_detail_keeps_excluded_members_internal(tmp_path):
     response = TestClient(_app(tmp_path)).get("/events/1?edition_date=2026-08-16&origin=home")
     assert response.status_code == 200
     assert "关联资讯与筛选追溯" in response.text
+    assert "独立核验来源" in response.text
+    assert "Verification proof" in response.text
     assert "Model update" in response.text
     assert "Excluded Stage A item" not in response.text
     assert 'nav-item active" href="/?edition_date=2026-08-16"' in response.text
@@ -106,5 +119,6 @@ def test_daily_edition_api_returns_selected_events_only(tmp_path):
     detail = client.get("/api/editions/2026-08-16/events/1")
     assert detail.status_code == 200
     assert detail.json()["event"]["members"][0]["title"] == "<script>alert(1)</script> model update"
+    assert detail.json()["event"]["event"]["verification_refs"][0]["status"] == "verified"
     assert "raw_payload" not in json.dumps(detail.json(), ensure_ascii=False)
     assert "run_id" not in json.dumps(detail.json(), ensure_ascii=False)

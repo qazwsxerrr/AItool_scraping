@@ -152,7 +152,9 @@ def test_stage_b_retry_does_not_call_stage_a(tmp_path):
 
     assert first_b.analysis_failed == 0
     assert first_b.candidate == 1
-    assert second_b.candidate == 0
+    # Reusing a successful B task still rematerializes the run-level
+    # active/reserve projection, so the C workbench remains observable.
+    assert second_b.candidate == 1
     assert provider.screen_calls == [1]
     assert provider.analysis_calls == [1, 1]
 

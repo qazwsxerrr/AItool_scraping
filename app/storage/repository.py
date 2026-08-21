@@ -21,7 +21,13 @@ from app.storage.models import (
     AIItemReview,
     DailyEdition,
     DailyEditionReportEntry,
+    IntelAgentSession,
+    IntelAgentStep,
+    IntelCandidateAdmission,
     IntelEvent,
+    IntelEventDraft,
+    IntelEventDraftItem,
+    IntelEventEvidence,
     IntelEventItem,
     IntelItem,
     IntelRun,
@@ -329,6 +335,7 @@ class IntelRepository:
         *,
         edition_date: date | str,
         records: Iterable[Mapping[str, Any]],
+        candidate_count: int | None = None,
     ) -> DailyEdition:
         """Replace one public date's final report without touching any build.
 
@@ -342,6 +349,9 @@ class IntelRepository:
         edition.status = "published"
         edition.published_at = utcnow()
         edition.error = None
+        edition.selected_count = len(edition.report_entries)
+        if candidate_count is not None:
+            edition.candidate_count = max(0, int(candidate_count))
         self.session.flush()
         return edition
 
@@ -358,6 +368,7 @@ class IntelRepository:
         for order, record in enumerate(records, start=1):
             source_ids = record.get("source_ids") if isinstance(record.get("source_ids"), list) else []
             source_refs = record.get("source_refs") if isinstance(record.get("source_refs"), list) else []
+            verification_refs = record.get("verification_refs") if isinstance(record.get("verification_refs"), list) else []
             risk_flags = record.get("risk_flags") if isinstance(record.get("risk_flags"), list) else []
             keywords = record.get("keywords") if isinstance(record.get("keywords"), list) else []
             entities = record.get("entities") if isinstance(record.get("entities"), list) else []
@@ -389,6 +400,7 @@ class IntelRepository:
                     source_group=_text(record.get("source_group")),
                     source_ids_json=_dump_json(source_ids),
                     source_refs_json=_dump_json(source_refs),
+                    verification_refs_json=_dump_json(verification_refs),
                     risk_flags_json=_dump_json(risk_flags),
                     keywords_json=_dump_json(keywords),
                     entities_json=_dump_json(entities),
@@ -443,6 +455,22 @@ class IntelRepository:
         run = self.session.get(IntelRun, int(run_id))
         if run is None:
             return
+        # Agent state has its own FK graph and must disappear before stage,
+        # event, or item rows.  It is build-private audit data, never public
+        # report history.
+        for agent_session in list(
+            self.session.scalars(
+                select(IntelAgentSession).where(IntelAgentSession.run_id == int(run_id))
+            ).all()
+        ):
+            self.session.delete(agent_session)
+        for admission in list(
+            self.session.scalars(
+                select(IntelCandidateAdmission).where(IntelCandidateAdmission.run_id == int(run_id))
+            ).all()
+        ):
+            self.session.delete(admission)
+        self.session.flush()
         # Stage tasks refer to items/events and attempts refer back to tasks.
         # Delete them first so SQLite installations with FK enforcement enabled
         # can purge an entire build without depending on implicit cascades.
@@ -1003,6 +1031,308 @@ class IntelRepository:
             stmt = stmt.limit(limit)
         return list(self.session.scalars(stmt).unique().all())
 
+    # ------------------------------------------------------------------
+    # Stage-B admission and C-agent durable workbench
+    # ------------------------------------------------------------------
+
+    def replace_candidate_admissions(
+        self,
+        run_id: int,
+        records: Iterable[Mapping[str, Any]],
+    ) -> list[IntelCandidateAdmission]:
+        """Atomically replace the deterministic B admission projection."""
+
+        build_id = self._daily_build_id(run_id)
+        for row in list(
+            self.session.scalars(
+                select(IntelCandidateAdmission).where(IntelCandidateAdmission.run_id == int(run_id))
+            ).all()
+        ):
+            self.session.delete(row)
+        self.session.flush()
+        created: list[IntelCandidateAdmission] = []
+        for record in records:
+            try:
+                item_id = int(record.get("item_id"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("candidate admission is missing item_id") from exc
+            item = self.session.get(IntelItem, item_id)
+            if item is None or int(item.build_id) != int(build_id):
+                raise ValueError(f"candidate admission item {item_id} is outside run {run_id}")
+            decision = _text(record.get("decision")) or "filtered"
+            if decision not in {"active", "reserve", "filtered"}:
+                raise ValueError(f"unsupported candidate admission decision: {decision}")
+            rank = record.get("rank")
+            try:
+                rank_value = max(1, int(rank)) if rank is not None else None
+            except (TypeError, ValueError, OverflowError):
+                rank_value = None
+            try:
+                score = max(0, min(100, int(record.get("guarded_score") or 0)))
+            except (TypeError, ValueError, OverflowError):
+                score = 0
+            row = IntelCandidateAdmission(
+                run_id=int(run_id),
+                item_id=item_id,
+                decision=decision,
+                rank=rank_value,
+                guarded_score=score,
+                reason_code=_text(record.get("reason_code")) or "",
+                reason=_text(record.get("reason")) or "",
+                policy_version=_text(record.get("policy_version")) or "stage_b_admission_v1",
+                policy_fingerprint=_text(record.get("policy_fingerprint")) or "",
+            )
+            self.session.add(row)
+            created.append(row)
+        self.session.flush()
+        return created
+
+    def list_candidate_admissions(
+        self,
+        run_id: int,
+        *,
+        decisions: Iterable[str] | None = None,
+    ) -> list[IntelCandidateAdmission]:
+        stmt = (
+            select(IntelCandidateAdmission)
+            .where(IntelCandidateAdmission.run_id == int(run_id))
+            .options(
+                joinedload(IntelCandidateAdmission.item).joinedload(IntelItem.source),
+                joinedload(IntelCandidateAdmission.item).joinedload(IntelItem.ai_review),
+            )
+            .order_by(
+                IntelCandidateAdmission.decision.asc(),
+                IntelCandidateAdmission.rank.asc().nullslast(),
+                IntelCandidateAdmission.item_id.asc(),
+            )
+        )
+        if decisions:
+            stmt = stmt.where(IntelCandidateAdmission.decision.in_(_unique_strings(decisions)))
+        return list(self.session.scalars(stmt).unique().all())
+
+    def get_agent_session(self, run_id: int, *, stage_name: str = "cluster") -> IntelAgentSession | None:
+        return self.session.scalar(
+            select(IntelAgentSession).where(
+                IntelAgentSession.run_id == int(run_id),
+                IntelAgentSession.stage_name == stage_name,
+            )
+        )
+
+    def start_agent_session(
+        self,
+        *,
+        run_id: int,
+        stage_id: int,
+        stage_name: str,
+        model: str | None,
+        prompt_version: str,
+        max_turns: int,
+        max_tool_calls: int,
+        max_web_searches: int,
+        state: Mapping[str, Any] | None = None,
+        reset: bool = False,
+    ) -> IntelAgentSession:
+        row = self.get_agent_session(run_id, stage_name=stage_name)
+        if row is not None and reset:
+            self.session.delete(row)
+            self.session.flush()
+            row = None
+        if row is None:
+            row = IntelAgentSession(
+                run_id=int(run_id),
+                stage_id=int(stage_id),
+                stage_name=stage_name,
+                model=_text(model),
+                prompt_version=prompt_version,
+                max_turns=max(1, int(max_turns)),
+                max_tool_calls=max(1, int(max_tool_calls)),
+                max_web_searches=max(0, int(max_web_searches)),
+                status="pending",
+            )
+            self.session.add(row)
+        row.model = _text(model)
+        row.prompt_version = prompt_version
+        row.max_turns = max(1, int(max_turns))
+        row.max_tool_calls = max(1, int(max_tool_calls))
+        row.max_web_searches = max(0, int(max_web_searches))
+        if state is not None:
+            row.state_json = _dump_json(dict(state))
+        self.session.flush()
+        return row
+
+    def append_agent_step(
+        self,
+        session_id: int,
+        *,
+        turn: int,
+        kind: str,
+        tool_name: str | None = None,
+        call_id: str | None = None,
+        input_value: Mapping[str, Any] | None = None,
+        output_value: Mapping[str, Any] | None = None,
+        raw_response: Mapping[str, Any] | None = None,
+        status: str = "success",
+        error_message: str | None = None,
+    ) -> IntelAgentStep:
+        next_sequence = int(
+            self.session.scalar(
+                select(IntelAgentStep.sequence)
+                .where(IntelAgentStep.session_id == int(session_id))
+                .order_by(IntelAgentStep.sequence.desc())
+                .limit(1)
+            )
+            or 0
+        ) + 1
+        raw_json = _dump_json(dict(raw_response)) if raw_response is not None else None
+        step = IntelAgentStep(
+            session_id=int(session_id),
+            sequence=next_sequence,
+            turn=max(0, int(turn)),
+            kind=_text(kind) or "response",
+            tool_name=_text(tool_name),
+            call_id=_text(call_id),
+            input_json=_dump_json(dict(input_value or {})),
+            output_json=_dump_json(dict(output_value or {})),
+            raw_response_json=raw_json,
+            raw_response_hash=(hashlib.sha256(raw_json.encode("utf-8")).hexdigest() if raw_json else None),
+            status=_text(status) or "success",
+            error_message=_text(error_message),
+        )
+        self.session.add(step)
+        self.session.flush()
+        return step
+
+    def list_agent_drafts(self, session_id: int) -> list[IntelEventDraft]:
+        stmt = (
+            select(IntelEventDraft)
+            .where(IntelEventDraft.session_id == int(session_id))
+            .options(joinedload(IntelEventDraft.members).joinedload(IntelEventDraftItem.item))
+            .order_by(IntelEventDraft.id.asc())
+        )
+        return list(self.session.scalars(stmt).unique().all())
+
+    def upsert_agent_draft(
+        self,
+        session_id: int,
+        *,
+        draft_key: str,
+        item_ids: Iterable[int],
+        title: str,
+        summary_cn: str | None,
+        topic: str,
+        topics: Iterable[str] | None,
+        keywords: Iterable[str] | None,
+        entities: Iterable[Mapping[str, Any]] | None,
+        novelty_status: str,
+        prior_event_key: str | None,
+        review_state: str,
+        confidence: int,
+        risk_flags: Iterable[str] | None,
+        metadata: Mapping[str, Any] | None = None,
+        member_relations: Mapping[int, str] | None = None,
+    ) -> IntelEventDraft:
+        key = _text(draft_key)
+        if not key:
+            raise ValueError("draft_key is required")
+        ids = list(dict.fromkeys(int(value) for value in item_ids))
+        if not ids:
+            raise ValueError("event draft must contain at least one item")
+        draft = self.session.scalar(
+            select(IntelEventDraft).where(
+                IntelEventDraft.session_id == int(session_id), IntelEventDraft.draft_key == key
+            )
+        )
+        if draft is None:
+            draft = IntelEventDraft(session_id=int(session_id), draft_key=key)
+            self.session.add(draft)
+            self.session.flush()
+        # Validate membership before deleting the existing rows so a failed
+        # update cannot leave a resumable draft empty.
+        for item_id in ids:
+            relation = self.session.scalar(
+                select(IntelEventDraftItem).where(
+                    IntelEventDraftItem.session_id == int(session_id),
+                    IntelEventDraftItem.item_id == item_id,
+                )
+            )
+            if relation is not None and int(relation.draft_id) != int(draft.id):
+                raise ValueError(f"item {item_id} is already assigned to another agent draft")
+        for relation in list(draft.members):
+            self.session.delete(relation)
+        draft.title = _text(title) or "(untitled)"
+        draft.summary_cn = _text(summary_cn)
+        draft.topic = _text(topic) or "technology_insight"
+        draft.topics_json = _dump_json(_unique_strings(topics or ()))
+        draft.keywords_json = _dump_json(_unique_strings(keywords or ()))
+        draft.entities_json = _dump_json([dict(item) for item in (entities or ()) if isinstance(item, Mapping)])
+        draft.novelty_status = _text(novelty_status) or "uncertain"
+        draft.prior_event_key = _text(prior_event_key)
+        draft.review_state = _text(review_state) or "candidate"
+        draft.confidence = max(0, min(100, int(confidence)))
+        draft.risk_flags_json = _dump_json(_unique_strings(risk_flags or ()))
+        draft.metadata_json = _dump_json(dict(metadata or {}))
+        draft.state = "draft"
+        for item_id in ids:
+            self.session.add(
+                IntelEventDraftItem(
+                    session_id=int(session_id),
+                    draft_id=int(draft.id),
+                    item_id=item_id,
+                    relation=_text((member_relations or {}).get(item_id)) or "related",
+                    confidence=max(0, min(100, int(confidence))),
+                )
+            )
+        self.session.flush()
+        return draft
+
+    def record_agent_evidence(
+        self,
+        session_id: int,
+        *,
+        draft_key: str | None,
+        url: str,
+        final_url: str | None = None,
+        title: str | None = None,
+        excerpt: str | None = None,
+        verification_claim: str | None = None,
+        source_scope: str = "verification",
+        status: str = "recorded",
+        item_id: int | None = None,
+    ) -> IntelEventEvidence:
+        draft = None
+        if draft_key:
+            draft = self.session.scalar(
+                select(IntelEventDraft).where(
+                    IntelEventDraft.session_id == int(session_id),
+                    IntelEventDraft.draft_key == str(draft_key),
+                )
+            )
+            if draft is None:
+                raise ValueError(f"unknown agent draft: {draft_key}")
+        final = _text(final_url) or _text(url)
+        parsed = urlsplit(final or "")
+        host = (parsed.hostname or "").casefold()
+        if not host:
+            raise ValueError("evidence URL must be absolute")
+        excerpt_text = (_text(excerpt) or "")[:4_000] or None
+        evidence = IntelEventEvidence(
+            session_id=int(session_id),
+            draft_id=int(draft.id) if draft is not None else None,
+            item_id=int(item_id) if item_id is not None else None,
+            source_scope=_text(source_scope) or "verification",
+            url=_text(url) or final or "",
+            final_url=final,
+            host=host,
+            title=_text(title),
+            excerpt=excerpt_text,
+            content_hash=(hashlib.sha256(excerpt_text.encode("utf-8")).hexdigest() if excerpt_text else None),
+            verification_claim=_text(verification_claim),
+            status=_text(status) or "recorded",
+        )
+        self.session.add(evidence)
+        self.session.flush()
+        return evidence
+
     def upsert_ai_screen(
         self,
         item_id: int,
@@ -1133,6 +1463,7 @@ class IntelRepository:
         display_score: float | None = None,
         novelty_status: str | None = None,
         state: str | None = None,
+        review_state: str | None = None,
         resolution_method: str | None = None,
         resolution_confidence: int | None = None,
         resolution_raw: Any | None = None,
@@ -1268,6 +1599,7 @@ class IntelRepository:
         if novelty is not None and (row.novelty_status in {None, "unknown"} or novelty != "unknown"):
             row.novelty_status = novelty
         _assign("state", _text(state))
+        _assign("review_state", _text(review_state))
         _assign("resolution_method", _text(resolution_method))
         if resolution_confidence is not None:
             try:

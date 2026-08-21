@@ -6,15 +6,15 @@
 source registry
 → fetch（抓取、解析、标准化、去重、来源健康记录）
 → Stage A screen（确定性初筛与轻量 AI 筛选）
-→ Stage B analyze（短摘要、关键词、主题分类与编辑优先级评分）
-→ Stage C aggregate（按本地评分门槛输入并一次 AI 调用聚合，同时判断近期重复/更新）
+→ Stage B analyze + admission（短摘要、关键词、主题分类、评分与候选池准入）
+→ Stage C agent（按需读取候选/正文/历史，调用工具聚合并可受限联网核验）
 → Stage D select（仅从 Stage C 候选中选择有序子集）
 → draft 审计工作区（按日期保留完整抓取与 A-D 决策）
 → export / approval（成功后发布为该日期唯一日报）
 → UI（首页、搜索、全部动态只读展示）
 ```
 
-Stage B1 对每个通过 Stage A 的条目执行一次结构化分析，只输出来源归因、主题分类、中文短摘要、关键词、实体和编辑优先级评分。它不做事件角色路由、事实抽取、论文证据判断、风险标记或自评置信度；完整 pipeline 会继续由 Stage C 一次性聚合新闻主线，并由独立的 Stage D 编辑 skill 选择当天的日报组合。
+Stage B1 对每个通过 Stage A 的条目执行一次结构化分析，只输出来源归因、主题分类、中文短摘要、关键词、实体和编辑优先级评分。随后本地 deterministic guard 以 `AI_ANALYSIS_MIN_SCORE=60` 为下限生成 `active`、`reserve`、`filtered` 候选池：初始 active 目标为 100 条、reserve 默认 20 条；积累 14 期日报后，active 目标按已发布的候选/入选比例动态校准在 60–120 条。Stage C 不再接收一大段全文提示词，而是运行可审计的 Responses agent，按需读取候选、正文和近 3 天历史，再由独立的 Stage D 编辑 skill 选择当天最终组合。
 
 `content_class` 描述来源/信号类型（官方发布、媒体报道、项目/工具、社区线索），`topic_category` 使用橘鸦日报的六类编辑主题（开发生态、模型发布、产品应用、行业动态、技术与洞察、前瞻与传闻）。两者分开保存，UI 和导出会同时展示，避免把第三方媒体报道误读成“官方产品发布”。
 
@@ -96,14 +96,20 @@ GITHUB_TOKEN=
 AI_REVIEW_API_URL=
 AI_REVIEW_API_KEY=
 AI_REVIEW_MODEL=
-AI_REVIEW_API_STYLE=generic_json
 AI_REVIEW_TIMEOUT_SECONDS=30
 AI_REVIEW_CONCURRENCY=4
 AI_REVIEW_CATEGORIES=开发生态,模型发布,产品应用,行业动态,技术与洞察,前瞻与传闻
-AI_STAGE_C_INPUT_MIN_SCORE=60
+AI_ANALYSIS_MIN_SCORE=60
+AI_STAGE_B_RESERVE_LIMIT=20
+AI_STAGE_C_AGENT_MAX_TURNS=24
+AI_STAGE_C_AGENT_MAX_TOOL_CALLS=80
+AI_STAGE_C_AGENT_MAX_WEB_SEARCHES=8
+AI_STAGE_C_TRUSTED_DOMAINS=
 ```
 
-`AI_STAGE_C_INPUT_MIN_SCORE` 默认 `60`。Stage C 直接读取完成 Stage B1、通过结构性校验、且经本地 guard 后评分不低于该阈值的条目；这里没有独立的 B2 路由层。Stage C 输出 `candidate_event_ids`，Stage D 只在 `max_selected` 上限内选择其中的有序子集。
+所有 AI 调用统一使用 OpenAI Responses 语义；`AI_REVIEW_API_URL` 可以是 `/v1` 基址或完整的 `/v1/responses` 地址。Stage C 需要 provider 支持 Responses 的 strict function calling 和 hosted `web_search`。网页搜索只能访问候选原始来源域名加 `AI_STAGE_C_TRUSTED_DOMAINS` 中配置的高可信域名；只有 provider 在同一会话的搜索来源或 `open_page` 操作中实际返回的 URL 才能标为“已核验”。若兼容 provider 执行了搜索却省略来源对象，链接只会保存为 `needs_review` 线索，并自动排除在 Stage D 的自动选稿和导出之外。
+
+`AI_ANALYSIS_MIN_SCORE` 默认 `60`，它是 Stage B 的本地评分门槛，不再由 Stage C 决定。Stage B 将合格项按来源/主题多样性形成 active 候选池（初始目标 100 条、14 期后动态 60–120 条）和最多 20 条 reserve；Stage C 仅从这两个持久化集合按需取数。Stage C 输出 `candidate_event_ids`，Stage D 只在 `max_selected` 上限内选择其中的有序子集。
 
 Stage B1 的 `b1_priority` 只衡量内容价值，由本地 guard 按 `audience_relevance` 25%、`material_change` 25%、`impact_scope` 20%、`independent_news_value` 20% 和 `specificity` 10% 重算。来源身份、AI 把握度和时间新鲜度不参与该分数：来源归因来自 source registry，72 小时窗口由本地 recency policy 处理。
 
@@ -210,8 +216,8 @@ $PYTHON -m app.main source-health --source x_account_openai
 
 1. 正式日报的 `fetch` 从 registry 载入全部当前启用来源，强制完整请求（不使用 HTTP 304 条件请求），把本次响应视为当天完整集合；每个条目只在当前 `draft.db` 内去重。
 2. `stage-a` 先执行来源级确定性初筛，再对保留条目调用结构化 AI；`stage-b1` 对通过 Stage A 的条目做 B1 分析，保存摘要、关键词、主题、实体和经本地 guard 的评分。原始条目、拒绝原因、AI 结果和失败 attempt 都保留在该日期 `draft.db`。
-3. `stage-c` 直接从当前 build 的成功 Stage B1 条目中按本地评分门槛和结构性校验构造输入，并把输入、排除原因和最近 3 天已发布日报一次性交给聚合 skill。AI 直接决定事件分组、`primary/duplicate/related` 关系、聚合标题与摘要，以及 `new/repeat/updated` 历史状态。本地代码校验所有输入 `item_id` 恰好出现一次、历史 key 合法，并保存事件、完整来源关系和输入审计。Provider、JSON 或 schema 任一失败都会让 Stage C 直接报错并保留失败审计。
-4. `stage-d` 只做最终选稿：读取 Stage C 成功任务中的 `candidate_event_ids`，通过一次独立 skill 请求返回 `selected=[{event_id, reason_code, reason}]`。数组顺序就是展示顺序；未选事件由候选集合与入选集合之差推导。Stage D 不改写标题或摘要，不重新评分、聚合、判断新旧、核实来源，也不生成观察池。Stage C 未完成或候选合同缺失时，Stage D 直接失败；候选为空时不调用 provider。
+3. `stage-b1` 完成后，本地规则把条目写成可审计的 `active` / `reserve` / `filtered` 候选准入记录；评分阈值、工作台容量和 reserve 都在 B 生效。`stage-c` 是状态化 Responses agent：它先读取 active 候选概要，按需读取正文、检索候选和近 3 天已发布日报；必要时才调用受限域名的 hosted web search。模型通过工具保存事件草稿、核验证据和待审项，本地代码校验每个 active `item_id` 恰好出现一次，并把草稿原子化为事件。超出 agent 预算时，未覆盖的候选会变为 `needs_review` 事件而不是被丢弃。
+4. `stage-d` 只做最终选稿：读取 Stage C 成功任务中的 `candidate_event_ids`，通过一次独立 skill 请求返回 `selected=[{event_id, reason_code, reason}]`。数组顺序就是展示顺序；未选事件由候选集合与入选集合之差推导。Stage D 不改写标题或摘要，不重新评分、聚合、判断新旧或生成观察池；它可看到 C 的待审状态和核验计数，但不自行联网。
 5. `pipeline status --edition-date ...` 同时显示正式日报状态、当前 draft 状态和 retained audit 路径。构建期间 UI/API 始终读取旧的已发布日报；它们不读取 draft。
 6. `export` 是明确的批准动作：只有所有来源和 AI 阶段完整成功时，才把 `draft.db` 提升为 `audit.db`、原子替换 `output/daily/YYYY-MM-DD/`，并在正式库内替换该日期的最终日报条目。任一步失败都会恢复旧 audit 和旧日报；失败 draft 留在原处，可按日期检查、重试或恢复。
 7. 同日重新抓取不合并上午结果：下午响应中不存在的资讯、被移除来源的资讯及其派生事件，会在下午成功批准后从当天最终日报和新的 `audit.db` 中消失。新 draft 运行期间，上午已发布的 `audit.db` 仍保留，便于和下午 draft 比对。
@@ -282,7 +288,7 @@ $PYTHON -m uvicorn app.web.app:app --host 127.0.0.1 --port 8000
 
 Stage A/B 对每条 AI provider 任务执行瞬态错误自动重试：首次调用失败后最多再重试 5 次（最多 6 次 provider 调用）。429、5xx、timeout 和 rate-limit 属于可重试错误；永久性 4xx、鉴权失败和 schema 错误不会重复请求。达到上限后 draft 保留为失败状态，旧日报不被替换，修复后可使用同一 `edition_date` 恢复。
 
-默认数量策略为：每个来源抓取 20 条，Stage A/B 处理当前完整 build，Stage C 仅聚合本地评分不低于 `AI_STAGE_C_INPUT_MIN_SCORE` 的有效条目，日报默认导出最多 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
+默认数量策略为：每个来源抓取 20 条，Stage A/B 处理当前完整 build；B 只让本地 guard 评分不低于 60 的条目进入 C 工作台，初始 active 上限为 100、reserve 为 20，14 期后 active 动态控制在 60–120；日报最终导出最多 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
 
 `export` 的日报产物默认写入 `output/daily/YYYY-MM-DD/`：
 

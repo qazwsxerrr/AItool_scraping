@@ -35,39 +35,61 @@ def test_settings_read_ai_review_model(monkeypatch):
     assert settings.ai_review_model == "review-model"
 
 
-def test_settings_read_stage_c_input_min_score(monkeypatch):
-    monkeypatch.delenv("AI_STAGE_C_INPUT_MIN_SCORE", raising=False)
-    monkeypatch.setenv("AI_STAGE_C_INPUT_MIN_SCORE", "72")
+def test_settings_read_stage_b_analysis_min_score(monkeypatch):
+    monkeypatch.delenv("AI_ANALYSIS_MIN_SCORE", raising=False)
+    monkeypatch.setenv("AI_ANALYSIS_MIN_SCORE", "72")
 
     settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
 
-    assert settings.ai_stage_c_input_min_score == 72
+    assert settings.ai_analysis_min_score == 72
 
 
-def test_settings_stage_c_input_min_score_defaults_to_60(monkeypatch):
-    monkeypatch.delenv("AI_STAGE_C_INPUT_MIN_SCORE", raising=False)
+def test_settings_stage_b_analysis_min_score_defaults_to_60(monkeypatch):
+    monkeypatch.delenv("AI_ANALYSIS_MIN_SCORE", raising=False)
 
     settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
 
-    assert settings.ai_stage_c_input_min_score == 60
+    assert settings.ai_analysis_min_score == 60
 
 
 def test_settings_stage_d_reuses_ai_review_configuration(monkeypatch):
-    for name in ("AI_REVIEW_API_URL", "AI_REVIEW_API_KEY", "AI_REVIEW_MODEL", "AI_REVIEW_API_STYLE", "REQUEST_RETRIES"):
+    for name in ("AI_REVIEW_API_URL", "AI_REVIEW_API_KEY", "AI_REVIEW_MODEL", "REQUEST_RETRIES"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AI_REVIEW_API_URL", "https://review.example/v1")
     monkeypatch.setenv("AI_REVIEW_API_KEY", "review-secret")
     monkeypatch.setenv("AI_REVIEW_MODEL", "review-model")
-    monkeypatch.setenv("AI_REVIEW_API_STYLE", "openai_responses")
     monkeypatch.setenv("REQUEST_RETRIES", "3")
     settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
     client = StageDSelectionClient.from_settings(settings)
-    assert client.api_url == "https://review.example/v1"
-    assert client.api_key == "review-secret"
     assert client.model == "review-model"
-    assert client.api_style == "openai_responses"
+    assert client.transport == "responses"
+    assert client.is_configured is True
     assert client.max_retries == 3
     assert client.timeout_seconds >= 120
+
+
+def test_settings_read_stage_c_agent_budgets_and_trusted_domains(monkeypatch):
+    values = {
+        "AI_STAGE_B_RESERVE_LIMIT": "17",
+        "AI_STAGE_C_AGENT_MAX_TURNS": "18",
+        "AI_STAGE_C_AGENT_MAX_TOOL_CALLS": "44",
+        "AI_STAGE_C_AGENT_MAX_WEB_SEARCHES": "6",
+        "AI_STAGE_C_TRUSTED_DOMAINS": "openai.com, docs.anthropic.com",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
+    assert settings.stage_b_reserve_limit == 17
+    assert settings.stage_c_agent_max_turns == 18
+    assert settings.stage_c_agent_max_tool_calls == 44
+    assert settings.stage_c_agent_max_web_searches == 6
+    assert settings.stage_c_trusted_domains == ("openai.com", "docs.anthropic.com")
+
+
+def test_settings_can_disable_stage_c_web_search(monkeypatch):
+    monkeypatch.setenv("AI_STAGE_C_AGENT_MAX_WEB_SEARCHES", "0")
+    settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
+    assert settings.stage_c_agent_max_web_searches == 0
 
 
 def test_settings_read_category_taxonomy(monkeypatch):

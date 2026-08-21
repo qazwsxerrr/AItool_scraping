@@ -1,73 +1,24 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from typing import Any, Mapping
 
 import pytest
 from sqlalchemy import select
 
-from app.ai.skills.stage_c_aggregation import (
-    STAGE_C_SCHEMA_VERSION,
-    StageCAggregationCallResult,
-    StageCAggregationResponse,
-)
+from app.ai.responses import AgentRunResult
 from app.ai.skills.stage_d_selection import STAGE_D_SELECTION_SCHEMA_VERSION
 from app.domain.models import FetchItem
 from app.jobs.event_cluster_job import run_event_cluster_job
 from app.jobs.export_job import run_intel_export_job
 from app.jobs.stage_d_job import StageDProfile, run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelEventItem, IntelItem, IntelRunStage, IntelRunStageTask, Source
+from app.storage.models import AIItemReview, IntelEventItem, IntelRunStageTask, Source
 from app.storage.repository import IntelRepository
 
 
-class _SelectionClient:
-    model = "test-stage-d-selection"
-    max_retries = 0
-
-    def select(self, events, *, edition, max_selected):
-        return {
-            "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
-            "selected": [
-                {
-                    "event_id": int(event["event_id"]),
-                    "reason_code": "material_change",
-                    "reason": "测试事件适合进入日报。",
-                }
-                for event in events[:max_selected]
-            ],
-        }
-
-
-class _StageCClient:
-    model = "test-stage-c"
-
-    def aggregate(self, current_items, *, recent_history, edition):
-        raw = {
-            "schema_version": STAGE_C_SCHEMA_VERSION,
-            "clusters": [
-                {
-                    "title_zh": str(item["title"]),
-                    "summary_zh": str(item.get("summary_cn") or item["title"]),
-                    "item_ids": [int(item["id"])],
-                    "novelty_status": "new",
-                    "prior_event_key": None,
-                }
-                for item in current_items
-            ],
-        }
-        return StageCAggregationCallResult(
-            parsed=StageCAggregationResponse.model_validate(raw),
-            raw_response=raw,
-            request_metadata={"model": self.model},
-        )
-
-
-class _FailingStageCClient:
-    model = "test-stage-c-failure"
-
-    def aggregate(self, current_items, *, recent_history, edition):
-        raise RuntimeError("stage c provider failed")
+REFERENCE = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
 
 
 def _db():
@@ -76,228 +27,134 @@ def _db():
     return create_session_factory(engine)
 
 
-def _build_with_stage_b_items(
-    session_factory,
-    *,
-    reference_time: datetime,
-    rows: list[tuple[str, int, str]],
-) -> tuple[int, dict[str, int]]:
-    """Seed one immutable daily build with completed Stage-B tasks."""
-
+def _seed(session_factory, rows: list[tuple[str, int]]) -> tuple[int, dict[str, int]]:
     with session_factory() as session:
         repo = IntelRepository(session)
-        session.add(
-            Source(
-                id="downstream-source",
-                name="Source",
-                transport="feed",
-                url="https://source.example/feed.xml",
-                source_group="official_blog",
-                content_class="official_model_company",
-            )
-        )
+        session.add(Source(
+            id="downstream-source", name="Source", transport="feed", url="https://source.example/feed.xml",
+            source_group="official_blog", source_role="official", primary_eligible=True,
+            content_class="official_model_company",
+        ))
         session.flush()
-        _, build = repo.start_daily_build(
-            edition_date="2026-08-15",
-            reference_time=reference_time,
-        )
-        analyze = repo.ensure_stage(build.id, "analyze")
-        item_ids: dict[str, int] = {}
-        for index, (title, score, status) in enumerate(rows, start=1):
+        _, build = repo.start_daily_build(edition_date="2026-08-15", reference_time=REFERENCE)
+        stage = repo.ensure_stage(build.id, "analyze")
+        admissions: list[dict[str, Any]] = []
+        ids: dict[str, int] = {}
+        for index, (title, score) in enumerate(rows, start=1):
             inserted = repo.insert_item(
                 FetchItem(
-                    source_id="downstream-source",
-                    external_id=f"downstream-{index}",
-                    title=title,
-                    url=f"https://source.example/{index}",
-                    summary=f"{title} summary",
-                    content_class="official_model_company",
-                    published_at=reference_time,
-                    captured_at=reference_time,
+                    source_id="downstream-source", external_id=f"downstream-{index}", title=title,
+                    url=f"https://source.example/{index}", summary=f"{title} summary",
+                    content_text=f"{title} full content", content_class="official_model_company",
+                    published_at=REFERENCE, captured_at=REFERENCE,
                 ),
                 run_id=build.id,
             )
             assert inserted.item_id is not None
             item_id = int(inserted.item_id)
-            item_ids[title] = item_id
-            session.add(
-                AIItemReview(
-                    item_id=item_id,
-                    content_class="official_model_company",
-                    topic="model_release",
-                    topics_json='["model_release"]',
-                    keywords_json='["gpt-5", "release"]',
-                    entities_json=json.dumps([{"type": "company", "name": "OpenAI"}]),
-                    summary_cn=f"{title} summary",
-                    b1_priority=score,
-                    status="success",
-                )
-            )
-            item = session.get(IntelItem, item_id)
-            assert item is not None
-            if status.startswith("analysis_filtered:"):
-                item.status = "analysis_filtered"
-            task = repo.ensure_stage_task(
-                analyze,
-                subject_type="item",
-                subject_id=item_id,
-                item_id=item_id,
-            )
-            repo.complete_stage_task(
-                task,
-                result={"item_id": item_id, "status": "success", "b1_priority": score},
-            )
-        repo.finish_stage(analyze, status="succeeded")
+            ids[title] = item_id
+            session.add(AIItemReview(
+                item_id=item_id, content_class="official_model_company", topic="model_release",
+                topics_json='["model_release"]', keywords_json='["release"]', entities_json='[]',
+                summary_cn=f"{title} summary", b1_priority=score, status="success",
+            ))
+            task = repo.ensure_stage_task(stage, subject_type="item", subject_id=item_id, item_id=item_id)
+            repo.complete_stage_task(task, result={"item_id": item_id, "b1_priority": score})
+            admissions.append({
+                "item_id": item_id, "decision": "active", "rank": index, "guarded_score": score,
+                "reason_code": "fixture", "reason": "fixture", "policy_version": "fixture",
+                "policy_fingerprint": "fixture",
+            })
+        repo.replace_candidate_admissions(build.id, admissions)
+        repo.finish_stage(stage, status="succeeded")
         repo.freeze_run_scope(build.id)
         session.commit()
-        return int(build.id), item_ids
+        return int(build.id), ids
 
 
-def test_cluster_retry_keeps_the_frozen_reference_time_and_current_build_projection():
+class _StageCAgent:
+    model = "test-stage-c-agent"
+    transport = "responses"
+
+    def run(self, *, function_tools, on_response, on_tool, **_kwargs):
+        tools = {tool.name: tool for tool in function_tools}
+        on_response(1, {"id": "response-1", "output": []})
+        calls = 0
+
+        def invoke(name: str, args: Mapping[str, Any]):
+            nonlocal calls
+            calls += 1
+            call = {"name": name, "call_id": f"call-{calls}", "arguments": json.dumps(args)}
+            output = dict(tools[name].handler(dict(args)))
+            on_tool(1, call, output)
+            return output
+
+        candidates = invoke("list_candidates", {"bucket": "active", "offset": 0, "limit": 30})["items"]
+        invoke("save_event_drafts", {"drafts": [
+            {
+                "draft_key": f"item-{item['id']}", "item_ids": [item["id"]], "title": item["title"],
+                "summary_cn": item.get("summary_cn") or item["title"], "topic": item.get("topic") or "technology_insight",
+                "topics": [item.get("topic") or "technology_insight"], "keywords": item.get("keywords") or [],
+                "entities": item.get("entities") or [], "novelty_status": "new", "prior_event_key": None,
+                "review_state": "candidate", "confidence": 90, "risk_flags": [],
+            }
+            for item in candidates
+        ]})
+        assert invoke("finalize_event_drafts", {})["ok"] is True
+        return AgentRunResult("response-1", 1, calls, 0, True, {"id": "response-1", "output": []})
+
+
+class _FailingStageCAgent:
+    model = "test-stage-c-failure"
+    transport = "responses"
+
+    def run(self, **_kwargs):
+        raise RuntimeError("stage c provider failed")
+
+
+class _SelectionClient:
+    model = "test-stage-d-selection"
+    transport = "responses"
+    max_retries = 0
+
+    def select(self, events, *, edition, max_selected):
+        return {
+            "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+            "selected": [
+                {"event_id": int(event["event_id"]), "reason_code": "material_change", "reason": "测试事件适合进入日报。"}
+                for event in events[:max_selected]
+            ],
+        }
+
+
+def test_stage_d_and_export_consume_only_new_c_agent_projection(tmp_path):
     session_factory = _db()
-    reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
-    run_id, _ = _build_with_stage_b_items(
-        session_factory,
-        reference_time=reference,
-        rows=[("Orchid Systems processor", 80, "candidate")],
+    run_id, item_ids = _seed(session_factory, [("Current build update", 90)])
+    clustered = run_event_cluster_job(session_factory=session_factory, run_id=run_id, ai_client=_StageCAgent())
+    assert clustered.candidate_event_ids == clustered.current_event_ids
+
+    selected = run_stage_d_job(
+        session_factory=session_factory, run_id=run_id, profile=StageDProfile(max_selected=1), ai_client=_SelectionClient()
     )
-
-    client = _StageCClient()
-    first = run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        reference_time=reference,
-        ai_client=client,
+    assert selected.selected == 1
+    exported = run_intel_export_job(
+        session_factory=session_factory, output_dir=tmp_path / "public", artifact_dir=tmp_path / "draft", run_id=run_id
     )
-    second = run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        force=True,
-        now=reference + timedelta(hours=100),
-        ai_client=client,
-    )
-
-    assert first.events == 1
-    assert first.candidate_event_ids == first.current_event_ids
-    assert first.reference_time == reference
-    assert second.reference_time == reference
-    assert second.events == 1
-    assert second.current_event_ids == first.current_event_ids
-    with session_factory() as session:
-        stage = session.scalar(
-            select(IntelRunStage).where(
-                IntelRunStage.run_id == run_id,
-                IntelRunStage.stage_name == "cluster",
-            )
-        )
-        task = session.scalar(select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id))
-        assert task is not None and task.status == "succeeded"
-
-
-def test_cluster_excludes_structurally_filtered_stage_b_items():
-
-    session_factory = _db()
-    reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
-    run_id, item_ids = _build_with_stage_b_items(
-        session_factory,
-        reference_time=reference,
-        rows=[
-            ("Orchid Systems candidate", 85, "candidate"),
-            ("Orchid Systems low signal", 42, "analysis_filtered:score_below_threshold"),
-        ],
-    )
-
-    result = run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        reference_time=reference,
-        ai_client=_StageCClient(),
-    )
-
-    assert result.processed == 1
-    assert result.events == 1
+    assert exported.exported == 1
+    assert "Current build update" in (tmp_path / "draft" / "intel_digest.md").read_text(encoding="utf-8")
     with session_factory() as session:
         relations = session.scalars(select(IntelEventItem)).all()
-        assert {relation.item_id for relation in relations} == {item_ids["Orchid Systems candidate"]}
+        assert {row.item_id for row in relations} == set(item_ids.values())
 
 
-def test_stage_d_and_export_use_only_the_current_daily_build(tmp_path):
+def test_stage_c_force_rerun_invalidates_stale_stage_d_and_export_state(tmp_path):
     session_factory = _db()
-    reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
-    run_id, _ = _build_with_stage_b_items(
-        session_factory,
-        reference_time=reference,
-        rows=[("Current build update", 90, "candidate")],
-    )
-    cluster = run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        reference_time=reference,
-        ai_client=_StageCClient(),
-    )
-    assert cluster.current_event_ids
-    assert cluster.candidate_event_ids == cluster.current_event_ids
+    run_id, _ = _seed(session_factory, [("Current build update", 90)])
+    run_event_cluster_job(session_factory=session_factory, run_id=run_id, ai_client=_StageCAgent())
+    run_stage_d_job(session_factory=session_factory, run_id=run_id, profile=StageDProfile(max_selected=1), ai_client=_SelectionClient())
+    run_intel_export_job(session_factory=session_factory, output_dir=tmp_path / "public", artifact_dir=tmp_path / "draft", run_id=run_id)
 
-    stage_d = run_stage_d_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        profile=StageDProfile(max_selected=1),
-        ai_client=_SelectionClient(),
-    )
-    assert stage_d.selected == 1
-
-    artifact_dir = tmp_path / "draft"
-    exported = run_intel_export_job(
-        session_factory=session_factory,
-        output_dir=tmp_path / "public-intel",
-        artifact_dir=artifact_dir,
-        run_id=run_id,
-    )
-
-    assert exported.exported == 1
-    assert "Current build update" in (artifact_dir / "intel_digest.md").read_text(encoding="utf-8")
-    assert not (tmp_path / "public-intel" / "daily" / "2026-08-15").exists()
-
-
-def test_stage_c_rerun_removes_stale_stage_d_and_export_state(tmp_path):
-    session_factory = _db()
-    reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
-    run_id, _ = _build_with_stage_b_items(
-        session_factory,
-        reference_time=reference,
-        rows=[("Current build update", 90, "candidate")],
-    )
-    run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        reference_time=reference,
-        ai_client=_StageCClient(),
-    )
-    run_stage_d_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        profile=StageDProfile(max_selected=1),
-        ai_client=_SelectionClient(),
-    )
-    run_intel_export_job(
-        session_factory=session_factory,
-        output_dir=tmp_path / "public-intel",
-        artifact_dir=tmp_path / "draft",
-        run_id=run_id,
-    )
-
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        assert repo.get_stage(run_id, "stage_d") is not None
-        assert repo.get_stage(run_id, "export") is not None
-
-    run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        reference_time=reference,
-        force=True,
-        ai_client=_StageCClient(),
-    )
+    run_event_cluster_job(session_factory=session_factory, run_id=run_id, force=True, ai_client=_StageCAgent())
 
     with session_factory() as session:
         repo = IntelRepository(session)
@@ -305,41 +162,15 @@ def test_stage_c_rerun_removes_stale_stage_d_and_export_state(tmp_path):
         assert repo.get_stage(run_id, "export") is None
 
 
-def test_failed_stage_c_rerun_still_removes_stale_stage_d_and_export_state(tmp_path):
+def test_failed_stage_c_force_rerun_still_invalidates_stale_downstream_state(tmp_path):
     session_factory = _db()
-    reference = datetime(2026, 8, 15, 12, tzinfo=timezone.utc)
-    run_id, _ = _build_with_stage_b_items(
-        session_factory,
-        reference_time=reference,
-        rows=[("Current build update", 90, "candidate")],
-    )
-    run_event_cluster_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        reference_time=reference,
-        ai_client=_StageCClient(),
-    )
-    run_stage_d_job(
-        session_factory=session_factory,
-        run_id=run_id,
-        profile=StageDProfile(max_selected=1),
-        ai_client=_SelectionClient(),
-    )
-    run_intel_export_job(
-        session_factory=session_factory,
-        output_dir=tmp_path / "public-intel",
-        artifact_dir=tmp_path / "draft",
-        run_id=run_id,
-    )
+    run_id, _ = _seed(session_factory, [("Current build update", 90)])
+    run_event_cluster_job(session_factory=session_factory, run_id=run_id, ai_client=_StageCAgent())
+    run_stage_d_job(session_factory=session_factory, run_id=run_id, profile=StageDProfile(max_selected=1), ai_client=_SelectionClient())
+    run_intel_export_job(session_factory=session_factory, output_dir=tmp_path / "public", artifact_dir=tmp_path / "draft", run_id=run_id)
 
     with pytest.raises(RuntimeError, match="stage c provider failed"):
-        run_event_cluster_job(
-            session_factory=session_factory,
-            run_id=run_id,
-            reference_time=reference,
-            force=True,
-            ai_client=_FailingStageCClient(),
-        )
+        run_event_cluster_job(session_factory=session_factory, run_id=run_id, force=True, ai_client=_FailingStageCAgent())
 
     with session_factory() as session:
         repo = IntelRepository(session)
