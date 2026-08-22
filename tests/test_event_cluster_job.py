@@ -9,9 +9,9 @@ from sqlalchemy import select
 
 from app.ai.responses import AgentBudgetExceeded, AgentProtocolError, AgentRunResult
 from app.domain.models import FetchItem
-from app.jobs.event_cluster_job import _stage_c_lease_seconds, run_event_cluster_job
+from app.jobs.event_cluster_job import _primary_sort_key, _stage_c_lease_seconds, run_event_cluster_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelAgentSession, IntelEvent, IntelEventEvidence, IntelRunStageTask, Source
+from app.storage.models import AIItemReview, IntelAgentSession, IntelEvent, IntelEventEvidence, IntelItem, IntelRunStageTask, Source
 from app.storage.repository import IntelRepository
 
 
@@ -22,6 +22,27 @@ def _db():
     engine = create_engine_from_url("sqlite:///:memory:")
     init_db(engine)
     return create_session_factory(engine)
+
+
+def test_stage_c_primary_source_uses_group_and_content_class_only():
+    official = IntelItem(
+        id=1, build_id=1, source_id="official", title="Official", content_hash="a",
+        content_class="official_model_company", b1_priority=70, captured_at=NOW,
+        source=Source(
+            id="official", name="Official", transport="feed", url="https://official.example/feed.xml",
+            source_group="official_blog", content_class="official_model_company",
+        ),
+    )
+    media = IntelItem(
+        id=2, build_id=1, source_id="media", title="Media", content_hash="b",
+        content_class="news_media", b1_priority=99, captured_at=NOW,
+        source=Source(
+            id="media", name="Media", transport="feed", url="https://media.example/feed.xml",
+            source_group="tech_media", content_class="news_media",
+        ),
+    )
+
+    assert _primary_sort_key(official) < _primary_sort_key(media)
 
 
 def _seed_build(
@@ -39,8 +60,6 @@ def _seed_build(
                 transport="feed",
                 url="https://source.example/feed.xml",
                 source_group="official_blog",
-                source_role="official",
-                primary_eligible=True,
                 content_class="official_model_company",
             )
         )

@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from typer.testing import CliRunner
 
 from app import main
-from app.config.limits import RECENT_WINDOW_HOURS
 from app.config.settings import Settings
 from app.jobs.fetch_job import IntelFetchResult, IntelSourceStats
 from app.jobs import pipeline_orchestrator as orchestrator
@@ -57,7 +56,10 @@ def test_start_creates_and_freezes_an_isolated_daily_draft(tmp_path):
         assert edition is not None and draft is not None
         assert draft.scope_frozen is True
         assert draft.reference_time is not None
-        assert draft.scope["freshness_window_hours"] == RECENT_WINDOW_HOURS
+        assert draft.scope["freshness_window_hours"] is None
+        assert draft.scope["freshness_cutoff_mode"] == "edition_previous_day_midnight"
+        assert draft.scope["freshness_timezone"] == "Asia/Shanghai"
+        assert draft.scope["freshness_edition_date"] == "2026-08-19"
         assert draft.scope["freshness_undated_policy"] == "exclude"
         assert draft.scope["freshness_github_trending_policy"] == "exempt"
 

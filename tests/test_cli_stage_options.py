@@ -41,6 +41,7 @@ def test_cli_accepts_content_class_and_force(monkeypatch):
     assert captured["content_class"] == "project_tool"
     assert captured["force"] is True
     assert captured["dry_run"] is True
+    assert captured["limit_per_source"] is None
 
 
 def test_cli_accepts_news_media_content_class(monkeypatch):

@@ -140,7 +140,7 @@ def test_stage_b_strict_parser_has_entities_and_no_legacy_decision_fields():
     payload = analysis_payload()
     result = parse_analysis_result(payload, envelope=envelope())
     assert isinstance(result, AnalysisResult)
-    assert result.b1_priority == 85
+    assert result.b1_priority == 86
     assert result.entities[0].type == "technology"
     assert not hasattr(result, "keep")
     assert not hasattr(result, "novelty")
@@ -201,7 +201,7 @@ def test_stage_b_priority_uses_only_the_five_content_value_components():
         )
     )
 
-    assert result.b1_priority == 67
+    assert result.b1_priority == 73
 
 
 def test_stage_b_empty_summary_falls_back_to_source():
@@ -231,8 +231,6 @@ def test_analysis_keeps_source_metadata_out_of_the_b1_result_and_prompt_is_minim
     item = envelope(
         source_content_class="official_model_company",
         source_group="x_official",
-        source_role="official",
-        source_subtype="account",
     )
     result = parse_analysis_result(analysis_payload(), envelope=item)
     assert not hasattr(result, "source_content_class")
@@ -245,6 +243,9 @@ def test_analysis_keeps_source_metadata_out_of_the_b1_result_and_prompt_is_minim
     assert "summary_cn" in analysis_instructions
     assert "keywords" in analysis_instructions
     assert "b1_priority" in analysis_instructions
+    assert "AI 主体相关性" in analysis_instructions
+    assert "audience_relevance=45%" in analysis_instructions
+    assert "impact_scope=25%" in analysis_instructions
     assert "source_authority" not in analysis_instructions
     assert "tracking_value" not in analysis_instructions
     assert "event_signature" not in analysis_instructions
@@ -285,7 +286,7 @@ def test_client_calls_independent_stage_endpoints_and_isolates_failures():
     analysis_http = FakeHttp(analysis_payload())
     analysis_client = IntelTriageClient(api_url="https://ai.example.test", api_key="secret", model="test", http_client=analysis_http)
     analysis = analysis_client.analyze(item)
-    assert analysis.b1_priority == 85
+    assert analysis.b1_priority == 86
     assert analysis_http.calls[0]["json"]["text"]["format"]["name"] == "intel_analysis"
 
     class Failing:

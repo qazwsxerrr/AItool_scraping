@@ -18,16 +18,16 @@ from .models import (
 
 
 SCORE_WEIGHTS = {
-    "audience_relevance": 0.25,
-    "material_change": 0.25,
-    "impact_scope": 0.20,
+    "audience_relevance": 0.45,
+    "material_change": 0.05,
+    "impact_scope": 0.25,
     "independent_news_value": 0.20,
-    "specificity": 0.10,
+    "specificity": 0.05,
 }
 
 
 def recompute_analysis_score(result: AnalysisResult) -> int:
-    """Calculate the local five-dimension B1 content-value priority.
+    """Calculate the local AI-subject-first five-dimension B1 priority.
 
     The provider score is retained in ``raw_response`` for audit, while the
     value used by deterministic Stage-C ordering/gating is reproducible.

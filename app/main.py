@@ -45,7 +45,7 @@ def fetch(
         "--limit",
         "--limit-per-source",
         min=1,
-        help=f"Maximum items to fetch per source (default: {DEFAULT_FETCH_LIMIT_PER_SOURCE}).",
+        help="Override every source limit; omitted uses source_registry.yaml default_limit.",
     ),
     source: str | None = typer.Option(None, help="Only fetch one source id."),
     content_class: str | None = typer.Option(None, "--class", help="Only fetch one content class."),
@@ -86,7 +86,7 @@ def fetch_only(
         "--limit",
         "--limit-per-source",
         min=1,
-        help=f"Maximum items to fetch per source (default: {DEFAULT_FETCH_LIMIT_PER_SOURCE}).",
+        help="Override every source limit; omitted uses source_registry.yaml default_limit.",
     ),
     source: str | None = typer.Option(None, help="Only fetch one source id."),
     content_class: str | None = typer.Option(None, "--class", help="Only fetch one content class."),
@@ -126,12 +126,12 @@ def fetch_only(
 
 @app.command("run-once")
 def run_once(
-    limit: int = typer.Option(
+    limit: int | None = typer.Option(
         DEFAULT_FETCH_LIMIT_PER_SOURCE,
         "--limit",
         "--fetch-limit",
         min=1,
-        help=f"Maximum items to fetch per source (default: {DEFAULT_FETCH_LIMIT_PER_SOURCE}).",
+        help="Override every source limit; omitted uses source_registry.yaml default_limit.",
     ),
     edition_date: str | None = typer.Option(
         None,
@@ -175,7 +175,7 @@ def pipeline_start(
         DEFAULT_FETCH_LIMIT_PER_SOURCE,
         "--limit",
         min=1,
-        help="Maximum items fetched per source for this run.",
+        help="Override every source limit; omitted uses source_registry.yaml default_limit.",
     ),
     edition_date: str | None = typer.Option(
         None,
@@ -209,7 +209,7 @@ def pipeline_run(
         DEFAULT_FETCH_LIMIT_PER_SOURCE,
         "--limit",
         min=1,
-        help="Maximum items fetched per source for this run.",
+        help="Override every source limit; omitted uses source_registry.yaml default_limit.",
     ),
     output_dir: str = typer.Option("output/intel", "--output-dir"),
     profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),

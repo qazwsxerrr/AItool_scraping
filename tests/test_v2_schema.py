@@ -44,6 +44,19 @@ def test_fresh_database_contains_only_ai_core_tables(tmp_path):
         "sources",
     ]
 
+    with sqlite3.connect(database) as connection:
+        source_columns = {row[1] for row in connection.execute("pragma table_info(sources)")}
+    assert {
+        "tier",
+        "topic_scopes_json",
+        "source_subtype",
+        "source_role",
+        "primary_eligible",
+        "quality_weight",
+        "spam_risk",
+        "selection_policy_json",
+    }.isdisjoint(source_columns)
+
 
 def test_init_db_rejects_incompatible_legacy_sqlite_without_backfill(tmp_path):
     database = tmp_path / "legacy.db"

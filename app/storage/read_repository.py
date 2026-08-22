@@ -62,7 +62,6 @@ class FeaturedItemRow:
     content_class: str | None
     source_name: str | None
     source_group: str | None
-    source_subtype: str | None
     risk_flags: list[str]
     published_at: datetime | None
     created_at: datetime | None
@@ -75,8 +74,6 @@ class FeaturedItemRow:
     topic_category: str | None = None
     source_id: str | None = None
     source_transport: str | None = None
-    source_tier: str | None = None
-    source_role: str | None = None
     source_url: str | None = None
     account_url: str | None = None
 
@@ -94,7 +91,6 @@ class FeaturedEventRow:
     content_class: str | None
     source_name: str | None
     source_group: str | None
-    source_subtype: str | None
     source_ids: tuple[str, ...]
     risk_flags: list[str]
     published_at: datetime | None
@@ -178,7 +174,6 @@ class SearchResultRow:
     topic_category: str | None = None
     source_group: str | None = None
     source_transport: str | None = None
-    source_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -210,9 +205,6 @@ class SourceRow:
     name: str
     transport: str
     source_group: str | None
-    source_subtype: str | None
-    source_role: str | None
-    tier: str | None
     content_class: str | None
     url: str | None
     account_url: str | None
@@ -393,7 +385,7 @@ class UIReadRepository:
                     published_at=row.published_at, created_at=row.created_at, content_class=row.content_class,
                     status="selected", ai_status="published_daily_report", selection_reason=row.selection_reason,
                     topic_category=row.topic_category, source_group=row.source_group,
-                    source_transport=row.source_transport, source_tier=row.source_tier,
+                    source_transport=row.source_transport,
                 )
                 for row in cards
             ],
@@ -408,8 +400,7 @@ class UIReadRepository:
         return [
             SourceRow(
                 source_id=source.id, name=source.name, transport=source.transport,
-                source_group=source.source_group, source_subtype=source.source_subtype,
-                source_role=source.source_role, tier=source.tier, content_class=source.content_class,
+                source_group=source.source_group, content_class=source.content_class,
                 url=_safe_url(source.url), account_url=_safe_url(source.account_url),
                 health_status=source.health_status, consecutive_failures=int(source.consecutive_failures or 0),
                 item_count=counts.get(source.id, 0),
@@ -510,7 +501,6 @@ class UIReadRepository:
             display_score=float(entry.display_score or 0.0), topic=entry.topic, content_class=entry.content_class,
             source_name=_text(primary.get("source_name")) if primary else None or (source.name if source is not None else (entry.source_ids[0] if entry.source_ids else None)),
             source_group=(_text(primary.get("source_group")) if primary else None) or entry.source_group,
-            source_subtype=source.source_subtype if source is not None else None,
             source_ids=tuple(entry.source_ids), risk_flags=list(entry.risk_flags), published_at=entry.published_at,
             keywords=tuple(entry.keywords), entities=tuple(value for value in entry.entities if isinstance(value, dict)),
             provenance=_text(provenance) or "published", source_refs=refs,
@@ -528,12 +518,10 @@ class UIReadRepository:
             risk_note="；".join(event.risk_flags) if event.risk_flags else None, status="selected",
             display_score=int(round(event.display_score)),
             content_class=event.content_class, source_name=event.source_name, source_group=event.source_group,
-            source_subtype=event.source_subtype, risk_flags=event.risk_flags, published_at=event.published_at,
+            risk_flags=event.risk_flags, published_at=event.published_at,
             created_at=entry.created_at, ai_status="published_daily_report", topic_category=event.topic,
             source_id=_text(primary.get("source_id")) if primary else (event.source_ids[0] if event.source_ids else None),
             source_transport=source.transport if source is not None else None,
-            source_tier=source.tier if source is not None else None,
-            source_role=source.source_role if source is not None else None,
             source_url=_safe_url(_text(primary.get("source_url")) if primary else None) or (_safe_url(source.url) if source is not None else None),
             account_url=_safe_url(source.account_url) if source is not None else None,
         )

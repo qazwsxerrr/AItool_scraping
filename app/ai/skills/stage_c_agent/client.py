@@ -38,7 +38,7 @@ class StageCAgentClient:
             api_url=settings.ai_review_api_url,
             api_key=settings.ai_review_api_key,
             model=settings.ai_review_model,
-            timeout_seconds=settings.ai_review_timeout_seconds,
+            timeout_seconds=max(float(settings.stage_c_timeout_seconds), 1.0),
             http_client=http_client,
         )
 

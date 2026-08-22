@@ -10,7 +10,12 @@ from app.ai.responses import AgentRunResult
 from app.ai.skills.intel_triage import ScreenResult
 from app.ai.skills.stage_d_selection import STAGE_D_SELECTION_SCHEMA_VERSION
 from app.domain.models import FetchItem, SourceSpec
-from app.domain.recency import recent_window_decision, recent_window_scope
+from app.domain.recency import (
+    recent_window_decision,
+    recent_window_scope,
+    stage_a_cutoff_at,
+    stage_a_time_decision,
+)
 from app.jobs.event_cluster_job import run_event_cluster_job
 from app.jobs.export_job import run_intel_export_job
 from app.jobs import pipeline_orchestrator
@@ -87,6 +92,27 @@ def test_recent_window_is_inclusive_and_trending_is_exempt_from_time_filter():
     assert decision.age_hours is None
 
 
+def test_stage_a_cutoff_uses_previous_day_midnight_in_shanghai():
+    cutoff = stage_a_cutoff_at("2026-08-22")
+    assert cutoff == datetime(2026, 8, 20, 16, tzinfo=timezone.utc)
+
+    source = _feed_source()
+    exact_boundary = SimpleNamespace(published_at=cutoff)
+    just_before = SimpleNamespace(published_at=cutoff - timedelta(seconds=1))
+    assert stage_a_time_decision(
+        exact_boundary,
+        source=source,
+        reference_time=datetime(2026, 8, 22, 8, tzinfo=timezone.utc),
+        edition_date="2026-08-22",
+    ).eligible is True
+    assert stage_a_time_decision(
+        just_before,
+        source=source,
+        reference_time=datetime(2026, 8, 22, 8, tzinfo=timezone.utc),
+        edition_date="2026-08-22",
+    ).reason == "too_old"
+
+
 class _ScreenProvider:
     model = "recent-window-fixture"
 
@@ -150,7 +176,7 @@ def test_stage_a_does_not_time_filter_github_trending_projects(tmp_path):
     )
     with session_factory() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(source, policy=source)
+        repo.upsert_source(source)
         _, run = repo.start_daily_build(
             edition_date="2026-08-16",
             reference_time=REFERENCE,
@@ -194,16 +220,18 @@ def test_stage_a_keeps_only_recent_items_and_records_run_local_audit(tmp_path):
     source = _feed_source()
     with session_factory() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(source, policy=source)
+        repo.upsert_source(source)
         _, run = repo.start_daily_build(
             edition_date="2026-08-16",
             reference_time=REFERENCE,
             scope=recent_window_scope(),
         )
+        cutoff = stage_a_cutoff_at("2026-08-16")
         for index, (title, published_at) in enumerate(
             (
-                ("fresh boundary", REFERENCE - timedelta(hours=72)),
-                ("stale", REFERENCE - timedelta(hours=72, seconds=1)),
+                ("fresh boundary", cutoff),
+                ("within rolling 72h but before edition cutoff", REFERENCE - timedelta(hours=48)),
+                ("stale", cutoff - timedelta(seconds=1)),
                 ("undated", None),
                 ("future", REFERENCE + timedelta(seconds=1)),
             ),
@@ -237,9 +265,11 @@ def test_stage_a_keeps_only_recent_items_and_records_run_local_audit(tmp_path):
 
     assert provider.titles == ["fresh boundary"]
     assert result.processed == 1
-    assert result.time_filtered == 3
+    assert result.edition_date == "2026-08-16"
+    assert result.cutoff_at == cutoff
+    assert result.time_filtered == 4
     assert result.time_filter_counts == {
-        "too_old": 1,
+        "too_old": 2,
         "missing_published_at": 1,
         "future_timestamp": 1,
     }
@@ -253,6 +283,7 @@ def test_stage_a_keeps_only_recent_items_and_records_run_local_audit(tmp_path):
         )
         assert statuses == {
             "fresh boundary": "new",
+            "within rolling 72h but before edition cutoff": "time_too_old",
             "stale": "time_too_old",
             "undated": "time_missing_published_at",
             "future": "time_future_timestamp",
@@ -261,7 +292,13 @@ def test_stage_a_keeps_only_recent_items_and_records_run_local_audit(tmp_path):
         tasks = session.scalars(
             select(IntelRunStageTask).where(IntelRunStageTask.stage_id == stage.id)
         ).all()
-        assert sorted(task.status for task in tasks) == ["skipped", "skipped", "skipped", "succeeded"]
+        assert sorted(task.status for task in tasks) == [
+            "skipped",
+            "skipped",
+            "skipped",
+            "skipped",
+            "succeeded",
+        ]
         assert stage.status == "succeeded"
 
 
@@ -270,7 +307,7 @@ def test_stage_c_uses_successful_stage_b_items_without_reapplying_recency(tmp_pa
     source = _feed_source()
     with session_factory() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(source, policy=source)
+        repo.upsert_source(source)
         _, run = repo.start_daily_build(
             edition_date="2026-08-16",
             reference_time=REFERENCE,
@@ -363,7 +400,7 @@ def test_all_time_filtered_items_advance_the_empty_pipeline_path(tmp_path):
     source = _feed_source()
     with session_factory() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(source, policy=source)
+        repo.upsert_source(source)
         _, run = repo.start_daily_build(
             edition_date="2026-08-16",
             reference_time=REFERENCE,
@@ -417,7 +454,7 @@ def test_daily_build_export_cannot_leak_a_stale_primary_item(tmp_path):
     source = _feed_source()
     with session_factory() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(source, policy=source)
+        repo.upsert_source(source)
         _, run = repo.start_daily_build(
             edition_date="2026-08-16",
             reference_time=REFERENCE,

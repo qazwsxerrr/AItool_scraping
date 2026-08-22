@@ -71,17 +71,8 @@ class Source(Base):
     github_pushed_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     github_period: Mapped[str | None] = mapped_column(String(16), nullable=True)
     source_group: Mapped[str] = mapped_column(String(64), nullable=False, default="general")
-    source_subtype: Mapped[str] = mapped_column(String(64), nullable=False, default="fixed")
     account_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Governance metadata has safe defaults for incomplete source specs.
-    tier: Mapped[str] = mapped_column(String(8), nullable=False, default="p4")
-    topic_scopes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
-    primary_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    quality_weight: Mapped[float | None] = mapped_column(Float, nullable=True)
-    source_role: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    spam_risk: Mapped[str | None] = mapped_column(String(32), nullable=True)
     content_class: Mapped[str] = mapped_column(String(64), nullable=False)
-    selection_policy_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     last_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Conditional request and source-health state consumed by fetch jobs.
     etag: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -95,18 +86,6 @@ class Source(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
     )
-
-    @property
-    def topic_scopes(self) -> list[str]:
-        """Decoded governance scopes for callers that prefer a Python list."""
-
-        try:
-            import json
-
-            value = json.loads(self.topic_scopes_json or "[]")
-            return [str(item) for item in value] if isinstance(value, list) else []
-        except (TypeError, ValueError):
-            return []
 
     intel_items: Mapped[list["IntelItem"]] = relationship(back_populates="source")
     fetch_attempts: Mapped[list["FetchAttempt"]] = relationship(back_populates="source")

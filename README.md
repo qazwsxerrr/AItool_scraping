@@ -14,7 +14,7 @@ source registry
 → UI（首页、搜索、全部动态只读展示）
 ```
 
-Stage B1 对每个通过 Stage A 的条目执行一次结构化分析，只输出来源归因、主题分类、中文短摘要、关键词、实体和编辑优先级评分。随后本地 deterministic guard 以 `AI_ANALYSIS_MIN_SCORE=60` 为下限生成 `active`、`reserve`、`filtered` 候选池：初始 active 目标为 100 条、reserve 默认 20 条；积累 14 期日报后，active 目标按已发布的候选/入选比例动态校准在 60–120 条。Stage C 不再接收一大段全文提示词，而是运行可审计的 Responses agent，按需读取候选、正文和近 3 天历史，再由独立的 Stage D 编辑 skill 选择当天最终组合。
+Stage B1 对每个通过 Stage A 的条目执行一次结构化分析，只输出来源归因、主题分类、中文短摘要、关键词、实体和编辑优先级评分。随后本地 deterministic guard 以 `AI_ANALYSIS_MIN_SCORE=70` 和 `audience_relevance>=65` 为下限生成 `active`、`reserve`、`filtered` 候选池：初始 active 目标为 100 条、reserve 默认 20 条；积累 14 期日报后，active 目标按已发布的候选/入选比例动态校准在 60–120 条。Stage C 不再接收一大段全文提示词，而是运行可审计的 Responses agent，按需读取候选、正文和近 3 天历史，再由独立的 Stage D 编辑 skill 选择当天最终组合。
 
 `content_class` 描述来源/信号类型（官方发布、媒体报道、项目/工具、社区线索），`topic_category` 使用橘鸦日报的六类编辑主题（开发生态、模型发布、产品应用、行业动态、技术与洞察、前瞻与传闻）。两者分开保存，UI 和导出会同时展示，避免把第三方媒体报道误读成“官方产品发布”。
 
@@ -22,28 +22,30 @@ Stage B1 对每个通过 Stage A 的条目执行一次结构化分析，只输�
 
 | `content_class` | 典型来源 | 处理方式 |
 | --- | --- | --- |
-| `official_model_company` | 官方模型、公司产品、API 和研究更新 | 按来源身份、时间窗口和关键词筛选，再交给 AI 分类和摘要 |
-| `news_media` | 科技媒体、垂直 AI 新闻和分析博客 | 保持来源归因，按较短时效窗口和来源级关键词筛选，不标注为官方发布 |
-| `project_tool` | GitHub Release、Product Hunt、AI 工具项目 | 按项目更新和时间窗口筛选；GitHub 项目可单独生成项目摘要 |
+| `official_model_company` | 官方模型、公司产品、API 和研究更新 | 参与统一内容筛选；聚合时优先作为事件主来源 |
+| `news_media` | 科技媒体、垂直 AI 新闻和分析博客 | 保持媒体归因，重要事实优先补直接来源，不标注为官方发布 |
+| `project_tool` | GitHub Release、Product Hunt、AI 工具项目 | 按项目更新参与统一筛选；GitHub 项目可单独生成项目摘要 |
 | `community_social` | X、Reddit、RSSHub、论坛 | 作为社区线索参与 AI 分类；输出保留来源归因和风险标记 |
 
 默认主题分类为：`开发生态`、`模型发布`、`产品应用`、`行业动态`、`技术与洞察`、`前瞻与传闻`。主题分类与来源类型是两个独立字段；Stage B1 只输出这六类，不再使用旧的模型、产品、项目、行业、论文、教程、观点分类。
 
-导出和 UI 保留 `source_id`、`source_name`、`source_group`、`source_subtype`、`source_role`、`transport`、`tier` 与 `x_official` 等来源字段。X 官方账号可通过 `source_group=x_official`、`source_role=official` 和 `x_official=true` 归因；这些字段只描述来源身份。
+来源只保留两层分类：`source_group` 表示可追溯的具体来源组，`content_class` 由来源组自动归并为四种粗粒度类型。`transport` 仅负责抓取路由，不参与内容分类。导出和 UI 保留 `source_id`、`source_name`、`source_group`、`content_class`、`transport` 与来源链接；X 官方账号统一通过 `source_group=x_official` 归因。
 
 ## 抓取来源
 
 来源配置位于 `app/config/source_registry.yaml`。唯一的抓取路由字段是 `transport`：`feed`、`rsshub` 或 `github`；Feed 细节在 `feed` 下，GitHub 细节在 `github` 下。日报主链路已停用普通 arXiv 聚合源、GitHub Trending 和 GitHub Search 新项目源；当前只保留明确仓库的 GitHub Releases。后续新项目发现可在独立专栏中重新启用，不与日报事件池混跑。
 
-当前 registry 在配置 `RSSHUB_BASE_URL` 后有 79 个启用来源（具体数量以 YAML 为准）：
+当前 registry 在配置 `RSSHUB_BASE_URL` 后有 69 个启用来源（具体数量以 YAML 为准）：
 
 | `transport` | 当前数量 | 主要来源组 | 抓取方式与内容 |
 | --- | ---: | --- | --- |
-| `feed` | 33 | `official_blog`、`official_research`、`tech_media`、`hacker_news`、`producthunt`、`linux_do`、`reddit_fixed` | HTTP 获取 RSS/Atom，统一解析为条目；普通 arXiv 聚合源当前禁用。个别公开源可在 registry 中显式 `bypass_proxy`，避免依赖进程级 `NO_PROXY`。 |
+| `feed` | 20 | `official_blog`、`official_research`、`tech_media`、`hacker_news`、`producthunt`、`linux_do`、`reddit_fixed` | HTTP 获取 RSS/Atom，统一解析为条目；普通 arXiv 聚合源当前禁用。个别公开源可在 registry 中显式 `bypass_proxy`，避免依赖进程级 `NO_PROXY`。 |
 | `github` | 3 | `github_release` | 只跟踪 Claude Code、Ollama、Transformers 等明确仓库的 Release；Trending 与 Topic Search 当前禁用。 |
-| `rsshub` | 43 | `x_official`、`x_social`，以及 Anthropic RSSHub 路由 | 访问本地 RSSHub 输出的 RSS/Atom；X 官方账号保留 `x_official=true` 等来源归因，不绕过 AI 筛选。 |
+| `rsshub` | 46 | `x_official`、`x_social`，以及 Anthropic、DeepSeek RSSHub 路由 | 访问本地 RSSHub 输出的 RSS/Atom；X 官方账号通过 `source_group=x_official` 归因，不绕过 AI 筛选。 |
 
-如果没有配置 `RSSHUB_BASE_URL`，43 个 RSSHub 模板会被安全跳过，CLI 会显示 `Registry skipped`；这不会阻断其它 Feed 和 GitHub Release 来源。单个来源失败也只记录在 `fetch_attempts` 和来源健康状态中，不会中断整个批次。
+如果没有配置 `RSSHUB_BASE_URL`，46 个 RSSHub 模板会被安全跳过，CLI 会显示 `Registry skipped`；这不会阻断其它 Feed 和 GitHub Release 来源。单个来源失败也只记录在 `fetch_attempts` 和来源健康状态中，不会中断整个批次。
+
+日常抓取不传 `--limit-per-source` 时使用各来源的 `default_limit`；该选项只用于人工调试时统一覆盖所有来源限额，例如 `--limit-per-source 30`。
 
 本地 RSSHub 的 X 认证路径只有 `TWITTER_AUTH_TOKEN`。`scripts/start_rsshub.sh` 会保留该 token 和 `PROXY_URI`，并显式移除 OAuth 与第三方 X API 变量；脚本在默认 Node 不受支持时会优先尝试 NVM Node 24，再回退到 Node 22。
 
@@ -99,21 +101,22 @@ AI_REVIEW_MODEL=
 AI_REVIEW_TIMEOUT_SECONDS=30
 AI_REVIEW_CONCURRENCY=4
 AI_REVIEW_CATEGORIES=开发生态,模型发布,产品应用,行业动态,技术与洞察,前瞻与传闻
-AI_ANALYSIS_MIN_SCORE=60
+AI_ANALYSIS_MIN_SCORE=70
 AI_STAGE_B_RESERVE_LIMIT=20
+AI_STAGE_C_TIMEOUT_SECONDS=120
 AI_STAGE_C_AGENT_MAX_TURNS=32
 AI_STAGE_C_AGENT_MAX_TOOL_CALLS=120
 AI_STAGE_C_AGENT_MAX_WEB_SEARCHES=16
 AI_STAGE_C_TRUSTED_DOMAINS=
 ```
 
-Stage C 默认预算为 `32` turns、`120` 次本地工具调用和 `16` 次 hosted 网页搜索；显式配置更大的正整数会原样生效，不再额外压到较小上限。`AI_STAGE_C_AGENT_MAX_WEB_SEARCHES=0` 是关闭网页搜索的明确开关。
+Stage C 每次 Responses 请求默认超时 `120` 秒，独立于 Stage A/B 使用的 `AI_REVIEW_TIMEOUT_SECONDS`；可通过 `AI_STAGE_C_TIMEOUT_SECONDS` 继续调大。按默认 `32` turns 估算，Stage C 任务租约约为 66 分钟。其默认预算为 `32` turns、`120` 次本地工具调用和 `16` 次 hosted 网页搜索；显式配置更大的正整数会原样生效，不再额外压到较小上限。`AI_STAGE_C_AGENT_MAX_WEB_SEARCHES=0` 是关闭网页搜索的明确开关。
 
 所有 AI 调用统一使用 OpenAI Responses 语义；`AI_REVIEW_API_URL` 可以是 `/v1` 基址或完整的 `/v1/responses` 地址。Stage C 需要 provider 支持 Responses 的 strict function calling 和 hosted `web_search`。网页搜索只能访问候选原始来源域名加 `AI_STAGE_C_TRUSTED_DOMAINS` 中配置的高可信域名；只有 provider 在同一会话的搜索来源或 `open_page` 操作中实际返回的 URL 才能标为“已核验”。对影响事件核心事实的不确定项，Stage C 会先进入核验回合：能确认时收窄表述并保留为候选，只有核验后仍无法解决、搜索不可用或预算耗尽时才保留 `needs_review`。若兼容 provider 执行了搜索却省略来源对象，链接只会保存为 `needs_review` 线索，并自动排除在 Stage D 的自动选稿和导出之外。
 
-`AI_ANALYSIS_MIN_SCORE` 默认 `60`，它是 Stage B 的本地评分门槛，不再由 Stage C 决定。Stage B 将合格项按来源/主题多样性形成 active 候选池（初始目标 100 条、14 期后动态 60–120 条）和最多 20 条 reserve；Stage C 仅从这两个持久化集合按需取数。Stage C 输出 `candidate_event_ids`，Stage D 只在 `max_selected` 上限内选择其中的有序子集。
+`AI_ANALYSIS_MIN_SCORE` 默认 `70`，`audience_relevance`（AI 主体相关性）默认不低于 `65`；两者共同构成 Stage B 的本地准入门槛，不再由 Stage C 决定。Stage B 将合格项按来源/主题多样性形成 active 候选池（初始目标 100 条、14 期后动态 60–120 条）和最多 20 条 reserve；Stage C 仅从这两个持久化集合按需取数。Stage C 输出 `candidate_event_ids`，Stage D 只在 `max_selected` 上限内选择其中的有序子集。
 
-Stage B1 的 `b1_priority` 只衡量内容价值，由本地 guard 按 `audience_relevance` 25%、`material_change` 25%、`impact_scope` 20%、`independent_news_value` 20% 和 `specificity` 10% 重算。来源身份、AI 把握度和时间新鲜度不参与该分数：来源归因来自 source registry，72 小时窗口由本地 recency policy 处理。
+Stage B1 的 `b1_priority` 只衡量内容价值，由本地 guard 按 `audience_relevance`（AI 主体相关性）45%、`impact_scope`（已确认影响范围）25%、`independent_news_value`（事件级独立新闻价值）20%、`material_change` 5% 和 `specificity` 5% 重算。来源身份、AI 把握度和时间新鲜度不参与该分数：来源归因来自 source registry，Stage A 按日报日期前一天 00:00（Asia/Shanghai）做本地时间筛选。
 
 `AI_REVIEW_CONCURRENCY` 取值为 `1..4`，默认 `4`，表示 Stage A/B provider 请求的并发上限。
 Stage D 与 Stage A/B/C 共用 `AI_REVIEW_*` provider 配置；它只使用不同的提示词和输出 schema，不需要额外的模型、API URL 或 API key。由于 Stage D 一次提交完整事件池，实际请求超时下限为 120 秒，但仍不引入独立的 provider 配置。
@@ -290,7 +293,7 @@ $PYTHON -m uvicorn app.web.app:app --host 127.0.0.1 --port 8000
 
 Stage A/B 对每条 AI provider 任务执行瞬态错误自动重试：首次调用失败后最多再重试 5 次（最多 6 次 provider 调用）。429、5xx、timeout 和 rate-limit 属于可重试错误；永久性 4xx、鉴权失败和 schema 错误不会重复请求。达到上限后 draft 保留为失败状态，旧日报不被替换，修复后可使用同一 `edition_date` 恢复。
 
-默认数量策略为：每个来源抓取 20 条，Stage A/B 处理当前完整 build；B 只让本地 guard 评分不低于 60 的条目进入 C 工作台，初始 active 上限为 100、reserve 为 20，14 期后 active 动态控制在 60–120；日报最终导出最多 30 条。`run-once --limit`（或 `--fetch-limit`）只控制每来源抓取量；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
+默认数量策略为：抓取层使用 `source_registry.yaml` 中每个来源自己的 `default_limit`，Stage A/B 处理当前完整 build；B 只让本地 guard 总分不低于 70 且 AI 主体相关性不低于 65 的条目进入 C 工作台，初始 active 上限为 100、reserve 为 20，14 期后 active 动态控制在 60–120；日报最终导出最多 30 条。`run-once --limit`（或 `--fetch-limit`）仅用于人工统一覆盖每来源抓取量；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
 
 `export` 的日报产物默认写入 `output/daily/YYYY-MM-DD/`：
 
@@ -308,7 +311,7 @@ bash scripts/start_rsshub.sh
 
 ## Web UI
 
-FastAPI/Jinja UI 只读取数据库和已生成报告，展示主题分类、来源归因、AI 摘要、风险和选择状态；首页按主题分组，卡片同时显示来源名称、来源组、transport、tier 和原文链接，并提供“来源目录”页。请求过程中不会运行 collector、AI、搜索或其他处理任务。
+FastAPI/Jinja UI 只读取数据库和已生成报告，展示主题分类、来源归因、AI 摘要、风险和选择状态；首页按主题分组，卡片同时显示来源名称、来源组、内容类型、transport 和原文链接，并提供“来源目录”页。请求过程中不会运行 collector、AI、搜索或其他处理任务。
 
 ## 验证
 

@@ -1103,8 +1103,7 @@ def _compact_admission(admission: IntelCandidateAdmission) -> dict[str, Any]:
         "source": {
             "id": item.source_id,
             "group": getattr(item.source, "source_group", None),
-            "role": getattr(item.source, "source_role", None),
-            "tier": getattr(item.source, "tier", None),
+            "content_class": item.content_class,
         },
     }
 
@@ -1192,23 +1191,20 @@ def _select_primary_item(items: Sequence[IntelItem]) -> IntelItem:
     return min(items, key=_primary_sort_key)
 
 
-def _primary_sort_key(item: IntelItem) -> tuple[int, int, int, float, int]:
+def _primary_sort_key(item: IntelItem) -> tuple[int, int, float, int]:
     source = item.source
-    role = str(getattr(source, "source_role", "") or "").casefold()
-    role_rank = {
-        "official": 0,
-        "first_party_official": 0,
-        "publisher": 1,
-        "news_media": 2,
-        "analysis": 3,
-        "code_hosting": 4,
-        "community": 5,
-        "social": 6,
-    }.get(role, 7)
+    group = str(getattr(source, "source_group", "") or "").casefold()
+    if group in {"official_blog", "official_research", "x_official", "github_release"}:
+        source_rank = 0
+    else:
+        source_rank = {
+            "news_media": 1,
+            "project_tool": 2,
+            "community_social": 3,
+        }.get(str(item.content_class or "").casefold(), 4)
     timestamp = _as_utc(item.published_at or item.captured_at)
     return (
-        0 if bool(getattr(source, "primary_eligible", False)) else 1,
-        role_rank,
+        source_rank,
         -int(item.b1_priority or 0),
         -(timestamp.timestamp() if timestamp is not None else 0.0),
         int(item.id),

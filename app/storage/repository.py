@@ -110,7 +110,7 @@ class IntelRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def upsert_source(self, source: SourceSpec, *, policy: Any | None = None) -> Source:
+    def upsert_source(self, source: SourceSpec) -> Source:
         """Persist one resolved ``SourceSpec`` without reconstructing config.
 
         The nested feed/GitHub options are intentionally stored as explicit
@@ -139,31 +139,8 @@ class IntelRepository:
         row.github_pushed_days = getattr(github, "pushed_days", None) if github is not None else None
         row.github_period = getattr(github, "period", None) if github is not None else None
         row.source_group = source.source_group or "general"
-        row.source_subtype = source.source_subtype or "fixed"
         row.account_url = source.account_url
-        row.tier = getattr(source, "tier", None) or "p4"
-        row.topic_scopes_json = _dump_json(list(getattr(source, "topic_scopes", ()) or ()))
-        row.primary_eligible = bool(getattr(source, "primary_eligible", False))
-        row.quality_weight = source.quality_weight
-        row.source_role = source.source_role
-        row.spam_risk = source.spam_risk
-        row.content_class = source.content_class or "community_social"
-        selection_policy = getattr(source, "selection_policy", {})
-        if hasattr(selection_policy, "model_dump"):
-            selection_policy = selection_policy.model_dump(exclude_none=True)
-        row.selection_policy_json = _dump_json(selection_policy or {})
-        if policy is not None:
-            # Resolved ``SourceSpec`` instances normally provide both values,
-            # but callers may pass a lightweight policy object. Preserve the
-            # source defaults so a missing optional attribute cannot violate
-            # the non-null schema on commit.
-            row.content_class = (
-                _text(getattr(policy, "content_class", None))
-                or source.content_class
-                or row.content_class
-                or "community_social"
-            )
-            row.selection_policy_json = _dump_json(_policy_dict(policy, "selection"))
+        row.content_class = source.content_class
         return row
 
     def update_source_health(
@@ -3017,24 +2994,6 @@ def _object_mapping(value: Any) -> dict[str, Any]:
         return asdict(value)
     if hasattr(value, "__dict__"):
         return dict(value.__dict__)
-    return {}
-
-
-def _policy_dict(policy: Any, kind: str) -> dict[str, Any]:
-    if isinstance(policy, Mapping):
-        value = policy.get(f"{kind}_policy", {})
-        return dict(value) if isinstance(value, Mapping) else {}
-    value = getattr(policy, f"{kind}_policy", None)
-    if isinstance(value, Mapping):
-        return dict(value)
-    if hasattr(value, "model_dump"):
-        dumped = value.model_dump(exclude_none=True)
-        if isinstance(dumped, Mapping):
-            return dict(dumped)
-    if hasattr(policy, "to_dict"):
-        data = policy.to_dict()
-        value = data.get(f"{kind}_policy", {})
-        return dict(value) if isinstance(value, Mapping) else {}
     return {}
 
 

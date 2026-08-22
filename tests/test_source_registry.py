@@ -1,10 +1,9 @@
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import yaml
 
 from app.config.source_registry import load_source_registry
-from app.domain import FetchItem, selection_decision
 from app.domain.models import SourceSpec
 
 
@@ -14,32 +13,17 @@ sources:
     name: Native Blog
     transport: feed
     url: https://example.com/feed.xml
-    enabled: true
-    priority: 10
-    fetch_interval: 3600
-    feed:
-      format: rss
-      adapter: generic
+    source_group: official_blog
   - id: rsshub_route
     name: RSSHub Route
     transport: rsshub
     url: ${RSSHUB_BASE_URL}/twitter/user/OpenAI
-    enabled: true
-    priority: 20
-    fetch_interval: 3600
-    feed:
-      format: rss
-      adapter: generic
+    source_group: x_official
   - id: disabled_future
     name: Disabled Future
     transport: rsshub
     url: ${RSSHUB_BASE_URL}/future/route
     enabled: false
-    priority: 30
-    fetch_interval: 3600
-    feed:
-      format: rss
-      adapter: generic
 """
 
 
@@ -55,11 +39,12 @@ def test_load_registry_skips_enabled_rsshub_source_when_base_url_missing(tmp_pat
 
     assert [source.id for source in result.sources] == ["native_blog"]
     assert isinstance(result.sources[0], SourceSpec)
+    assert result.sources[0].content_class == "official_model_company"
     assert result.skipped[0].source_id == "rsshub_route"
     assert "RSSHUB_BASE_URL" in result.skipped[0].reason
 
 
-def test_load_registry_interpolates_rsshub_base_url_when_present(tmp_path):
+def test_load_registry_interpolates_rsshub_base_url_and_derives_class(tmp_path):
     result = load_source_registry(
         write_registry(tmp_path), env={"RSSHUB_BASE_URL": "https://rsshub.example.com"}
     )
@@ -69,254 +54,70 @@ def test_load_registry_interpolates_rsshub_base_url_when_present(tmp_path):
     assert rsshub_source.transport == "rsshub"
     assert rsshub_source.feed.format == "rss"
     assert rsshub_source.url == "https://rsshub.example.com/twitter/user/OpenAI"
+    assert rsshub_source.content_class == "official_model_company"
 
 
-def test_default_registry_includes_linux_do_sources():
+def test_default_registry_keeps_expected_non_x_sources():
     result = load_source_registry(env={})
     source_by_id = {source.id: source for source in result.sources}
 
-    expected_sources = {
-        "linux_do_top": ("LINUX DO Top Topics", "https://linux.do/top.rss"),
-        "linux_do_hot": ("LINUX DO Hot Topics", "https://linux.do/hot.rss"),
-    }
+    assert "linux_do_top" not in source_by_id
     assert "linux_do_latest" not in source_by_id
-
-    for source_id, (name, url) in expected_sources.items():
-        linux_source = source_by_id[source_id]
-        assert linux_source.name == name
-        assert linux_source.transport == "feed"
-        assert linux_source.feed.format == "rss"
-        assert linux_source.feed.adapter == "generic"
-        assert linux_source.url == url
-
-
-def test_default_registry_excludes_disabled_github_arxiv_sources_and_keeps_producthunt_atom():
-    result = load_source_registry(env={})
-    source_by_id = {source.id: source for source in result.sources}
+    assert source_by_id["linux_do_hot"].default_limit == 12
 
     producthunt = source_by_id["producthunt_feed"]
-    assert producthunt.transport == "feed"
     assert producthunt.feed.format == "atom"
     assert producthunt.feed.adapter == "producthunt"
+    assert producthunt.content_class == "project_tool"
 
-    disabled_ids = {
-        "arxiv_ai_cl_ml_feed",
-        "github_trending_daily_native",
-        "github_trending_weekly_native",
-        "github_search_topic_llm",
-        "github_search_topic_ai_agent",
-        "github_search_topic_rag",
-        "github_search_topic_vector_database",
-        "github_search_topic_large_language_model",
-        "github_search_topic_machine_learning",
-    }
-    assert disabled_ids.isdisjoint(source_by_id)
+    release = source_by_id["github_releases_ollama"]
+    assert release.github.mode == "releases"
+    assert release.source_group == "github_release"
+    assert release.content_class == "project_tool"
 
-    assert "github_trending_python_daily" not in source_by_id
-    assert "github_trending_typescript_daily" not in source_by_id
-
-    release_source = source_by_id["github_releases_ollama"]
-    assert release_source.transport == "github"
-    assert release_source.github.mode == "releases"
-    assert release_source.url == "https://api.github.com/repos/ollama/ollama/releases"
-    assert release_source.source_group == "github_release"
-    assert release_source.source_subtype == "repo_releases"
-    assert release_source.quality_weight == 0.80
-    assert release_source.spam_risk == "low"
-
-
-def test_default_registry_includes_official_feed_expansion():
-    result = load_source_registry(env={})
-    source_by_id = {source.id: source for source in result.sources}
-
-    expected = {
-        "openrouter_blog": ("https://openrouter.ai/blog/feed.xml", "official_blog"),
-        "google_research_blog": ("https://research.google/blog/rss/", "official_research"),
-        "nvidia_ai_blog": ("https://blogs.nvidia.com/feed/", "official_blog"),
-        "aws_machine_learning_blog": (
-            "https://aws.amazon.com/blogs/machine-learning/feed/",
-            "official_blog",
-        ),
-    }
-    assert expected.keys() <= source_by_id.keys()
-    for source_id, (url, group) in expected.items():
-        source = source_by_id[source_id]
-        assert source.transport == "feed"
-        assert source.feed.format == "rss"
-        assert source.feed.adapter == "generic"
-        assert source.url == url
-        assert source.source_group == group
-        assert source.content_class == "official_model_company"
-        assert source.selection_policy.keywords
-
-
-def test_default_registry_includes_gap_p0_p1_sources():
-    result = load_source_registry(env={"RSSHUB_BASE_URL": "https://rsshub.example"})
-    source_by_id = {source.id: source for source in result.sources}
-
-    official_sources = {
-        "langchain_blog": (
-            "feed",
-            "https://www.langchain.com/blog/rss.xml",
-            "developer_blog",
-        ),
-        "google_developers_blog": (
-            "feed",
-            "https://developers.googleblog.com/feeds/posts/default/?alt=rss",
-            "developer_blog",
-        ),
-        "cursor_changelog": (
-            "feed",
-            "https://cursor.com/changelog/rss.xml",
-            "product_changelog",
-        ),
-        "deepseek_api_news_rsshub": (
-            "rsshub",
-            "https://rsshub.example/deepseek/news",
-            "api_news",
-        ),
-    }
-    for source_id, (transport, url, subtype) in official_sources.items():
-        source = source_by_id[source_id]
-        assert source.transport == transport
-        assert source.url == url
-        assert source.source_group == "official_blog"
-        assert source.source_subtype == subtype
-        assert source.source_role == "official"
-        assert source.content_class == "official_model_company"
-        assert source.tier == "p1"
-        assert source.primary_eligible is True
-        assert source.selection_policy.mode == "first_party_recent"
-
-    assert "gary_marcus_blog" not in source_by_id
-    assert "reddit_local_llama_new" not in source_by_id
-
-    tomer_tunguz = source_by_id["tomer_tunguz_blog"]
-    assert tomer_tunguz.url == "https://www.tomtunguz.com/index.xml"
-    assert tomer_tunguz.source_group == "tech_media"
-    assert tomer_tunguz.source_role == "analysis"
-    assert tomer_tunguz.content_class == "news_media"
-    assert tomer_tunguz.selection_policy.mode == "media_recent"
-    assert tomer_tunguz.selection_policy.keywords == ()
-
-
-def test_default_registry_includes_verified_aihot_feed_expansion():
-    result = load_source_registry(env={})
-    source_by_id = {source.id: source for source in result.sources}
-
-    expected = {
-        "google_blog_ai": ("https://blog.google/rss/", "official_blog", "official_model_company"),
-        "ithome_ai_news": ("https://www.ithome.com/rss/", "tech_media", "news_media"),
-        "the_decoder_ai_news": ("https://the-decoder.com/feed/", "tech_media", "news_media"),
-        "techcrunch_ai": ("https://techcrunch.com/category/artificial-intelligence/feed/", "tech_media", "news_media"),
-        "the_verge_ai": ("https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", "tech_media", "news_media"),
-        "hacker_news_ai": ("https://hnrss.org/newest?q=AI", "hacker_news", "community_social"),
-    }
-    for source_id, (url, group, content_class) in expected.items():
-        source = source_by_id[source_id]
-        assert source.url == url
-        assert source.source_group == group
-        assert source.content_class == content_class
-        assert source.feed is not None
-
-    assert source_by_id["the_verge_ai"].feed.format == "atom"
-    assert source_by_id["ithome_ai_news"].selection_policy.max_age_days == 3
+    assert source_by_id["openrouter_blog"].content_class == "official_model_company"
+    assert source_by_id["ithome_ai_news"].content_class == "news_media"
+    assert source_by_id["hacker_news_ai"].content_class == "community_social"
     assert source_by_id["ithome_ai_news"].bypass_proxy is True
     assert source_by_id["hacker_news_ai"].bypass_proxy is True
-    assert source_by_id["the_decoder_ai_news"].selection_policy.keywords == ()
 
 
-def test_default_registry_includes_aihot_official_x_accounts():
+def test_default_registry_contains_verified_x_routes():
     result = load_source_registry(env={"RSSHUB_BASE_URL": "https://rsshub.example"})
     source_by_id = {source.id: source for source in result.sources}
 
-    expected_handles = {
-        "x_account_baidu": "Baidu_Inc",
-        "x_account_alibaba_cloud": "alibaba_cloud",
-        "x_account_siliconflow": "SiliconFlowAI",
-        "x_account_openrouter": "OpenRouter",
-        "x_account_runway": "runwayml",
-        "x_account_replit": "Replit",
-        "x_account_openbmb": "OpenBMB",
-        "x_account_sensetime": "SenseTime_AI",
-        "x_account_antling": "AntLingAGI",
+    expected = {
+        "x_account_openai_devs": "OpenAIDevs",
+        "x_account_opencode": "opencode",
+        "x_account_exa_ai_labs": "ExaAILabs",
     }
-    for source_id, handle in expected_handles.items():
-        source = source_by_id[source_id]
-        assert source.source_group == "x_official"
-        assert source.content_class == "official_model_company"
-        assert source.tier == "p1"
-        assert source.primary_eligible is True
-        assert source.selection_policy.mode == "first_party_recent"
-        assert source.selection_policy.max_age_days == 7
-        assert source.url.endswith(f"/twitter/user/{handle}")
-        assert source.account_url == f"https://x.com/{handle}"
-
-
-def test_default_registry_treats_gap_x_accounts_as_first_party_sources():
-    result = load_source_registry(env={"RSSHUB_BASE_URL": "https://rsshub.example"})
-    source_by_id = {source.id: source for source in result.sources}
-    now = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
-
-    expected_handles = {
-        "x_account_claude_devs": "ClaudeDevs",
-        "x_account_pvncher": "pvncher",
-        "x_account_thdxr": "thdxr",
-        "x_account_xhyctf": "xhyctf",
-        "x_account_devin_desktop": "devindesktop",
-        "x_account_cursor_ai": "cursor_ai",
-    }
-    for source_id, handle in expected_handles.items():
+    for source_id, handle in expected.items():
         source = source_by_id[source_id]
         assert source.transport == "rsshub"
         assert source.source_group == "x_official"
-        assert source.source_subtype == "account"
-        assert source.source_role == "official"
         assert source.content_class == "official_model_company"
-        assert source.tier == "p1"
-        assert source.primary_eligible is True
-        assert source.selection_policy.mode == "first_party_recent"
-        assert source.selection_policy.max_age_days == 7
         assert source.url == f"https://rsshub.example/twitter/user/{handle}"
         assert source.account_url == f"https://x.com/{handle}"
-        decision = selection_decision(
-            FetchItem(
-                source_id=source_id,
-                title="A first-party product update without generic AI keywords",
-                url=f"https://x.com/{handle}/status/1",
-                published_at=now,
-            ),
-            source,
-            now=now,
-        )
-        assert decision.selected is True
-        assert decision.reason == "selected:first_party_recent"
+        assert source.default_limit == 15
 
 
-def test_legacy_routing_fields_are_rejected(tmp_path):
-    path = tmp_path / "source_registry.yaml"
-    path.write_text(
-        """
+@pytest.mark.parametrize(
+    ("yaml_body", "error"),
+    [
+        (
+            """
 sources:
   - id: legacy
     name: Legacy
     type: rss
     url: https://example.test/feed.xml
 """,
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="type"):
-        load_source_registry(path, env={})
-
-
-def test_github_search_pushed_days_must_be_positive(tmp_path):
-    path = tmp_path / "source_registry.yaml"
-    path.write_text(
-        """
+            "type",
+        ),
+        (
+            """
 sources:
   - id: invalid_github_search
-    name: Invalid GitHub Search
     transport: github
     url: https://api.github.com/search/repositories
     github:
@@ -324,37 +125,22 @@ sources:
       query: agent
       pushed_days: 0
 """,
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="pushed_days"):
-        load_source_registry(path, env={})
-
-
-def test_producthunt_adapter_must_be_atom(tmp_path):
-    path = tmp_path / "source_registry.yaml"
-    path.write_text(
-        """
+            "pushed_days",
+        ),
+        (
+            """
 sources:
   - id: invalid_producthunt
-    name: Invalid Product Hunt
     transport: feed
     url: https://example.test/producthunt.rss
     feed:
       format: rss
       adapter: producthunt
 """,
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="producthunt.*atom"):
-        load_source_registry(path, env={})
-
-
-def test_registry_rejects_duplicate_source_ids(tmp_path):
-    path = tmp_path / "source_registry.yaml"
-    path.write_text(
-        """
+            "producthunt.*atom",
+        ),
+        (
+            """
 sources:
   - id: duplicate
     transport: feed
@@ -363,74 +149,112 @@ sources:
     transport: feed
     url: https://example.test/two.xml
 """,
-        encoding="utf-8",
-    )
+            "duplicate source id: duplicate",
+        ),
+    ],
+)
+def test_registry_rejects_invalid_configuration(tmp_path, yaml_body, error):
+    path = tmp_path / "source_registry.yaml"
+    path.write_text(yaml_body, encoding="utf-8")
 
-    with pytest.raises(ValueError, match="duplicate source id: duplicate"):
+    with pytest.raises(ValueError, match=error):
         load_source_registry(path, env={})
 
 
-def test_enabled_sources_use_canonical_groups_and_governance_defaults():
+def test_enabled_sources_use_only_canonical_groups_and_derived_classes():
     result = load_source_registry(env={"RSSHUB_BASE_URL": "https://rsshub.example"})
-    canonical = {
-        "official_blog",
-        "official_research",
-        "github_trending",
-        "github_release",
-        "github_search",
-        "producthunt",
-        "hacker_news",
-        "reddit_fixed",
-        "reddit_search",
-        "linux_do",
-        "x_official",
-        "x_social",
-        "x_search",
-        "tech_media",
+    canonical_groups = {
+        "official_blog", "official_research", "github_trending", "github_release",
+        "github_search", "producthunt", "hacker_news", "reddit_fixed", "reddit_search",
+        "linux_do", "x_official", "x_social", "x_search", "tech_media",
     }
+    expected_class = {
+        "official_blog": "official_model_company",
+        "official_research": "official_model_company",
+        "x_official": "official_model_company",
+        "tech_media": "news_media",
+        "github_trending": "project_tool",
+        "github_release": "project_tool",
+        "github_search": "project_tool",
+        "producthunt": "project_tool",
+    }
+
     assert result.sources
-    assert all(source.source_group in canonical for source in result.sources)
-    assert all(source.tier in {"p1", "p2", "p3", "p4"} for source in result.sources)
-    assert all(source.topic_scopes for source in result.sources)
-    first_party_x_sources = [
-        source
-        for source in result.sources
-        if source.source_group == "x_official"
-        and source.source_role == "official"
-        and source.source_subtype == "account"
-    ]
-    assert first_party_x_sources
-    assert all(source.content_class == "official_model_company" for source in first_party_x_sources)
-    assert all(source.tier == "p1" for source in first_party_x_sources)
-    assert all(source.primary_eligible for source in first_party_x_sources)
-    assert all(source.selection_policy.mode == "first_party_recent" for source in first_party_x_sources)
-    assert all(source.selection_policy.max_age_days == 7 for source in first_party_x_sources)
+    assert all(source.source_group in canonical_groups for source in result.sources)
     assert all(
-        not source.primary_eligible
+        source.content_class == expected_class.get(source.source_group, "community_social")
         for source in result.sources
-        if source.source_group in {"x_social", "x_search"}
     )
 
 
-def test_default_registry_contains_v3_official_feeds_and_x_handles():
+def test_default_registry_physically_removes_rejected_daily_sources():
+    registry_path = Path(__file__).parents[1] / "app" / "config" / "source_registry.yaml"
+    raw_ids = {
+        source["id"]
+        for source in yaml.safe_load(registry_path.read_text(encoding="utf-8"))["sources"]
+    }
+    removed_ids = {
+        "aws_whats_new_feed", "aws_machine_learning_blog", "artificial_intelligence_news",
+        "marktechpost_ai", "the_verge_ai", "ars_technica_ai", "tomer_tunguz_blog",
+        "simon_willison_blog", "interconnects_ai", "bytebytego_ai", "linux_do_top",
+        "reddit_local_llama_top_day", "reddit_local_llama_top_week",
+    }
+
+    assert removed_ids.isdisjoint(raw_ids)
+
+
+def test_registry_yaml_does_not_reintroduce_removed_classification_fields():
+    registry_path = Path(__file__).parents[1] / "app" / "config" / "source_registry.yaml"
+    sources = yaml.safe_load(registry_path.read_text(encoding="utf-8"))["sources"]
+    removed_fields = {
+        "tier", "topic_scopes", "source_subtype", "source_role", "primary_eligible",
+        "quality_weight", "spam_risk", "selection_policy", "content_class",
+    }
+
+    assert all(removed_fields.isdisjoint(source) for source in sources)
+
+
+def test_default_registry_applies_every_enabled_source_limit():
     result = load_source_registry(env={"RSSHUB_BASE_URL": "https://rsshub.example"})
     source_by_id = {source.id: source for source in result.sources}
-    assert source_by_id["anthropic_news_rsshub"].source_group == "official_blog"
-    assert source_by_id["anthropic_research_rsshub"].source_group == "official_research"
-    assert source_by_id["anthropic_research_rsshub"].url == "https://rsshub.example/anthropic/research?limit=6"
-    assert source_by_id["anthropic_engineering_rsshub"].source_group == "official_research"
-    assert source_by_id["x_account_chatgpt"].url.endswith("/twitter/user/ChatGPT")
-    assert source_by_id["x_account_xai"].url.endswith("/twitter/user/spacexai")
-    for source_id, handle in {
-        "x_account_zai_org": "Zai_org",
-        "x_account_kimi_moonshot": "Kimi_Moonshot",
-        "x_account_minimax_ai": "MiniMax_AI",
-    }.items():
-        source = source_by_id[source_id]
-        assert source.source_group == "x_official"
-        assert source.content_class == "official_model_company"
-        assert source.tier == "p1"
-        assert source.primary_eligible is True
-        assert source.selection_policy.mode == "first_party_recent"
-        assert handle in source.url
-        assert source.account_url == f"https://x.com/{handle}"
+    expected_by_limit = {
+        6: {
+            "google_research_blog", "microsoft_research_feed", "nvidia_ai_platforms_news",
+            "github_blog_ai", "github_releases_claude_code", "github_releases_ollama",
+            "github_releases_transformers", "anthropic_research_rsshub",
+            "anthropic_engineering_rsshub",
+        },
+        8: {
+            "huggingface_blog", "openrouter_blog", "nvidia_ai_blog", "langchain_blog",
+            "google_developers_blog", "producthunt_feed", "x_account_openai",
+            "x_account_chatgpt", "x_account_anthropic", "x_account_claude",
+            "x_account_google_deepmind", "x_account_gemini", "x_account_xai",
+            "x_account_grok", "x_account_ai_at_meta", "x_account_mistral_ai",
+            "x_account_cohere", "x_account_perplexity_ai", "x_account_msft_copilot",
+            "x_account_deepseek", "x_account_qwen", "x_account_huggingface",
+            "x_account_ollama", "x_account_replicate", "x_account_zai_org",
+            "x_account_kimi_moonshot", "x_account_minimax_ai", "x_account_baidu",
+            "x_account_alibaba_cloud", "x_account_siliconflow", "x_account_openrouter",
+            "x_account_runway", "x_account_replit", "x_account_openbmb",
+            "x_account_sensetime", "x_account_antling", "x_account_together_ai",
+        },
+        10: {
+            "openai_news", "google_deepmind_blog", "google_blog_ai",
+            "deepseek_api_news_rsshub", "anthropic_news_rsshub",
+        },
+        12: {"cursor_changelog", "hacker_news_ai", "linux_do_hot", "reddit_local_llama_hot"},
+        15: {
+            "ithome_ai_news", "the_decoder_ai_news", "techcrunch_ai",
+            "x_account_claude_devs", "x_account_pvncher", "x_account_thdxr",
+            "x_account_xhyctf", "x_account_devin_desktop", "x_account_cursor_ai",
+            "x_account_openai_devs", "x_account_opencode", "x_account_exa_ai_labs",
+        },
+        20: {"x_account_sam_altman", "x_account_tibo"},
+    }
+    expected_ids = set().union(*expected_by_limit.values())
+
+    assert set(source_by_id) == expected_ids
+    for expected_limit, source_ids in expected_by_limit.items():
+        assert all(source_by_id[source_id].default_limit == expected_limit for source_id in source_ids)
+    assert len(source_by_id) == 69
+    assert sum(source.default_limit for source in result.sources) == 668

@@ -54,10 +54,6 @@ def test_removed_stage_b_fields_are_rejected_by_strict_contract():
         "confidence": 90,
         "source_content_class": "official_model_company",
         "source_group": "official_blog",
-        "source_role": "first_party_official",
-        "source_subtype": "website",
-        "source_tier": "tier_1",
-        "primary_eligible": True,
     }.items():
         with pytest.raises(ValidationError):
             parse_analysis_result(_payload(**{field: value}))

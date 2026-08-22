@@ -6,7 +6,7 @@
   <div>
     <p class="eyebrow">PROVENANCE / SOURCE CATALOG</p>
     <h1>来源目录</h1>
-    <p class="muted-text">每条情报都保留来源名称、来源组、抓取通道和来源层级。来源身份不等于事实背书，主题分类由 AI 编辑模型完成。</p>
+    <p class="muted-text">每条情报都保留来源名称、来源组、抓取通道和内容类型。来源身份不等于事实背书，主题分类由 AI 编辑模型完成。</p>
   </div>
   <div class="source-legend"><span class="legend-dot healthy"></span> healthy <span class="legend-dot warning"></span> needs attention</div>
 </section>
@@ -26,13 +26,11 @@
         <div class="source-card-tags">
           {% if source.source_group %}<span class="badge primary">{{ source.source_group | source_group_label }}</span>{% endif %}
           {% if source.transport %}<span class="badge">{{ source.transport | transport_label }}</span>{% endif %}
-          {% if source.tier %}<span class="badge">{{ source.tier | tier_label }}</span>{% endif %}
           {% if source.content_class %}<span class="badge badge-source">{{ source.content_class | content_class_label }}</span>{% endif %}
         </div>
         <dl class="source-facts">
           <div><dt>已入库</dt><dd>{{ source.item_count }} 条</dd></div>
-          <div><dt>子类型</dt><dd>{{ source.source_subtype or '—' }}</dd></div>
-          <div><dt>来源角色</dt><dd>{{ source.source_role | source_role_label if source.source_role else '—' }}</dd></div>
+          <div><dt>抓取通道</dt><dd>{{ source.transport | transport_label }}</dd></div>
           <div><dt>连续失败</dt><dd>{{ source.consecutive_failures }}</dd></div>
         </dl>
         <div class="source-card-links">

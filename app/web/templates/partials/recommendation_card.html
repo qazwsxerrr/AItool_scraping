@@ -28,7 +28,6 @@
     <div class="badges">
       <span class="badge primary">{{ card.status | status_label }}</span>
       {% if card.content_class %}<span class="badge badge-source">{{ card.content_class | content_class_label }}</span>{% endif %}
-      {% if card.source_tier %}<span class="badge">{{ card.source_tier | tier_label }}</span>{% endif %}
       {% if card.risk_flags %}
         <details class="risk-details">
           <summary class="badge warning">风险提示 {{ card.risk_flags | length }}</summary>

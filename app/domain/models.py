@@ -31,17 +31,6 @@ CONTENT_CLASSES: tuple[ContentClass, ...] = (
     NEWS_MEDIA,
 )
 
-# Source governance vocabulary. These aliases intentionally live in the
-# transport-neutral domain module so registry and storage consumers share one
-# spelling without importing configuration code.
-SourceTier: TypeAlias = Literal["p1", "p2", "p3", "p4"]
-TopicScope: TypeAlias = Literal[
-    "model_product",
-    "industry_infrastructure",
-    "research",
-    "open_source_tool",
-    "practice_opinion",
-]
 CanonicalSourceGroup: TypeAlias = Literal[
     "official_blog",
     "official_research",
@@ -76,62 +65,22 @@ CANONICAL_SOURCE_GROUPS: tuple[CanonicalSourceGroup, ...] = (
 )
 
 
-class SelectionPolicy(BaseModel):
-    """Typed common rules with room for collector-specific policy fields."""
+def content_class_for_source(
+    source_group: str | None,
+    transport: str | None = None,
+) -> ContentClass:
+    """Return the single coarse source class used by the pipeline."""
 
-    model_config = ConfigDict(extra="allow", frozen=True)
-
-    mode: str = "default"
-    max_age_days: int | None = None
-    time_window_days: int | None = None
-    pushed_days: int | None = None
-    min_stars: int | None = None
-    min_votes: int | None = None
-    min_engagement: float | None = None
-    keywords: tuple[str, ...] = ()
-    sort_by: str | None = None
-    sort_order: Literal["asc", "desc"] = "desc"
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalise_input(cls, value: Any) -> Any:
-        if value is None or isinstance(value, cls):
-            return value or {}
-        if not isinstance(value, Mapping):
-            raise TypeError("selection_policy must be a mapping or SelectionPolicy")
-
-        data = dict(value)
-        if "window_days" in data and "max_age_days" not in data:
-            data["max_age_days"] = data["window_days"]
-        if "stars" in data and "min_stars" not in data and isinstance(data["stars"], (int, float)):
-            data["min_stars"] = data["stars"]
-        if "votes" in data and "min_votes" not in data and isinstance(data["votes"], (int, float)):
-            data["min_votes"] = data["votes"]
-        if "engagement" in data and "min_engagement" not in data and isinstance(data["engagement"], (int, float)):
-            data["min_engagement"] = data["engagement"]
-        if "sort" in data and "sort_by" not in data:
-            data["sort_by"] = data["sort"]
-        if "keyword" in data and "keywords" not in data:
-            data["keywords"] = data["keyword"]
-        if isinstance(data.get("keywords"), str):
-            data["keywords"] = tuple(
-                part.strip()
-                for part in data["keywords"].replace("，", ",").split(",")
-                if part.strip()
-            )
-        return data
-
-    @model_validator(mode="after")
-    def _validate_ranges(self) -> "SelectionPolicy":
-        for name in ("max_age_days", "time_window_days", "pushed_days"):
-            value = getattr(self, name)
-            if value is not None and value <= 0:
-                raise ValueError(f"{name} must be positive when configured")
-        for name in ("min_stars", "min_votes", "min_engagement"):
-            value = getattr(self, name)
-            if value is not None and value < 0:
-                raise ValueError(f"{name} must be non-negative when configured")
-        return self
+    group = str(source_group or "").strip().casefold()
+    if group in {"official_blog", "official_research", "x_official"}:
+        return OFFICIAL_MODEL_COMPANY
+    if group == "tech_media":
+        return NEWS_MEDIA
+    if group in {"github_trending", "github_release", "github_search", "producthunt"}:
+        return PROJECT_TOOL
+    if str(transport or "").strip().casefold() == "github":
+        return PROJECT_TOOL
+    return COMMUNITY_SOCIAL
 
 
 Transport: TypeAlias = Literal["feed", "rsshub", "github"]
@@ -216,7 +165,7 @@ class GitHubOptions(BaseModel):
 
 
 class SourceSpec(BaseModel):
-    """Canonical registry source with resolved content and policy metadata.
+    """Canonical source with routing, provenance and fetch controls.
 
     ``transport`` is the only top-level routing discriminator.  Feed details
     live under :attr:`feed`; GitHub mode details live under :attr:`github`.
@@ -236,18 +185,24 @@ class SourceSpec(BaseModel):
     priority: int = 100
     fetch_interval: int = 3600
     source_group: str | None = None
-    source_subtype: str | None = None
-    tier: SourceTier = "p4"
-    topic_scopes: tuple[TopicScope, ...] = ()
-    primary_eligible: bool = False
-    quality_weight: float | None = None
-    source_role: str | None = None
-    spam_risk: Literal["low", "medium", "high"] | None = None
     account_url: str | None = None
     bypass_proxy: bool = False
     default_limit: int = 30
-    content_class: ContentClass | None = None
-    selection_policy: SelectionPolicy = Field(default_factory=SelectionPolicy)
+    content_class: ContentClass = COMMUNITY_SOCIAL
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_content_class(cls, value: Any) -> Any:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            return value
+        data = dict(value)
+        data["content_class"] = content_class_for_source(
+            data.get("source_group"),
+            data.get("transport"),
+        )
+        return data
 
     @model_validator(mode="after")
     def _validate_transport(self) -> "SourceSpec":
@@ -260,12 +215,8 @@ class SourceSpec(BaseModel):
             raise ValueError("fetch_interval must be positive")
         if self.default_limit <= 0:
             raise ValueError("default_limit must be positive")
-        if self.quality_weight is not None and not 0 <= self.quality_weight <= 1:
-            raise ValueError("quality_weight must be between 0 and 1")
         if self.source_group is not None and not _valid_source_token(self.source_group):
             raise ValueError("source_group must contain lowercase letters, numbers, underscore or dash")
-        if self.source_subtype is not None and not _valid_source_token(self.source_subtype):
-            raise ValueError("source_subtype must contain lowercase letters, numbers, underscore or dash")
         if self.transport in {"feed", "rsshub"}:
             if self.github is not None:
                 raise ValueError(f"{self.transport} source cannot define github options")
@@ -289,10 +240,22 @@ class SourceSpec(BaseModel):
 
     @classmethod
     def from_config(cls, source: Any) -> "SourceSpec":
-        # Lazy import avoids a models -> policies -> models cycle.
-        from .policies import source_spec_from_config
-
-        return source_spec_from_config(source)
+        if isinstance(source, cls):
+            return source
+        if isinstance(source, Mapping):
+            data = dict(source)
+        elif hasattr(source, "model_dump"):
+            data = dict(source.model_dump(mode="python"))
+        elif hasattr(source, "__dict__"):
+            data = dict(vars(source))
+        else:
+            raise TypeError("source config must be a mapping or SourceSpec")
+        source_id = str(data.get("id") or "").strip()
+        if not source_id:
+            raise ValueError("source id is required")
+        data["id"] = source_id
+        data["name"] = data.get("name") or source_id
+        return cls.model_validate(data)
 
 
 def _valid_source_token(value: str) -> bool:
@@ -478,21 +441,3 @@ class FetchBatch(BaseModel):
     @property
     def status_code(self) -> int | None:
         return self.http_status
-
-
-class SelectionDecision(BaseModel):
-    """Explainable result of deterministic source-specific selection."""
-
-    model_config = ConfigDict(frozen=True, extra="allow")
-
-    selected: bool
-    reason: str
-    content_class: ContentClass
-    mode: str
-    score: float = 0.0
-    matched_keywords: tuple[str, ...] = ()
-    risk_flags: tuple[str, ...] = ()
-
-    @property
-    def keep(self) -> bool:
-        return self.selected

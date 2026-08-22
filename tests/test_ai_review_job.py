@@ -29,9 +29,6 @@ def _source() -> SourceSpec:
         url="https://official.example/feed.xml",
         feed={"format": "rss", "adapter": "generic"},
         source_group="official_blog",
-        source_subtype="fixed_news",
-        source_role="official",
-        content_class="official_model_company",
     )
 
 
@@ -39,7 +36,7 @@ def _daily_build(session_factory, source: SourceSpec, titles: list[str]) -> int:
     now = datetime.now(timezone.utc)
     with session_factory() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(source, policy=source)
+        repo.upsert_source(source)
         _, build = repo.start_daily_build(edition_date="2026-08-19", reference_time=now)
         for index, title in enumerate(titles, start=1):
             repo.insert_item(
@@ -159,7 +156,7 @@ def test_daily_stage_a_b_keeps_all_successful_analyses_and_marks_low_signal(tmp_
     run_id = _daily_build(session_factory, source, ["high reject", "low score", "paper", "candidate"])
     ai = _AI(
         reject_titles={"high reject": 90},
-        score_by_title={"low score": 59, "paper": 99, "candidate": 60},
+        score_by_title={"low score": 59, "paper": 99, "candidate": 70},
         paper_titles={"paper"},
     )
 

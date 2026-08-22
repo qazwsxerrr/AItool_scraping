@@ -21,7 +21,6 @@
     {% if result.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ result.selection_reason }}</p>{% endif %}
     <div class="badges">
       {% if result.topic_category %}<span class="badge topic-badge">{{ result.topic_category | topic_label }}</span>{% endif %}
-      {% if result.source_tier %}<span class="badge">{{ result.source_tier | tier_label }}</span>{% endif %}
       {% for badge in result.badges %}
         <span class="badge {{ 'danger' if badge in ['failed', 'broken', 'stale', 'ai_failed'] else 'primary' if loop.first else '' }}">{{ badge | status_label if badge in ['ai_failed', 'filtered', 'rejected', 'new', 'selected'] else (badge | content_class_label if badge in ['official_model_company', 'project_tool', 'community_social'] else badge) }}</span>
       {% endfor %}

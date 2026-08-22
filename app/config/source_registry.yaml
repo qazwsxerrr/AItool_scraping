@@ -10,16 +10,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: fixed_news
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 30
-  default_limit: 6
-  tier: p1
-  topic_scopes:
-  - model_product
-  primary_eligible: true
+  default_limit: 10
 - id: google_deepmind_blog
   name: Google DeepMind Blog
   transport: feed
@@ -31,16 +22,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: fixed_blog
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 30
-  default_limit: 6
-  tier: p1
-  topic_scopes:
-  - model_product
-  primary_eligible: true
+  default_limit: 10
 - id: huggingface_blog
   name: Hugging Face Blog
   transport: feed
@@ -52,16 +34,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: fixed_blog
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 30
-  default_limit: 6
-  tier: p1
-  topic_scopes:
-  - model_product
-  primary_eligible: true
+  default_limit: 8
 - id: openrouter_blog
   name: OpenRouter Blog
   transport: feed
@@ -73,30 +46,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: fixed_blog
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 30
-    keywords:
-    - ai
-    - model
-    - router
-    - inference
-    - agent
-    - api
-    - release
-    - launch
-    - pricing
-    - eval
-  default_limit: 6
-  tier: p1
-  topic_scopes:
-  - model_product
-  primary_eligible: true
+  default_limit: 8
 - id: google_research_blog
   name: Google Research Blog
   transport: feed
@@ -108,35 +58,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_research
-  source_subtype: research_blog
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 30
-    keywords:
-    - ai
-    - model
-    - research
-    - framework
-    - agent
-    - language
-    - learning
-    - diffusion
-    - benchmark
-    - robotics
-    - intelligence
-    - foundation
-    - generative
-    - gemini
-    - machine
   default_limit: 6
-  tier: p1
-  topic_scopes:
-  - research
-  primary_eligible: true
 - id: nvidia_ai_blog
   name: NVIDIA AI Blog
   transport: feed
@@ -148,66 +70,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: ai_blog
-  quality_weight: 0.85
-  source_role: official
-  spam_risk: medium
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 30
-    keywords:
-    - ai
-    - model
-    - inference
-    - generative
-    - agent
-    - robotics
-    - blackwell
-    - cuda
-    - foundation
-    - open weights
-    - accelerated computing
-  default_limit: 6
-  tier: p1
-  topic_scopes:
-  - model_product
-  primary_eligible: true
-- id: aws_machine_learning_blog
-  name: AWS Machine Learning Blog
-  transport: feed
-  url: https://aws.amazon.com/blogs/machine-learning/feed/
-  enabled: true
-  priority: 34
-  fetch_interval: 7200
-  feed:
-    format: rss
-    adapter: generic
-  source_group: official_blog
-  source_subtype: machine_learning_blog
-  quality_weight: 0.85
-  source_role: official
-  spam_risk: medium
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 30
-    keywords:
-    - bedrock
-    - sagemaker
-    - agent
-    - agentcore
-    - jumpstart
-    - titan
-    - llama
-    - embedding
-    - transformer
-    - neuron
-  default_limit: 6
-  tier: p1
-  topic_scopes:
-  - model_product
-  primary_eligible: true
+  default_limit: 8
 - id: microsoft_research_feed
   name: Microsoft Research
   transport: feed
@@ -219,13 +82,6 @@ sources:
     format: rss
     adapter: generic
   source_group: official_research
-  source_subtype: research_feed
-  tier: p1
-  topic_scopes:
-  - research
-  - industry_infrastructure
-  primary_eligible: true
-  content_class: official_model_company
   default_limit: 6
 - id: nvidia_ai_platforms_news
   name: NVIDIA AI and Platforms News
@@ -238,32 +94,6 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: ai_platforms_news
-  tier: p1
-  topic_scopes:
-  - industry_infrastructure
-  - model_product
-  primary_eligible: true
-  content_class: official_model_company
-  default_limit: 6
-- id: aws_whats_new_feed
-  name: AWS What's New
-  transport: feed
-  url: https://aws.amazon.com/about-aws/whats-new/recent/feed/
-  enabled: true
-  priority: 37
-  fetch_interval: 21600
-  feed:
-    format: rss
-    adapter: generic
-  source_group: official_blog
-  source_subtype: whats_new
-  tier: p1
-  topic_scopes:
-  - industry_infrastructure
-  - model_product
-  primary_eligible: true
-  content_class: official_model_company
   default_limit: 6
 - id: arxiv_ai_cl_ml_feed
   name: arXiv AI CL LG ML
@@ -276,12 +106,6 @@ sources:
     format: atom
     adapter: generic
   source_group: official_research
-  source_subtype: arxiv_research
-  tier: p1
-  topic_scopes:
-  - research
-  primary_eligible: true
-  content_class: official_model_company
   default_limit: 6
 - id: google_blog_ai
   name: Google Blog AI
@@ -294,29 +118,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: ai_product_blog
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 7
-    keywords:
-    - ai
-    - artificial intelligence
-    - gemini
-    - deepmind
-    - model
-    - agent
-    - machine learning
-    - 人工智能
-  default_limit: 12
-  tier: p1
-  topic_scopes:
-  - model_product
-  - industry_infrastructure
-  primary_eligible: true
+  default_limit: 10
 - id: langchain_blog
   name: LangChain Blog
   transport: feed
@@ -328,20 +130,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: developer_blog
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 30
-  default_limit: 12
-  tier: p1
-  topic_scopes:
-  - model_product
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 8
 - id: google_developers_blog
   name: Google Developers Blog
   transport: feed
@@ -353,21 +142,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: developer_blog
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 7
-  default_limit: 15
-  tier: p1
-  topic_scopes:
-  - model_product
-  - industry_infrastructure
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 8
 - id: cursor_changelog
   name: Cursor Changelog
   transport: feed
@@ -379,46 +154,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: product_changelog
-  quality_weight: 0.95
-  source_role: official
-  spam_risk: low
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 30
   default_limit: 12
-  tier: p1
-  topic_scopes:
-  - model_product
-  - open_source_tool
-  primary_eligible: true
-- id: tomer_tunguz_blog
-  name: Tomer Tunguz Blog
-  transport: feed
-  url: https://www.tomtunguz.com/index.xml
-  enabled: true
-  priority: 64
-  fetch_interval: 7200
-  feed:
-    format: rss
-    adapter: generic
-  source_group: tech_media
-  source_subtype: analysis_blog
-  quality_weight: 0.8
-  source_role: analysis
-  spam_risk: low
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 7
-    keywords: []
-  default_limit: 15
-  tier: p2
-  topic_scopes:
-  - industry_infrastructure
-  - practice_opinion
-  primary_eligible: true
 - id: ithome_ai_news
   name: IT之家 AI 资讯
   transport: feed
@@ -431,40 +167,7 @@ sources:
     format: rss
     adapter: generic
   source_group: tech_media
-  source_subtype: chinese_ai_news
-  quality_weight: 0.75
-  source_role: news_media
-  spam_risk: medium
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 3
-    keywords:
-    - ai
-    - 人工智能
-    - 大模型
-    - 模型
-    - 智能体
-    - agent
-    - openai
-    - chatgpt
-    - claude
-    - gemini
-    - grok
-    - deepseek
-    - qwen
-    - 千问
-    - 智谱
-    - 机器人
-    - 推理
-    - gpu
-    - 芯片
-  default_limit: 30
-  tier: p2
-  topic_scopes:
-  - model_product
-  - industry_infrastructure
-  primary_eligible: true
+  default_limit: 15
 - id: the_decoder_ai_news
   name: The Decoder AI News
   transport: feed
@@ -476,21 +179,7 @@ sources:
     format: rss
     adapter: generic
   source_group: tech_media
-  source_subtype: ai_news
-  quality_weight: 0.85
-  source_role: news_media
-  spam_risk: low
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 3
-    keywords: []
-  default_limit: 20
-  tier: p2
-  topic_scopes:
-  - model_product
-  - industry_infrastructure
-  primary_eligible: true
+  default_limit: 15
 - id: techcrunch_ai
   name: TechCrunch AI
   transport: feed
@@ -502,211 +191,7 @@ sources:
     format: rss
     adapter: generic
   source_group: tech_media
-  source_subtype: ai_news
-  quality_weight: 0.8
-  source_role: news_media
-  spam_risk: low
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 3
-    keywords: []
-  default_limit: 20
-  tier: p2
-  topic_scopes:
-  - model_product
-  - industry_infrastructure
-  primary_eligible: true
-- id: the_verge_ai
-  name: The Verge AI
-  transport: feed
-  url: https://www.theverge.com/rss/ai-artificial-intelligence/index.xml
-  enabled: true
-  priority: 54
-  fetch_interval: 3600
-  feed:
-    format: atom
-    adapter: generic
-  source_group: tech_media
-  source_subtype: ai_news
-  quality_weight: 0.8
-  source_role: news_media
-  spam_risk: low
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 3
-    keywords: []
-  default_limit: 20
-  tier: p2
-  topic_scopes:
-  - model_product
-  - industry_infrastructure
-  primary_eligible: true
-- id: ars_technica_ai
-  name: Ars Technica AI
-  transport: feed
-  url: https://arstechnica.com/ai/feed/
-  enabled: true
-  priority: 55
-  fetch_interval: 7200
-  feed:
-    format: rss
-    adapter: generic
-  source_group: tech_media
-  source_subtype: ai_news
-  quality_weight: 0.8
-  source_role: news_media
-  spam_risk: low
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 3
-    keywords: []
-  default_limit: 20
-  tier: p2
-  topic_scopes:
-  - model_product
-  - industry_infrastructure
-  primary_eligible: true
-- id: marktechpost_ai
-  name: MarkTechPost AI
-  transport: feed
-  url: https://www.marktechpost.com/feed/
-  enabled: true
-  priority: 56
-  fetch_interval: 7200
-  feed:
-    format: rss
-    adapter: generic
-  source_group: tech_media
-  source_subtype: ai_news
-  quality_weight: 0.7
-  source_role: news_media
-  spam_risk: medium
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 3
-    keywords: []
   default_limit: 15
-  tier: p2
-  topic_scopes:
-  - model_product
-  - research
-  primary_eligible: true
-- id: artificial_intelligence_news
-  name: Artificial Intelligence News
-  transport: feed
-  url: https://www.artificialintelligence-news.com/feed/
-  enabled: true
-  priority: 57
-  fetch_interval: 7200
-  feed:
-    format: rss
-    adapter: generic
-  source_group: tech_media
-  source_subtype: ai_news
-  quality_weight: 0.75
-  source_role: news_media
-  spam_risk: low
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 3
-    keywords: []
-  default_limit: 15
-  tier: p2
-  topic_scopes:
-  - model_product
-  - industry_infrastructure
-  primary_eligible: true
-- id: simon_willison_blog
-  name: Simon Willison Blog
-  transport: feed
-  url: https://simonwillison.net/atom/everything/
-  enabled: true
-  priority: 58
-  fetch_interval: 7200
-  feed:
-    format: atom
-    adapter: generic
-  source_group: tech_media
-  source_subtype: analysis_blog
-  quality_weight: 0.8
-  source_role: analysis
-  spam_risk: low
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 3
-    keywords: []
-  default_limit: 15
-  tier: p2
-  topic_scopes:
-  - model_product
-  - practice_opinion
-  primary_eligible: true
-- id: interconnects_ai
-  name: Interconnects AI
-  transport: feed
-  url: https://www.interconnects.ai/feed
-  enabled: true
-  priority: 59
-  fetch_interval: 7200
-  feed:
-    format: rss
-    adapter: generic
-  source_group: tech_media
-  source_subtype: analysis_blog
-  quality_weight: 0.75
-  source_role: analysis
-  spam_risk: low
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 3
-    keywords: []
-  default_limit: 15
-  tier: p2
-  topic_scopes:
-  - research
-  - practice_opinion
-  primary_eligible: true
-- id: bytebytego_ai
-  name: ByteByteGo AI
-  transport: feed
-  url: https://blog.bytebytego.com/feed
-  enabled: true
-  priority: 60
-  fetch_interval: 14400
-  feed:
-    format: rss
-    adapter: generic
-  source_group: tech_media
-  source_subtype: engineering_blog
-  quality_weight: 0.7
-  source_role: analysis
-  spam_risk: low
-  content_class: news_media
-  selection_policy:
-    mode: media_recent
-    max_age_days: 3
-    keywords:
-    - ai
-    - llm
-    - agent
-    - mcp
-    - model
-    - inference
-    - 人工智能
-    - 大模型
-  default_limit: 15
-  tier: p2
-  topic_scopes:
-  - model_product
-  - practice_opinion
-  primary_eligible: true
 - id: github_blog_ai
   name: GitHub Blog AI
   transport: feed
@@ -718,28 +203,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: developer_platform_blog
-  quality_weight: 0.8
-  source_role: official
-  spam_risk: low
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 7
-    keywords:
-    - ai
-    - copilot
-    - model
-    - agent
-    - mcp
-    - llm
-    - github models
-  default_limit: 15
-  tier: p2
-  topic_scopes:
-  - model_product
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 6
 - id: hacker_news_ai
   name: Hacker News AI
   transport: feed
@@ -752,20 +216,7 @@ sources:
     format: rss
     adapter: generic
   source_group: hacker_news
-  source_subtype: community_ai_links
-  quality_weight: 0.45
-  source_role: community
-  spam_risk: high
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 2
-    keywords: []
-  default_limit: 30
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
+  default_limit: 12
 - id: github_releases_claude_code
   name: GitHub Releases Claude Code
   transport: github
@@ -776,20 +227,7 @@ sources:
   github:
     mode: releases
   source_group: github_release
-  source_subtype: repo_releases
-  quality_weight: 0.85
-  source_role: code_hosting
-  spam_risk: low
-  content_class: project_tool
-  selection_policy:
-    mode: project_recent
-    max_age_days: 30
-    sort: published_at
-  default_limit: 10
-  tier: p2
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 6
 - id: producthunt_feed
   name: Product Hunt Feed
   transport: feed
@@ -801,18 +239,7 @@ sources:
     format: atom
     adapter: producthunt
   source_group: producthunt
-  source_subtype: fixed_feed
-  content_class: project_tool
-  selection_policy:
-    mode: producthunt_hot
-    max_age_days: 30
-    min_votes: 0
-    sort: votes
   default_limit: 8
-  tier: p3
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: false
 - id: github_trending_daily_native
   name: GitHub Trending Daily
   transport: github
@@ -824,20 +251,7 @@ sources:
     mode: trending
     period: daily
   source_group: github_trending
-  source_subtype: trending_daily
-  quality_weight: 0.9
-  source_role: code_hosting
-  spam_risk: medium
-  content_class: project_tool
-  selection_policy:
-    mode: github_trending
-    period: daily
-    sort: stars_since
   default_limit: 12
-  tier: p3
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: false
 - id: github_trending_weekly_native
   name: GitHub Trending Weekly
   transport: github
@@ -849,20 +263,7 @@ sources:
     mode: trending
     period: weekly
   source_group: github_trending
-  source_subtype: trending_weekly
-  quality_weight: 0.95
-  source_role: code_hosting
-  spam_risk: medium
-  content_class: project_tool
-  selection_policy:
-    mode: github_trending
-    period: weekly
-    sort: stars_since
   default_limit: 12
-  tier: p3
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: false
 - id: github_search_topic_llm
   name: GitHub Search Topic LLM
   transport: github
@@ -877,21 +278,7 @@ sources:
     order: desc
     pushed_days: 7
   source_group: github_search
-  source_subtype: search_repositories
-  quality_weight: 0.75
-  source_role: code_hosting
-  spam_risk: medium
-  content_class: project_tool
-  selection_policy:
-    mode: github_active_high_star
-    pushed_days: 7
-    min_stars: 100
-    sort: stars
   default_limit: 10
-  tier: p3
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: false
 - id: github_search_topic_ai_agent
   name: GitHub Search Topic AI Agent
   transport: github
@@ -906,21 +293,7 @@ sources:
     order: desc
     pushed_days: 7
   source_group: github_search
-  source_subtype: search_repositories
-  quality_weight: 0.75
-  source_role: code_hosting
-  spam_risk: medium
-  content_class: project_tool
-  selection_policy:
-    mode: github_active_high_star
-    pushed_days: 7
-    min_stars: 100
-    sort: stars
   default_limit: 10
-  tier: p3
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: false
 - id: github_search_topic_rag
   name: GitHub Search Topic RAG
   transport: github
@@ -935,22 +308,7 @@ sources:
     order: desc
     pushed_days: 7
   source_group: github_search
-  source_subtype: search_repositories
-  quality_weight: 0.75
-  source_role: code_hosting
-  spam_risk: medium
-  content_class: project_tool
-  selection_policy:
-    mode: github_active_high_star
-    pushed_days: 7
-    min_stars: 100
-    sort: stars
-    reserve_only: true
   default_limit: 10
-  tier: p3
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: false
 - id: github_search_topic_vector_database
   name: GitHub Search Topic Vector Database
   transport: github
@@ -965,22 +323,7 @@ sources:
     order: desc
     pushed_days: 7
   source_group: github_search
-  source_subtype: search_repositories
-  quality_weight: 0.75
-  source_role: code_hosting
-  spam_risk: medium
-  content_class: project_tool
-  selection_policy:
-    mode: github_active_high_star
-    pushed_days: 7
-    min_stars: 100
-    sort: stars
-    reserve_only: true
   default_limit: 10
-  tier: p3
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: false
 - id: github_search_topic_large_language_model
   name: GitHub Search Topic Large Language Model
   transport: github
@@ -995,22 +338,7 @@ sources:
     order: desc
     pushed_days: 7
   source_group: github_search
-  source_subtype: search_repositories
-  quality_weight: 0.75
-  source_role: code_hosting
-  spam_risk: medium
-  content_class: project_tool
-  selection_policy:
-    mode: github_active_high_star
-    pushed_days: 7
-    min_stars: 100
-    sort: stars
-    reserve_only: true
   default_limit: 10
-  tier: p3
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: false
 - id: github_search_topic_machine_learning
   name: GitHub Search Topic Machine Learning
   transport: github
@@ -1025,22 +353,7 @@ sources:
     order: desc
     pushed_days: 7
   source_group: github_search
-  source_subtype: search_repositories
-  quality_weight: 0.75
-  source_role: code_hosting
-  spam_risk: medium
-  content_class: project_tool
-  selection_policy:
-    mode: github_active_high_star
-    pushed_days: 7
-    min_stars: 100
-    sort: stars
-    reserve_only: true
   default_limit: 15
-  tier: p3
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: false
 - id: github_releases_ollama
   name: GitHub Releases Ollama
   transport: github
@@ -1051,20 +364,7 @@ sources:
   github:
     mode: releases
   source_group: github_release
-  source_subtype: repo_releases
-  quality_weight: 0.8
-  source_role: code_hosting
-  spam_risk: low
-  content_class: project_tool
-  selection_policy:
-    mode: project_recent
-    max_age_days: 30
-    sort: published_at
-  default_limit: 10
-  tier: p2
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 6
 - id: github_releases_transformers
   name: GitHub Releases Hugging Face Transformers
   transport: github
@@ -1075,41 +375,7 @@ sources:
   github:
     mode: releases
   source_group: github_release
-  source_subtype: repo_releases
-  quality_weight: 0.8
-  source_role: code_hosting
-  spam_risk: low
-  content_class: project_tool
-  selection_policy:
-    mode: project_recent
-    max_age_days: 30
-    sort: published_at
-  default_limit: 10
-  tier: p2
-  topic_scopes:
-  - open_source_tool
-  primary_eligible: true
-- id: linux_do_top
-  name: LINUX DO Top Topics
-  transport: feed
-  url: https://linux.do/top.rss
-  enabled: true
-  priority: 55
-  fetch_interval: 3600
-  feed:
-    format: rss
-    adapter: generic
-  source_group: linux_do
-  source_subtype: fixed_top
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 30
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
+  default_limit: 6
 - id: linux_do_hot
   name: LINUX DO Hot Topics
   transport: feed
@@ -1121,16 +387,7 @@ sources:
     format: rss
     adapter: generic
   source_group: linux_do
-  source_subtype: fixed_hot
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 30
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
+  default_limit: 12
 - id: reddit_local_llama_hot
   name: Reddit LocalLLaMA Hot
   transport: feed
@@ -1142,58 +399,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_fixed
-  source_subtype: fixed_hot
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 25
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
-- id: reddit_local_llama_top_day
-  name: Reddit LocalLLaMA Top Day
-  transport: feed
-  url: https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day
-  enabled: true
-  priority: 80
-  fetch_interval: 14400
-  feed:
-    format: atom
-    adapter: generic
-  source_group: reddit_fixed
-  source_subtype: fixed_top_day
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 20
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
-- id: reddit_local_llama_top_week
-  name: Reddit LocalLLaMA Top Week
-  transport: feed
-  url: https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week
-  enabled: true
-  priority: 85
-  fetch_interval: 86400
-  feed:
-    format: atom
-    adapter: generic
-  source_group: reddit_fixed
-  source_subtype: fixed_top_week
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 20
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
+  default_limit: 12
 - id: reddit_local_llama_search_agent
   name: Reddit LocalLLaMA Search agent
   transport: feed
@@ -1205,16 +411,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_search
-  source_subtype: search
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 10
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: reddit_local_llama_search_open_weights
   name: Reddit LocalLLaMA Search open weights
   transport: feed
@@ -1226,16 +423,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_search
-  source_subtype: search
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 10
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: reddit_local_llama_search_gguf
   name: Reddit LocalLLaMA Search gguf
   transport: feed
@@ -1247,16 +435,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_search
-  source_subtype: search
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 10
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: reddit_local_llama_search_benchmark
   name: Reddit LocalLLaMA Search benchmark
   transport: feed
@@ -1268,16 +447,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_search
-  source_subtype: search
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 10
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: reddit_local_llama_search_mcp
   name: Reddit LocalLLaMA Search MCP
   transport: feed
@@ -1289,16 +459,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_search
-  source_subtype: search
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 8
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: reddit_local_llama_search_workflow
   name: Reddit LocalLLaMA Search workflow
   transport: feed
@@ -1310,16 +471,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_search
-  source_subtype: search
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 8
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: reddit_local_llama_search_2api
   name: Reddit LocalLLaMA Search 2API
   transport: feed
@@ -1331,16 +483,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_search
-  source_subtype: search
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 8
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: reddit_local_llama_search_claude_code
   name: Reddit LocalLLaMA Search Claude Code workflow
   transport: feed
@@ -1352,16 +495,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_search
-  source_subtype: search
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 8
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: reddit_local_llama_search_comfyui
   name: Reddit LocalLLaMA Search ComfyUI workflow
   transport: feed
@@ -1373,16 +507,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_search
-  source_subtype: search
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 8
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: reddit_local_llama_search_n8n_dify
   name: Reddit LocalLLaMA Search n8n Dify
   transport: feed
@@ -1394,16 +519,7 @@ sources:
     format: atom
     adapter: generic
   source_group: reddit_search
-  source_subtype: search
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 8
-  tier: p4
-  topic_scopes:
-  - practice_opinion
-  primary_eligible: false
 - id: x_account_openai
   name: X OpenAI via RSSHub
   transport: rsshub
@@ -1415,19 +531,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_chatgpt
   name: X ChatGPT via RSSHub
   transport: rsshub
@@ -1439,19 +543,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_anthropic
   name: X Anthropic via RSSHub
   transport: rsshub
@@ -1463,19 +555,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_claude
   name: X Claude via RSSHub
   transport: rsshub
@@ -1487,19 +567,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_google_deepmind
   name: X Google DeepMind via RSSHub
   transport: rsshub
@@ -1511,19 +579,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_gemini
   name: X Gemini via RSSHub
   transport: rsshub
@@ -1535,19 +591,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_xai
   name: X xAI (SpaceXAI) via RSSHub
   transport: rsshub
@@ -1559,19 +603,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_grok
   name: X Grok via RSSHub
   transport: rsshub
@@ -1583,19 +615,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_meta_ai
   name: X Meta AI via RSSHub (moved to AIatMeta)
   transport: rsshub
@@ -1607,14 +627,6 @@ sources:
     format: rss
     adapter: generic
   source_group: x_social
-  source_subtype: account
-  quality_weight: 0.35
-  source_role: social
-  spam_risk: high
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 5
 - id: x_account_ai_at_meta
   name: X AI at Meta via RSSHub
@@ -1627,19 +639,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_mistral_ai
   name: X Mistral AI via RSSHub
   transport: rsshub
@@ -1651,19 +651,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_cohere
   name: X Cohere via RSSHub
   transport: rsshub
@@ -1675,19 +663,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_perplexity_ai
   name: X Perplexity via RSSHub
   transport: rsshub
@@ -1699,19 +675,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_msft_copilot
   name: X Microsoft Copilot via RSSHub
   transport: rsshub
@@ -1723,19 +687,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_deepseek
   name: X DeepSeek via RSSHub
   transport: rsshub
@@ -1747,19 +699,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_qwen
   name: X Qwen via RSSHub
   transport: rsshub
@@ -1771,19 +711,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_huggingface
   name: X Hugging Face via RSSHub
   transport: rsshub
@@ -1795,19 +723,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_ollama
   name: X Ollama via RSSHub
   transport: rsshub
@@ -1819,19 +735,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_replicate
   name: X Replicate via RSSHub
   transport: rsshub
@@ -1843,19 +747,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_zai_org
   name: X Z.ai official
   transport: rsshub
@@ -1867,15 +759,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  source_role: official
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
   account_url: https://x.com/Zai_org
-  content_class: community_social
-  default_limit: 5
+  default_limit: 8
 - id: x_account_kimi_moonshot
   name: X Kimi Moonshot official
   transport: rsshub
@@ -1887,15 +772,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  source_role: official
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
   account_url: https://x.com/Kimi_Moonshot
-  content_class: community_social
-  default_limit: 5
+  default_limit: 8
 - id: x_account_minimax_ai
   name: X MiniMax AI official
   transport: rsshub
@@ -1907,15 +785,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  source_role: official
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
   account_url: https://x.com/MiniMax_AI
-  content_class: community_social
-  default_limit: 5
+  default_limit: 8
 - id: x_account_baidu
   name: X Baidu official
   transport: rsshub
@@ -1927,20 +798,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
   account_url: https://x.com/Baidu_Inc
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_alibaba_cloud
   name: X Alibaba Cloud official
   transport: rsshub
@@ -1952,21 +811,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
   account_url: https://x.com/alibaba_cloud
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  - industry_infrastructure
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_siliconflow
   name: X SiliconFlow official
   transport: rsshub
@@ -1978,20 +824,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
   account_url: https://x.com/SiliconFlowAI
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_openrouter
   name: X OpenRouter official
   transport: rsshub
@@ -2003,20 +837,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
   account_url: https://x.com/OpenRouter
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_runway
   name: X Runway official
   transport: rsshub
@@ -2028,20 +850,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
   account_url: https://x.com/runwayml
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_replit
   name: X Replit official
   transport: rsshub
@@ -2053,21 +863,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
   account_url: https://x.com/Replit
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  - open_source_tool
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_openbmb
   name: X OpenBMB official
   transport: rsshub
@@ -2079,20 +876,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
   account_url: https://x.com/OpenBMB
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_sensetime
   name: X SenseTime official
   transport: rsshub
@@ -2104,20 +889,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
   account_url: https://x.com/SenseTime_AI
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_antling
   name: X AntLing official
   transport: rsshub
@@ -2129,20 +902,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
   account_url: https://x.com/AntLingAGI
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_claude_devs
   name: X Claude Developers official
   transport: rsshub
@@ -2154,21 +915,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
   account_url: https://x.com/ClaudeDevs
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p1
-  topic_scopes:
-  - model_product
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 15
 - id: x_account_pvncher
   name: X pvncher official
   transport: rsshub
@@ -2180,21 +928,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
   account_url: https://x.com/pvncher
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p1
-  topic_scopes:
-  - model_product
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 15
 - id: x_account_thdxr
   name: X thdxr official
   transport: rsshub
@@ -2206,21 +941,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
   account_url: https://x.com/thdxr
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p1
-  topic_scopes:
-  - model_product
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 15
 - id: x_account_xhyctf
   name: X xhyctf official
   transport: rsshub
@@ -2232,21 +954,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
   account_url: https://x.com/xhyctf
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p1
-  topic_scopes:
-  - model_product
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 15
 - id: x_account_devin_desktop
   name: X Devin Desktop official
   transport: rsshub
@@ -2258,21 +967,8 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
   account_url: https://x.com/devindesktop
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p1
-  topic_scopes:
-  - model_product
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 15
 - id: x_account_cursor_ai
   name: X Cursor official
   transport: rsshub
@@ -2284,21 +980,47 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.9
-  source_role: official
-  spam_risk: low
   account_url: https://x.com/cursor_ai
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 7
-  default_limit: 10
-  tier: p1
-  topic_scopes:
-  - model_product
-  - open_source_tool
-  primary_eligible: true
+  default_limit: 15
+- id: x_account_openai_devs
+  name: X OpenAI Developers official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/OpenAIDevs
+  enabled: true
+  priority: 140
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  account_url: https://x.com/OpenAIDevs
+  default_limit: 15
+- id: x_account_opencode
+  name: X OpenCode official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/opencode
+  enabled: true
+  priority: 141
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  account_url: https://x.com/opencode
+  default_limit: 15
+- id: x_account_exa_ai_labs
+  name: X Exa official
+  transport: rsshub
+  url: ${RSSHUB_BASE_URL}/twitter/user/ExaAILabs
+  enabled: true
+  priority: 142
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: x_official
+  account_url: https://x.com/ExaAILabs
+  default_limit: 15
 - id: x_account_sam_altman
   name: X Sam Altman via RSSHub
   transport: rsshub
@@ -2310,20 +1032,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.85
-  source_role: official
-  spam_risk: low
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p1
-  topic_scopes:
-  - model_product
-  - practice_opinion
-  primary_eligible: true
+  default_limit: 20
 - id: x_account_tibo
   name: X Tibo via RSSHub
   transport: rsshub
@@ -2335,20 +1044,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.80
-  source_role: official
-  spam_risk: low
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p1
-  topic_scopes:
-  - model_product
-  - practice_opinion
-  primary_eligible: true
+  default_limit: 20
 - id: x_account_together_ai
   name: X Together AI via RSSHub
   transport: rsshub
@@ -2360,19 +1056,7 @@ sources:
     format: rss
     adapter: generic
   source_group: x_official
-  source_subtype: account
-  quality_weight: 0.75
-  source_role: official
-  spam_risk: medium
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
-  default_limit: 5
-  tier: p2
-  topic_scopes:
-  - model_product
-  primary_eligible: false
+  default_limit: 8
 - id: x_account_local_llama
   name: X LocalLLaMA via RSSHub (inactive)
   transport: rsshub
@@ -2384,14 +1068,6 @@ sources:
     format: rss
     adapter: generic
   source_group: x_social
-  source_subtype: account
-  quality_weight: 0.35
-  source_role: social
-  spam_risk: high
-  content_class: community_social
-  selection_policy:
-    mode: community_recent
-    max_age_days: 7
   default_limit: 5
 - id: deepseek_api_news_rsshub
   name: DeepSeek API News via RSSHub
@@ -2404,20 +1080,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: api_news
-  quality_weight: 0.95
-  source_role: official
-  spam_risk: low
-  content_class: official_model_company
-  selection_policy:
-    mode: first_party_recent
-    max_age_days: 30
-  default_limit: 12
-  tier: p1
-  topic_scopes:
-  - model_product
-  - industry_infrastructure
-  primary_eligible: true
+  default_limit: 10
 - id: anthropic_news_rsshub
   name: Anthropic News via RSSHub
   transport: rsshub
@@ -2429,16 +1092,7 @@ sources:
     format: rss
     adapter: generic
   source_group: official_blog
-  source_subtype: anthropic
-  tier: p1
-  topic_scopes:
-  - model_product
-  primary_eligible: true
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 30
-  default_limit: 6
+  default_limit: 10
 - id: anthropic_research_rsshub
   name: Anthropic Research via RSSHub
   transport: rsshub
@@ -2450,15 +1104,6 @@ sources:
     format: rss
     adapter: generic
   source_group: official_research
-  source_subtype: anthropic
-  tier: p1
-  topic_scopes:
-  - research
-  primary_eligible: true
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 30
   default_limit: 6
 - id: anthropic_engineering_rsshub
   name: Anthropic Engineering via RSSHub
@@ -2471,16 +1116,6 @@ sources:
     format: rss
     adapter: generic
   source_group: official_research
-  source_subtype: anthropic
-  tier: p1
-  topic_scopes:
-  - industry_infrastructure
-  - model_product
-  primary_eligible: true
-  content_class: official_model_company
-  selection_policy:
-    mode: official_recent
-    max_age_days: 30
   default_limit: 6
 - id: mistral_news_disabled
   name: Mistral News (disabled placeholder)

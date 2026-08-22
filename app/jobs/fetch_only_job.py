@@ -109,8 +109,6 @@ def _serialize_diagnostic_item(source: SourceSpec, item: FetchItem) -> dict[str,
         "source_name": source.name,
         "source_transport": source.transport,
         "source_group": source.source_group,
-        "source_subtype": source.source_subtype,
-        "source_role": source.source_role,
         "source_url": source.url,
         "content_class": source.content_class,
     }

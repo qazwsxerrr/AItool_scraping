@@ -32,8 +32,7 @@ def _seed(session_factory, rows: list[tuple[str, int]]) -> tuple[int, dict[str, 
         repo = IntelRepository(session)
         session.add(Source(
             id="downstream-source", name="Source", transport="feed", url="https://source.example/feed.xml",
-            source_group="official_blog", source_role="official", primary_eligible=True,
-            content_class="official_model_company",
+            source_group="official_blog", content_class="official_model_company",
         ))
         session.flush()
         _, build = repo.start_daily_build(edition_date="2026-08-15", reference_time=REFERENCE)

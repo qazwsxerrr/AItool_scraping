@@ -4,6 +4,7 @@ import sqlite3
 
 import pytest
 
+from app.ai.skills.stage_c_agent.client import StageCAgentClient
 from app.ai.skills.stage_d_selection.client import StageDSelectionClient
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, init_db
@@ -44,12 +45,12 @@ def test_settings_read_stage_b_analysis_min_score(monkeypatch):
     assert settings.ai_analysis_min_score == 72
 
 
-def test_settings_stage_b_analysis_min_score_defaults_to_60(monkeypatch):
+def test_settings_stage_b_analysis_min_score_defaults_to_70(monkeypatch):
     monkeypatch.delenv("AI_ANALYSIS_MIN_SCORE", raising=False)
 
     settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
 
-    assert settings.ai_analysis_min_score == 60
+    assert settings.ai_analysis_min_score == 70
 
 
 def test_settings_stage_d_reuses_ai_review_configuration(monkeypatch):
@@ -71,6 +72,7 @@ def test_settings_stage_d_reuses_ai_review_configuration(monkeypatch):
 def test_settings_read_stage_c_agent_budgets_and_trusted_domains(monkeypatch):
     values = {
         "AI_STAGE_B_RESERVE_LIMIT": "17",
+        "AI_STAGE_C_TIMEOUT_SECONDS": "240",
         "AI_STAGE_C_AGENT_MAX_TURNS": "96",
         "AI_STAGE_C_AGENT_MAX_TOOL_CALLS": "480",
         "AI_STAGE_C_AGENT_MAX_WEB_SEARCHES": "64",
@@ -80,6 +82,7 @@ def test_settings_read_stage_c_agent_budgets_and_trusted_domains(monkeypatch):
         monkeypatch.setenv(name, value)
     settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
     assert settings.stage_b_reserve_limit == 17
+    assert settings.stage_c_timeout_seconds == 240
     assert settings.stage_c_agent_max_turns == 96
     assert settings.stage_c_agent_max_tool_calls == 480
     assert settings.stage_c_agent_max_web_searches == 64
@@ -88,6 +91,7 @@ def test_settings_read_stage_c_agent_budgets_and_trusted_domains(monkeypatch):
 
 def test_settings_stage_c_agent_budget_defaults(monkeypatch):
     for name in (
+        "AI_STAGE_C_TIMEOUT_SECONDS",
         "AI_STAGE_C_AGENT_MAX_TURNS",
         "AI_STAGE_C_AGENT_MAX_TOOL_CALLS",
         "AI_STAGE_C_AGENT_MAX_WEB_SEARCHES",
@@ -96,9 +100,16 @@ def test_settings_stage_c_agent_budget_defaults(monkeypatch):
 
     settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
 
+    assert settings.stage_c_timeout_seconds == 120
     assert settings.stage_c_agent_max_turns == 32
     assert settings.stage_c_agent_max_tool_calls == 120
     assert settings.stage_c_agent_max_web_searches == 16
+
+
+def test_stage_c_client_uses_its_dedicated_timeout():
+    client = StageCAgentClient.from_settings(Settings(stage_c_timeout_seconds=180))
+
+    assert client.timeout_seconds == 180
 
 
 def test_settings_can_disable_stage_c_web_search(monkeypatch):

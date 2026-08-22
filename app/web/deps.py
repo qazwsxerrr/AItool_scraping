@@ -68,18 +68,6 @@ _SOURCE_GROUP_LABELS = {
     "x_search": "X 搜索",
 }
 _TRANSPORT_LABELS = {"feed": "RSS/Atom", "rsshub": "RSSHub", "github": "GitHub"}
-_TIER_LABELS = {"p1": "一级来源", "p2": "二级来源", "p3": "社区来源", "p4": "发现线索"}
-_ROLE_LABELS = {
-    "official": "官方发布",
-    "community": "社区",
-    "social": "社交媒体",
-    "social_search": "社交搜索",
-    "forum": "论坛",
-    "code_hosting": "代码托管",
-    "launch_platform": "产品发布平台",
-    "news_media": "媒体",
-    "search": "搜索发现",
-}
 _STATUS_LABELS = {
     "new": "待处理",
     "candidate": "候选事件",
@@ -114,18 +102,6 @@ def transport_label(value: str | None) -> str:
     return _TRANSPORT_LABELS.get(value, value)
 
 
-def tier_label(value: str | None) -> str:
-    if not value:
-        return "未分级"
-    return _TIER_LABELS.get(value, value)
-
-
-def source_role_label(value: str | None) -> str:
-    if not value:
-        return "未标注角色"
-    return _ROLE_LABELS.get(value, value.replace("_", " "))
-
-
 def topic_label(value: str | None) -> str:
     if not value:
         return "未分类"
@@ -142,8 +118,6 @@ templates.env.filters["content_class_label"] = content_class_label
 templates.env.filters["status_label"] = status_label
 templates.env.filters["source_group_label"] = source_group_label
 templates.env.filters["transport_label"] = transport_label
-templates.env.filters["tier_label"] = tier_label
-templates.env.filters["source_role_label"] = source_role_label
 templates.env.filters["topic_label"] = topic_label
 templates.env.globals["current_date"] = current_date
 

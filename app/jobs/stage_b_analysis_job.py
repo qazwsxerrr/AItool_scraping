@@ -794,18 +794,12 @@ def _admission_identity(item: IntelItem) -> str:
 
 def _admission_sort_key(value: tuple[IntelItem, int]) -> tuple[int, int, float, int]:
     item, score = value
-    source = item.source
-    role = str(getattr(source, "source_role", "") or "").casefold()
     source_rank = {
-        "official": 0,
-        "first_party_official": 0,
-        "publisher": 1,
+        "official_model_company": 0,
+        "project_tool": 1,
         "news_media": 2,
-        "analysis": 3,
-        "code_hosting": 4,
-        "community": 5,
-        "social": 6,
-    }.get(role, 7)
+        "community_social": 3,
+    }.get(str(item.content_class or "").casefold(), 4)
     timestamp = item.published_at or item.captured_at
     return (-int(score), source_rank, -(timestamp.timestamp() if timestamp is not None else 0.0), int(item.id))
 

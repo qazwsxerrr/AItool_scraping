@@ -137,18 +137,18 @@ def build_daily_build_summary(
     fetch_metadata = stages_by_name.get("fetch").metadata_dict if stages_by_name.get("fetch") else {}
     fetched = _as_nonnegative_int(fetch_metadata.get("fetched")) or frozen
     inserted = _as_nonnegative_int(fetch_metadata.get("inserted")) or frozen
-    within_72h = screen_task_count - sum(
+    within_stage_a_window = screen_task_count - sum(
         1 for task in screen_tasks if task.status == "skipped"
     )
     scope_items = frozen
     if not screen_task_count:
-        within_72h = max(0, scope_items - time_excluded)
+        within_stage_a_window = max(0, scope_items - time_excluded)
 
     funnel = {
         "fetched": fetched,
         "inserted": inserted,
         "frozen": frozen,
-        "within_72h": max(0, within_72h),
+        "within_stage_a_window": max(0, within_stage_a_window),
         "time_excluded": time_excluded,
         "time_excluded_by_reason": time_excluded_by_reason,
         "stage_a_pass": stage_a_pass,
@@ -241,7 +241,14 @@ def _stage_details(
         window_hours = metadata.get("freshness_window_hours", metadata.get("window_hours"))
         if window_hours is not None:
             details["window_hours"] = _as_nonnegative_int(window_hours)
-        for key in ("cutoff_at", "reference_time", "freshness_policy"):
+        for key in (
+            "cutoff_at",
+            "reference_time",
+            "freshness_policy",
+            "freshness_cutoff_mode",
+            "freshness_timezone",
+            "freshness_edition_date",
+        ):
             if metadata.get(key) is not None:
                 details[key] = metadata[key]
         freshness_counts = metadata.get("freshness_counts")

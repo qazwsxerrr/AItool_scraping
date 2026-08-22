@@ -57,6 +57,7 @@ class Settings:
     ai_review_concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY
     ai_review_categories: tuple[str, ...] = DEFAULT_AI_REVIEW_CATEGORIES
     stage_b_reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT
+    stage_c_timeout_seconds: float = 120.0
     stage_c_agent_max_turns: int = DEFAULT_STAGE_C_AGENT_MAX_TURNS
     stage_c_agent_max_tool_calls: int = DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS
     stage_c_agent_max_web_searches: int = DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES
@@ -97,6 +98,7 @@ class Settings:
             stage_b_reserve_limit=_positive_int(
                 os.getenv("AI_STAGE_B_RESERVE_LIMIT"), DEFAULT_STAGE_B_RESERVE_LIMIT, maximum=100
             ),
+            stage_c_timeout_seconds=float(os.getenv("AI_STAGE_C_TIMEOUT_SECONDS", "120")),
             stage_c_agent_max_turns=_positive_int(
                 os.getenv("AI_STAGE_C_AGENT_MAX_TURNS"), DEFAULT_STAGE_C_AGENT_MAX_TURNS, maximum=None
             ),

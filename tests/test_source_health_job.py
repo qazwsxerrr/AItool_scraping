@@ -29,7 +29,7 @@ def test_source_health_persists_failure_backoff_and_success_reset(tmp_path):
 
     with session_factory() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(_source(), policy=_source())
+        repo.upsert_source(_source())
         repo.update_source_health(
             "health_test",
             success=False,

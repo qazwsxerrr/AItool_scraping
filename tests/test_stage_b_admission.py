@@ -4,7 +4,7 @@ import json
 from datetime import date, datetime, timezone
 
 from app.domain.models import FetchItem
-from app.jobs.stage_b_analysis_job import materialize_stage_b_admission
+from app.jobs.stage_b_analysis_job import _admission_sort_key, materialize_stage_b_admission
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import AIItemReview, DailyEdition, IntelItem, Source
 from app.storage.repository import IntelRepository
@@ -19,13 +19,25 @@ def _db():
     return create_session_factory(engine)
 
 
+def test_b_admission_tie_break_uses_content_class_without_tier_or_role():
+    official = IntelItem(
+        id=1, build_id=1, source_id="official", title="Official", content_hash="a",
+        content_class="official_model_company", captured_at=NOW,
+    )
+    community = IntelItem(
+        id=2, build_id=1, source_id="community", title="Community", content_hash="b",
+        content_class="community_social", captured_at=NOW,
+    )
+
+    assert _admission_sort_key((official, 80)) < _admission_sort_key((community, 80))
+
+
 def _seed_analysis(session_factory, rows: list[tuple[str, int, str]]) -> tuple[int, dict[str, int]]:
     with session_factory() as session:
         repo = IntelRepository(session)
         session.add(Source(
             id="b-source", name="B source", transport="feed", url="https://b.example/feed.xml",
-            source_group="official_blog", source_role="official", primary_eligible=True,
-            content_class="official_model_company",
+            source_group="official_blog", content_class="official_model_company",
         ))
         session.flush()
         _, run = repo.start_daily_build(edition_date="2026-08-20", reference_time=NOW)
@@ -102,7 +114,7 @@ def test_b_admission_uses_calibrated_dynamic_target_after_fourteen_editions():
     assert len(result.reserve_ids) == 10
 
 
-def test_b_admission_rejects_high_total_score_when_direct_ai_relevance_is_low():
+def test_b_admission_rejects_high_total_score_when_ai_subject_relevance_is_below_gate():
     session_factory = _db()
     run_id, ids = _seed_analysis(
         session_factory,
@@ -116,7 +128,7 @@ def test_b_admission_rejects_high_total_score_when_direct_ai_relevance_is_low():
         assert review is not None
         review.score_components_json = json.dumps(
             {
-                "audience_relevance": 20,
+                "audience_relevance": 64,
                 "material_change": 100,
                 "impact_scope": 100,
                 "independent_news_value": 100,

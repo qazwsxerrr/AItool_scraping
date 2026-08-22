@@ -8,7 +8,12 @@ from app.jobs.fetch_job import run_intel_fetch_job
 from app.jobs.fetch_only_job import run_fetch_only_job
 
 
-def _source(source_id: str, *, group: str = "official_blog") -> SourceSpec:
+def _source(
+    source_id: str,
+    *,
+    group: str = "official_blog",
+    default_limit: int = 30,
+) -> SourceSpec:
     return SourceSpec(
         id=source_id,
         name=source_id.replace("_", " ").title(),
@@ -16,11 +21,8 @@ def _source(source_id: str, *, group: str = "official_blog") -> SourceSpec:
         url=f"https://example.test/{source_id}.xml",
         feed={"format": "rss", "adapter": "generic"},
         source_group=group,
-        source_subtype="fixed_news",
-        tier="p1" if group == "official_blog" else "p4",
-        source_role="official" if group == "official_blog" else "social",
-        content_class="official_model_company" if group == "official_blog" else "community_social",
         fetch_interval=1,
+        default_limit=default_limit,
     )
 
 
@@ -28,12 +30,45 @@ class _Router:
     def __init__(self, batches):
         self.batches = batches
         self.calls = []
+        self.limits = []
         self.request_headers = []
 
     def collect(self, source, limit, request_headers=None):
         self.calls.append(source.id)
+        self.limits.append(limit)
         self.request_headers.append(dict(request_headers or {}))
         return self.batches[source.id]
+
+
+def test_fetch_uses_registry_limits_unless_manually_overridden():
+    research = _source("research", default_limit=6)
+    executive = _source("executive", default_limit=20)
+    batches = {
+        source.id: FetchBatch(source=source, items=[], http_status=200, transport="httpx")
+        for source in (research, executive)
+    }
+
+    registry_router = _Router(batches)
+    run_intel_fetch_job(
+        session_factory=None,
+        sources=[research, executive],
+        router=registry_router,
+        limit_per_source=None,
+        force=True,
+        dry_run=True,
+    )
+    override_router = _Router(batches)
+    run_intel_fetch_job(
+        session_factory=None,
+        sources=[research, executive],
+        router=override_router,
+        limit_per_source=30,
+        force=True,
+        dry_run=True,
+    )
+
+    assert registry_router.limits == [6, 20]
+    assert override_router.limits == [30, 30]
 
 
 def test_fetch_only_exports_diagnostic_rows_without_database_writes(tmp_path):

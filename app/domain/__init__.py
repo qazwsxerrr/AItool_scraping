@@ -1,4 +1,4 @@
-"""Pure domain objects and selection policies for the intelligence pipeline."""
+"""Pure domain objects for the intelligence pipeline."""
 
 from .models import (
     COMMUNITY_SOCIAL,
@@ -17,20 +17,12 @@ from .models import (
     GitHubMode,
     GitHubOptions,
     GitHubSort,
-    SelectionDecision,
-    SelectionPolicy,
     SourceSpec,
     SourceTransport,
     Transport,
     TrendingPeriod,
+    content_class_for_source,
 )
-from .policies import (
-    classify_source,
-    selection_decision,
-    should_select,
-    source_spec_from_config,
-)
-from .scoring import score_item
 
 __all__ = [
     "COMMUNITY_SOCIAL",
@@ -49,15 +41,9 @@ __all__ = [
     "GitHubMode",
     "GitHubOptions",
     "GitHubSort",
-    "SelectionDecision",
-    "SelectionPolicy",
     "SourceSpec",
     "SourceTransport",
     "Transport",
     "TrendingPeriod",
-    "classify_source",
-    "selection_decision",
-    "should_select",
-    "source_spec_from_config",
-    "score_item",
+    "content_class_for_source",
 ]

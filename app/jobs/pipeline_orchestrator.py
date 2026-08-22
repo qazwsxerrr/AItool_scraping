@@ -580,7 +580,7 @@ def start_pipeline_run_from_settings(
             scope={
                 "fetch_limit": limit,
                 "reference_time": datetime.now(timezone.utc).isoformat(),
-                **recent_window_scope(),
+                **recent_window_scope(edition_date=normalized_edition),
             },
         )
         session.commit()

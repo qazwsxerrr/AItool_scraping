@@ -30,9 +30,6 @@ def _source() -> SourceSpec:
         url="https://example.test/feed.xml",
         feed={"format": "rss", "adapter": "generic"},
         source_group="official_blog",
-        source_subtype="fixed_news",
-        source_role="official",
-        content_class="official_model_company",
     )
 
 
@@ -40,7 +37,7 @@ def _run_with_items(session_factory, titles: list[str]) -> tuple[SourceSpec, int
     source = _source()
     with session_factory() as session:
         repo = IntelRepository(session)
-        repo.upsert_source(source, policy=source)
+        repo.upsert_source(source)
         reference_time = datetime(2026, 8, 16, 12, tzinfo=timezone.utc)
         _, run = repo.start_daily_build(edition_date="2026-08-16", reference_time=reference_time)
         for index, title in enumerate(titles, 1):

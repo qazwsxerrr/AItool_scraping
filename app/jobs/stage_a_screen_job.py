@@ -13,7 +13,7 @@ import logging
 from uuid import uuid4
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 import httpx
@@ -31,13 +31,15 @@ from app.config.limits import (
     DEFAULT_AI_REVIEW_LIMIT,
     DEFAULT_AI_REVIEW_CONCURRENCY,
     DEFAULT_AI_SCREEN_REJECT_THRESHOLD,
-    RECENT_WINDOW_HOURS,
 )
 from app.domain.models import SourceSpec
 from app.domain.recency import (
-    FRESHNESS_POLICY_VERSION,
+    STAGE_A_FRESHNESS_CUTOFF_MODE,
+    STAGE_A_FRESHNESS_POLICY_VERSION,
+    STAGE_A_FRESHNESS_TIMEZONE,
     RecentWindowDecision,
-    recent_window_decision,
+    stage_a_cutoff_at,
+    stage_a_time_decision,
 )
 from app.jobs.provider_retry import ProviderResponseFailure, ProviderRetryExhausted, call_with_provider_retries
 from app.storage.models import IntelItem, IntelRun, IntelRunStageTask
@@ -60,6 +62,7 @@ class StageAScreenResult:
     partial_reason: str | None = None
     item_ids: list[int] = field(default_factory=list)
     eligible_item_ids: list[int] = field(default_factory=list)
+    edition_date: str | None = None
     reference_time: datetime | None = None
     cutoff_at: datetime | None = None
     errors: list[str] = field(default_factory=list)
@@ -143,7 +146,15 @@ def run_stage_a_screen_job(
     # request.  A malformed nested schema must fail fast for the whole stage.
     preflight_intel_triage_schemas()
 
-    effective_run_id, all_contexts, time_filtered, eligible_exceeds_limit, reference_time = _prepare_scope(
+    (
+        effective_run_id,
+        all_contexts,
+        time_filtered,
+        eligible_exceeds_limit,
+        edition_date,
+        reference_time,
+        cutoff_at,
+    ) = _prepare_scope(
         session_factory,
         run_id=run_id,
         source_specs=specs,
@@ -154,10 +165,9 @@ def run_stage_a_screen_job(
         now=now,
     )
     result.run_id = effective_run_id
+    result.edition_date = edition_date
     result.reference_time = reference_time
-    result.cutoff_at = _as_utc(reference_time)
-    if result.cutoff_at is not None:
-        result.cutoff_at -= timedelta(hours=RECENT_WINDOW_HOURS)
+    result.cutoff_at = cutoff_at
     result.time_filtered = len(time_filtered)
     for entry in time_filtered:
         result.time_filter_counts[entry.decision.reason] = result.time_filter_counts.get(entry.decision.reason, 0) + 1
@@ -173,8 +183,9 @@ def run_stage_a_screen_job(
         stage="screen",
         model=getattr(ai_client, "model", None),
         reject_threshold=reject_threshold,
-        freshness_window_hours=RECENT_WINDOW_HOURS,
-        freshness_policy=FRESHNESS_POLICY_VERSION,
+        freshness_policy=STAGE_A_FRESHNESS_POLICY_VERSION,
+        freshness_cutoff_mode=STAGE_A_FRESHNESS_CUTOFF_MODE,
+        freshness_timezone=STAGE_A_FRESHNESS_TIMEZONE,
     )
     task_ids_by_item: dict[int, int] = {}
     requested_task_ids = {int(value) for value in task_ids} if task_ids is not None else None
@@ -189,8 +200,11 @@ def run_stage_a_screen_job(
         )
         stage_metadata = {
             "reject_threshold": reject_threshold,
-            "freshness_window_hours": RECENT_WINDOW_HOURS,
-            "freshness_policy": FRESHNESS_POLICY_VERSION,
+            "freshness_window_hours": None,
+            "freshness_policy": STAGE_A_FRESHNESS_POLICY_VERSION,
+            "freshness_cutoff_mode": STAGE_A_FRESHNESS_CUTOFF_MODE,
+            "freshness_timezone": STAGE_A_FRESHNESS_TIMEZONE,
+            "freshness_edition_date": edition_date,
             "reference_time": reference_time.isoformat() if reference_time else None,
             "cutoff_at": result.cutoff_at.isoformat() if result.cutoff_at else None,
             "freshness_counts": dict(result.time_filter_counts),
@@ -467,7 +481,7 @@ def _prepare_scope(
     item_ids: Iterable[int] | None,
     dry_run: bool,
     now: Any | None,
-) -> tuple[int, list[_ItemContext], list[_TimeFilteredItem], bool, datetime | None]:
+) -> tuple[int, list[_ItemContext], list[_TimeFilteredItem], bool, str, datetime, datetime]:
     """Freeze/resolve the item scope and build detached provider envelopes."""
 
     requested_ids = {int(value) for value in item_ids} if item_ids is not None else None
@@ -478,6 +492,9 @@ def _prepare_scope(
             raise ValueError(f"intel run {run_id} does not exist")
         if run.edition_id is None:
             raise ValueError("Stage A requires the current daily edition build")
+        edition_date = run.edition_date
+        if not edition_date:
+            raise ValueError("Stage A requires a valid daily edition date")
         candidates = repo.list_run_items(run_id, role=None)
         if requested_ids is not None:
             candidates = [item for item in candidates if int(item.id) in requested_ids]
@@ -486,7 +503,9 @@ def _prepare_scope(
             candidates,
             source_specs=source_specs,
             reference_time=reference_time,
+            edition_date=edition_date,
         )
+        cutoff_at = stage_a_cutoff_at(edition_date)
         truncated_by_limit = limit is not None and len(eligible) > limit
         if dry_run:
             return (
@@ -494,10 +513,12 @@ def _prepare_scope(
                 [_context_from_item(item, source_specs) for item in eligible],
                 filtered,
                 truncated_by_limit,
+                edition_date,
                 reference_time,
+                cutoff_at,
             )
         contexts = [_context_from_item(item, source_specs) for item in eligible]
-        return run_id, contexts, filtered, truncated_by_limit, reference_time
+        return run_id, contexts, filtered, truncated_by_limit, edition_date, reference_time, cutoff_at
 
 
 def _filter_recent_items(
@@ -505,15 +526,17 @@ def _filter_recent_items(
     *,
     source_specs: Mapping[str, SourceSpec],
     reference_time: datetime,
+    edition_date: str,
 ) -> tuple[list[IntelItem], list[_TimeFilteredItem]]:
     eligible: list[IntelItem] = []
     filtered: list[_TimeFilteredItem] = []
     for item in candidates:
         source_spec = source_specs.get(item.source_id) or _spec_from_row(item.source)
-        decision = recent_window_decision(
+        decision = stage_a_time_decision(
             item,
             source=source_spec,
             reference_time=reference_time,
+            edition_date=edition_date,
         )
         if decision.eligible:
             eligible.append(item)
@@ -834,10 +857,7 @@ def _item_to_envelope(item: IntelItem, spec: SourceSpec) -> RawIntelEnvelope:
         source_id=item.source_id,
         source_name=source.name if source is not None else spec.name,
         source_group=spec.source_group or (source.source_group if source is not None else None),
-        source_subtype=spec.source_subtype or (source.source_subtype if source is not None else None),
-        source_role=spec.source_role or (source.source_role if source is not None else None),
-        source_tier=spec.tier or (source.tier if source is not None else None),
-        source_content_class=spec.content_class or item.content_class or "community_social",
+        source_content_class=spec.content_class,
         external_id=item.external_id,
         content_hash=item.content_hash,
         title=item.title,
@@ -866,12 +886,7 @@ def _spec_from_row(row: Any) -> SourceSpec:
         "fetch_interval": row.fetch_interval,
         "default_limit": row.default_limit,
         "source_group": row.source_group,
-        "source_subtype": row.source_subtype,
-        "source_role": row.source_role,
-        "spam_risk": row.spam_risk,
-        "quality_weight": row.quality_weight,
         "content_class": row.content_class,
-        "selection_policy": _json_dict(row.selection_policy_json),
     }
     if row.transport in {"feed", "rsshub"}:
         data["feed"] = {"format": row.feed_format or "rss", "adapter": row.feed_adapter or "generic"}
@@ -901,12 +916,18 @@ def _config_fingerprint(
     reject_threshold: int,
     freshness_window_hours: int | None = None,
     freshness_policy: str | None = None,
+    freshness_cutoff_mode: str | None = None,
+    freshness_timezone: str | None = None,
 ) -> str:
     payload = {"stage": stage, "model": str(model or ""), "reject_threshold": int(reject_threshold)}
     if freshness_window_hours is not None:
         payload["freshness_window_hours"] = int(freshness_window_hours)
     if freshness_policy:
         payload["freshness_policy"] = freshness_policy
+    if freshness_cutoff_mode:
+        payload["freshness_cutoff_mode"] = freshness_cutoff_mode
+    if freshness_timezone:
+        payload["freshness_timezone"] = freshness_timezone
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 

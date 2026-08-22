@@ -136,9 +136,6 @@ class RawIntelEnvelope(BaseModel):
     source_id: str = Field(min_length=1)
     source_name: str | None = None
     source_group: str | None = None
-    source_subtype: str | None = None
-    source_role: str | None = None
-    source_tier: str | None = None
     source_content_class: ContentClass = COMMUNITY_SOCIAL
     external_id: str | None = None
     guid: str | None = None
@@ -194,7 +191,7 @@ class RawIntelEnvelope(BaseModel):
         data["raw_payload"] = dict(data.get("raw_payload") or {})
         return data
 
-    @field_validator("source_name", "source_group", "source_subtype", "source_role", "source_tier", "external_id", "guid", "content_hash", "author", "language", "kind", mode="before")
+    @field_validator("source_name", "source_group", "external_id", "guid", "content_hash", "author", "language", "kind", mode="before")
     @classmethod
     def _clean_optional_strings(cls, value: Any) -> str | None:
         text = normalize_text(value, preserve_newlines=False)

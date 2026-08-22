@@ -4,34 +4,10 @@ import json
 from datetime import date
 
 from app.domain.models import FetchItem, SourceSpec
-from app.domain.policies import should_select
 from app.github.report import render_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import IntelItem
 from app.storage.repository import IntelRepository
-
-
-def test_github_trending_policy_requires_period_star_signal():
-    source = SourceSpec(
-        id="github_trending_weekly_native",
-        name="GitHub Trending Weekly",
-        transport="github",
-        url="https://github.com/trending?since=weekly",
-        github={"mode": "trending", "period": "weekly"},
-        source_subtype="trending_weekly",
-        content_class="project_tool",
-        selection_policy={"mode": "github_trending"},
-    )
-    selected = FetchItem(
-        source_id=source.id,
-        title="GitHub repo: owner/tool",
-        url="https://github.com/owner/tool",
-        metrics={"stars": 1200, "stars_since": 250},
-    )
-    missing = selected.model_copy(update={"metrics": {"stars": 1200}})
-
-    assert should_select(selected, source)
-    assert not should_select(missing, source)
 
 
 def test_github_metrics_merge_preserves_daily_weekly_and_search_signals(tmp_path):
@@ -47,9 +23,6 @@ def test_github_metrics_merge_preserves_daily_weekly_and_search_signals(tmp_path
             url="https://github.com/trending?since=daily",
             github={"mode": "trending", "period": "daily"},
             source_group="github",
-            source_subtype="trending_daily",
-            content_class="project_tool",
-            selection_policy={"mode": "github_trending"},
         ),
         SourceSpec(
             id="github_trending_weekly_native",
@@ -58,9 +31,6 @@ def test_github_metrics_merge_preserves_daily_weekly_and_search_signals(tmp_path
             url="https://github.com/trending?since=weekly",
             github={"mode": "trending", "period": "weekly"},
             source_group="github",
-            source_subtype="trending_weekly",
-            content_class="project_tool",
-            selection_policy={"mode": "github_trending"},
         ),
         SourceSpec(
             id="github_search_topic_llm",
@@ -69,9 +39,6 @@ def test_github_metrics_merge_preserves_daily_weekly_and_search_signals(tmp_path
             url="https://api.github.com/search/repositories",
             github={"mode": "search", "query": "topic:llm", "pushed_days": 7},
             source_group="github",
-            source_subtype="search_repositories",
-            content_class="project_tool",
-            selection_policy={"mode": "github_active_high_star", "pushed_days": 7, "min_stars": 100},
         ),
     ]
     with session_factory() as session:
@@ -134,9 +101,6 @@ def test_github_search_and_trending_rows_remain_separate_source_observations(tmp
         url="https://github.com/trending?since=weekly",
         github={"mode": "trending", "period": "weekly"},
         source_group="github",
-        source_subtype="trending_weekly",
-        content_class="project_tool",
-        selection_policy={"mode": "github_trending"},
     )
     search = SourceSpec(
         id="github_search_topic_llm",
@@ -145,9 +109,6 @@ def test_github_search_and_trending_rows_remain_separate_source_observations(tmp
         url="https://api.github.com/search/repositories",
         github={"mode": "search", "query": "topic:llm", "pushed_days": 7},
         source_group="github",
-        source_subtype="search_repositories",
-        content_class="project_tool",
-        selection_policy={"mode": "github_active_high_star", "pushed_days": 7, "min_stars": 100},
     )
     with session_factory() as session:
         repo = IntelRepository(session)
@@ -200,9 +161,6 @@ def test_github_enrichment_persists_readme_and_does_not_expose_metrics_as_readme
         url="https://api.github.com/search/repositories",
         github={"mode": "search", "query": "topic:llm", "pushed_days": 7},
         source_group="github",
-        source_subtype="search_repositories",
-        content_class="project_tool",
-        selection_policy={"mode": "github_active_high_star", "pushed_days": 7, "min_stars": 100},
     )
     with session_factory() as session:
         repo = IntelRepository(session)

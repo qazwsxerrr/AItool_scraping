@@ -119,8 +119,7 @@ def run_intel_fetch_job(
         with session_factory() as session:
             repo = IntelRepository(session)
             for spec in selected:
-                policy = spec
-                source_row = repo.upsert_source(spec, policy=policy)
+                source_row = repo.upsert_source(spec)
                 latest = session.scalars(
                     select(FetchAttempt)
                     .where(FetchAttempt.source_id == spec.id)
@@ -176,12 +175,8 @@ def run_intel_fetch_job(
             # turn it into a 304-only audit attempt and leave no item
             # membership for the forced pipeline scope.
             request_headers = {} if force else _conditional_headers(source_row if not dry_run else None)
-            # The orchestration default is a uniform 30 items per source.
-            # Registry ``default_limit`` remains available to callers that
-            # pass an explicit value, but ``None`` must not silently fall back
-            # to a smaller source-specific cap.
             effective_limit = (
-                DEFAULT_FETCH_LIMIT_PER_SOURCE
+                spec.default_limit
                 if limit_per_source is None
                 else max(1, int(limit_per_source))
             )
