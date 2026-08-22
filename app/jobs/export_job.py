@@ -674,14 +674,14 @@ def _markdown(
                         f"display_score=`{record.get('display_score')}` | topic=`{record.get('topic')}`"
                     ),
                     (
-                        f"- 类别：`{record.get('content_class')}` | 来源组：`{record.get('source_group') or '-'}`"
+                        f"- 类别：`{record.get('content_class')}` | 来源：{_primary_source_markdown(record)}"
                         f" | 状态：`selected`"
                     ),
                     _event_time_line(record),
                     f"- 摘要：{record.get('summary_cn') or record.get('summary') or '暂无摘要'}",
                     f"- 选稿依据：{record.get('reason') or '未记录'}",
                     f"- 风险：{', '.join(record.get('risk_flags') or []) or '无'}",
-                    f"- 链接：{record.get('url') or '无'}",
+                    _related_links_markdown_line(record),
                     _verification_markdown_line(record),
                     "",
                 ]
@@ -701,6 +701,85 @@ def _event_time_line(record: dict[str, Any]) -> str:
         f"- 时间：published_at=`{record.get('published_at') or '-'}` | "
         f"basis=`{freshness.get('time_basis') or '-'}` | age=`{age_text}`"
     )
+
+
+def _source_refs(record: dict[str, Any]) -> list[dict[str, Any]]:
+    refs = record.get("source_refs")
+    return [ref for ref in refs if isinstance(ref, dict)] if isinstance(refs, list) else []
+
+
+def _primary_source_ref(refs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next((ref for ref in refs if bool(ref.get("is_primary"))), refs[0] if refs else None)
+
+
+def _source_name(ref: dict[str, Any] | None, record: dict[str, Any]) -> str:
+    if ref is not None:
+        for key in ("source_name", "source_id"):
+            value = str(ref.get(key) or "").strip()
+            if value:
+                return value
+    source_ids = record.get("source_ids")
+    if isinstance(source_ids, list):
+        for value in source_ids:
+            text = str(value or "").strip()
+            if text:
+                return text
+    return "未标注来源"
+
+
+def _source_url(ref: dict[str, Any] | None, record: dict[str, Any], *, fallback_to_record: bool = False) -> str:
+    if ref is not None:
+        value = str(ref.get("source_url") or "").strip()
+        if value:
+            return value
+    if fallback_to_record:
+        return str(record.get("url") or record.get("canonical_url") or "").strip()
+    return ""
+
+
+def _markdown_link(label: str, url: str) -> str:
+    safe_label = label.replace("[", "\\[").replace("]", "\\]")
+    return f"[{safe_label}]({url})" if url else safe_label
+
+
+def _primary_source_markdown(record: dict[str, Any]) -> str:
+    refs = _source_refs(record)
+    primary = _primary_source_ref(refs)
+    return _markdown_link(_source_name(primary, record), _source_url(primary, record, fallback_to_record=True))
+
+
+def _related_source_label(ref: dict[str, Any], record: dict[str, Any], *, duplicate_name: bool) -> str:
+    name = _source_name(ref, record)
+    title = " ".join(str(ref.get("title") or "").split())
+    if not duplicate_name or not title or title == name:
+        return name
+    return f"{name}：{title[:100]}{'…' if len(title) > 100 else ''}"
+
+
+def _related_links_markdown_line(record: dict[str, Any]) -> str:
+    refs = _source_refs(record)
+    primary = _primary_source_ref(refs)
+    candidates: list[tuple[dict[str, Any], str, str]] = []
+    seen_urls: set[str] = set()
+    for ref in refs:
+        if ref is primary:
+            continue
+        url = _source_url(ref, record)
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        candidates.append((ref, url, _source_name(ref, record)))
+    if not candidates:
+        return "- 相关链接：无"
+    name_counts = Counter(name for _, _, name in candidates)
+    links = [
+        _markdown_link(
+            _related_source_label(ref, record, duplicate_name=name_counts[name] > 1),
+            url,
+        )
+        for ref, url, name in candidates
+    ]
+    return "- 相关链接：" + "；".join(links)
 
 
 def _verification_refs(event: IntelEvent) -> list[dict[str, Any]]:

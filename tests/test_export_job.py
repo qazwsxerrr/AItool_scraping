@@ -7,7 +7,7 @@ import pytest
 
 from app.ai.skills.stage_d_selection import STAGE_D_SELECTION_SCHEMA_VERSION
 from app.domain.models import FetchItem
-from app.jobs.export_job import _verification_markdown_line, run_intel_export_job
+from app.jobs.export_job import _markdown, _verification_markdown_line, run_intel_export_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import AIItemReview, IntelItem, Source
 from app.storage.repository import IntelRepository
@@ -186,6 +186,8 @@ def test_export_uses_stage_d_order_but_stage_c_content(tmp_path):
     assert "Stage C 标题 2" not in digest
     assert "观察" not in digest
     assert "选稿依据：影响范围最大。" in digest
+    assert "来源：[Export source](https://example.test/export-1)" in digest
+    assert "来源组：" not in digest
     assert not (tmp_path / "public-intel" / "daily" / "2026-08-19").exists()
 
 
@@ -251,3 +253,45 @@ def test_markdown_never_labels_needs_review_evidence_as_verified():
 
     assert "核验来源：[已核验页面](https://verify.example/confirmed)" in line
     assert "待人工核验链接：[待复核页面](https://verify.example/review)（needs_review）" in line
+
+
+def test_markdown_shows_primary_source_and_secondary_sources_as_related_links():
+    markdown = _markdown(
+        [
+            {
+                "record_type": "intel_event",
+                "event_id": 1,
+                "display_order": 1,
+                "display_score": 90,
+                "title": "同一事件的多来源报道",
+                "topic": "model_release",
+                "content_class": "official_model_company",
+                "summary_cn": "摘要",
+                "reason": "选稿依据",
+                "risk_flags": [],
+                "url": "https://primary.example/article",
+                "source_refs": [
+                    {
+                        "source_id": "primary",
+                        "source_name": "主来源",
+                        "source_url": "https://primary.example/article",
+                        "title": "主来源文章",
+                        "is_primary": True,
+                    },
+                    {
+                        "source_id": "secondary",
+                        "source_name": "补充来源",
+                        "source_url": "https://secondary.example/article",
+                        "title": "补充报道",
+                        "is_primary": False,
+                    },
+                ],
+                "verification_refs": [],
+            }
+        ]
+    )
+
+    assert "来源：[主来源](https://primary.example/article)" in markdown
+    assert "来源组：" not in markdown
+    assert "相关链接：[补充来源](https://secondary.example/article)" in markdown
+    assert "相关链接：[主来源]" not in markdown

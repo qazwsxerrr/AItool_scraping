@@ -29,6 +29,7 @@ from app.ai.skills.intel_triage import (
     strict_parse_analysis,
 )
 from app.config.limits import (
+    DEFAULT_AI_AUDIENCE_RELEVANCE_MIN,
     DEFAULT_AI_ANALYSIS_MIN_SCORE,
     DEFAULT_AI_REVIEW_CONCURRENCY,
     DEFAULT_AI_REVIEW_LIMIT,
@@ -192,6 +193,7 @@ def run_stage_b_analysis_job(
             force=stage_force if existing_stage is not None else False,
             metadata={
                 "analysis_min_score": min_score,
+                "audience_relevance_min": DEFAULT_AI_AUDIENCE_RELEVANCE_MIN,
             },
         )
         # An admission is a complete run-level projection.  Never let C read
@@ -573,6 +575,10 @@ def materialize_stage_b_admission(
     """
 
     threshold = _bounded_score(min_score, DEFAULT_AI_ANALYSIS_MIN_SCORE)
+    audience_threshold = _bounded_score(
+        DEFAULT_AI_AUDIENCE_RELEVANCE_MIN,
+        DEFAULT_AI_AUDIENCE_RELEVANCE_MIN,
+    )
     reserve_cap = _bounded_positive(reserve_limit, DEFAULT_STAGE_B_RESERVE_LIMIT, maximum=100)
     with session_factory() as session:
         repo = IntelRepository(session)
@@ -605,6 +611,15 @@ def materialize_stage_b_admission(
             score = _bounded_score(review.b1_priority, 0)
             if item.status == "analysis_filtered":
                 filtered[item_id] = ("analysis_structural_invalid", "Stage B output failed structural guard", score)
+            elif (
+                (audience_relevance := _review_audience_relevance(review)) is not None
+                and audience_relevance < audience_threshold
+            ):
+                filtered[item_id] = (
+                    "below_ai_relevance_threshold",
+                    f"audience relevance {audience_relevance} is below {audience_threshold}",
+                    score,
+                )
             elif score < threshold:
                 filtered[item_id] = ("below_score_threshold", f"guarded score {score} is below {threshold}", score)
             else:
@@ -614,12 +629,14 @@ def materialize_stage_b_admission(
         policy_payload = {
             "version": STAGE_B_ADMISSION_POLICY_VERSION,
             "min_score": threshold,
+            "min_audience_relevance": audience_threshold,
             "target": target,
             "reserve_limit": reserve_cap,
             "items": [
                 {
                     "id": int(item.id),
                     "score": score,
+                    "audience_relevance": _review_audience_relevance(item.ai_review),
                     "identity": _admission_identity(item),
                     "topic": item.ai_review.topic if item.ai_review is not None else None,
                 }
@@ -660,7 +677,7 @@ def materialize_stage_b_admission(
                     "rank": rank,
                     "guarded_score": score,
                     "reason_code": "admitted_ranked",
-                    "reason": "Passed deterministic B score gate and active diversity budget",
+                    "reason": "Passed deterministic B AI-relevance and score gates and active diversity budget",
                     "policy_version": STAGE_B_ADMISSION_POLICY_VERSION,
                     "policy_fingerprint": policy_fingerprint,
                 }
@@ -673,7 +690,7 @@ def materialize_stage_b_admission(
                     "rank": rank,
                     "guarded_score": score,
                     "reason_code": "reserve_or_duplicate_support",
-                    "reason": "Kept for C-agent inspection without consuming the active budget",
+                    "reason": "Passed deterministic B AI-relevance and score gates; kept for C-agent inspection without consuming the active budget",
                     "policy_version": STAGE_B_ADMISSION_POLICY_VERSION,
                     "policy_fingerprint": policy_fingerprint,
                 }
@@ -1077,6 +1094,25 @@ def _bounded_score(value: Any, default: int) -> int:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError):
         return default
+
+
+def _review_audience_relevance(review: Any) -> int | None:
+    """Read B1's direct-AI relevance component without changing old rows.
+
+    Older locally seeded/replayed reviews may not have score components.  A
+    missing component is left untouched for backward compatibility; newly
+    produced structured B1 reviews always carry it and therefore receive the
+    deterministic relevance gate in :func:`materialize_stage_b_admission`.
+    """
+
+    components = getattr(review, "score_components", None)
+    if not isinstance(components, Mapping) or "audience_relevance" not in components:
+        return None
+    value = components.get("audience_relevance")
+    try:
+        return max(0, min(100, int(float(value))))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _bounded_positive(value: Any, default: int, *, maximum: int) -> int:

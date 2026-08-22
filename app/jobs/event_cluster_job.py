@@ -1,8 +1,9 @@
 """Stage C: stateful Responses agent for event-level aggregation.
 
 Unlike the removed batch prompt, this job gives the model a bounded workbench
-and durable tools.  The model investigates on demand; deterministic code owns
-score admission, coverage validation, persistence, and downstream contracts.
+and durable tools. The model aggregates, researches material uncertainty, and
+keeps unresolved claims auditable; deterministic code owns score admission,
+coverage validation, persistence, and downstream contracts.
 """
 
 from __future__ import annotations
@@ -64,6 +65,7 @@ DAILY_HISTORY_DAYS = DEFAULT_STAGE_C_AGENT_HISTORY_DAYS
 STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_agent_candidates_v1"
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
 _PRIMARY_POLICY_VERSION = "source_then_b1_priority_v2"
+_VERIFICATION_POLICY_VERSION = "research_before_needs_review_v1"
 
 
 class StageCDownstreamBusyError(RuntimeError):
@@ -226,10 +228,11 @@ def run_event_cluster_job(
             config_fingerprint=config_fingerprint,
             reference_time=current,
             metadata={
-                "aggregation_mode": "responses_agent_tools_v2",
+                "aggregation_mode": "responses_agent_tools_v3",
                 "agent_version": STAGE_C_AGENT_VERSION,
                 "prompt_version": STAGE_C_AGENT_PROMPT_VERSION,
                 "candidate_contract_version": STAGE_C_CANDIDATE_CONTRACT_VERSION,
+                "verification_policy": _VERIFICATION_POLICY_VERSION,
                 "history_days": DAILY_HISTORY_DAYS,
                 "max_turns": max_turns,
                 "max_tool_calls": max_tool_calls,
@@ -335,6 +338,7 @@ def run_event_cluster_job(
                 admissions=admissions,
                 history=history,
                 allowed_domains=allowed_domains,
+                max_web_searches=max_web_searches,
             )
 
             def on_response(turn: int, response: Mapping[str, Any]) -> None:
@@ -377,7 +381,10 @@ def run_event_cluster_job(
                         "active_candidate_count": len(admissions["active"]),
                         "reserve_candidate_count": len(admissions["reserve"]),
                         "history_window_days": DAILY_HISTORY_DAYS,
-                        "instructions": "Use tools to investigate and call finalize_event_drafts only after all active candidates are covered.",
+                        "instructions": (
+                            "Use tools to aggregate the active candidates. Research material uncertainty with hosted web search "
+                            "before retaining an event as needs_review, then finalize after all active candidates are covered."
+                        ),
                     },
                     function_tools=tools.function_tools,
                     allowed_domains=allowed_domains,
@@ -508,6 +515,7 @@ class _StageCAgentTools:
         admissions: Mapping[str, Sequence[IntelCandidateAdmission]],
         history: Sequence[Mapping[str, Any]],
         allowed_domains: Sequence[str],
+        max_web_searches: int,
     ) -> None:
         self.session = session
         self.repo = repo
@@ -515,6 +523,7 @@ class _StageCAgentTools:
         self.agent_session = agent_session
         self.history = list(history)
         self.allowed_domains = set(allowed_domains)
+        self.max_web_searches = max_web_searches
         self.web_search_observed_urls: set[str] = set()
         self.web_search_calls_seen = 0
         self.admissions = {key: list(value) for key, value in admissions.items()}
@@ -567,6 +576,7 @@ class _StageCAgentTools:
                     "novelty_status": draft.novelty_status,
                     "review_state": draft.review_state,
                     "confidence": int(draft.confidence),
+                    "risk_flags": _json_strings(draft.risk_flags_json),
                 }
                 for draft in drafts
             ],
@@ -732,8 +742,37 @@ class _StageCAgentTools:
     def finalize_event_drafts(self, args: dict[str, Any]) -> Mapping[str, Any]:
         del args
         validation = _validate_agent_drafts(self.repo, self.agent_session, self.active_ids)
-        if validation["errors"]:
-            return {"ok": False, "errors": validation["errors"], "missing_active_ids": validation["missing_active_ids"]}
+        review_drafts = [
+            draft
+            for draft in self.repo.list_agent_drafts(int(self.agent_session.id))
+            if str(draft.review_state or "").casefold() == "needs_review"
+        ]
+        verification_pending = bool(review_drafts and self.max_web_searches > 0 and self.web_search_calls_seen == 0)
+        errors = list(validation["errors"])
+        if verification_pending:
+            errors.append("needs_review drafts require a hosted web verification pass before finalization")
+        if errors:
+            return {
+                "ok": False,
+                "errors": errors,
+                "missing_active_ids": validation["missing_active_ids"],
+                "verification_pending": [
+                    {
+                        "draft_key": draft.draft_key,
+                        "title": draft.title,
+                        "risk_flags": _json_strings(draft.risk_flags_json),
+                    }
+                    for draft in review_drafts
+                ]
+                if verification_pending
+                else [],
+                "next_action": (
+                    "Use hosted web search for unresolved central claims, record returned sources, and revise the draft. "
+                    "Keep needs_review only when the research pass still cannot resolve it."
+                    if verification_pending
+                    else None
+                ),
+            }
         self.agent_session.finalization_requested = True
         self.agent_session.status = "finalizing"
         self.session.commit()
@@ -1194,6 +1233,7 @@ def _stage_c_config_fingerprint(
         "prompt_version": STAGE_C_AGENT_PROMPT_VERSION,
         "candidate_contract_version": STAGE_C_CANDIDATE_CONTRACT_VERSION,
         "primary_policy_version": _PRIMARY_POLICY_VERSION,
+        "verification_policy_version": _VERIFICATION_POLICY_VERSION,
         "model": model,
         "max_turns": max_turns,
         "max_tool_calls": max_tool_calls,

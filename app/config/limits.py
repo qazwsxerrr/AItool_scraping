@@ -12,19 +12,25 @@ DEFAULT_AI_SCREEN_REJECT_THRESHOLD = 90
 DEFAULT_AI_ANALYSIS_MIN_SCORE = 60
 """Minimum deterministic Stage-B score admitted to the C-agent workbench."""
 
+DEFAULT_AI_AUDIENCE_RELEVANCE_MIN = 60
+"""Minimum direct AI relevance required before a B1 item can enter C."""
+
 DEFAULT_STAGE_B_ACTIVE_TARGET = 100
 DEFAULT_STAGE_B_ACTIVE_MIN = 60
 DEFAULT_STAGE_B_ACTIVE_MAX = 120
 DEFAULT_STAGE_B_RESERVE_LIMIT = 20
-STAGE_B_ADMISSION_POLICY_VERSION = "stage_b_admission_v1"
+STAGE_B_ADMISSION_POLICY_VERSION = "stage_b_admission_v2"
 
 DEFAULT_AI_REVIEW_CONCURRENCY = 4
 """Maximum concurrent provider calls for Stage A or Stage B."""
 
-STAGE_C_AGENT_VERSION = "stage_c_agent_v3"
-DEFAULT_STAGE_C_AGENT_MAX_TURNS = 24
-DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS = 80
-DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES = 8
+STAGE_C_AGENT_VERSION = "stage_c_agent_v5"
+# These are deliberately roomy defaults for the stateful verification flow.
+# Operators can configure a larger value when a run needs it; web search uses
+# 0 as its explicit disable switch.
+DEFAULT_STAGE_C_AGENT_MAX_TURNS = 32
+DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS = 120
+DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES = 16
 DEFAULT_STAGE_C_AGENT_HISTORY_DAYS = 3
 
 DEFAULT_DAILY_REPORT_LIMIT = 30
@@ -36,6 +42,7 @@ RECENT_WINDOW_HOURS = 72
 
 __all__ = [
     "DEFAULT_AI_ANALYSIS_MIN_SCORE",
+    "DEFAULT_AI_AUDIENCE_RELEVANCE_MIN",
     "DEFAULT_AI_REVIEW_CONCURRENCY",
     "DEFAULT_AI_REVIEW_LIMIT",
     "DEFAULT_AI_SCREEN_REJECT_THRESHOLD",

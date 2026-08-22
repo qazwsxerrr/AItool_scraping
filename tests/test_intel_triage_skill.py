@@ -255,6 +255,14 @@ def test_analysis_keeps_source_metadata_out_of_the_b1_result_and_prompt_is_minim
     assert "low_information、insufficient_content" in screen_instructions
 
 
+def test_stage_a_prompt_uses_source_independent_positive_scope_evidence():
+    instructions = build_screen_provider_payload(envelope())["input"][0]["content"]
+
+    assert "通过标准由三项正向证据组成" in instructions
+    assert "AI 模型、推理、智能体" in instructions
+    assert "所有来源使用同一内容标准" in instructions
+
+
 def test_payloads_are_stage_specific_and_responses_only():
     item = envelope()
     screen = build_screen_provider_payload(item)

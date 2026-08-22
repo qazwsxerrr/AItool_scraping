@@ -229,6 +229,71 @@ class _InvalidCoverageAgent:
         return AgentRunResult("invalid-response", 1, 1, 0, False, {"id": "invalid-response", "output": []})
 
 
+class _ReviewFlowAgent:
+    model = "stage-c-review-flow-fixture"
+    transport = "responses"
+
+    def __init__(self, *, unresolved: bool = False) -> None:
+        self.unresolved = unresolved
+        self.first_finalize: dict[str, Any] | None = None
+
+    def run(self, *, function_tools, on_response, on_tool, **_kwargs):
+        tools = {tool.name: tool for tool in function_tools}
+        calls = 0
+
+        def invoke(turn: int, name: str, arguments: Mapping[str, Any]):
+            nonlocal calls
+            calls += 1
+            call = {"name": name, "call_id": f"review-{calls}", "arguments": json.dumps(arguments)}
+            result = dict(tools[name].handler(dict(arguments)))
+            on_tool(turn, call, result)
+            return result
+
+        on_response(1, {"id": "review-initial", "output": []})
+        page = invoke(1, "list_candidates", {"bucket": "active", "offset": 0, "limit": 30})
+        item = page["items"][0]
+        draft = {
+            "draft_key": f"review-{item['id']}",
+            "item_ids": [item["id"]],
+            "title": item["title"],
+            "summary_cn": item.get("summary_cn") or item["title"],
+            "topic": item.get("topic") or "technology_insight",
+            "topics": [item.get("topic") or "technology_insight"],
+            "keywords": item.get("keywords") or [],
+            "entities": item.get("entities") or [],
+            "novelty_status": "new",
+            "prior_event_key": None,
+            "review_state": "needs_review",
+            "confidence": 80,
+            "risk_flags": ["claim_requires_confirmation"],
+        }
+        assert invoke(1, "save_event_drafts", {"drafts": [draft]})["ok"] is True
+        self.first_finalize = invoke(1, "finalize_event_drafts", {})
+        assert self.first_finalize["ok"] is False
+
+        source_action = {"sources": []} if self.unresolved else {"sources": [{"url": "https://source.example/verified"}]}
+        on_response(2, {"id": "review-search", "output": [{"type": "web_search_call", "action": source_action}]})
+        if not self.unresolved:
+            evidence = invoke(
+                2,
+                "record_verification_evidence",
+                {
+                    "draft_key": draft["draft_key"],
+                    "url": "https://source.example/verified",
+                    "title": "Verification source",
+                    "excerpt": "The source confirms the launch.",
+                    "claim": "确认发布动作",
+                },
+            )
+            assert evidence["status"] == "verified"
+            draft["review_state"] = "candidate"
+            draft["risk_flags"] = []
+            saved = invoke(2, "save_event_drafts", {"drafts": [draft]})
+            assert saved["ok"] is True, saved
+        assert invoke(2, "finalize_event_drafts", {})["ok"] is True
+        return AgentRunResult("review-search", 2, calls, 1, True, {"id": "review-search", "output": []})
+
+
 def test_stage_c_agent_reads_b_workbench_and_materializes_events():
     session_factory = _db()
     run_id, item_ids = _seed_build(
@@ -340,6 +405,50 @@ def test_stage_c_marks_unbound_web_evidence_and_event_for_review_when_provider_o
         assert event is not None
         assert event.review_state == "needs_review"
         assert "unbound_web_evidence" in json.loads(event.risk_flags_json)
+
+
+def test_stage_c_researches_needs_review_before_promoting_a_candidate():
+    session_factory = _db()
+    run_id, _ = _seed_build(session_factory, rows=[("需核验的发布", 90, "active")])
+    agent = _ReviewFlowAgent()
+
+    result = run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=agent,
+        reference_time=NOW,
+    )
+
+    assert agent.first_finalize is not None
+    assert "needs_review drafts require a hosted web verification pass before finalization" in agent.first_finalize["errors"]
+    assert result.web_searches == 1
+    with session_factory() as session:
+        event = session.scalar(select(IntelEvent).where(IntelEvent.build_id == run_id))
+        evidence = session.scalars(select(IntelEventEvidence)).all()
+        assert event is not None
+        assert event.review_state == "candidate"
+        assert [row.status for row in evidence] == ["verified"]
+
+
+def test_stage_c_keeps_needs_review_after_an_unresolved_research_pass():
+    session_factory = _db()
+    run_id, _ = _seed_build(session_factory, rows=[("无法核验的发布", 90, "active")])
+    agent = _ReviewFlowAgent(unresolved=True)
+
+    result = run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=agent,
+        reference_time=NOW,
+    )
+
+    assert agent.first_finalize is not None
+    assert result.unresolved == 1
+    assert result.web_searches == 1
+    with session_factory() as session:
+        event = session.scalar(select(IntelEvent).where(IntelEvent.build_id == run_id))
+        assert event is not None
+        assert event.review_state == "needs_review"
 
 
 def test_stage_c_batches_one_hundred_active_candidates_within_agent_tool_budget():

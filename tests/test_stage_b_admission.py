@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 
 from app.domain.models import FetchItem
@@ -99,3 +100,38 @@ def test_b_admission_uses_calibrated_dynamic_target_after_fourteen_editions():
     assert result.target == 60
     assert len(result.active_ids) == 60
     assert len(result.reserve_ids) == 10
+
+
+def test_b_admission_rejects_high_total_score_when_direct_ai_relevance_is_low():
+    session_factory = _db()
+    run_id, ids = _seed_analysis(
+        session_factory,
+        [
+            ("generic cloud update", 95, "https://b.example/cloud"),
+            ("direct model release", 80, "https://b.example/model"),
+        ],
+    )
+    with session_factory() as session:
+        review = session.get(AIItemReview, ids["generic cloud update"])
+        assert review is not None
+        review.score_components_json = json.dumps(
+            {
+                "audience_relevance": 20,
+                "material_change": 100,
+                "impact_scope": 100,
+                "independent_news_value": 100,
+                "specificity": 100,
+            }
+        )
+        session.commit()
+
+    result = materialize_stage_b_admission(session_factory=session_factory, run_id=run_id, min_score=60)
+
+    assert result is not None
+    assert ids["generic cloud update"] not in result.active_ids
+    assert ids["generic cloud update"] not in result.reserve_ids
+    with session_factory() as session:
+        rows = IntelRepository(session).list_candidate_admissions(run_id)
+        row = next(item for item in rows if item.item_id == ids["generic cloud update"])
+        assert row.decision == "filtered"
+        assert row.reason_code == "below_ai_relevance_threshold"

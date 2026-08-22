@@ -98,13 +98,13 @@ class Settings:
                 os.getenv("AI_STAGE_B_RESERVE_LIMIT"), DEFAULT_STAGE_B_RESERVE_LIMIT, maximum=100
             ),
             stage_c_agent_max_turns=_positive_int(
-                os.getenv("AI_STAGE_C_AGENT_MAX_TURNS"), DEFAULT_STAGE_C_AGENT_MAX_TURNS, maximum=64
+                os.getenv("AI_STAGE_C_AGENT_MAX_TURNS"), DEFAULT_STAGE_C_AGENT_MAX_TURNS, maximum=None
             ),
             stage_c_agent_max_tool_calls=_positive_int(
-                os.getenv("AI_STAGE_C_AGENT_MAX_TOOL_CALLS"), DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS, maximum=200
+                os.getenv("AI_STAGE_C_AGENT_MAX_TOOL_CALLS"), DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS, maximum=None
             ),
             stage_c_agent_max_web_searches=_nonnegative_int(
-                os.getenv("AI_STAGE_C_AGENT_MAX_WEB_SEARCHES"), DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES, maximum=50
+                os.getenv("AI_STAGE_C_AGENT_MAX_WEB_SEARCHES"), DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES, maximum=None
             ),
             stage_c_trusted_domains=trusted_domains,
         )
@@ -133,20 +133,20 @@ def _bounded_int(value: str | None, default: int) -> int:
         return default
 
 
-def _positive_int(value: str | None, default: int, *, maximum: int) -> int:
+def _positive_int(value: str | None, default: int, *, maximum: int | None) -> int:
     try:
         parsed = int(str(value).strip()) if value is not None else default
     except (TypeError, ValueError):
         parsed = default
-    return max(1, min(maximum, parsed))
+    return max(1, min(maximum, parsed)) if maximum is not None else max(1, parsed)
 
 
-def _nonnegative_int(value: str | None, default: int, *, maximum: int) -> int:
+def _nonnegative_int(value: str | None, default: int, *, maximum: int | None) -> int:
     try:
         parsed = int(str(value).strip()) if value is not None else default
     except (TypeError, ValueError):
         parsed = default
-    return max(0, min(maximum, parsed))
+    return max(0, min(maximum, parsed)) if maximum is not None else max(0, parsed)
 
 
 def _parse_domains(value: str | None) -> tuple[str, ...]:

@@ -71,19 +71,34 @@ def test_settings_stage_d_reuses_ai_review_configuration(monkeypatch):
 def test_settings_read_stage_c_agent_budgets_and_trusted_domains(monkeypatch):
     values = {
         "AI_STAGE_B_RESERVE_LIMIT": "17",
-        "AI_STAGE_C_AGENT_MAX_TURNS": "18",
-        "AI_STAGE_C_AGENT_MAX_TOOL_CALLS": "44",
-        "AI_STAGE_C_AGENT_MAX_WEB_SEARCHES": "6",
+        "AI_STAGE_C_AGENT_MAX_TURNS": "96",
+        "AI_STAGE_C_AGENT_MAX_TOOL_CALLS": "480",
+        "AI_STAGE_C_AGENT_MAX_WEB_SEARCHES": "64",
         "AI_STAGE_C_TRUSTED_DOMAINS": "openai.com, docs.anthropic.com",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
     settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
     assert settings.stage_b_reserve_limit == 17
-    assert settings.stage_c_agent_max_turns == 18
-    assert settings.stage_c_agent_max_tool_calls == 44
-    assert settings.stage_c_agent_max_web_searches == 6
+    assert settings.stage_c_agent_max_turns == 96
+    assert settings.stage_c_agent_max_tool_calls == 480
+    assert settings.stage_c_agent_max_web_searches == 64
     assert settings.stage_c_trusted_domains == ("openai.com", "docs.anthropic.com")
+
+
+def test_settings_stage_c_agent_budget_defaults(monkeypatch):
+    for name in (
+        "AI_STAGE_C_AGENT_MAX_TURNS",
+        "AI_STAGE_C_AGENT_MAX_TOOL_CALLS",
+        "AI_STAGE_C_AGENT_MAX_WEB_SEARCHES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
+
+    assert settings.stage_c_agent_max_turns == 32
+    assert settings.stage_c_agent_max_tool_calls == 120
+    assert settings.stage_c_agent_max_web_searches == 16
 
 
 def test_settings_can_disable_stage_c_web_search(monkeypatch):

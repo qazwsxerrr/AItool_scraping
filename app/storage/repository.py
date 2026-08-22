@@ -1259,6 +1259,10 @@ class IntelRepository:
                 raise ValueError(f"item {item_id} is already assigned to another agent draft")
         for relation in list(draft.members):
             self.session.delete(relation)
+        # An agent may revise a persisted draft after a verification pass.
+        # Flush removals before adding its replacement members so SQLite does
+        # not see the same (session_id, item_id) uniqueness key twice.
+        self.session.flush()
         draft.title = _text(title) or "(untitled)"
         draft.summary_cn = _text(summary_cn)
         draft.topic = _text(topic) or "technology_insight"
@@ -1768,7 +1772,10 @@ class IntelRepository:
             and ((input_fingerprint is not None and old_input != row.input_fingerprint)
                  or (config_fingerprint is not None and old_config != row.config_fingerprint))
         )
-        if fingerprint_changed or force:
+        # A newly created stage cannot have tasks to reset yet.  Skipping the
+        # reset until the row exists also keeps ``force=True`` safe when an
+        # upstream rebuild has deleted the old downstream stage row.
+        if (fingerprint_changed or force) and not created:
             self._reset_stage_tasks(row.id, include_succeeded=force or fingerprint_changed)
             row.status = status or "pending"
             row.finished_at = None

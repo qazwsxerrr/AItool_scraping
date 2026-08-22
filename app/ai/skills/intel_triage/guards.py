@@ -56,6 +56,8 @@ SCREEN_HARD_REJECT_REASON_CODES = frozenset(
         "duplicate_without_update",
     }
 )
+
+
 def canonical_screen_reason_code(value: Any) -> str:
     """Normalize a provider reason code for deterministic local policy."""
 
@@ -147,10 +149,10 @@ def apply_analysis_guards(
 def analysis_guard_failure(result: AnalysisResult | Mapping[str, Any]) -> str | None:
     """Return only a true provider/structural failure reason.
 
-    Editorial value and score are deliberately not Stage-B gates.  An empty
-    summary remains structural only after
-    :func:`apply_analysis_guards` had a chance to recover the source summary or
-    title as a fallback.
+    Editorial value is evaluated by the later B admission projection, not as
+    a provider/structural failure here.  An empty summary remains structural
+    only after :func:`apply_analysis_guards` had a chance to recover the source
+    summary or title as a fallback.
     """
 
     parsed = result if isinstance(result, AnalysisResult) else AnalysisResult.model_validate(result)

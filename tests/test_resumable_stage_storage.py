@@ -136,3 +136,22 @@ def test_changed_fingerprint_and_force_reclaim_successful_task(tmp_path):
         repo.complete_stage_task(task, owner="worker-a", result={"version": 2})
         assert repo.claim_stage_task(stage, task_id=task.id, owner="worker-a") is None
         assert repo.claim_stage_task(stage, task_id=task.id, owner="worker-a", force=True) is not None
+
+
+def test_force_can_create_a_new_stage_after_downstream_invalidation(tmp_path):
+    session_factory, _ = _factory(tmp_path)
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        build = _new_draft(repo)
+        stage = repo.ensure_stage(build.id, "stage_d")
+        repo.ensure_stage_task(stage, subject_type="run", subject_id=build.id)
+        repo.invalidate_downstream_stages(
+            build.id,
+            stage_names=("stage_d",),
+            upstream_stage="cluster",
+        )
+
+        recreated = repo.ensure_stage(build.id, "stage_d", force=True)
+
+        assert recreated.id is not None
+        assert repo.get_stage(build.id, "stage_d") is recreated
