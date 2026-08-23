@@ -1,5 +1,6 @@
-version: stage-d-selection-v1
+version: stage-d-editorial-review-v4
 
-# Stage D only selects an ordered subset from Stage C's new/updated candidate
-# event IDs. There is intentionally no minimum.
+# Stage D reviews Stage C's candidate and needs_review events against the daily
+# editorial requirements, then returns only the ordered events worth keeping.
+# There is intentionally no minimum.
 max_selected: 30

@@ -69,14 +69,16 @@ def test_settings_stage_d_reuses_ai_review_configuration(monkeypatch):
     assert client.timeout_seconds >= 120
 
 
-def test_settings_read_stage_c_agent_budgets_and_trusted_domains(monkeypatch):
+def test_settings_read_stage_c_and_d_search_budgets_and_tavily(monkeypatch):
     values = {
         "AI_STAGE_B_RESERVE_LIMIT": "17",
         "AI_STAGE_C_TIMEOUT_SECONDS": "240",
         "AI_STAGE_C_AGENT_MAX_TURNS": "96",
         "AI_STAGE_C_AGENT_MAX_TOOL_CALLS": "480",
         "AI_STAGE_C_AGENT_MAX_WEB_SEARCHES": "64",
-        "AI_STAGE_C_TRUSTED_DOMAINS": "openai.com, docs.anthropic.com",
+        "AI_STAGE_D_MAX_WEB_SEARCHES": "9",
+        "TAVILY_API_KEY": "test-tavily-key",
+        "TAVILY_API_URL": "https://search.example/api",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -86,7 +88,9 @@ def test_settings_read_stage_c_agent_budgets_and_trusted_domains(monkeypatch):
     assert settings.stage_c_agent_max_turns == 96
     assert settings.stage_c_agent_max_tool_calls == 480
     assert settings.stage_c_agent_max_web_searches == 64
-    assert settings.stage_c_trusted_domains == ("openai.com", "docs.anthropic.com")
+    assert settings.stage_d_max_web_searches == 9
+    assert settings.tavily_api_key == "test-tavily-key"
+    assert settings.tavily_api_url == "https://search.example/api"
 
 
 def test_settings_stage_c_agent_budget_defaults(monkeypatch):

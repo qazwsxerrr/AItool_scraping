@@ -246,6 +246,7 @@ def test_analysis_keeps_source_metadata_out_of_the_b1_result_and_prompt_is_minim
     assert "AI 主体相关性" in analysis_instructions
     assert "audience_relevance=45%" in analysis_instructions
     assert "impact_scope=25%" in analysis_instructions
+    assert "只返回 2–4 个" in analysis_instructions
     assert "source_authority" not in analysis_instructions
     assert "tracking_value" not in analysis_instructions
     assert "event_signature" not in analysis_instructions

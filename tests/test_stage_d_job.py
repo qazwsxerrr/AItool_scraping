@@ -1,21 +1,39 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select
 
 from app.ai.skills.stage_d_selection import (
+    STAGE_D_SELECTION_PROMPT_VERSION,
     STAGE_D_SELECTION_SCHEMA_VERSION,
+    STAGE_D_SELECTION_SYSTEM_PROMPT,
+    build_stage_d_provider_payload,
     strict_parse_stage_d_selection,
 )
+from app.ai.tavily import TavilySearchResponse, TavilySearchResult
 from app.jobs.stage_d_job import StageDExecutionError, StageDProfile, run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import IntelEvent, IntelRunStageAttempt
+from app.storage.models import IntelAgentSession, IntelAgentStep, IntelEvent, IntelEventEvidence, IntelRunStageAttempt
 from app.storage.repository import IntelRepository
 
 
 REFERENCE = datetime(2026, 8, 19, 8, tzinfo=timezone.utc)
+
+
+def test_stage_d_prompt_reviews_stage_c_candidates_against_daily_requirements():
+    prompt = STAGE_D_SELECTION_SYSTEM_PROMPT
+
+    assert STAGE_D_SELECTION_PROMPT_VERSION == "stage_d_editorial_review_v2"
+    assert "Stage C 的输出是待审候选，不是入选结论" in prompt
+    assert "只有目标、计划、预测、自我评价或营销表态" in prompt
+    assert "不为凑满数量而保留边缘内容" in prompt
+    assert "`needs_review` 不自动淘汰，也不自动通过" in prompt
+
+    payload = build_stage_d_provider_payload([], max_selected=30)
+    assert payload["input"][0]["content"] == prompt
 
 
 def _db():
@@ -127,6 +145,34 @@ class _SelectionClient:
         }
 
 
+class _SearchClient:
+    is_configured = True
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def search(self, query, *, topic="general", max_results=5, **_kwargs):
+        self.calls.append(query)
+        index = len(self.calls)
+        return TavilySearchResponse(
+            query=query,
+            request_id=f"request-{index}",
+            response_time=0.1,
+            results=(
+                TavilySearchResult(
+                    result_id=f"search-result-{index:03d}",
+                    title=f"核验来源 {index}",
+                    url=f"https://verify.example/{index}",
+                    content="公开来源提供了该事件的核验线索。",
+                    score=0.9,
+                    published_date="2026-08-19",
+                ),
+            ),
+            usage={"credits": 1},
+            raw_response={},
+        )
+
+
 def test_selection_schema_accepts_only_an_ordered_candidate_subset():
     parsed = strict_parse_stage_d_selection(
         {
@@ -236,6 +282,8 @@ def test_empty_stage_c_candidates_finish_without_calling_the_provider():
             "input_fingerprint": task.input_fingerprint,
             "config_fingerprint": task.config_fingerprint,
             "provider_attempts": 0,
+            "web_searches": 0,
+            "agent_session_id": 1,
         }
 
 
@@ -250,8 +298,9 @@ def test_stage_d_persists_only_the_ordered_selection_task_result():
         ai_client=client,
     )
 
+    expected_candidates = [event_ids[2], event_ids[0]]
     assert (result.candidates, result.selected, result.unselected) == (2, 1, 1)
-    assert [row["event_id"] for row in client.calls[0]["events"]] == [event_ids[2], event_ids[0]]
+    assert [row["event_id"] for row in client.calls[0]["events"]] == expected_candidates
     assert client.calls[0]["max_selected"] == 30
     assert "intel_event_stage_d_snapshots" not in inspect(engine).get_table_names()
     with session_factory() as session:
@@ -261,7 +310,7 @@ def test_stage_d_persists_only_the_ordered_selection_task_result():
         tasks = repo.list_stage_tasks(stage, include_expired=True)
         assert len(tasks) == 1
         task = tasks[0]
-        assert task.result["candidate_event_ids"] == [event_ids[2], event_ids[0]]
+        assert task.result["candidate_event_ids"] == expected_candidates
         assert task.result["selected"] == [
             {
                 "event_id": event_ids[0],
@@ -278,6 +327,8 @@ def test_stage_d_persists_only_the_ordered_selection_task_result():
             "input_fingerprint",
             "config_fingerprint",
             "provider_attempts",
+            "web_searches",
+            "agent_session_id",
         }
         event = session.get(IntelEvent, event_ids[0])
         assert event is not None and event.title == "Stage C 标题 0"
@@ -287,7 +338,7 @@ def test_stage_d_persists_only_the_ordered_selection_task_result():
         assert attempts[0].raw_response["schema_version"] == STAGE_D_SELECTION_SCHEMA_VERSION
 
 
-def test_stage_d_withholds_needs_review_events_from_the_provider_and_selection():
+def test_stage_d_sends_needs_review_events_to_the_final_reviewer():
     _engine, session_factory = _db()
     run_id, event_ids = _build(
         session_factory,
@@ -302,17 +353,115 @@ def test_stage_d_withholds_needs_review_events_from_the_provider_and_selection()
         ai_client=client,
     )
 
-    assert (result.candidates, result.withheld_needs_review, result.selected) == (1, 1, 1)
-    assert [row["event_id"] for row in client.calls[0]["events"]] == [event_ids[0]]
+    assert (result.candidates, result.withheld_needs_review, result.selected) == (2, 0, 2)
+    assert [row["event_id"] for row in client.calls[0]["events"]] == event_ids
     with session_factory() as session:
         repo = IntelRepository(session)
         stage = repo.get_stage(run_id, "stage_d")
         assert stage is not None
         task = repo.get_task(stage, subject_type="run", subject_id=run_id)
         assert task is not None
-        assert task.result["candidate_event_ids"] == [event_ids[0]]
-        assert task.result["withheld_needs_review_event_ids"] == [event_ids[1]]
+        assert task.result["candidate_event_ids"] == event_ids
+        assert task.result["withheld_needs_review_event_ids"] == []
         assert task.result["all_stage_c_candidate_event_ids"] == event_ids
+
+
+def test_stage_d_leaves_intent_only_event_judgment_to_the_final_reviewer():
+    _engine, session_factory = _db()
+    run_id, event_ids = _build(session_factory, event_count=2, needs_review_indexes=[0])
+    with session_factory() as session:
+        event = session.get(IntelEvent, event_ids[0])
+        assert event is not None
+        event.risk_flags_json = json.dumps([])
+        event.resolution_raw_json = json.dumps(
+            {
+                "draft_metadata": {
+                    "event_action": "strategy",
+                    "lifecycle_state": "announced",
+                    "substance_status": "concrete",
+                    "substantive_facts": [
+                        {
+                            "fact_type": "organization",
+                            "claim": "公司宣布将优化组织并引进人才。",
+                            "supporting_item_ids": [1],
+                        },
+                        {
+                            "fact_type": "policy",
+                            "claim": "公司将持续投入以提升竞争力。",
+                            "supporting_item_ids": [1],
+                        },
+                    ],
+                }
+            }
+        )
+        session.commit()
+
+    client = _SelectionClient()
+    result = run_stage_d_job(session_factory=session_factory, run_id=run_id, ai_client=client)
+
+    assert (result.candidates, result.selected, result.unselected) == (2, 2, 0)
+    assert [row["event_id"] for row in client.calls[0]["events"]] == event_ids
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        stage = repo.get_stage(run_id, "stage_d")
+        assert stage is not None
+        task = repo.get_task(stage, subject_type="run", subject_id=run_id)
+        assert task is not None
+        assert [row["event_id"] for row in task.result["selected"]] == event_ids
+        attempts = repo.list_stage_attempts(task)
+        assert len(attempts) == 1
+        assert "selection_guard" not in attempts[0].metadata_dict
+
+
+def test_stage_d_tavily_sources_are_passed_to_review_and_persisted_for_audit():
+    _engine, session_factory = _db()
+    run_id, event_ids = _build(session_factory, event_count=2, needs_review_indexes=[1])
+    client = _SelectionClient(selected_indexes=[1])
+    search = _SearchClient()
+
+    result = run_stage_d_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=client,
+        search_client=search,
+        max_web_searches=1,
+    )
+
+    assert result.web_searches == 1
+    assert len(search.calls) == 1
+    reviewed = client.calls[0]["events"]
+    needs_review = next(row for row in reviewed if row["event_id"] == event_ids[1])
+    assert needs_review["search_status"] == "searched"
+    assert needs_review["search_evidence"][0]["url"] == "https://verify.example/1"
+    with session_factory() as session:
+        agent = session.scalar(select(IntelAgentSession).where(IntelAgentSession.stage_name == "stage_d"))
+        assert agent is not None and agent.web_search_count == 1
+        steps = session.scalars(select(IntelAgentStep).where(IntelAgentStep.session_id == agent.id)).all()
+        assert [step.tool_name for step in steps] == ["search_web"]
+        evidence = session.scalars(select(IntelEventEvidence).where(IntelEventEvidence.session_id == agent.id)).all()
+        assert len(evidence) == 1
+        assert evidence[0].event_id == event_ids[1]
+        assert evidence[0].source_scope == "tavily"
+
+
+def test_stage_d_keeps_tavily_audit_when_the_editorial_provider_fails():
+    _engine, session_factory = _db()
+    run_id, _ = _build(session_factory, event_count=1, needs_review_indexes=[0])
+
+    with pytest.raises(StageDExecutionError, match="provider unavailable"):
+        run_stage_d_job(
+            session_factory=session_factory,
+            run_id=run_id,
+            ai_client=_SelectionClient(error=ValueError("provider unavailable")),
+            search_client=_SearchClient(),
+            max_web_searches=1,
+        )
+
+    with session_factory() as session:
+        agent = session.scalar(select(IntelAgentSession).where(IntelAgentSession.stage_name == "stage_d"))
+        assert agent is not None and agent.status == "failed"
+        assert session.scalars(select(IntelAgentStep).where(IntelAgentStep.session_id == agent.id)).all()
+        assert session.scalars(select(IntelEventEvidence).where(IntelEventEvidence.session_id == agent.id)).all()
 
 
 def test_invalid_selection_is_blocked_without_local_fallback():

@@ -90,7 +90,14 @@ def build_daily_build_summary(
             "error": error,
             "details": details,
         }
-        if status in {"failed", "blocked", "partial"} or error is not None:
+        # Fetch source failures are warnings captured in ``details``.  They
+        # remain visible in the manifest but do not become a build failure.
+        fetch_warning = (
+            stage_name == "fetch"
+            and isinstance(details.get("failed_sources"), list)
+            and bool(details.get("failed_sources"))
+        )
+        if (status in {"failed", "blocked", "partial"} or error is not None) and not fetch_warning:
             _append_failure(failure_reasons, stage=stage_name, status=status, error=error)
 
     screen_tasks = tasks_by_stage.get(stages_by_name["screen"].id, []) if "screen" in stages_by_name else []
@@ -167,10 +174,17 @@ def build_daily_build_summary(
         "stage_d_selected": stage_d_selected,
     }
     funnel["full_rebuild_items"] = frozen
+    source_warnings = []
+    fetch_details = stages_payload.get("fetch", {}).get("details", {})
+    if isinstance(fetch_details, dict) and isinstance(fetch_details.get("failed_sources"), list):
+        source_warnings = [
+            dict(row) for row in fetch_details["failed_sources"] if isinstance(row, dict)
+        ]
     return {
         "funnel": funnel,
         "stages": stages_payload,
         "failure_reasons": failure_reasons,
+        "source_warnings": source_warnings,
     }
 
 
@@ -231,11 +245,17 @@ def _stage_details(
         return {}
     metadata = stage.metadata_dict
     if stage_name == "fetch":
-        return {
+        details: dict[str, Any] = {
             key: _as_nonnegative_int(metadata.get(key))
             for key in ("fetched", "inserted", "failed")
             if metadata.get(key) is not None
         }
+        failed_sources = metadata.get("failed_sources")
+        if isinstance(failed_sources, (list, tuple)):
+            details["failed_sources"] = [
+                dict(row) for row in failed_sources if isinstance(row, dict)
+            ]
+        return details
     if stage_name == "screen":
         details: dict[str, Any] = {}
         window_hours = metadata.get("freshness_window_hours", metadata.get("window_hours"))

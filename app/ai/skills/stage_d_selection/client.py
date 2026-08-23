@@ -13,7 +13,11 @@ from app.config.settings import Settings
 
 from .models import StageDSelectionResponse
 from .parser import strict_parse_stage_d_selection
-from .prompts import build_stage_d_provider_payload, preflight_stage_d_selection_schema
+from .prompts import (
+    STAGE_D_SELECTION_PROMPT_VERSION,
+    build_stage_d_provider_payload,
+    preflight_stage_d_selection_schema,
+)
 
 
 MIN_STAGE_D_TIMEOUT_SECONDS = 120.0
@@ -210,7 +214,7 @@ def _request_metadata(
         "event_count": int(event_count),
         "max_selected": int(max_selected),
         "phase": "selection",
-        "prompt_version": "stage_d_selection_v1",
+        "prompt_version": STAGE_D_SELECTION_PROMPT_VERSION,
         "schema_version": "stage_d_selection_v1",
         "request_bytes": len(serialized),
         "request_sha256": digest,

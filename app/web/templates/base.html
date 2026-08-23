@@ -3,45 +3,122 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#101827">
-    <title>{% block title %}AI 热点内容台{% endblock %}</title>
+    <meta name="theme-color" content="#0b0f17">
+    <title>{% block title %}AIHOT — AI 行业动态聚合 · 每日精选与 AI 日报{% endblock %}</title>
+    <script>
+      (function() {
+        try {
+          var t = localStorage.getItem('theme') || 'auto';
+          if (t === 'dark' || (t === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+            document.documentElement.setAttribute('data-theme', 'dark');
+          } else if (t === 'light') {
+            document.documentElement.setAttribute('data-theme', 'light');
+          }
+        } catch (e) {}
+      })();
+    </script>
     <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
   </head>
   <body>
     <header class="topbar">
       <div class="brand-block">
-        <a class="brand" href="/{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}" aria-label="返回首页"><span class="brand-mark">AI</span><span>热点内容台</span></a>
-        <p class="subtitle">抓取 · AI 筛选 · 主题归类 · 来源追溯</p>
+        <a class="brand" href="/{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}" aria-label="返回首页">
+          <span class="brand-mark">AI</span>
+          <span class="brand-text">AIHOT</span>
+        </a>
+        <span class="subtitle">AI 动态聚合 · 精选与日报</span>
       </div>
       <div class="topbar-actions">
         <span class="today-stamp">{{ current_date() }}</span>
+
+        <div class="theme-switcher" role="group" aria-label="主题切换">
+          <button type="button" class="theme-btn" id="theme-btn-auto" onclick="setTheme('auto')" title="跟随系统">A</button>
+          <button type="button" class="theme-btn" id="theme-btn-light" onclick="setTheme('light')" title="浅色模式">
+            <svg class="icon icon-sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="currentColor"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41"/></svg>
+          </button>
+          <button type="button" class="theme-btn" id="theme-btn-dark" onclick="setTheme('dark')" title="深色模式">
+            <svg class="icon icon-sm" viewBox="0 0 24 24"><path fill="currentColor" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          </button>
+        </div>
+
         <form class="top-search" action="/search" method="get">
-        <label class="sr-only" for="top-search-input">搜索情报</label>
+          <label class="sr-only" for="top-search-input">搜索情报</label>
           <span class="search-icon" aria-hidden="true">⌕</span>
           {% if active_edition_date %}<input type="hidden" name="edition_date" value="{{ active_edition_date }}">{% endif %}
-          <input id="top-search-input" name="q" type="search" placeholder="搜索模型、工具、论文…" value="{{ request.query_params.get('q', '') }}">
+          <input id="top-search-input" name="q" type="search" placeholder="搜索模型、产品、论文…" value="{{ request.query_params.get('q', '') }}">
         </form>
       </div>
     </header>
     <div class="shell">
       <nav class="sidebar" aria-label="主导航">
-        <div class="nav-caption">内容</div>
-        <a class="nav-item {{ 'active' if active_nav == 'home' else '' }}" href="/{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">✦</span><span>今日精选</span></a>
-        <a class="nav-item {{ 'active' if active_nav == 'all' else '' }}" href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">▤</span><span>本期精选</span></a>
-        <a class="nav-item {{ 'active' if active_nav == 'search' else '' }}" href="/search{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">⌕</span><span>热点搜索</span></a>
-        <div class="nav-caption">专题</div>
-        <a class="nav-item {{ 'active' if active_nav == 'github' else '' }}" href="/github"><span class="nav-icon">◈</span><span>GitHub 项目</span></a>
-        <a class="nav-item {{ 'active' if active_nav == 'sources' else '' }}" href="/sources"><span class="nav-icon">◎</span><span>来源目录</span></a>
-        <div class="nav-caption">运行</div>
-        <a class="nav-item {{ 'active' if active_nav == 'runs' else '' }}" href="/{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}"><span class="nav-icon">!</span><span>运行状态</span></a>
+        <div class="nav-caption">精选</div>
+        <a class="nav-item {{ 'active' if active_nav == 'home' else '' }}" href="/{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">
+          <span class="nav-icon"><svg class="icon icon-sm" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" fill="none" stroke="currentColor" stroke-width="2"/></svg></span>
+          <span>今日精选</span>
+        </a>
+        <a class="nav-item {{ 'active' if active_nav == 'all' else '' }}" href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">
+          <span class="nav-icon"><svg class="icon icon-sm" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6" stroke="currentColor" stroke-width="2"/><line x1="8" y1="12" x2="21" y2="12" stroke="currentColor" stroke-width="2"/><line x1="8" y1="18" x2="21" y2="18" stroke="currentColor" stroke-width="2"/><line x1="3" y1="6" x2="3.01" y2="6" stroke="currentColor" stroke-width="3"/><line x1="3" y1="12" x2="3.01" y2="12" stroke="currentColor" stroke-width="3"/><line x1="3" y1="18" x2="3.01" y2="18" stroke="currentColor" stroke-width="3"/></svg></span>
+          <span>本期精选</span>
+        </a>
+        <a class="nav-item {{ 'active' if active_nav == 'search' else '' }}" href="/search{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">
+          <span class="nav-icon"><svg class="icon icon-sm" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8" fill="none" stroke="currentColor" stroke-width="2"/><line x1="21" y1="21" x2="16.65" y2="16.65" stroke="currentColor" stroke-width="2"/></svg></span>
+          <span>热点搜索</span>
+        </a>
+        <div class="nav-caption">发现</div>
+        <a class="nav-item {{ 'active' if active_nav == 'github' else '' }}" href="/github">
+          <span class="nav-icon"><svg class="icon icon-sm" viewBox="0 0 24 24"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22" fill="none" stroke="currentColor" stroke-width="2"/></svg></span>
+          <span>GitHub 项目</span>
+        </a>
+        <a class="nav-item {{ 'active' if active_nav == 'sources' else '' }}" href="/sources">
+          <span class="nav-icon"><svg class="icon icon-sm" viewBox="0 0 24 24"><path d="M4 11a9 9 0 0 1 9 9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M4 4a16 16 0 0 1 16 16" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="5" cy="19" r="1" fill="currentColor"/></svg></span>
+          <span>来源目录</span>
+        </a>
+        <div class="nav-caption">系统</div>
+        <a class="nav-item {{ 'active' if active_nav == 'runs' else '' }}" href="/{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">
+          <span class="nav-icon"><svg class="icon icon-sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><line x1="12" y1="8" x2="12" y2="12" stroke="currentColor" stroke-width="2"/><line x1="12" y1="16" x2="12.01" y2="16" stroke="currentColor" stroke-width="2"/></svg></span>
+          <span>运行状态</span>
+        </a>
         <div class="sidebar-note">
           <span class="sidebar-note-dot"></span>
-          <div><strong>本地数据优先</strong><small>页面只读数据库与导出结果</small></div>
+          <div><strong>本地数据优先</strong><small>页面只读 SQLite 快照</small></div>
         </div>
       </nav>
       <main class="content">
         {% block content %}{% endblock %}
       </main>
     </div>
+
+    <script>
+      function setTheme(mode) {
+        try {
+          localStorage.setItem('theme', mode);
+          if (mode === 'dark') {
+            document.documentElement.setAttribute('data-theme', 'dark');
+          } else if (mode === 'light') {
+            document.documentElement.setAttribute('data-theme', 'light');
+          } else {
+            document.documentElement.removeAttribute('data-theme');
+            if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+              document.documentElement.setAttribute('data-theme', 'dark');
+            } else {
+              document.documentElement.setAttribute('data-theme', 'light');
+            }
+          }
+          updateThemeUI(mode);
+        } catch(e) {}
+      }
+      function updateThemeUI(mode) {
+        var current = mode || localStorage.getItem('theme') || 'auto';
+        ['auto', 'light', 'dark'].forEach(function(m) {
+          var btn = document.getElementById('theme-btn-' + m);
+          if (btn) {
+            btn.classList.toggle('active', m === current);
+          }
+        });
+      }
+      document.addEventListener('DOMContentLoaded', function() {
+        updateThemeUI();
+      });
+    </script>
   </body>
 </html>

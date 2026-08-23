@@ -1,29 +1,28 @@
 <article class="card github-card">
   <div class="github-stars" aria-label="GitHub stars">
-    <strong>{{ project.stars }}</strong>
+    <strong>★ {{ project.stars }}</strong>
     <small>stars</small>
   </div>
   <div class="card-body">
-    <div class="card-meta">
-      <span>{{ 'GitHub Trending' if project.trending else 'GitHub Search API' }}</span>
-      {% if project.status %}<span>{{ project.status }}</span>{% endif %}
-      {% if project.primary_language %}<span>{{ project.primary_language }}</span>{% endif %}
-      {% if project.pushed_at %}<span>更新 {{ project.pushed_at | relative_time }}</span>{% endif %}
-      {% if project.trending.weekly %}<span>周榜 #{{ project.trending.weekly.get('rank') }}</span>{% endif %}
-      {% if project.trending.daily %}<span>日榜 #{{ project.trending.daily.get('rank') }}</span>{% endif %}
-      {% if project.latest_release_names %}<span>release {{ project.latest_release_names[0] }}</span>{% endif %}
+    <div class="source-line">
+      <span class="source-avatar">GH</span>
+      <span class="source-name">{{ 'GitHub Trending' if project.trending else 'GitHub Search API' }}</span>
+      {% if project.primary_language %}<span class="source-group">{{ project.primary_language }}</span>{% endif %}
+      {% if project.trending.weekly %}<span class="source-transport">周榜 #{{ project.trending.weekly.get('rank') }}</span>{% endif %}
+      {% if project.trending.daily %}<span class="source-transport">日榜 #{{ project.trending.daily.get('rank') }}</span>{% endif %}
+      {% if project.pushed_at %}<time>更新 {{ project.pushed_at | relative_time }}</time>{% endif %}
     </div>
     <h3>
       {% if project.url %}<a href="{{ project.url }}" target="_blank" rel="noopener noreferrer">{{ project.display_title }}</a>{% else %}{{ project.display_title }}{% endif %}
     </h3>
     {% if project.ai_summary or project.summary %}
-      <p class="github-introduction" title="{{ project.ai_summary or project.summary }}">项目介绍：{{ project.ai_summary or project.summary }}</p>
+      <p class="summary-clamp" title="{{ project.ai_summary or project.summary }}"><strong>项目介绍：</strong>{{ project.ai_summary or project.summary }}</p>
     {% endif %}
     <div class="github-metrics" aria-label="GitHub 项目指标">
-      <span>stars {{ project.stars }}</span>
+      <span>★ stars {{ project.stars }}</span>
       <span>forks {{ project.forks }}</span>
-      {% if project.trending.weekly %}<span>本周新增 {{ project.weekly_stars_since }}</span>{% endif %}
-      {% if project.trending.daily %}<span>今日新增 {{ project.daily_stars_since }}</span>{% endif %}
+      {% if project.trending.weekly %}<span>本周新增 +{{ project.weekly_stars_since }}</span>{% endif %}
+      {% if project.trending.daily %}<span>今日新增 +{{ project.daily_stars_since }}</span>{% endif %}
       <span>watchers {{ project.watchers }}</span>
       <span>issues {{ project.open_issues }}</span>
     </div>

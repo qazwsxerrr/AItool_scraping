@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from app.ai.responses import AgentBudgetExceeded, AgentProtocolError, AgentRunResult
+from app.ai.tavily import TavilySearchResponse, TavilySearchResult
 from app.domain.models import FetchItem
 from app.jobs.event_cluster_job import _primary_sort_key, _stage_c_lease_seconds, run_event_cluster_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
@@ -16,6 +17,36 @@ from app.storage.repository import IntelRepository
 
 
 NOW = datetime(2026, 8, 19, 8, tzinfo=timezone.utc)
+
+
+class _SearchClient:
+    is_configured = True
+
+    def __init__(self, *, url: str = "https://source.example/verified", empty: bool = False) -> None:
+        self.url = url
+        self.empty = empty
+        self.calls: list[dict[str, Any]] = []
+
+    def search(self, query, *, topic="general", max_results=5, **_kwargs):
+        self.calls.append({"query": query, "topic": topic, "max_results": max_results})
+        rows = () if self.empty else (
+            TavilySearchResult(
+                result_id="result-verified-001",
+                title="Verification source",
+                url=self.url,
+                content="The source confirms the launch.",
+                score=0.95,
+                published_date="2026-08-19",
+            ),
+        )
+        return TavilySearchResponse(
+            query=query,
+            request_id="tavily-request-1",
+            response_time=0.1,
+            results=rows,
+            usage={"credits": 1},
+            raw_response={},
+        )
 
 
 def _db():
@@ -133,11 +164,15 @@ class _ToolAgent:
         bad_evidence: bool = False,
         source_less_web: bool = False,
         opened_page_evidence: bool = False,
+        intent_only: bool = False,
+        repeat: bool = False,
     ) -> None:
         self.web_evidence = web_evidence
         self.bad_evidence = bad_evidence
         self.source_less_web = source_less_web
         self.opened_page_evidence = opened_page_evidence
+        self.intent_only = intent_only
+        self.repeat = repeat
         self.contexts: list[dict[str, Any]] = []
 
     def run(self, *, initial_context, function_tools, on_response, on_tool, **_kwargs):
@@ -145,17 +180,6 @@ class _ToolAgent:
         tools = {tool.name: tool for tool in function_tools}
         turn = 1
         output: list[dict[str, Any]] = []
-        if self.web_evidence:
-            output.append(
-                {
-                    "type": "web_search_call",
-                    "action": (
-                        {"type": "open_page", "url": "https://source.example/opened"}
-                        if self.opened_page_evidence
-                        else {} if self.source_less_web else {"sources": [{"url": "https://source.example/verified"}]}
-                    ),
-                }
-            )
         on_response(turn, {"id": "fixture-response", "output": output})
         calls = 0
 
@@ -186,8 +210,21 @@ class _ToolAgent:
                 "topics": [item.get("topic") or "technology_insight"],
                 "keywords": item.get("keywords") or [],
                 "entities": item.get("entities") or [],
-                "novelty_status": "new",
-                "prior_event_key": None,
+                "event_action": "release",
+                "lifecycle_state": "ga",
+                "aggregation_basis": [],
+                "novelty_status": "repeat" if self.repeat else "new",
+                "prior_event_key": f"url:{item['canonical_url']}" if self.repeat else None,
+                "novelty_reason": "当前候选与近三期事件相同且没有实质变化。" if self.repeat else "当前候选未匹配近三期已发布日报。",
+                "material_changes": [],
+                "substance_status": "intent_only" if self.intent_only else "concrete",
+                "substantive_facts": [] if self.intent_only else [
+                    {
+                        "fact_type": "product",
+                        "claim": "候选正文确认产品已正式发布。",
+                        "supporting_item_ids": [item["id"]],
+                    }
+                ],
                 "review_state": "candidate",
                 "confidence": 88,
                 "risk_flags": [],
@@ -198,22 +235,26 @@ class _ToolAgent:
             saved = invoke("save_event_drafts", {"drafts": drafts[offset : offset + 8]})
             assert saved["ok"] is True
         if active and (self.web_evidence or self.bad_evidence):
-            invoke(
-                "record_verification_evidence",
+            searched = invoke(
+                "search_web",
                 {
                     "draft_key": f"draft-{active[0]['id']}",
-                    "url": (
-                        "https://evil.example/not-returned"
-                        if self.bad_evidence
-                        else "https://source.example/opened"
-                        if self.opened_page_evidence
-                        else "https://source.example/verified"
-                    ),
-                    "title": "Verification source",
-                    "excerpt": "The source confirms the launch.",
+                    "query": active[0]["title"],
                     "claim": "确认发布动作",
+                    "topic": "news",
+                    "max_results": 5,
                 },
             )
+            if self.bad_evidence or searched.get("results"):
+                invoke(
+                    "attach_search_evidence",
+                    {
+                        "draft_key": f"draft-{active[0]['id']}",
+                        "result_id": "not-returned-result" if self.bad_evidence else searched["results"][0]["result_id"],
+                        "claim": "确认发布动作",
+                        "verdict": "supports",
+                    },
+                )
         final = invoke("finalize_event_drafts", {})
         assert final["ok"] is True
         return AgentRunResult(
@@ -280,8 +321,21 @@ class _ReviewFlowAgent:
             "topics": [item.get("topic") or "technology_insight"],
             "keywords": item.get("keywords") or [],
             "entities": item.get("entities") or [],
+            "event_action": "release",
+            "lifecycle_state": "ga",
+            "aggregation_basis": [],
             "novelty_status": "new",
             "prior_event_key": None,
+            "novelty_reason": "当前候选未匹配近三期已发布日报。",
+            "material_changes": [],
+            "substance_status": "concrete",
+            "substantive_facts": [
+                {
+                    "fact_type": "product",
+                    "claim": "候选正文确认产品已正式发布。",
+                    "supporting_item_ids": [item["id"]],
+                }
+            ],
             "review_state": "needs_review",
             "confidence": 80,
             "risk_flags": ["claim_requires_confirmation"],
@@ -290,18 +344,27 @@ class _ReviewFlowAgent:
         self.first_finalize = invoke(1, "finalize_event_drafts", {})
         assert self.first_finalize["ok"] is False
 
-        source_action = {"sources": []} if self.unresolved else {"sources": [{"url": "https://source.example/verified"}]}
-        on_response(2, {"id": "review-search", "output": [{"type": "web_search_call", "action": source_action}]})
-        if not self.unresolved:
+        searched = invoke(
+            2,
+            "search_web",
+            {
+                "draft_key": draft["draft_key"],
+                "query": item["title"],
+                "claim": "确认发布动作",
+                "topic": "news",
+                "max_results": 5,
+            },
+        )
+        on_response(2, {"id": "review-search", "output": []})
+        if not self.unresolved and searched.get("results"):
             evidence = invoke(
                 2,
-                "record_verification_evidence",
+                "attach_search_evidence",
                 {
                     "draft_key": draft["draft_key"],
-                    "url": "https://source.example/verified",
-                    "title": "Verification source",
-                    "excerpt": "The source confirms the launch.",
+                    "result_id": searched["results"][0]["result_id"],
                     "claim": "确认发布动作",
+                    "verdict": "supports",
                 },
             )
             assert evidence["status"] == "verified"
@@ -337,6 +400,81 @@ def test_stage_c_agent_reads_b_workbench_and_materializes_events():
         assert agent_session.finalization_requested is True
 
 
+def test_stage_c_rejects_intent_only_event_but_keeps_it_in_the_audit_pool():
+    session_factory = _db()
+    run_id, _ = _seed_build(
+        session_factory,
+        rows=[("Acme 计划提升下一代模型竞争力", 90, "active")],
+    )
+
+    result = run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=_ToolAgent(intent_only=True),
+        reference_time=NOW,
+    )
+
+    assert result.unresolved == 0
+    assert len(result.current_event_ids) == 1
+    assert result.candidate_event_ids == []
+    with session_factory() as session:
+        event = session.scalar(select(IntelEvent).where(IntelEvent.build_id == run_id))
+        assert event is not None
+        assert event.novelty_status == "new"
+        assert event.review_state == "rejected"
+        assert "intent_only_event" in json.loads(event.risk_flags_json)
+        metadata = json.loads(event.resolution_raw_json)["draft_metadata"]
+        assert metadata["substance_status"] == "intent_only"
+        assert metadata["substantive_facts"] == []
+        assert metadata["substance_guard"]["applied_review_state"] == "rejected"
+
+
+def test_stage_c_does_not_send_confirmed_repeat_without_material_change_to_stage_d():
+    session_factory = _db()
+    run_id, _ = _seed_build(
+        session_factory,
+        rows=[("Acme Model 1 发布", 90, "active")],
+    )
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        repo.replace_published_daily_report(
+            edition_date="2026-08-18",
+            records=[
+                {
+                    "event_key": "url:https://source.example/1",
+                    "title": "Acme Model 1 发布",
+                    "url": "https://source.example/1",
+                    "source_ids": ["agent-source"],
+                    "source_refs": [
+                        {
+                            "source_id": "agent-source",
+                            "source_url": "https://source.example/1",
+                            "is_primary": True,
+                        }
+                    ],
+                }
+            ],
+        )
+        session.commit()
+
+    result = run_event_cluster_job(
+        session_factory=session_factory,
+        run_id=run_id,
+        ai_client=_ToolAgent(repeat=True),
+        reference_time=NOW,
+    )
+
+    assert len(result.current_event_ids) == 1
+    assert result.candidate_event_ids == []
+    assert result.repeats == 1
+    with session_factory() as session:
+        event = session.scalar(select(IntelEvent).where(IntelEvent.build_id == run_id))
+        assert event is not None
+        assert event.novelty_status == "repeat"
+        assert event.review_state == "rejected"
+        assert "confirmed_repeat_without_material_change" in json.loads(event.risk_flags_json)
+
+
 def test_stage_c_budget_exhaustion_becomes_needs_review_not_data_loss():
     session_factory = _db()
     run_id, _ = _seed_build(
@@ -353,7 +491,7 @@ def test_stage_c_budget_exhaustion_becomes_needs_review_not_data_loss():
         assert states == ["needs_review", "needs_review"]
 
 
-def test_stage_c_binds_evidence_only_to_hosted_search_sources():
+def test_stage_c_binds_evidence_only_to_tavily_search_results():
     session_factory = _db()
     run_id, _ = _seed_build(session_factory, rows=[("有核验的发布", 90, "active")])
 
@@ -361,6 +499,7 @@ def test_stage_c_binds_evidence_only_to_hosted_search_sources():
         session_factory=session_factory,
         run_id=run_id,
         ai_client=_ToolAgent(web_evidence=True),
+        search_client=_SearchClient(),
         reference_time=NOW,
     )
 
@@ -371,7 +510,7 @@ def test_stage_c_binds_evidence_only_to_hosted_search_sources():
         assert evidence[0].event_id is not None
 
 
-def test_stage_c_binds_evidence_to_a_page_opened_by_hosted_search():
+def test_stage_c_binds_evidence_to_the_exact_tavily_result_url():
     session_factory = _db()
     run_id, _ = _seed_build(session_factory, rows=[("打开页面后核验", 90, "active")])
 
@@ -379,6 +518,7 @@ def test_stage_c_binds_evidence_to_a_page_opened_by_hosted_search():
         session_factory=session_factory,
         run_id=run_id,
         ai_client=_ToolAgent(web_evidence=True, opened_page_evidence=True),
+        search_client=_SearchClient(url="https://source.example/opened"),
         reference_time=NOW,
     )
 
@@ -397,6 +537,7 @@ def test_stage_c_rejects_unreturned_evidence_url_without_failing_aggregation():
         session_factory=session_factory,
         run_id=run_id,
         ai_client=_ToolAgent(bad_evidence=True),
+        search_client=_SearchClient(),
         reference_time=NOW,
     )
 
@@ -405,7 +546,7 @@ def test_stage_c_rejects_unreturned_evidence_url_without_failing_aggregation():
         assert session.scalars(select(IntelEventEvidence)).all() == []
 
 
-def test_stage_c_marks_unbound_web_evidence_and_event_for_review_when_provider_omits_source_objects():
+def test_stage_c_empty_tavily_results_do_not_create_unbound_evidence():
     session_factory = _db()
     run_id, _ = _seed_build(session_factory, rows=[("无来源列表的核验", 90, "active")])
 
@@ -413,17 +554,16 @@ def test_stage_c_marks_unbound_web_evidence_and_event_for_review_when_provider_o
         session_factory=session_factory,
         run_id=run_id,
         ai_client=_ToolAgent(web_evidence=True, source_less_web=True),
+        search_client=_SearchClient(empty=True),
         reference_time=NOW,
     )
 
     with session_factory() as session:
         evidence = session.scalars(select(IntelEventEvidence)).all()
-        assert len(evidence) == 1
-        assert evidence[0].status == "needs_review"
+        assert evidence == []
         event = session.scalar(select(IntelEvent).where(IntelEvent.build_id == run_id))
         assert event is not None
-        assert event.review_state == "needs_review"
-        assert "unbound_web_evidence" in json.loads(event.risk_flags_json)
+        assert event.review_state == "candidate"
 
 
 def test_stage_c_researches_needs_review_before_promoting_a_candidate():
@@ -435,11 +575,12 @@ def test_stage_c_researches_needs_review_before_promoting_a_candidate():
         session_factory=session_factory,
         run_id=run_id,
         ai_client=agent,
+        search_client=_SearchClient(),
         reference_time=NOW,
     )
 
     assert agent.first_finalize is not None
-    assert "needs_review drafts require a hosted web verification pass before finalization" in agent.first_finalize["errors"]
+    assert "each needs_review draft requires its own Tavily verification pass before finalization" in agent.first_finalize["errors"]
     assert result.web_searches == 1
     with session_factory() as session:
         event = session.scalar(select(IntelEvent).where(IntelEvent.build_id == run_id))
@@ -458,6 +599,7 @@ def test_stage_c_keeps_needs_review_after_an_unresolved_research_pass():
         session_factory=session_factory,
         run_id=run_id,
         ai_client=agent,
+        search_client=_SearchClient(empty=True),
         reference_time=NOW,
     )
 

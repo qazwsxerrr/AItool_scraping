@@ -24,7 +24,7 @@ STAGE_B_ADMISSION_POLICY_VERSION = "stage_b_admission_v3"
 DEFAULT_AI_REVIEW_CONCURRENCY = 4
 """Maximum concurrent provider calls for Stage A or Stage B."""
 
-STAGE_C_AGENT_VERSION = "stage_c_agent_v5"
+STAGE_C_AGENT_VERSION = "stage_c_agent_v8"
 # These are deliberately roomy defaults for the stateful verification flow.
 # Operators can configure a larger value when a run needs it; web search uses
 # 0 as its explicit disable switch.
@@ -32,6 +32,7 @@ DEFAULT_STAGE_C_AGENT_MAX_TURNS = 32
 DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS = 120
 DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES = 16
 DEFAULT_STAGE_C_AGENT_HISTORY_DAYS = 3
+DEFAULT_STAGE_D_MAX_WEB_SEARCHES = 6
 
 DEFAULT_DAILY_REPORT_LIMIT = 30
 """Hard maximum number of selected events in one daily report."""
@@ -56,6 +57,7 @@ __all__ = [
     "DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS",
     "DEFAULT_STAGE_C_AGENT_MAX_TURNS",
     "DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES",
+    "DEFAULT_STAGE_D_MAX_WEB_SEARCHES",
     "RECENT_WINDOW_HOURS",
     "STAGE_B_ADMISSION_POLICY_VERSION",
     "STAGE_C_AGENT_VERSION",

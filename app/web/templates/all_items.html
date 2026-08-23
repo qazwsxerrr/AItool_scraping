@@ -1,12 +1,12 @@
 {% extends "base.html" %}
-{% block title %}全部动态 - AI 热点内容台{% endblock %}
+{% block title %}全部 AI 动态 — AIHOT{% endblock %}
 
 {% block content %}
 <section class="page-head">
   <div>
     <p class="eyebrow">DAILY EDITION / SELECTED EVENTS</p>
     <h1>{{ active_edition_date or '当前' }} 日报精选</h1>
-    <p class="muted-text">仅展示当前日报快照的最终入选事件；Stage A/B 排除的原始资讯不会出现在这里。</p>
+    <p class="muted-text">展示当前日报快照中的所有最终入选事件；已被初筛剔除的低质重复内容不会出现在这里。</p>
   </div>
   <a class="button button-quiet" href="/sources">来源目录 →</a>
 </section>
@@ -59,8 +59,8 @@
     </nav>
   {% else %}
     <div class="empty-state">
-      <h3>暂无动态</h3>
-      <p>可以调整日期或筛选条件；原始筛除项仅在内部审计链路中保留。</p>
+      <h3>暂无符合条件的动态</h3>
+      <p>可以调整日期或筛选条件。</p>
     </div>
   {% endif %}
 </section>

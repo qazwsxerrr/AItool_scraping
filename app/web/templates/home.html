@@ -1,37 +1,55 @@
 {% extends "base.html" %}
-{% block title %}今日精选 - AI 热点内容台{% endblock %}
+{% block title %}AIHOT — AI 行业动态聚合 · 每日精选与 AI 日报{% endblock %}
 
 {% block content %}
-<section class="hero-panel">
-  <div class="hero-copy">
+<!-- Editorial Header (Restrained & Direct) -->
+<section class="page-head">
+  <div>
     <p class="eyebrow">AI INTELLIGENCE · {{ stats.edition_date or 'LOCAL EDITION' }}</p>
     <h1>{{ stats.edition_date or '当前' }} 日报精选</h1>
-    <p class="hero-lede">从抓取到 AI 筛选，再到主题归类与来源追溯，把噪声整理成可以快速浏览的 AI 信息流。</p>
-    <div class="hero-actions">
-      <a class="button button-solid" href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">浏览本期精选 <span>→</span></a>
-      <a class="button button-quiet" href="/sources">查看来源目录</a>
-    </div>
-  </div>
-  <div class="hero-status">
-    <div class="status-orb"><span></span></div>
-    <div>
-      <span class="status-kicker">当前日报</span>
-      <strong>{{ stats.edition_date or '尚未发布' }}</strong>
-      <small>{{ stats.status | status_label if stats.status else '等待数据进入' }}</small>
-    </div>
+    <p class="muted-text">每日精选 AI 行业动态：模型发布、产品发布、行业事件、开源热点与编辑洞察。</p>
   </div>
 </section>
 
-<section class="metric-strip" aria-label="数据概览">
-  <div class="metric-card metric-primary"><span>本期发布</span><strong>{{ stats.selected_items }}</strong><small>条最终事件</small></div>
-  <div class="metric-card"><span>本期精选</span><strong>{{ stats.selected_items }}</strong><small>条最终事件</small></div>
-  <div class="metric-card"><span>主题分类</span><strong>{{ stats.category_counts | length }}</strong><small>个活跃类别</small></div>
-  <div class="metric-card"><span>来源渠道</span><strong>{{ stats.source_counts | length }}</strong><small>个来源组</small></div>
-</section>
+<!-- AIHOT Style Compact Hot Ticker Strip (热点榜) -->
+{% set top_cards = [] %}
+{% if grouped_cards %}
+  {% for group in grouped_cards %}
+    {% for card in group.cards %}
+      {% if card.display_score >= 80 %}
+        {% set _ = top_cards.append(card) %}
+      {% endif %}
+    {% endfor %}
+  {% endfor %}
+{% endif %}
 
+{% if top_cards %}
+<section class="hot-ticker-card" aria-label="热点榜">
+  <div class="hot-ticker-head">
+    <h3>
+      <svg class="icon icon-sm" viewBox="0 0 24 24"><path fill="var(--flame)" d="M12 23c-4.97 0-9-3.58-9-8 0-4.19 3.42-7.86 6.54-11.23.53-.57 1.46-.22 1.46.56v1.94c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V3.33c0-.78.93-1.13 1.46-.56C20.58 6.14 24 9.81 24 14c0 4.42-4.03 8-9 8h-3z"/></svg>
+      今日 AI 焦点榜
+    </h3>
+    <a href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">查看完整榜单 ›</a>
+  </div>
+  <div class="hot-ticker-list">
+    {% for card in top_cards[:4] %}
+      <div class="hot-ticker-item">
+        <span class="hot-rank-num top-{{ loop.index }}">{{ loop.index }}</span>
+        <a class="hot-ticker-title" href="/events/{{ card.id }}?{% if active_edition_date %}edition_date={{ active_edition_date }}&amp;{% endif %}origin=home">{{ card.title }}</a>
+        <span class="hot-score-tag">🔥 {{ card.display_score }}</span>
+      </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+<!-- Restrained Category Tabs & Selector Toolbar -->
 <section class="topic-toolbar" aria-label="主题和来源筛选">
   <div class="topic-tabs">
-    <a class="topic-tab {{ 'active' if not category else '' }}" href="/?edition_date={{ active_edition_date or '' }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">全部主题</a>
+    <a class="topic-tab {{ 'active' if not category else '' }}" href="/?edition_date={{ active_edition_date or '' }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">
+      <span>全部</span>
+    </a>
     {% for option in category_options %}
       <a class="topic-tab {{ 'active' if category == option.value else '' }}" href="/?edition_date={{ active_edition_date or '' }}&amp;category={{ option.value }}{% if source_group %}&amp;source_group={{ source_group }}{% endif %}">
         <span>{{ option.value | topic_label }}</span><em>{{ option.count }}</em>
@@ -40,7 +58,7 @@
   </div>
   <form class="compact-select" action="/" method="get">
     {% if category %}<input type="hidden" name="category" value="{{ category }}">{% endif %}
-    <label for="home-edition">日报</label>
+    <label for="home-edition">期数</label>
     <select id="home-edition" name="edition_date" onchange="this.form.submit()">
       {% for option in edition_options %}
         <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}</option>
@@ -56,15 +74,15 @@
   </form>
 </section>
 
-  <div class="content-layout">
+<!-- Content Feed & Secondary Rail -->
+<div class="content-layout">
   <div class="feed-column">
     {% if github_projects %}
-      <section class="github-home-list feed-section">
+      <section class="feed-section">
         <div class="section-heading">
-          <div><p class="eyebrow">OPEN SOURCE RADAR</p><h2>本周 GitHub AI 项目热点</h2></div>
-          <a class="text-link" href="/github">查看全部 {{ github_project_stats.total }} <span>→</span></a>
+          <h2>GitHub 开源 AI 热点</h2>
+          <a class="inline-link" href="/github">查看全部 {{ github_project_stats.total }} <span>→</span></a>
         </div>
-        <p class="section-intro">按 Trending 周期新增 Star 与项目活跃度整理，项目介绍来自已持久化的 README/摘要。</p>
         {% for project in github_projects %}
           {% include "partials/github_project_card.html" %}
         {% endfor %}
@@ -75,7 +93,7 @@
       {% for group in grouped_cards %}
         <section class="feed-section">
           <div class="section-heading">
-            <div><p class="eyebrow">TOPIC {{ '%02d' | format(loop.index) }}</p><h2>{{ group.name | topic_label }}</h2></div>
+            <h2>{{ group.name | topic_label }}</h2>
             <span class="section-count">{{ group.cards | length }} 条</span>
           </div>
           {% for card in group.cards %}
@@ -84,9 +102,9 @@
         </section>
       {% endfor %}
     {% else %}
-      <section class="empty-state empty-state-large">
+      <section class="empty-state">
         <div class="empty-icon">✦</div>
-        <h3>暂无精选内容</h3>
+        <h3>暂无精选动态</h3>
         <p>当前日报尚无可展示的最终入选事件。</p>
         <a class="button button-solid" href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">查看本期精选</a>
       </section>
@@ -95,7 +113,10 @@
 
   <aside class="insight-rail">
     <section class="rail-card">
-      <div class="rail-heading"><h3>来源分布</h3><a href="/sources">全部</a></div>
+      <div class="rail-heading">
+        <h3>信源分布</h3>
+        <a href="/sources">全部来源</a>
+      </div>
       {% if source_options %}
         <div class="source-bars">
           {% for option in source_options[:8] %}
@@ -107,16 +128,15 @@
           {% endfor %}
         </div>
       {% else %}
-        <p class="rail-empty">运行一次抓取后，这里会显示来源分布。</p>
+        <p class="muted-text">暂无来源分布数据。</p>
       {% endif %}
     </section>
+
     <section class="rail-card rail-note">
-      <p class="eyebrow">HOW TO READ</p>
-      <h3>先看主题，再看来源</h3>
-      <p>主题是 AI 对内容的编辑归类；来源标签描述信息从哪里来、通过什么通道进入，以及来源层级。</p>
-      <a class="text-link" href="/sources">了解来源字段 <span>→</span></a>
+      <h3>阅读指南</h3>
+      <p>按主题浏览 AI 编辑总结，信息源保留原始级别与归因标记。</p>
+      <a class="inline-link" href="/sources">了解来源分类 <span>→</span></a>
     </section>
   </aside>
 </div>
-
 {% endblock %}

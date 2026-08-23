@@ -13,6 +13,7 @@ from app.config.limits import (
     DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS,
     DEFAULT_STAGE_C_AGENT_MAX_TURNS,
     DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES,
+    DEFAULT_STAGE_D_MAX_WEB_SEARCHES,
 )
 
 
@@ -61,7 +62,10 @@ class Settings:
     stage_c_agent_max_turns: int = DEFAULT_STAGE_C_AGENT_MAX_TURNS
     stage_c_agent_max_tool_calls: int = DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS
     stage_c_agent_max_web_searches: int = DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES
-    stage_c_trusted_domains: tuple[str, ...] = ()
+    stage_d_max_web_searches: int = DEFAULT_STAGE_D_MAX_WEB_SEARCHES
+    tavily_api_key: str | None = field(default=None, repr=False)
+    tavily_api_url: str = "https://api.tavily.com"
+    tavily_timeout_seconds: float = 30.0
 
     @classmethod
     def from_env(cls, dotenv_path: str | Path = ".env") -> "Settings":
@@ -69,7 +73,6 @@ class Settings:
         rsshub_base_url = _env_value("RSSHUB_BASE_URL")
         ai_review_model = os.getenv("AI_REVIEW_MODEL") or None
         categories = _parse_categories(os.getenv("AI_REVIEW_CATEGORIES"))
-        trusted_domains = _parse_domains(os.getenv("AI_STAGE_C_TRUSTED_DOMAINS"))
         return cls(
             database_url=os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL),
             rsshub_base_url=rsshub_base_url.rstrip("/") if rsshub_base_url else None,
@@ -108,7 +111,12 @@ class Settings:
             stage_c_agent_max_web_searches=_nonnegative_int(
                 os.getenv("AI_STAGE_C_AGENT_MAX_WEB_SEARCHES"), DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES, maximum=None
             ),
-            stage_c_trusted_domains=trusted_domains,
+            stage_d_max_web_searches=_nonnegative_int(
+                os.getenv("AI_STAGE_D_MAX_WEB_SEARCHES"), DEFAULT_STAGE_D_MAX_WEB_SEARCHES, maximum=None
+            ),
+            tavily_api_key=os.getenv("TAVILY_API_KEY") or None,
+            tavily_api_url=(os.getenv("TAVILY_API_URL") or "https://api.tavily.com").rstrip("/"),
+            tavily_timeout_seconds=float(os.getenv("TAVILY_TIMEOUT_SECONDS", "30")),
         )
 
 
@@ -149,14 +157,3 @@ def _nonnegative_int(value: str | None, default: int, *, maximum: int | None) ->
     except (TypeError, ValueError):
         parsed = default
     return max(0, min(maximum, parsed)) if maximum is not None else max(0, parsed)
-
-
-def _parse_domains(value: str | None) -> tuple[str, ...]:
-    if not value:
-        return ()
-    values: list[str] = []
-    for raw in value.replace("，", ",").split(","):
-        host = raw.strip().casefold().removeprefix("https://").removeprefix("http://").split("/", 1)[0]
-        if host and host not in values:
-            values.append(host)
-    return tuple(values)

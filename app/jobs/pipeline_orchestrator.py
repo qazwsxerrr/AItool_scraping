@@ -316,6 +316,46 @@ def _stage_progress(repo: IntelRepository, stage: Any | None) -> str:
     return "active"
 
 
+def _fetch_stage_is_source_warning(stage: Any | None, run: Any | None = None) -> bool:
+    """Treat fetch-source failures as an auditable warning for publication.
+
+    Older drafts persisted the fetch stage as ``failed`` before source
+    failures were changed to warnings.  Recognize those rows when resuming or
+    publishing so a historical source failure does not remain a hidden gate.
+    A build with no fetched items is still rejected by the resume precondition
+    below; this helper only removes the source-failure publication gate.
+    """
+
+    if stage is None or str(getattr(stage, "stage_name", "")) != "fetch":
+        return False
+    metadata = getattr(stage, "metadata_dict", {}) or {}
+    failed_sources = metadata.get("failed_sources")
+    if isinstance(failed_sources, (list, tuple)) and failed_sources:
+        return True
+    try:
+        if int(metadata.get("failed") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    reason = str(getattr(run, "partial_reason", "") or "").casefold()
+    return reason.startswith("fetch_failed_sources:")
+
+
+def _normalise_source_warning_state(session: Any, run: Any, stage: Any | None) -> None:
+    """Clear legacy source-warning partial flags before final publication."""
+
+    if not _fetch_stage_is_source_warning(stage, run):
+        return
+    reason = str(getattr(run, "partial_reason", "") or getattr(run, "error", "") or "").casefold()
+    if not reason.startswith("fetch_failed_sources:"):
+        return
+    if bool(getattr(run, "partial", False)) or getattr(run, "partial_reason", None) or getattr(run, "error", None):
+        run.partial = False
+        run.partial_reason = None
+        run.error = None
+        session.flush()
+
+
 def _stage_has_successful_tasks(repo: IntelRepository, stage: Any | None) -> bool:
     """Return whether a stage has at least one reusable successful task."""
 
@@ -349,6 +389,11 @@ def _sync_pipeline_run_status(
             name: _stage_progress(repo, stages.get(name))
             for name in PIPELINE_STAGE_ORDER
         }
+        # Source fetch failures are warnings recorded in fetch metadata.  Do
+        # not let a legacy ``fetch.status=failed`` row turn the whole daily
+        # build into a non-publishable partial run.
+        if _fetch_stage_is_source_warning(stages.get("fetch"), run):
+            progress["fetch"] = "succeeded"
 
         if "missing" in progress.values() or "active" in progress.values():
             changed = False
@@ -502,31 +547,55 @@ def _freeze_after_fetch(
                 "sources": len(source_ids),
             },
         )
+        failed_sources = _failed_source_details(fetch)
         repo.finish_stage(
             fetch_stage,
-            status="failed" if getattr(fetch, "total_failed", 0) else "succeeded",
+            # A failed source is an auditable warning, not a failed daily
+            # build.  The frozen successful source set is still a valid input
+            # for A-D and can be published; keep the exact failures in stage
+            # metadata instead of turning them into a publication gate.
+            status="succeeded",
             metadata={
                 "sources": len(source_ids),
                 "fetched": getattr(fetch, "total_fetched", 0),
                 "inserted": getattr(fetch, "total_inserted", 0),
                 "failed": getattr(fetch, "total_failed", 0),
+                "failed_sources": failed_sources,
             },
         )
-        if getattr(fetch, "total_failed", 0) and run.edition_id is not None:
-            error = f"fetch_failed_sources:{int(getattr(fetch, 'total_failed', 0))}"
-            # Source failures are isolated to their own attempts. Freeze the
-            # successful source set and let A-D build a non-public partial
-            # draft from it; only a complete source set may replace the daily
-            # report.
-            run.partial = True
-            run.partial_reason = error
-            run.error = error
-            edition = session.get(DailyEdition, int(run.edition_id))
-            if edition is not None:
-                edition.status = "building_with_errors"
-                edition.error = error
         session.commit()
         return run.reference_time
+
+
+def _failed_source_details(fetch: IntelFetchResult) -> list[dict[str, Any]]:
+    """Return compact diagnostics for source requests that failed.
+
+    A failed source is a publication warning: the successful source set can
+    still produce a dated edition, while the missing source is recorded in
+    the fetch metadata and exported audit artifacts.
+    """
+
+    stats = getattr(fetch, "stats", {}) or {}
+    failures: list[dict[str, Any]] = []
+    for source_id, stat in stats.items():
+        try:
+            failed = int(getattr(stat, "failed", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            failed = 0
+        status = str(getattr(stat, "status", "") or "").casefold()
+        if failed <= 0 and status != "failed":
+            continue
+        detail: dict[str, Any] = {
+            "source_id": str(source_id),
+            "status": status or "failed",
+        }
+        for key in ("error", "http_status", "transport", "attempt_id"):
+            value = getattr(stat, key, None)
+            if value is not None and value != "":
+                detail[key] = value
+        failures.append(detail)
+    failures.sort(key=lambda row: str(row.get("source_id") or ""))
+    return failures
 
 
 def _mark_daily_build_failed(session_factory: Any, run_id: int, error: str | None) -> None:
@@ -795,7 +864,15 @@ def publish_daily_draft_from_settings(
     audit_promotion = None
     try:
         run_status = _sync_pipeline_run_status(draft_factory, int(run_id), finalize=True)
-        if run_status != "completed":
+        if run_status == "partial":
+            with draft_factory() as session:
+                legacy_run = session.get(IntelRun, int(run_id))
+                fetch_stage = IntelRepository(session).get_stage(int(run_id), "fetch")
+                if legacy_run is not None:
+                    _normalise_source_warning_state(session, legacy_run, fetch_stage)
+                    session.commit()
+            run_status = _sync_pipeline_run_status(draft_factory, int(run_id), finalize=True)
+        if run_status not in {"completed", "partial"}:
             with draft_factory() as session:
                 repo = IntelRepository(session)
                 if run_status == "partial":
@@ -815,9 +892,8 @@ def publish_daily_draft_from_settings(
             output_dir=output_dir,
             dry_run=False,
             artifact_dir=staging_dir,
+            allow_partial=True,
         )
-        if result.partial:
-            raise RuntimeError(f"daily build is not publishable: {result.partial_reason or 'partial'}")
 
         # Close this process's connection pool before moving SQLite files.
         # The exporter has completed all writes at this point, so the retained
@@ -1176,12 +1252,9 @@ def resume_pipeline_from_settings(
             session.commit()
             result.errors.append(reason)
             return result
-        if fetch_stage.status == "failed" and not repo.list_run_item_ids(int(run_id)):
-            reason = "fetch stage produced no usable items; start a fresh full pipeline run for this edition"
-            repo.mark_daily_build_failed(int(run_id), error=reason)
-            session.commit()
-            result.errors.append(reason)
-            return result
+        # A fetch failure, including a run with zero usable items, is only a
+        # source warning.  Downstream stages may produce an empty but fully
+        # auditable edition; publication is not gated on source completeness.
 
     for stage_name in PIPELINE_STAGES:
         if not _stage_needs_resume(session_factory, run_id, stage_name, settings=settings):

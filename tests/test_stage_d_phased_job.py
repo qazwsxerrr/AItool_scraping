@@ -113,7 +113,6 @@ def test_stage_d_reads_only_stage_c_candidate_event_ids():
 
     assert result.candidates == 2
     assert [row["event_id"] for row in client.calls[0]] == event_ids[:-1]
-    assert event_ids[-1] not in [row["event_id"] for row in client.calls[0]]
 
 
 def test_event_content_change_invalidates_stage_d_input_fingerprint():

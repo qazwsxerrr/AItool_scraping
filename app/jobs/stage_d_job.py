@@ -7,6 +7,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
@@ -25,7 +26,8 @@ from app.ai.skills.stage_d_selection import (
     build_stage_d_provider_payload,
     strict_parse_stage_d_selection,
 )
-from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
+from app.ai.tavily import TavilySearchClient, TavilySearchError
+from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT, DEFAULT_STAGE_D_MAX_WEB_SEARCHES
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import IntelEvent, IntelRun, IntelRunStageTask
@@ -34,7 +36,7 @@ from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
 STAGE_D_NAME = "stage_d"
-STAGE_D_VERSION = "stage-d-selection-v1"
+STAGE_D_VERSION = "stage-d-editorial-review-v4"
 
 
 class StageDExecutionError(RuntimeError):
@@ -75,6 +77,7 @@ class StageDResult:
     selected: int = 0
     unselected: int = 0
     provider_attempts: int = 0
+    web_searches: int = 0
     reused: bool = False
     ai_failed: int = 0
     failed_phase: str | None = None
@@ -103,12 +106,15 @@ def run_stage_d_job(
     profile: StageDProfile | Mapping[str, Any] | str | Path | None = None,
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
+    search_client: TavilySearchClient | None = None,
+    max_web_searches: int = DEFAULT_STAGE_D_MAX_WEB_SEARCHES,
     force: bool = False,
     run_id: int,
 ) -> StageDResult:
     """Select Stage-C candidates and persist only the generic run-task result."""
 
     policy = _coerce_profile(profile if profile is not None else profile_path)
+    max_web_searches = _bounded_int(max_web_searches, DEFAULT_STAGE_D_MAX_WEB_SEARCHES, lower=0, upper=100)
     result = StageDResult(run_id=int(run_id))
     owner = f"stage-d-selection:{int(run_id)}:{uuid4().hex}"
 
@@ -128,17 +134,8 @@ def run_stage_d_job(
                 run_id=int(run_id),
                 event_ids=candidate_event_ids,
             )
-            withheld_needs_review_ids = [
-                int(event.id)
-                for event in events
-                if str(event.review_state or "").casefold() == "needs_review"
-            ]
-            withheld_needs_review_id_set = set(withheld_needs_review_ids)
-            selectable_events = [
-                event
-                for event in events
-                if int(event.id) not in withheld_needs_review_id_set
-            ]
+            withheld_needs_review_ids: list[int] = []
+            selectable_events = events
             selectable_event_ids = [int(event.id) for event in selectable_events]
             event_payload = [_selection_event(event) for event in selectable_events]
             result.candidates = len(event_payload)
@@ -160,13 +157,23 @@ def run_stage_d_job(
                     "withheld_needs_review_event_ids": withheld_needs_review_ids,
                 }
             )
-            config_fingerprint = _stage_d_config_fingerprint(policy, ai_client)
+            config_fingerprint = _stage_d_config_fingerprint(
+                policy,
+                ai_client,
+                search_client=search_client,
+                max_web_searches=max_web_searches,
+            )
             stage = repo.ensure_stage(
                 int(run_id),
                 STAGE_D_NAME,
                 input_fingerprint=input_fingerprint,
                 config_fingerprint=config_fingerprint,
-                metadata=_stage_d_stage_metadata(policy, ai_client),
+                metadata=_stage_d_stage_metadata(
+                    policy,
+                    ai_client,
+                    search_client=search_client,
+                    max_web_searches=max_web_searches,
+                ),
                 force=bool(force),
             )
             task = repo.ensure_stage_task(
@@ -200,6 +207,7 @@ def run_stage_d_job(
                     result.provider_attempts = int(
                         (_mapping(task.result)).get("provider_attempts") or 0
                     )
+                    result.web_searches = int((_mapping(task.result)).get("web_searches") or 0)
                     result.reused = True
                     return result
 
@@ -221,6 +229,30 @@ def run_stage_d_job(
             raw_response: Any | None = None
             request_metadata: dict[str, Any] = {}
             try:
+                search_evidence, search_audit, agent_session = _run_stage_d_searches(
+                    session=session,
+                    repo=repo,
+                    run_id=int(run_id),
+                    stage_id=int(stage.id),
+                    events=selectable_events,
+                    search_client=search_client,
+                    max_web_searches=max_web_searches,
+                    input_fingerprint=input_fingerprint,
+                    config_fingerprint=config_fingerprint,
+                    model=getattr(ai_client, "model", None),
+                    reset=bool(force),
+                )
+                event_payload = [
+                    _selection_event(
+                        event,
+                        search_evidence=search_evidence.get(int(event.id), ()),
+                    )
+                    for event in selectable_events
+                ]
+                result.web_searches = len(search_audit)
+                # Search calls and their source records are durable even when
+                # the subsequent editorial model request fails.
+                session.commit()
                 if event_payload and policy.max_selected > 0:
                     parsed, attempts, raw_response, request_metadata = _call_selection_provider(
                         ai_client,
@@ -253,9 +285,16 @@ def run_stage_d_job(
                         "input_fingerprint": input_fingerprint,
                         "config_fingerprint": config_fingerprint,
                         "provider_attempts": attempts,
+                        "web_searches": result.web_searches,
+                        "agent_session_id": int(agent_session.id),
                     },
                     raw_response=raw_response,
-                    metadata=request_metadata,
+                    metadata={
+                        **request_metadata,
+                        "search_provider": "tavily" if search_client is not None and search_client.is_configured else "disabled",
+                        "search_audit": search_audit,
+                        "agent_session_id": int(agent_session.id),
+                    },
                 )
                 if completed is None:
                     raise StageDExecutionError(
@@ -265,6 +304,8 @@ def run_stage_d_job(
                 result.selected = len(selected_rows)
                 result.unselected = result.candidates - result.selected
                 result.provider_attempts = attempts
+                agent_session.status = "succeeded"
+                agent_session.finished_at = datetime.now(timezone.utc)
                 run.selected = result.selected
                 finished = repo.finish_stage(
                     stage,
@@ -281,6 +322,9 @@ def run_stage_d_job(
                         selected_count=result.selected,
                         unselected_count=result.unselected,
                         provider_attempts=result.provider_attempts,
+                        web_searches=result.web_searches,
+                        search_client=search_client,
+                        max_web_searches=max_web_searches,
                     ),
                 )
                 if finished is None:
@@ -294,6 +338,12 @@ def run_stage_d_job(
                 session.rollback()
                 raise
             except Exception as exc:
+                agent = repo.get_agent_session(int(run_id), stage_name=STAGE_D_NAME)
+                if agent is not None:
+                    agent.status = "failed"
+                    agent.error_code = getattr(exc, "error_code", None) or exc.__class__.__name__
+                    agent.error_message = str(exc)[:4_000]
+                    agent.finished_at = datetime.now(timezone.utc)
                 result.ai_failed += 1
                 result.failed_phase = "selection"
                 result.errors.append(str(exc))
@@ -335,6 +385,13 @@ def run_stage_d_from_settings(
         session_factory=create_session_factory(engine),
         profile=profile if profile is not None else profile_path,
         ai_client=ai_client if ai_client is not None else StageDSelectionClient.from_settings(settings),
+        search_client=TavilySearchClient(
+            api_key=settings.tavily_api_key,
+            api_url=settings.tavily_api_url,
+            timeout_seconds=settings.tavily_timeout_seconds,
+            max_retries=settings.request_retries,
+        ),
+        max_web_searches=settings.stage_d_max_web_searches,
         force=force,
         run_id=run_id,
     )
@@ -365,12 +422,15 @@ def _load_stage_c_candidate_event_ids(repo: IntelRepository, run_id: int) -> lis
             "precondition",
             "Stage C run task must succeed before Stage D",
         )
-    if "candidate_event_ids" not in task.result:
+    # Current C contracts publish only candidate and needs_review rows here.
+    # Fall back to the former all-event field for already-completed old builds.
+    source_field = "candidate_event_ids" if "candidate_event_ids" in task.result else "current_event_ids"
+    if source_field not in task.result:
         raise StageDExecutionError(
             "precondition",
             "Stage C result is missing candidate_event_ids; rerun Stage C",
         )
-    return _strict_event_ids(task.result.get("candidate_event_ids"))
+    return _strict_event_ids(task.result.get(source_field))
 
 
 def _load_candidate_events(
@@ -400,12 +460,17 @@ def _load_candidate_events(
     return [by_id[event_id] for event_id in event_ids]
 
 
-def _selection_event(event: IntelEvent) -> dict[str, Any]:
+def _selection_event(
+    event: IntelEvent,
+    *,
+    search_evidence: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
     source_groups = _json_strings(event.source_groups_json)
     if not source_groups and event.source_group:
         source_groups = [event.source_group]
     evidence = list(getattr(event, "evidence", ()) or ())
     verified = [row for row in evidence if str(row.status or "").casefold() == "verified"]
+    substance_status = _event_substance_status(event)
     return {
         "event_id": int(event.id),
         "title": str(event.title or ""),
@@ -423,7 +488,145 @@ def _selection_event(event: IntelEvent) -> dict[str, Any]:
         "review_state": event.review_state,
         "verification_count": len(evidence),
         "verification_status": "verified" if verified else ("unverified" if evidence else "not_checked"),
+        "substance_status": substance_status,
+        "search_status": "searched" if search_evidence else "not_searched",
+        "search_evidence": [dict(row) for row in search_evidence],
     }
+
+
+def _event_draft_metadata(event: IntelEvent) -> dict[str, Any]:
+    resolution = _json_value(event.resolution_raw_json, {})
+    return _mapping(_mapping(resolution).get("draft_metadata"))
+
+
+def _event_substance_status(event: IntelEvent) -> str:
+    return str(_event_draft_metadata(event).get("substance_status") or "unknown").strip().casefold() or "unknown"
+
+
+def _run_stage_d_searches(
+    *,
+    session: Session,
+    repo: IntelRepository,
+    run_id: int,
+    stage_id: int,
+    events: Sequence[IntelEvent],
+    search_client: TavilySearchClient | None,
+    max_web_searches: int,
+    input_fingerprint: str,
+    config_fingerprint: str,
+    model: str | None,
+    reset: bool,
+) -> tuple[dict[int, list[dict[str, Any]]], list[dict[str, Any]], Any]:
+    # One D run represents one human-like review pass. A forced/retried pass
+    # gets a fresh audit session so old snippets cannot silently affect it.
+    agent_session = repo.start_agent_session(
+        run_id=run_id,
+        stage_id=stage_id,
+        stage_name=STAGE_D_NAME,
+        model=model,
+        prompt_version=STAGE_D_SELECTION_PROMPT_VERSION,
+        max_turns=1,
+        max_tool_calls=max(1, max_web_searches),
+        max_web_searches=max_web_searches,
+        state={
+            "input_fingerprint": input_fingerprint,
+            "config_fingerprint": config_fingerprint,
+            "search_provider": "tavily" if search_client is not None and search_client.is_configured else "disabled",
+        },
+        reset=reset or repo.get_agent_session(run_id, stage_name=STAGE_D_NAME) is not None,
+    )
+    agent_session.status = "running"
+    agent_session.started_at = datetime.now(timezone.utc)
+    evidence_by_event: dict[int, list[dict[str, Any]]] = {}
+    audit: list[dict[str, Any]] = []
+    if search_client is None or not search_client.is_configured or max_web_searches <= 0:
+        return evidence_by_event, audit, agent_session
+
+    ordered = sorted(events, key=_stage_d_search_priority)
+    for event in ordered[:max_web_searches]:
+        event_id = int(event.id)
+        query = _stage_d_search_query(event)
+        input_value = {
+            "event_id": event_id,
+            "query": query,
+            "topic": "news",
+            "max_results": 5,
+        }
+        agent_session.web_search_count += 1
+        try:
+            response = search_client.search(query, topic="news", max_results=5)
+            output = {"ok": True, "provider": "tavily", "event_id": event_id, **response.as_dict()}
+            rows = [row.as_dict() for row in response.results]
+            evidence_by_event[event_id] = rows
+            for row in response.results:
+                evidence = repo.record_agent_evidence(
+                    int(agent_session.id),
+                    draft_key=None,
+                    url=row.url,
+                    final_url=row.url,
+                    title=row.title,
+                    excerpt=row.content,
+                    verification_claim=f"Stage D editorial verification for event {event_id}",
+                    source_scope="tavily",
+                    status="recorded",
+                )
+                evidence.event_id = event_id
+            status = "success"
+            error_message = None
+            audit.append(
+                {
+                    "event_id": event_id,
+                    "query": query,
+                    "request_id": response.request_id,
+                    "result_count": len(rows),
+                    "status": status,
+                }
+            )
+        except TavilySearchError as exc:
+            output = {
+                "ok": False,
+                "provider": "tavily",
+                "event_id": event_id,
+                "error": str(exc),
+                "status_code": exc.status_code,
+                "retryable": exc.retryable,
+            }
+            status = "error"
+            error_message = str(exc)
+            audit.append(
+                {
+                    "event_id": event_id,
+                    "query": query,
+                    "result_count": 0,
+                    "status": status,
+                    "error": str(exc),
+                }
+            )
+        repo.append_agent_step(
+            int(agent_session.id),
+            turn=1,
+            kind="tool_call",
+            tool_name="search_web",
+            input_value=input_value,
+            output_value=output,
+            status=status,
+            error_message=error_message,
+        )
+        agent_session.tool_call_count += 1
+        session.flush()
+    return evidence_by_event, audit, agent_session
+
+
+def _stage_d_search_priority(event: IntelEvent) -> tuple[int, int, int]:
+    review_rank = 0 if str(event.review_state or "").casefold() == "needs_review" else 1
+    novelty_rank = 0 if str(event.novelty_status or "").casefold() in {"uncertain", "repeat"} else 1
+    return (review_rank, novelty_rank, -int(event.display_score or 0))
+
+
+def _stage_d_search_query(event: IntelEvent) -> str:
+    keywords = _json_strings(event.keywords_json)[:4]
+    parts = [str(event.title or "").strip(), *keywords]
+    return " ".join(value for value in parts if value)[:300]
 
 
 def _call_selection_provider(
@@ -499,6 +702,9 @@ def _stored_selection(
 def _stage_d_stage_metadata(
     policy: StageDProfile,
     ai_client: Any | None,
+    *,
+    search_client: TavilySearchClient | None = None,
+    max_web_searches: int = DEFAULT_STAGE_D_MAX_WEB_SEARCHES,
     **counts: Any,
 ) -> dict[str, Any]:
     metadata = {
@@ -508,12 +714,21 @@ def _stage_d_stage_metadata(
         "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
         "max_selected": policy.max_selected,
         "model": getattr(ai_client, "model", None),
+        "search_provider": "tavily" if search_client is not None and search_client.is_configured else "disabled",
+        "max_web_searches": max_web_searches,
+        "review_scope": "all_stage_c_events",
     }
     metadata.update({key: value for key, value in counts.items() if value is not None})
     return metadata
 
 
-def _stage_d_config_fingerprint(policy: StageDProfile, ai_client: Any | None) -> str:
+def _stage_d_config_fingerprint(
+    policy: StageDProfile,
+    ai_client: Any | None,
+    *,
+    search_client: TavilySearchClient | None,
+    max_web_searches: int,
+) -> str:
     return _response_hash(
         {
             "stage_d_version": STAGE_D_VERSION,
@@ -523,6 +738,8 @@ def _stage_d_config_fingerprint(policy: StageDProfile, ai_client: Any | None) ->
             "model": getattr(ai_client, "model", None),
             "transport": "responses",
             "max_selected": policy.max_selected,
+            "search_provider": "tavily" if search_client is not None and search_client.is_configured else "disabled",
+            "max_web_searches": max_web_searches,
         }
     )
 

@@ -73,6 +73,7 @@ def run_intel_export_job(
     github_report_dir: str | Path | None = None,
     run_id: int,
     artifact_dir: str | Path | None = None,
+    allow_partial: bool = False,
 ) -> IntelExportResult:
     final_output = Path(output_dir)
     effective_limit = _normalise_export_limit(limit)
@@ -101,7 +102,25 @@ def run_intel_export_job(
                 run_id=run_id,
                 reference_time=run.reference_time,
             )
-            if bool(run.partial) or str(run.status).casefold() in {"failed", "partial"}:
+            # ``partial`` is a retained audit label for explicit downstream
+            # truncation/failure states.  A source fetch warning is not a
+            # publication gate and is handled through fetch metadata.
+            fetch_stage = repo.get_stage(int(run_id), "fetch")
+            fetch_metadata = fetch_stage.metadata_dict if fetch_stage is not None else {}
+            try:
+                fetch_failed_count = int(fetch_metadata.get("failed") or 0)
+            except (TypeError, ValueError):
+                fetch_failed_count = 0
+            source_warning = (
+                str(run.partial_reason or "").casefold().startswith("fetch_failed_sources:")
+                or bool(fetch_metadata.get("failed_sources"))
+                or fetch_failed_count > 0
+            )
+            is_partial_build = (
+                not source_warning
+                and (bool(run.partial) or str(run.status).casefold() in {"failed", "partial"})
+            )
+            if is_partial_build and not allow_partial:
                 raise RuntimeError(f"daily build is not publishable: {run.partial_reason or run.status}")
             input_fingerprint = _export_input_fingerprint(records, int(run_id))
             stage_task = repo.ensure_stage_task(
@@ -158,8 +177,9 @@ def run_intel_export_job(
                 edition_date=run.edition_date,
                 status_counts=status_counts,
                 failure_counts=failure_counts,
-                partial=False,
-                partial_reason=None,
+                source_warnings=(build_summary or {}).get("source_warnings", []),
+                partial=is_partial_build,
+                partial_reason=run.partial_reason or run.error if is_partial_build else None,
             )
             payloads = {
                 jsonl_path: jsonl_payload,
@@ -169,8 +189,8 @@ def run_intel_export_job(
                 run=run,
                 records=records,
                 jsonl_payload=jsonl_payload,
-                partial=False,
-                partial_reason=None,
+                partial=is_partial_build,
+                partial_reason=run.partial_reason or run.error if is_partial_build else None,
                 build_summary=build_summary,
             )
             _atomic_write_bundle(payloads)
@@ -221,8 +241,8 @@ def run_intel_export_job(
         github_report_path=str(github_report_path) if github_report_path else None,
         status_counts=status_counts,
         failure_counts=failure_counts,
-        partial=False,
-        partial_reason=None,
+        partial=is_partial_build,
+        partial_reason=run.partial_reason or run.error if is_partial_build else None,
         run_id=run_id,
         records=tuple(records),
     )
@@ -237,6 +257,7 @@ def run_intel_export_from_settings(
     github_report_dir: str | Path | None = None,
     run_id: int,
     artifact_dir: str | Path | None = None,
+    allow_partial: bool = False,
 ) -> IntelExportResult:
     database_url = _readable_database_url(settings.database_url, dry_run=dry_run)
     engine = create_engine_from_url(database_url)
@@ -251,6 +272,7 @@ def run_intel_export_from_settings(
             github_report_dir=github_report_dir,
             run_id=run_id,
             artifact_dir=artifact_dir,
+            allow_partial=allow_partial,
         )
     finally:
         # Daily publication moves the completed SQLite draft into its
@@ -403,6 +425,7 @@ def _manifest(
         "stage_d_candidate_count": int((build_summary or {}).get("funnel", {}).get("stage_d_candidate_count", 0)),
         "funnel": (build_summary or {}).get("funnel", {}),
         "stages": (build_summary or {}).get("stages", {}),
+        "source_warnings": (build_summary or {}).get("source_warnings", []),
         "failure_reasons": (build_summary or {}).get("failure_reasons", []),
         "artifacts": {
             "items_jsonl": "intel_items.jsonl",
@@ -646,6 +669,7 @@ def _markdown(
     edition_date: str | None = None,
     status_counts: dict[str, int] | None = None,
     failure_counts: dict[str, int] | None = None,
+    source_warnings: list[dict[str, Any]] | None = None,
     partial: bool = False,
     partial_reason: str | None = None,
 ) -> str:
@@ -657,6 +681,9 @@ def _markdown(
     lines = [title, "", f"保留条目：{len(records)}", ""]
     if partial:
         lines.extend([f"运行状态：partial（{partial_reason or 'explicit_ai_limit'}）", ""])
+    warning_line = _source_warning_markdown_line(source_warnings)
+    if warning_line:
+        lines.extend([warning_line, ""])
     if counts:
         lines.append("主题分类统计：" + "、".join(f"{key}={value}" for key, value in sorted(counts.items())))
         lines.append("")
@@ -666,28 +693,48 @@ def _markdown(
         lines.append("")
     for index, record in enumerate(records, start=1):
         if record.get("record_type") == "intel_event":
-            lines.extend(
-                [
-                    f"## {index}. {record.get('title') or '(untitled)'}",
-                    (
-                        f"- 事件：`{record.get('event_id')}` | 展示顺序：`{record.get('display_order')}` | "
-                        f"display_score=`{record.get('display_score')}` | topic=`{record.get('topic')}`"
-                    ),
-                    (
-                        f"- 类别：`{record.get('content_class')}` | 来源：{_primary_source_markdown(record)}"
-                        f" | 状态：`selected`"
-                    ),
-                    _event_time_line(record),
-                    f"- 摘要：{record.get('summary_cn') or record.get('summary') or '暂无摘要'}",
-                    f"- 选稿依据：{record.get('reason') or '未记录'}",
-                    f"- 风险：{', '.join(record.get('risk_flags') or []) or '无'}",
-                    _related_links_markdown_line(record),
-                    _verification_markdown_line(record),
-                    "",
-                ]
-            )
+            event_lines = [
+                f"## {index}. {record.get('title') or '(untitled)'}",
+                (
+                    f"- 事件：`{record.get('event_id')}` | 展示顺序：`{record.get('display_order')}` | "
+                    f"display_score=`{record.get('display_score')}` | topic=`{record.get('topic')}`"
+                ),
+                (
+                    f"- 类别：`{record.get('content_class')}` | 来源：{_primary_source_markdown(record)}"
+                    f" | 状态：`selected`"
+                ),
+                _event_time_line(record),
+                f"- 摘要：{record.get('summary_cn') or record.get('summary') or '暂无摘要'}",
+                f"- 选稿依据：{record.get('reason') or '未记录'}",
+                f"- 风险：{', '.join(record.get('risk_flags') or []) or '无'}",
+                _related_links_markdown_line(record),
+            ]
+            verification_line = _verification_markdown_line(record)
+            if verification_line:
+                event_lines.append(verification_line)
+            event_lines.append("")
+            lines.extend(event_lines)
             continue
     return "\n".join(lines) + "\n"
+
+
+def _source_warning_markdown_line(source_warnings: list[dict[str, Any]] | None) -> str | None:
+    """Render source fetch failures as a non-blocking publication warning."""
+
+    if not isinstance(source_warnings, list):
+        return None
+    labels: list[str] = []
+    for row in source_warnings:
+        if not isinstance(row, dict):
+            continue
+        source_id = str(row.get("source_id") or "").strip()
+        if not source_id:
+            continue
+        status = str(row.get("status") or "failed").strip()
+        label = f"{source_id}（{status}）"
+        if label not in labels:
+            labels.append(label)
+    return "- 来源警告：" + "、".join(labels) if labels else None
 
 
 def _event_time_line(record: dict[str, Any]) -> str:
@@ -786,6 +833,8 @@ def _verification_refs(event: IntelEvent) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for evidence in list(getattr(event, "evidence", ()) or ()):
+        if str(evidence.status or "").strip().casefold() != "verified":
+            continue
         url = str(evidence.final_url or evidence.url or "").strip()
         host = str(evidence.host or "").strip()
         claim = str(evidence.verification_claim or "").strip()
@@ -807,27 +856,24 @@ def _verification_refs(event: IntelEvent) -> list[dict[str, Any]]:
     return rows
 
 
-def _verification_markdown_line(record: dict[str, Any]) -> str:
+def _verification_markdown_line(record: dict[str, Any]) -> str | None:
     refs = record.get("verification_refs")
     if not isinstance(refs, list) or not refs:
-        return "- 核验来源：无"
+        return None
     verified_labels: list[str] = []
-    review_labels: list[str] = []
     for ref in refs[:6]:
         if not isinstance(ref, dict):
             continue
-        label = str(ref.get("title") or ref.get("host") or ref.get("url") or "核验来源").strip()
+        if str(ref.get("status") or "").strip().casefold() != "verified":
+            continue
+        label = str(ref.get("title") or ref.get("host") or ref.get("url") or "复核来源").strip()
         url = str(ref.get("url") or "").strip()
         value = f"[{label}]({url})" if url else label
-        status = str(ref.get("status") or "needs_review").strip().casefold()
-        if status == "verified":
+        if value not in verified_labels:
             verified_labels.append(value)
-        else:
-            review_labels.append(f"{value}（{status or 'needs_review'}）")
-    lines = ["- 核验来源：" + ("；".join(verified_labels) if verified_labels else "无")]
-    if review_labels:
-        lines.append("- 待人工核验链接：" + "；".join(review_labels))
-    return "\n".join(lines)
+    if not verified_labels:
+        return None
+    return "- 复核依据：" + "；".join(verified_labels)
 
 
 def _json(value: str | None, default: Any) -> Any:

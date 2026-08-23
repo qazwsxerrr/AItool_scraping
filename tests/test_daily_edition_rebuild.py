@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import inspect, select, text
 
 from app.config.settings import Settings
+from app.ai.skills.stage_d_selection import STAGE_D_SELECTION_SCHEMA_VERSION
 from app.jobs import pipeline_orchestrator as orchestrator
 from app.jobs.event_cluster_job import _load_published_daily_history
 from app.jobs.export_job import IntelExportResult
@@ -332,7 +333,7 @@ def test_failed_or_partial_draft_leaves_the_published_report_visible(tmp_path, m
         assert [card.title for card in ui.list_featured_cards(edition=edition)] == ["Published report"]
 
 
-def test_partial_fetch_draft_cannot_replace_a_public_report(tmp_path):
+def test_source_fetch_warning_does_not_block_publication(tmp_path):
     settings = Settings(database_url=f"sqlite:///{tmp_path / 'daily.db'}")
     public_engine = create_engine_from_url(settings.database_url)
     init_db(public_engine)
@@ -345,18 +346,52 @@ def test_partial_fetch_draft_cannot_replace_a_public_report(tmp_path):
     with create_session_factory(draft_engine)() as session:
         repo = IntelRepository(session)
         _, build = repo.start_daily_build(edition_date="2026-08-19")
-        repo.finish_stage(repo.ensure_stage(build.id, "fetch"), status="failed")
+        fetch_stage = repo.ensure_stage(build.id, "fetch")
+        repo.finish_stage(
+            fetch_stage,
+            status="failed",
+            metadata={
+                "sources": 1,
+                "fetched": 0,
+                "inserted": 0,
+                "failed": 1,
+                "failed_sources": [{"source_id": "broken_source", "status": "failed"}],
+            },
+        )
         for stage_name in ("screen", "analyze", "cluster", "stage_d"):
             repo.finish_stage(repo.ensure_stage(build.id, stage_name), status="succeeded")
         build.partial = True
         build.partial_reason = "fetch_failed_sources:1"
+        stage_d = repo.get_stage(build.id, "stage_d")
+        assert stage_d is not None
+        stage_d_task = repo.ensure_stage_task(
+            stage_d,
+            subject_type="run",
+            subject_id=build.id,
+            target_run_id=build.id,
+        )
+        repo.complete_stage_task(
+            stage_d_task,
+            result={
+                "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+                "candidate_event_ids": [],
+                "selected": [],
+            },
+        )
         session.commit()
 
-    with pytest.raises(RuntimeError, match="not publishable"):
-        orchestrator.publish_daily_draft_from_settings(settings=settings, edition_date="2026-08-19")
-    assert daily_draft_exists(settings, "2026-08-19")
+    result = orchestrator.publish_daily_draft_from_settings(
+        settings=settings,
+        edition_date="2026-08-19",
+        output_dir=tmp_path / "intel",
+    )
+    assert result.exported == 0
+    assert not daily_draft_exists(settings, "2026-08-19")
     with create_session_factory(public_engine)() as session:
-        assert [entry.title for entry in session.scalars(select(DailyEditionReportEntry)).all()] == ["Published report"]
+        assert list(session.scalars(select(DailyEditionReportEntry)).all()) == []
+    manifest = (tmp_path / "daily" / "2026-08-19" / "manifest.json").read_text(encoding="utf-8")
+    assert '"source_warnings"' in manifest
+    assert "broken_source" in manifest
 
 
 def test_init_db_does_not_run_an_automatic_historical_rebuild(tmp_path):

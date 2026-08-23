@@ -233,7 +233,7 @@ def test_export_rejects_an_invalid_or_legacy_stage_d_result(tmp_path):
         )
 
 
-def test_markdown_never_labels_needs_review_evidence_as_verified():
+def test_markdown_only_shows_verified_evidence_as_review_basis():
     line = _verification_markdown_line(
         {
             "verification_refs": [
@@ -251,8 +251,36 @@ def test_markdown_never_labels_needs_review_evidence_as_verified():
         }
     )
 
-    assert "核验来源：[已核验页面](https://verify.example/confirmed)" in line
-    assert "待人工核验链接：[待复核页面](https://verify.example/review)（needs_review）" in line
+    assert line == "- 复核依据：[已核验页面](https://verify.example/confirmed)"
+
+
+def test_markdown_omits_review_line_when_there_is_no_verified_evidence():
+    record = {
+        "record_type": "intel_event",
+        "event_id": 1,
+        "display_order": 1,
+        "display_score": 80,
+        "title": "仅有搜索线索的事件",
+        "topic": "model_release",
+        "content_class": "official_model_company",
+        "summary_cn": "摘要",
+        "reason": "保留理由",
+        "risk_flags": [],
+        "source_refs": [],
+        "verification_refs": [
+            {
+                "url": "https://verify.example/recorded",
+                "title": "搜索结果",
+                "status": "recorded",
+            }
+        ],
+    }
+
+    assert _verification_markdown_line(record) is None
+    markdown = _markdown([record])
+    assert "核验来源：无" not in markdown
+    assert "待人工核验链接" not in markdown
+    assert "复核依据" not in markdown
 
 
 def test_markdown_shows_primary_source_and_secondary_sources_as_related_links():

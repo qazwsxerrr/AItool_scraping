@@ -1,14 +1,17 @@
 {% extends "base.html" %}
-{% block title %}来源目录 - AI 热点内容台{% endblock %}
+{% block title %}来源目录 — AIHOT{% endblock %}
 
 {% block content %}
 <section class="page-head source-page-head">
   <div>
-    <p class="eyebrow">PROVENANCE / SOURCE CATALOG</p>
+    <p class="eyebrow">SOURCE CATALOG</p>
     <h1>来源目录</h1>
-    <p class="muted-text">每条情报都保留来源名称、来源组、抓取通道和内容类型。来源身份不等于事实背书，主题分类由 AI 编辑模型完成。</p>
+    <p class="muted-text">每条情报都保留来源名称、来源组、抓取通道与类型。来源身份不等于事实背书。</p>
   </div>
-  <div class="source-legend"><span class="legend-dot healthy"></span> healthy <span class="legend-dot warning"></span> needs attention</div>
+  <div class="source-legend">
+    <span class="legend-dot healthy"></span> healthy
+    <span class="legend-dot warning"></span> needs attention
+  </div>
 </section>
 
 {% if sources %}
@@ -31,16 +34,19 @@
         <dl class="source-facts">
           <div><dt>已入库</dt><dd>{{ source.item_count }} 条</dd></div>
           <div><dt>抓取通道</dt><dd>{{ source.transport | transport_label }}</dd></div>
-          <div><dt>连续失败</dt><dd>{{ source.consecutive_failures }}</dd></div>
+          <div><dt>连续失败</dt><dd>{{ source.consecutive_failures }} 次</dd></div>
         </dl>
         <div class="source-card-links">
-          {% if source.url %}<a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">打开 Feed / API ↗</a>{% endif %}
-          {% if source.account_url %}<a href="{{ source.account_url }}" target="_blank" rel="noopener noreferrer">打开账号 ↗</a>{% endif %}
+          {% if source.url %}<a class="inline-link" href="{{ source.url }}" target="_blank" rel="noopener noreferrer">Feed / API ↗</a>{% endif %}
+          {% if source.account_url %}<a class="inline-link" href="{{ source.account_url }}" target="_blank" rel="noopener noreferrer">主页 ↗</a>{% endif %}
         </div>
       </article>
     {% endfor %}
   </section>
 {% else %}
-  <div class="empty-state empty-state-large"><div class="empty-icon">◎</div><h3>还没有来源</h3><p>载入 source registry 后，这里会展示来源健康状态和归因信息。</p></div>
+  <div class="empty-state">
+    <h3>还没有来源数据</h3>
+    <p>载入 source registry 后将展示健康状态。</p>
+  </div>
 {% endif %}
 {% endblock %}

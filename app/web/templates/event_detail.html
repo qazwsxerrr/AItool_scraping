@@ -12,21 +12,25 @@
   </header>
 
   <section class="detail-panel event-overview">
-    <div class="detail-metric"><span>日报展示顺序</span><strong>#{{ detail.event.display_order }}</strong></div>
-    <div class="detail-metric"><span>展示评分</span><strong>{{ '%.0f' | format(detail.event.display_score) }}</strong></div>
+    <div class="detail-metric"><span>展示顺序</span><strong>#{{ detail.event.display_order }}</strong></div>
+    <div class="detail-metric"><span>热度评分</span><strong>🔥 {{ '%.0f' | format(detail.event.display_score) }}</strong></div>
     <div class="detail-metric"><span>发布时间</span><strong>{{ detail.event.published_at | datetime }}</strong></div>
-    <div class="detail-metric"><span>聚类成员</span><strong>{{ detail.members | length }}</strong></div>
+    <div class="detail-metric"><span>聚类成员</span><strong>{{ detail.members | length }} 条</strong></div>
   </section>
 
   <section class="detail-panel">
-    <div class="section-heading"><div><p class="eyebrow">事件信息</p><h2>来源、风险与关联标签</h2></div></div>
+    <div class="section-heading">
+      <div>
+        <h2>来源、风险与关联标签</h2>
+      </div>
+    </div>
     <div class="event-detail-grid">
       <div>
         <h3>关联来源</h3>
         <ul class="plain-list">
           {% for source in detail.event.source_refs %}
             <li>
-              {% if source.source_url %}<a class="text-link" href="{{ source.source_url }}" target="_blank" rel="noopener noreferrer">{{ source.source_name or source.source_id or '来源' }} ↗</a>{% else %}{{ source.source_name or source.source_id or '来源' }}{% endif %}
+              {% if source.source_url %}<a class="inline-link" href="{{ source.source_url }}" target="_blank" rel="noopener noreferrer">{{ source.source_name or source.source_id or '来源' }} ↗</a>{% else %}{{ source.source_name or source.source_id or '来源' }}{% endif %}
               {% if source.match_type %}<small>{{ source.match_type }}{% if source.match_confidence is not none %} · {{ source.match_confidence }}%{% endif %}</small>{% endif %}
             </li>
           {% else %}<li class="muted-text">暂无可展示来源。</li>{% endfor %}
@@ -36,7 +40,7 @@
           {% for source in detail.event.verification_refs %}
             <li>
               {% set verification_url = source.final_url or source.url %}
-              {% if verification_url %}<a class="text-link" href="{{ verification_url }}" target="_blank" rel="noopener noreferrer">{{ source.title or source.host or '核验来源' }} ↗</a>{% else %}{{ source.title or source.host or '核验来源' }}{% endif %}
+              {% if verification_url %}<a class="inline-link" href="{{ verification_url }}" target="_blank" rel="noopener noreferrer">{{ source.title or source.host or '核验来源' }} ↗</a>{% else %}{{ source.title or source.host or '核验来源' }}{% endif %}
               {% if source.status %}<small>{{ source.status }}</small>{% endif %}
               {% if source.claim %}<small> · {{ source.claim }}</small>{% endif %}
             </li>
@@ -54,13 +58,18 @@
         <h3>聚类与编辑追溯</h3>
         <p class="detail-copy">聚类方式：{{ detail.resolution_method or '未知' }}{% if detail.resolution_confidence is not none %} · 置信度 {{ detail.resolution_confidence }}%{% endif %}</p>
         {% if detail.selection_reason %}<p class="detail-copy"><strong>选稿依据：</strong>{{ detail.selection_reason }}</p>{% endif %}
-        <p class="detail-copy">日报：{{ active_edition_date or '当前版本' }}</p>
+        <p class="detail-copy">日报期数：{{ active_edition_date or '当前版本' }}</p>
       </div>
     </div>
   </section>
 
   <section class="detail-panel">
-    <div class="section-heading"><div><p class="eyebrow">CLUSTER MEMBERS</p><h2>关联资讯与筛选追溯</h2></div><span class="section-count">{{ detail.members | length }} 条可公开成员</span></div>
+    <div class="section-heading">
+      <div>
+        <h2>关联资讯与筛选追溯</h2>
+      </div>
+      <span class="section-count">{{ detail.members | length }} 条可公开成员</span>
+    </div>
     <div class="member-list">
       {% for member in detail.members %}
         <article class="member-card">

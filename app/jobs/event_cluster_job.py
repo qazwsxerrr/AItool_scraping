@@ -26,17 +26,19 @@ from app.ai.responses import AgentBudgetExceeded, AgentProtocolError, FunctionTo
 from app.ai.skills.intel_triage import normalize_url
 from app.ai.skills.stage_c_agent import StageCAgentClient
 from app.ai.skills.stage_c_agent.prompts import (
+    ATTACH_SEARCH_EVIDENCE_SCHEMA,
     FINALIZE_DRAFTS_SCHEMA,
     LIST_CANDIDATES_SCHEMA,
     LIST_DRAFTS_SCHEMA,
     MARK_UNRESOLVED_SCHEMA,
     READ_HISTORY_SCHEMA,
     READ_ITEMS_SCHEMA,
-    RECORD_EVIDENCE_SCHEMA,
     SAVE_DRAFTS_SCHEMA,
     SEARCH_CANDIDATES_SCHEMA,
+    SEARCH_WEB_SCHEMA,
     STAGE_C_AGENT_PROMPT_VERSION,
 )
+from app.ai.tavily import TavilySearchClient, TavilySearchError, TavilySearchResult
 from app.config.limits import (
     DEFAULT_STAGE_C_AGENT_HISTORY_DAYS,
     DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS,
@@ -62,10 +64,10 @@ from app.storage.repository import IntelRepository
 
 
 DAILY_HISTORY_DAYS = DEFAULT_STAGE_C_AGENT_HISTORY_DAYS
-STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_agent_candidates_v1"
+STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_events_v4"
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
 _PRIMARY_POLICY_VERSION = "source_then_b1_priority_v2"
-_VERIFICATION_POLICY_VERSION = "research_before_needs_review_v1"
+_VERIFICATION_POLICY_VERSION = "tavily_per_event_verification_v2"
 
 
 class StageCDownstreamBusyError(RuntimeError):
@@ -178,7 +180,7 @@ def run_event_cluster_job(
     max_turns: int = DEFAULT_STAGE_C_AGENT_MAX_TURNS,
     max_tool_calls: int = DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS,
     max_web_searches: int = DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES,
-    trusted_domains: Sequence[str] = (),
+    search_client: TavilySearchClient | None = None,
 ) -> EventClusterResult:
     """Run C as an auditable multi-turn tool session for one daily build."""
 
@@ -210,17 +212,13 @@ def run_event_cluster_job(
             ),
         }
         input_fingerprint = _cluster_input_fingerprint(admissions, history)
-        allowed_domains = _allowed_domains(
-            admissions=[*admissions["active"], *admissions["reserve"]],
-            configured=trusted_domains,
-        )
         config_fingerprint = _stage_c_config_fingerprint(
             model=model_name,
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
             max_web_searches=max_web_searches,
             lease_seconds=lease_seconds,
-            allowed_domains=allowed_domains,
+            search_provider="tavily" if search_client is not None and search_client.is_configured else "disabled",
         )
         stage = repo.ensure_stage(
             int(run_id),
@@ -228,7 +226,7 @@ def run_event_cluster_job(
             config_fingerprint=config_fingerprint,
             reference_time=current,
             metadata={
-                "aggregation_mode": "responses_agent_tools_v3",
+                "aggregation_mode": "responses_agent_tools_v4",
                 "agent_version": STAGE_C_AGENT_VERSION,
                 "prompt_version": STAGE_C_AGENT_PROMPT_VERSION,
                 "candidate_contract_version": STAGE_C_CANDIDATE_CONTRACT_VERSION,
@@ -238,7 +236,8 @@ def run_event_cluster_job(
                 "max_tool_calls": max_tool_calls,
                 "max_web_searches": max_web_searches,
                 "lease_seconds": lease_seconds,
-                "allowed_domain_count": len(allowed_domains),
+                "search_provider": "tavily" if search_client is not None and search_client.is_configured else "disabled",
+                "history_scope": "previous_three_published_editions",
             },
         )
         task = repo.ensure_stage_task(
@@ -318,7 +317,7 @@ def run_event_cluster_job(
                 state={
                     "input_fingerprint": input_fingerprint,
                     "config_fingerprint": config_fingerprint,
-                    "allowed_domains": allowed_domains,
+                    "search_provider": "tavily" if search_client is not None and search_client.is_configured else "disabled",
                     "reference_time": current.isoformat(),
                     "lease_seconds": lease_seconds,
                 },
@@ -337,14 +336,13 @@ def run_event_cluster_job(
                 agent_session=agent_session,
                 admissions=admissions,
                 history=history,
-                allowed_domains=allowed_domains,
+                search_client=search_client,
                 max_web_searches=max_web_searches,
             )
 
             def on_response(turn: int, response: Mapping[str, Any]) -> None:
                 if repo.heartbeat_stage_task(task, owner=owner, lease_seconds=lease_seconds) is None:
                     raise StageCLeaseLostError("Stage C task lease was lost while saving an agent response")
-                tools.record_web_search_observations(response)
                 repo.append_agent_step(
                     int(agent_session.id),
                     turn=turn,
@@ -353,7 +351,6 @@ def run_event_cluster_job(
                 )
                 agent_session.response_id = _text(response.get("id")) or agent_session.response_id
                 agent_session.turn_count = max(agent_session.turn_count, int(turn))
-                agent_session.web_search_count += _web_search_count(response)
                 session.commit()
 
             def on_tool(turn: int, call: Mapping[str, Any], output: Mapping[str, Any]) -> None:
@@ -371,6 +368,8 @@ def run_event_cluster_job(
                     error_message=_text(output.get("error")),
                 )
                 agent_session.tool_call_count += 1
+                if str(call.get("name") or "") == "search_web":
+                    agent_session.web_search_count += 1
                 session.commit()
 
             if not agent_session.finalization_requested:
@@ -382,15 +381,14 @@ def run_event_cluster_job(
                         "reserve_candidate_count": len(admissions["reserve"]),
                         "history_window_days": DAILY_HISTORY_DAYS,
                         "instructions": (
-                            "Use tools to aggregate the active candidates. Research material uncertainty with hosted web search "
-                            "before retaining an event as needs_review, then finalize after all active candidates are covered."
+                            "Use local tools to aggregate every active candidate. Keep follow-up events separate, compare only "
+                            "the previous three published editions for novelty, and use search_web for material uncertainty "
+                            "before retaining an event as needs_review. Finalize after all active candidates are covered."
                         ),
                     },
                     function_tools=tools.function_tools,
-                    allowed_domains=allowed_domains,
                     max_turns=max_turns,
                     max_tool_calls=max_tool_calls,
-                    max_web_searches=max_web_searches,
                     # A retry starts a fresh model turn but reads persisted
                     # drafts/tools; this avoids replaying an interrupted call.
                     previous_response_id=None,
@@ -399,7 +397,7 @@ def run_event_cluster_job(
                 )
                 result.turns = agent_result.turns
                 result.tool_calls = agent_result.tool_calls
-                result.web_searches = agent_result.web_searches
+                result.web_searches = int(agent_session.web_search_count)
             if repo.heartbeat_stage_task(task, owner=owner, lease_seconds=lease_seconds) is None:
                 raise StageCLeaseLostError("Stage C task lease was lost before event materialization")
             if not agent_session.finalization_requested:
@@ -500,7 +498,12 @@ def run_event_cluster_from_settings(
         max_turns=settings.stage_c_agent_max_turns,
         max_tool_calls=settings.stage_c_agent_max_tool_calls,
         max_web_searches=settings.stage_c_agent_max_web_searches,
-        trusted_domains=settings.stage_c_trusted_domains,
+        search_client=TavilySearchClient(
+            api_key=settings.tavily_api_key,
+            api_url=settings.tavily_api_url,
+            timeout_seconds=settings.tavily_timeout_seconds,
+            max_retries=settings.request_retries,
+        ),
     )
 
 
@@ -514,7 +517,7 @@ class _StageCAgentTools:
         agent_session: IntelAgentSession,
         admissions: Mapping[str, Sequence[IntelCandidateAdmission]],
         history: Sequence[Mapping[str, Any]],
-        allowed_domains: Sequence[str],
+        search_client: TavilySearchClient | None,
         max_web_searches: int,
     ) -> None:
         self.session = session
@@ -522,10 +525,17 @@ class _StageCAgentTools:
         self.run = run
         self.agent_session = agent_session
         self.history = list(history)
-        self.allowed_domains = set(allowed_domains)
+        self.history_by_key = {
+            str(row.get("event_key")): dict(row)
+            for row in self.history
+            if str(row.get("event_key") or "").strip()
+        }
+        self.history_identity_index = _history_identity_index(self.history)
+        self.search_client = search_client
         self.max_web_searches = max_web_searches
-        self.web_search_observed_urls: set[str] = set()
-        self.web_search_calls_seen = 0
+        self.search_results: dict[str, TavilySearchResult] = {}
+        self.search_attempted_draft_keys: set[str] = set()
+        self.search_calls = 0
         self.admissions = {key: list(value) for key, value in admissions.items()}
         self.by_item_id = {
             int(row.item_id): row
@@ -533,6 +543,7 @@ class _StageCAgentTools:
             for row in rows
         }
         self.active_ids = {int(row.item_id) for row in self.admissions.get("active", ())}
+        self._restore_search_state()
 
     @property
     def function_tools(self) -> list[FunctionTool]:
@@ -543,7 +554,8 @@ class _StageCAgentTools:
             FunctionTool("search_candidates", "在 B 准入候选内按词检索相关内容。", SEARCH_CANDIDATES_SCHEMA, self.search_candidates),
             FunctionTool("read_recent_history", "查询过去三天的已发布日报事件，判断重复或更新。", READ_HISTORY_SCHEMA, self.read_recent_history),
             FunctionTool("save_event_drafts", "批量保存或更新 1–8 个事件聚合草稿。", SAVE_DRAFTS_SCHEMA, self.save_event_drafts),
-            FunctionTool("record_verification_evidence", "记录网页搜索得到的允许域名核验证据。", RECORD_EVIDENCE_SCHEMA, self.record_verification_evidence),
+            FunctionTool("search_web", "通过 Tavily 搜索公开网页并返回可审计的来源结果。", SEARCH_WEB_SCHEMA, self.search_web),
+            FunctionTool("attach_search_evidence", "把 Tavily 结果绑定到草稿和具体核验 claim。", ATTACH_SEARCH_EVIDENCE_SCHEMA, self.attach_search_evidence),
             FunctionTool("mark_unresolved", "把无法可靠聚合的 active 候选显式放入待审事件。", MARK_UNRESOLVED_SCHEMA, self.mark_unresolved),
             FunctionTool("finalize_event_drafts", "检查 active 覆盖并提交事件草稿。", FINALIZE_DRAFTS_SCHEMA, self.finalize_event_drafts),
         ]
@@ -577,6 +589,7 @@ class _StageCAgentTools:
                     "review_state": draft.review_state,
                     "confidence": int(draft.confidence),
                     "risk_flags": _json_strings(draft.risk_flags_json),
+                    "metadata": _json_mapping(draft.metadata_json),
                 }
                 for draft in drafts
             ],
@@ -616,7 +629,7 @@ class _StageCAgentTools:
         if not all(isinstance(value, Mapping) for value in raw_drafts):
             return {"ok": False, "error": "every draft must be an object"}
 
-        prepared: list[tuple[dict[str, Any], list[int]]] = []
+        prepared: list[tuple[dict[str, Any], list[int], dict[str, Any], dict[str, Any]]] = []
         assigned: dict[int, str] = {}
         keys: set[str] = set()
         for raw_value in raw_drafts:
@@ -638,7 +651,22 @@ class _StageCAgentTools:
                 if prior_key is not None:
                     return {"ok": False, "error": f"item {item_id} appears in both {prior_key} and {draft_key}"}
                 assigned[item_id] = draft_key
-            prepared.append((draft_args, ids))
+            try:
+                novelty = _prepare_draft_novelty(
+                    draft_args,
+                    item_ids=ids,
+                    admissions=self.by_item_id,
+                    history_by_key=self.history_by_key,
+                    history_identity_index=self.history_identity_index,
+                )
+                substance = _prepare_draft_substance(
+                    draft_args,
+                    item_ids=ids,
+                    novelty_status=str(novelty["novelty_status"]),
+                )
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            prepared.append((draft_args, ids, novelty, substance))
 
         for existing in self.repo.list_agent_drafts(int(self.agent_session.id)):
             for member in existing.members:
@@ -652,7 +680,10 @@ class _StageCAgentTools:
         saved: list[dict[str, Any]] = []
         try:
             with self.session.begin_nested():
-                for draft_args, ids in prepared:
+                for draft_args, ids, novelty, substance in prepared:
+                    risk_flags = _strings(draft_args.get("risk_flags"))
+                    risk_flags.extend(value for value in novelty["risk_flags"] if value not in risk_flags)
+                    risk_flags.extend(value for value in substance["risk_flags"] if value not in risk_flags)
                     draft = self.repo.upsert_agent_draft(
                         int(self.agent_session.id),
                         draft_key=str(draft_args.get("draft_key") or ""),
@@ -667,70 +698,129 @@ class _StageCAgentTools:
                             for value in draft_args.get("entities", [])
                             if isinstance(value, Mapping)
                         ],
-                        novelty_status=str(draft_args.get("novelty_status") or "uncertain"),
-                        prior_event_key=_text(draft_args.get("prior_event_key")),
-                        review_state=str(draft_args.get("review_state") or "candidate"),
+                        novelty_status=str(novelty["novelty_status"]),
+                        prior_event_key=_text(novelty.get("prior_event_key")),
+                        review_state=str(substance["review_state"]),
                         confidence=_bounded_score(draft_args.get("confidence"), 0),
-                        risk_flags=_strings(draft_args.get("risk_flags")),
-                        metadata={"saved_by": "responses_agent_batch", "batch_size": len(prepared)},
+                        risk_flags=risk_flags,
+                        metadata={
+                            "saved_by": "responses_agent_batch",
+                            "batch_size": len(prepared),
+                            "event_action": draft_args.get("event_action"),
+                            "lifecycle_state": draft_args.get("lifecycle_state"),
+                            "aggregation_basis": _strings(draft_args.get("aggregation_basis")),
+                            "novelty_reason": _text(draft_args.get("novelty_reason")),
+                            "material_changes": novelty["material_changes"],
+                            "novelty_guard": novelty["guard"],
+                            "substance_status": substance["substance_status"],
+                            "substantive_facts": substance["substantive_facts"],
+                            "substance_guard": substance["guard"],
+                        },
                     )
                     saved.append(
-                        {"draft_key": draft.draft_key, "draft_id": int(draft.id), "item_ids": ids}
+                        {
+                            "draft_key": draft.draft_key,
+                            "draft_id": int(draft.id),
+                            "item_ids": ids,
+                            "review_state": draft.review_state,
+                            "substance_status": substance["substance_status"],
+                        }
                     )
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         self.session.commit()
         return {"ok": True, "drafts": saved}
 
-    def record_verification_evidence(self, args: dict[str, Any]) -> Mapping[str, Any]:
-        url = str(args.get("url") or "").strip()
-        host = _safe_evidence_host(url)
-        if host is None:
-            return {"ok": False, "error": "evidence URL must be a public http(s) URL"}
-        if not _host_is_allowed(host, self.allowed_domains):
-            return {"ok": False, "error": f"evidence host is not allowed: {host}"}
-        canonical = canonical_event_url(url)
-        if canonical is None:
-            return {"ok": False, "error": "evidence URL is invalid"}
-        if canonical in self.web_search_observed_urls:
-            evidence_status = "verified"
-        elif self.web_search_calls_seen and not self.web_search_observed_urls:
-            # Some compatible Responses providers execute hosted search but
-            # omit returned source objects even when requested. Preserve the
-            # lead for an operator, but never let it masquerade as verified
-            # evidence or an automatically publishable event.
-            evidence_status = "needs_review"
-        else:
-            return {"ok": False, "error": "evidence URL was not observed in this session's hosted web-search actions"}
+    def search_web(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        draft_key = _text(args.get("draft_key"))
+        if draft_key:
+            self.search_attempted_draft_keys.add(draft_key)
+        if self.search_calls >= self.max_web_searches:
+            return {"ok": False, "error": "Stage C Tavily search budget exhausted", "error_code": "search_budget_exhausted"}
+        if self.search_client is None or not self.search_client.is_configured:
+            return {"ok": False, "error": "Tavily API is not configured", "error_code": "search_not_configured"}
+        self.search_calls += 1
+        try:
+            response = self.search_client.search(
+                str(args.get("query") or ""),
+                topic=str(args.get("topic") or "general"),
+                max_results=int(args.get("max_results") or 5),
+            )
+        except TavilySearchError as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "error_code": "tavily_search_failed",
+                "status_code": exc.status_code,
+                "retryable": exc.retryable,
+            }
+        for row in response.results:
+            self.search_results[row.result_id] = row
+        return {
+            "ok": True,
+            "provider": "tavily",
+            "draft_key": draft_key,
+            "claim": _text(args.get("claim")),
+            **response.as_dict(),
+        }
+
+    def attach_search_evidence(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        result_id = str(args.get("result_id") or "").strip()
+        row = self.search_results.get(result_id)
+        if row is None:
+            return {"ok": False, "error": "result_id was not returned by a Tavily search in this session"}
+        verdict = str(args.get("verdict") or "contextual")
+        status = {"supports": "verified", "contradicts": "contradicted", "contextual": "recorded"}.get(verdict)
+        if status is None:
+            return {"ok": False, "error": "invalid evidence verdict"}
         try:
             evidence = self.repo.record_agent_evidence(
                 int(self.agent_session.id),
                 draft_key=str(args.get("draft_key") or ""),
-                url=url,
-                title=_text(args.get("title")),
-                excerpt=_text(args.get("excerpt")),
+                url=row.url,
+                final_url=row.url,
+                title=row.title,
+                excerpt=row.content,
                 verification_claim=_text(args.get("claim")),
-                status=evidence_status,
+                source_scope="tavily",
+                status=status,
             )
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
-        if evidence_status == "needs_review" and evidence.draft_id is not None:
-            draft = self.session.get(IntelEventDraft, int(evidence.draft_id))
-            if draft is not None:
-                flags = _json_strings(draft.risk_flags_json)
-                if "unbound_web_evidence" not in flags:
-                    flags.append("unbound_web_evidence")
-                draft.risk_flags_json = json.dumps(flags, ensure_ascii=False)
-                draft.review_state = "needs_review"
         self.session.commit()
-        return {"ok": True, "evidence_id": int(evidence.id), "host": host, "status": evidence_status}
+        return {
+            "ok": True,
+            "evidence_id": int(evidence.id),
+            "result_id": result_id,
+            "host": evidence.host,
+            "status": status,
+        }
 
-    def record_web_search_observations(self, response: Mapping[str, Any]) -> None:
-        """Bind evidence only to URLs actually observed in hosted search actions."""
-
-        calls = _web_search_count(response)
-        self.web_search_calls_seen += calls
-        self.web_search_observed_urls.update(_web_search_observed_urls(response))
+    def _restore_search_state(self) -> None:
+        for step in self.agent_session.steps:
+            if step.kind != "tool_call" or step.tool_name != "search_web":
+                continue
+            self.search_calls += 1
+            input_value = _json_mapping(step.input_json)
+            output_value = _json_mapping(step.output_json)
+            draft_key = _text(input_value.get("draft_key") or output_value.get("draft_key"))
+            if draft_key:
+                self.search_attempted_draft_keys.add(draft_key)
+            for raw in output_value.get("results") or ():
+                if not isinstance(raw, Mapping):
+                    continue
+                result_id = _text(raw.get("result_id"))
+                url = _text(raw.get("url"))
+                if not result_id or not url:
+                    continue
+                self.search_results[result_id] = TavilySearchResult(
+                    result_id=result_id,
+                    title=_text(raw.get("title")),
+                    url=url,
+                    content=_text(raw.get("content")),
+                    score=_float_or_none(raw.get("score")),
+                    published_date=_text(raw.get("published_date")),
+                )
 
     def mark_unresolved(self, args: dict[str, Any]) -> Mapping[str, Any]:
         ids = _unique_positive_ids(args.get("item_ids"), limit=40)
@@ -741,16 +831,28 @@ class _StageCAgentTools:
 
     def finalize_event_drafts(self, args: dict[str, Any]) -> Mapping[str, Any]:
         del args
-        validation = _validate_agent_drafts(self.repo, self.agent_session, self.active_ids)
+        validation = _validate_agent_drafts(
+            self.repo,
+            self.agent_session,
+            self.active_ids,
+            admissions=self.admissions,
+        )
         review_drafts = [
             draft
             for draft in self.repo.list_agent_drafts(int(self.agent_session.id))
             if str(draft.review_state or "").casefold() == "needs_review"
         ]
-        verification_pending = bool(review_drafts and self.max_web_searches > 0 and self.web_search_calls_seen == 0)
+        verification_pending = [
+            draft
+            for draft in review_drafts
+            if self.max_web_searches > 0
+            and self.search_client is not None
+            and self.search_client.is_configured
+            and draft.draft_key not in self.search_attempted_draft_keys
+        ]
         errors = list(validation["errors"])
         if verification_pending:
-            errors.append("needs_review drafts require a hosted web verification pass before finalization")
+            errors.append("each needs_review draft requires its own Tavily verification pass before finalization")
         if errors:
             return {
                 "ok": False,
@@ -762,12 +864,12 @@ class _StageCAgentTools:
                         "title": draft.title,
                         "risk_flags": _json_strings(draft.risk_flags_json),
                     }
-                    for draft in review_drafts
+                    for draft in verification_pending
                 ]
                 if verification_pending
                 else [],
                 "next_action": (
-                    "Use hosted web search for unresolved central claims, record returned sources, and revise the draft. "
+                    "Use search_web for each unresolved draft, attach returned sources to its claims, and revise the draft. "
                     "Keep needs_review only when the research pass still cannot resolve it."
                     if verification_pending
                     else None
@@ -838,7 +940,7 @@ def _materialize_agent_events(
     result: EventClusterResult,
 ) -> None:
     active_ids = {int(row.item_id) for row in admissions["active"]}
-    validation = _validate_agent_drafts(repo, agent_session, active_ids)
+    validation = _validate_agent_drafts(repo, agent_session, active_ids, admissions=admissions)
     if validation["errors"]:
         raise StageCAgentContractError("; ".join(validation["errors"]))
     all_admissions = {int(row.item_id): row for rows in admissions.values() for row in rows}
@@ -847,11 +949,28 @@ def _materialize_agent_events(
     result.current_event_ids.clear()
     result.candidate_event_ids.clear()
     seen_keys: set[str] = set()
+    assigned_ids = {
+        int(member.item_id)
+        for draft in repo.list_agent_drafts(int(agent_session.id))
+        for member in draft.members
+    }
     for draft in repo.list_agent_drafts(int(agent_session.id)):
         member_ids = [int(member.item_id) for member in draft.members]
+        draft_identities = {
+            key
+            for item_id in member_ids
+            for key in exact_identity_keys(_item_mapping(all_admissions[item_id].item))
+        }
+        for reserve in admissions.get("reserve", ()):
+            reserve_id = int(reserve.item_id)
+            if reserve_id in assigned_ids:
+                continue
+            if draft_identities & set(exact_identity_keys(_item_mapping(reserve.item))):
+                member_ids.append(reserve_id)
+                assigned_ids.add(reserve_id)
         members = [all_admissions[item_id].item for item_id in member_ids]
         primary = _select_primary_item(members)
-        event_key = draft.prior_event_key or canonical_event_key(_item_mapping(primary))
+        event_key = canonical_event_key(_item_mapping(primary))
         if event_key in seen_keys:
             event_key = f"agent:{int(agent_session.id)}:{int(draft.id)}"
         seen_keys.add(event_key)
@@ -890,6 +1009,8 @@ def _materialize_agent_events(
                 "agent_session_id": int(agent_session.id),
                 "draft_key": draft.draft_key,
                 "prompt_version": agent_session.prompt_version,
+                "prior_event_key": draft.prior_event_key,
+                "draft_metadata": _json_mapping(draft.metadata_json),
             },
             risk_flags=risk_flags,
             primary_item_id=int(primary.id),
@@ -923,12 +1044,15 @@ def _materialize_agent_events(
         if novelty == "repeat":
             result.repeats += 1
         else:
-            result.candidate_event_ids.append(int(event.id))
             if novelty == "updated":
                 result.updated += 1
             else:
                 result.events += 1
                 result.event_ids.append(int(event.id))
+        # Keep every materialized event in the C audit pool, but only pass the
+        # two reviewable states downstream. Rejected rows remain traceable in C.
+        if str(draft.review_state or "").casefold() in {"candidate", "needs_review"}:
+            result.candidate_event_ids.append(int(event.id))
         if draft.review_state == "needs_review":
             result.unresolved += 1
     session.flush()
@@ -985,6 +1109,8 @@ def _validate_agent_drafts(
     repo: IntelRepository,
     agent_session: IntelAgentSession,
     active_ids: set[int],
+    *,
+    admissions: Mapping[str, Sequence[IntelCandidateAdmission]] | None = None,
 ) -> dict[str, Any]:
     drafts = repo.list_agent_drafts(int(agent_session.id))
     seen: set[int] = set()
@@ -1000,6 +1126,20 @@ def _validate_agent_drafts(
     missing = sorted(active_ids - seen)
     if missing:
         errors.append("active candidates are not covered")
+    if admissions is not None:
+        rows = {int(row.item_id): row for values in admissions.values() for row in values}
+        identity_owner: dict[str, str] = {}
+        for draft in drafts:
+            for member in draft.members:
+                item_id = int(member.item_id)
+                if item_id not in active_ids or item_id not in rows:
+                    continue
+                for identity in exact_identity_keys(_item_mapping(rows[item_id].item)):
+                    owner = identity_owner.setdefault(identity, draft.draft_key)
+                    if owner != draft.draft_key:
+                        errors.append(
+                            f"active candidates with exact identity {identity} are split across {owner} and {draft.draft_key}"
+                        )
     return {"errors": errors, "missing_active_ids": missing, "draft_count": len(drafts)}
 
 
@@ -1146,43 +1286,192 @@ def _history_matches(row: Mapping[str, Any], tokens: Sequence[str]) -> bool:
     return all(token in haystack for token in tokens)
 
 
-def _allowed_domains(
+def _history_identity_index(history: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for row in history:
+        event_key = _text(row.get("event_key"))
+        if not event_key:
+            continue
+        identities: set[str] = set()
+        if event_key.startswith(("url:", "external:")):
+            identities.add(event_key)
+        for ref in row.get("source_refs") or ():
+            if not isinstance(ref, Mapping):
+                continue
+            identities.update(exact_identity_keys(ref))
+        for identity in identities:
+            bucket = result.setdefault(identity, [])
+            if event_key not in bucket:
+                bucket.append(event_key)
+    return result
+
+
+def _prepare_draft_novelty(
+    draft: Mapping[str, Any],
     *,
-    admissions: Iterable[IntelCandidateAdmission],
-    configured: Sequence[str],
-) -> list[str]:
-    hosts: set[str] = set()
-    for raw in configured:
-        host = _safe_evidence_host("https://" + str(raw).strip().removeprefix("https://").removeprefix("http://"))
-        if host:
-            hosts.add(host)
-    for admission in admissions:
-        item = admission.item
-        source = item.source
-        for value in (item.canonical_url, item.source_url, getattr(source, "url", None), getattr(source, "account_url", None)):
-            host = _safe_evidence_host(value)
-            if host:
-                hosts.add(host)
-    return sorted(hosts)[:100]
+    item_ids: Sequence[int],
+    admissions: Mapping[int, IntelCandidateAdmission],
+    history_by_key: Mapping[str, Mapping[str, Any]],
+    history_identity_index: Mapping[str, Sequence[str]],
+) -> dict[str, Any]:
+    if len(item_ids) > 1 and not _strings(draft.get("aggregation_basis")):
+        raise ValueError(f"multi-member draft {draft.get('draft_key')} requires aggregation_basis")
+    material_changes: list[dict[str, Any]] = []
+    for raw in draft.get("material_changes") or ():
+        if not isinstance(raw, Mapping):
+            raise ValueError("material_changes must contain objects")
+        supporting = _unique_positive_ids(raw.get("supporting_item_ids"), limit=40)
+        outside = [item_id for item_id in supporting if item_id not in item_ids]
+        if outside:
+            raise ValueError(f"material change references non-member item ids: {outside}")
+        if not supporting:
+            raise ValueError("every material change requires supporting_item_ids")
+        material_changes.append(
+            {
+                "change_type": str(raw.get("change_type") or "other"),
+                "claim": _text(raw.get("claim")),
+                "supporting_item_ids": supporting,
+            }
+        )
+
+    exact_prior_keys: list[str] = []
+    for item_id in item_ids:
+        for identity in exact_identity_keys(_item_mapping(admissions[int(item_id)].item)):
+            for event_key in history_identity_index.get(identity, ()):
+                if event_key not in exact_prior_keys:
+                    exact_prior_keys.append(event_key)
+    requested_prior = _text(draft.get("prior_event_key"))
+    requested_status = str(draft.get("novelty_status") or "uncertain").casefold()
+    risk_flags: list[str] = []
+    guard: dict[str, Any] = {
+        "requested_status": requested_status,
+        "requested_prior_event_key": requested_prior,
+        "exact_history_matches": exact_prior_keys,
+        "history_scope": "previous_three_published_editions",
+    }
+
+    if requested_prior and requested_prior not in history_by_key:
+        prior_event_key = None
+        novelty_status = "uncertain"
+        risk_flags.append("prior_event_outside_history_window")
+    else:
+        prior_event_key = requested_prior or (exact_prior_keys[0] if exact_prior_keys else None)
+        if prior_event_key:
+            novelty_status = "updated" if material_changes else "repeat"
+        elif requested_status in {"repeat", "updated"}:
+            novelty_status = "uncertain"
+            risk_flags.append("history_match_not_found")
+        elif requested_status in {"new", "uncertain"}:
+            novelty_status = requested_status
+        else:
+            novelty_status = "uncertain"
+            risk_flags.append("invalid_novelty_status")
+    guard["applied_status"] = novelty_status
+    guard["applied_prior_event_key"] = prior_event_key
+    return {
+        "novelty_status": novelty_status,
+        "prior_event_key": prior_event_key,
+        "material_changes": material_changes,
+        "risk_flags": risk_flags,
+        "guard": guard,
+    }
 
 
-def _safe_evidence_host(value: Any) -> str | None:
-    try:
-        parsed = urlsplit(str(value or "").strip())
-    except ValueError:
-        return None
-    host = (parsed.hostname or "").casefold()
-    if parsed.scheme not in {"http", "https"} or not host or host in {"localhost", "localhost.localdomain"}:
-        return None
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return host
-    return None if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved else host
+def _prepare_draft_substance(
+    draft: Mapping[str, Any],
+    *,
+    item_ids: Sequence[int],
+    novelty_status: str,
+) -> dict[str, Any]:
+    """Validate event substance independently from recent-history novelty.
 
+    A previously unseen event is not automatically a normal candidate.  This
+    guard only enforces the generic three-state contract; the model decides the
+    event semantics from the complete claim rather than local keyword rules.
+    """
 
-def _host_is_allowed(host: str, allowed_domains: Iterable[str]) -> bool:
-    return any(host == allowed or host.endswith("." + allowed) for allowed in allowed_domains)
+    allowed_fact_types = {
+        "product",
+        "model",
+        "capability",
+        "timeline",
+        "commercial",
+        "organization",
+        "policy",
+        "research",
+        "availability",
+        "data",
+        "other",
+    }
+    substantive_facts: list[dict[str, Any]] = []
+    for raw in draft.get("substantive_facts") or ():
+        if not isinstance(raw, Mapping):
+            raise ValueError("substantive_facts must contain objects")
+        fact_type = str(raw.get("fact_type") or "").casefold()
+        if fact_type not in allowed_fact_types:
+            raise ValueError(f"unsupported substantive fact type: {fact_type or 'empty'}")
+        claim = _text(raw.get("claim"))
+        if not claim:
+            raise ValueError("every substantive fact requires a claim")
+        supporting = _unique_positive_ids(raw.get("supporting_item_ids"), limit=40)
+        outside = [item_id for item_id in supporting if item_id not in item_ids]
+        if outside:
+            raise ValueError(f"substantive fact references non-member item ids: {outside}")
+        if not supporting:
+            raise ValueError("every substantive fact requires supporting_item_ids")
+        substantive_facts.append(
+            {
+                "fact_type": fact_type,
+                "claim": claim,
+                "supporting_item_ids": supporting,
+            }
+        )
+
+    requested_status = str(draft.get("substance_status") or "uncertain").casefold()
+    requested_review_state = str(draft.get("review_state") or "candidate").casefold()
+    risk_flags: list[str] = []
+    if requested_status not in {"concrete", "intent_only", "uncertain"}:
+        applied_status = "uncertain"
+        risk_flags.append("invalid_substance_status")
+    else:
+        applied_status = requested_status
+
+    if applied_status == "concrete" and not substantive_facts:
+        applied_status = "uncertain"
+        risk_flags.append("concrete_event_without_substantive_facts")
+    if requested_review_state not in {"candidate", "needs_review", "rejected"}:
+        review_state = "needs_review"
+        risk_flags.append("invalid_review_state")
+    else:
+        review_state = requested_review_state
+
+    normalized_novelty_status = str(novelty_status).casefold()
+    if normalized_novelty_status == "repeat":
+        review_state = "rejected"
+        risk_flags.append("confirmed_repeat_without_material_change")
+    elif applied_status == "intent_only":
+        review_state = "rejected"
+        risk_flags.append("intent_only_event")
+    elif applied_status == "uncertain":
+        review_state = "needs_review"
+        risk_flags.append("uncertain_event_core")
+
+    guard = {
+        "requested_status": requested_status,
+        "applied_status": applied_status,
+        "requested_review_state": requested_review_state,
+        "applied_review_state": review_state,
+        "novelty_status": normalized_novelty_status,
+        "substantive_fact_count": len(substantive_facts),
+        "policy": "three_state_substance_consistency_v2",
+    }
+    return {
+        "substance_status": applied_status,
+        "substantive_facts": substantive_facts,
+        "review_state": review_state,
+        "risk_flags": risk_flags,
+        "guard": guard,
+    }
 
 
 def _select_primary_item(items: Sequence[IntelItem]) -> IntelItem:
@@ -1222,7 +1511,7 @@ def _stage_c_config_fingerprint(
     max_tool_calls: int,
     max_web_searches: int,
     lease_seconds: int,
-    allowed_domains: Sequence[str],
+    search_provider: str,
 ) -> str:
     payload = {
         "agent_version": STAGE_C_AGENT_VERSION,
@@ -1235,7 +1524,7 @@ def _stage_c_config_fingerprint(
         "max_tool_calls": max_tool_calls,
         "max_web_searches": max_web_searches,
         "lease_seconds": lease_seconds,
-        "allowed_domains": list(allowed_domains),
+        "search_provider": search_provider,
     }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -1287,47 +1576,11 @@ def _parse_call_arguments(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _web_search_count(response: Mapping[str, Any]) -> int:
-    output = response.get("output")
-    return sum(1 for item in output if isinstance(item, Mapping) and item.get("type") == "web_search_call") if isinstance(output, list) else 0
-
-
-def _web_search_observed_urls(response: Mapping[str, Any]) -> set[str]:
-    """Extract URLs from provider-returned hosted-search source and page actions."""
-
-    result: set[str] = set()
-    output = response.get("output")
-    if not isinstance(output, list):
-        return result
-    for item in output:
-        if not isinstance(item, Mapping) or item.get("type") != "web_search_call":
-            continue
-        action = item.get("action")
-        for url in _urls_from_search_action(action):
-            canonical = canonical_event_url(url)
-            if canonical:
-                result.add(canonical)
-    return result
-
-
-def _urls_from_search_action(value: Any) -> list[str]:
-    urls: list[str] = []
-
-    def visit(node: Any) -> None:
-        if isinstance(node, Mapping):
-            for key, raw_value in node.items():
-                if str(key).casefold() in {"url", "link", "final_url", "canonical_url"}:
-                    url = _text(raw_value)
-                    if url and url not in urls:
-                        urls.append(url)
-                if isinstance(raw_value, (Mapping, list, tuple)):
-                    visit(raw_value)
-        elif isinstance(node, (list, tuple)):
-            for child in node:
-                visit(child)
-
-    visit(value)
-    return urls
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _unique_positive_ids(value: Any, *, limit: int) -> list[int]:

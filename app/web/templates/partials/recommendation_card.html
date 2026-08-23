@@ -3,7 +3,7 @@
     <div class="score-pill score-{{ 'high' if card.display_score >= 80 else 'mid' if card.display_score >= 60 else 'low' }}">
       {{ card.display_score }}
     </div>
-    <small>展示评分</small>
+    <small>热度</small>
   </div>
   <div class="card-body">
     <div class="source-line">
@@ -18,11 +18,11 @@
       <a href="/events/{{ card.id }}?{% if active_edition_date %}edition_date={{ active_edition_date }}&amp;{% endif %}origin={{ active_nav or 'home' }}">{{ card.title }}</a>
     </h3>
     {% if card.summary %}<p class="summary-clamp" title="{{ card.summary }}">{{ card.summary }}</p>{% endif %}
-    {% if card.selection_reason %}<p class="note"><strong>筛选依据：</strong>{{ card.selection_reason }}</p>{% endif %}
+    {% if card.selection_reason %}<p class="note"><strong>推荐理由：</strong>{{ card.selection_reason }}</p>{% endif %}
     <div class="card-footline">
       <div class="topic-label"><span class="topic-dot"></span>{{ card.topic_category | topic_label if card.topic_category else (card.content_class or '未分类') }}</div>
       <div class="card-links">
-        {% if card.url %}<a class="inline-link" href="{{ card.url }}" target="_blank" rel="noopener noreferrer">阅读原文 <span>↗</span></a>{% endif %}
+        {% if card.url %}<a class="inline-link" href="{{ card.url }}" target="_blank" rel="noopener noreferrer">阅读原文 ↗</a>{% endif %}
       </div>
     </div>
     <div class="badges">

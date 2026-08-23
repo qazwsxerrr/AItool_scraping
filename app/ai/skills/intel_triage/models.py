@@ -357,7 +357,7 @@ class AnalysisResult(BaseModel):
         data["topic"] = normalized_topic
         data["topics"] = normalized_topics
         data["summary_cn"] = normalize_text(data.get("summary_cn"), preserve_newlines=False)
-        data["keywords"] = _clean_list(data.get("keywords"), limit=48)
+        data["keywords"] = _clean_list(data.get("keywords"), limit=4)
         data["entities"] = data.get("entities") or []
         data["b1_priority"] = _clamp_score(data.get("b1_priority", 0))
         return data
@@ -378,7 +378,7 @@ class AnalysisResult(BaseModel):
     @field_validator("keywords", mode="before")
     @classmethod
     def _clean_lists(cls, value: Any) -> list[str]:
-        return _clean_list(value, limit=48)
+        return _clean_list(value, limit=4)
 
     @field_validator("b1_priority", mode="before")
     @classmethod

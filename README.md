@@ -43,7 +43,7 @@ Stage B1 对每个通过 Stage A 的条目执行一次结构化分析，只输�
 | `github` | 3 | `github_release` | 只跟踪 Claude Code、Ollama、Transformers 等明确仓库的 Release；Trending 与 Topic Search 当前禁用。 |
 | `rsshub` | 46 | `x_official`、`x_social`，以及 Anthropic、DeepSeek RSSHub 路由 | 访问本地 RSSHub 输出的 RSS/Atom；X 官方账号通过 `source_group=x_official` 归因，不绕过 AI 筛选。 |
 
-如果没有配置 `RSSHUB_BASE_URL`，46 个 RSSHub 模板会被安全跳过，CLI 会显示 `Registry skipped`；这不会阻断其它 Feed 和 GitHub Release 来源。单个来源失败也只记录在 `fetch_attempts` 和来源健康状态中，不会中断整个批次。
+如果没有配置 `RSSHUB_BASE_URL`，46 个 RSSHub 模板会被安全跳过，CLI 会显示 `Registry skipped`；这不会阻断其它 Feed 和 GitHub Release 来源。单个来源失败只记录在 `fetch_attempts`、来源健康状态、日报 manifest 和日报警告中，不会中断整个批次或阻止发布。
 
 日常抓取不传 `--limit-per-source` 时使用各来源的 `default_limit`；该选项只用于人工调试时统一覆盖所有来源限额，例如 `--limit-per-source 30`。
 
@@ -107,19 +107,22 @@ AI_STAGE_C_TIMEOUT_SECONDS=120
 AI_STAGE_C_AGENT_MAX_TURNS=32
 AI_STAGE_C_AGENT_MAX_TOOL_CALLS=120
 AI_STAGE_C_AGENT_MAX_WEB_SEARCHES=16
-AI_STAGE_C_TRUSTED_DOMAINS=
+AI_STAGE_D_MAX_WEB_SEARCHES=6
+TAVILY_API_KEY=
+TAVILY_API_URL=https://api.tavily.com
+TAVILY_TIMEOUT_SECONDS=30
 ```
 
-Stage C 每次 Responses 请求默认超时 `120` 秒，独立于 Stage A/B 使用的 `AI_REVIEW_TIMEOUT_SECONDS`；可通过 `AI_STAGE_C_TIMEOUT_SECONDS` 继续调大。按默认 `32` turns 估算，Stage C 任务租约约为 66 分钟。其默认预算为 `32` turns、`120` 次本地工具调用和 `16` 次 hosted 网页搜索；显式配置更大的正整数会原样生效，不再额外压到较小上限。`AI_STAGE_C_AGENT_MAX_WEB_SEARCHES=0` 是关闭网页搜索的明确开关。
+Stage C 每次 Responses 请求默认超时 `120` 秒，独立于 Stage A/B 使用的 `AI_REVIEW_TIMEOUT_SECONDS`；可通过 `AI_STAGE_C_TIMEOUT_SECONDS` 继续调大。按默认 `32` turns 估算，Stage C 任务租约约为 66 分钟。其默认预算为 `32` turns、`120` 次本地工具调用和 `16` 次 Tavily 搜索；显式配置更大的非负整数会原样生效。`AI_STAGE_C_AGENT_MAX_WEB_SEARCHES=0` 和 `AI_STAGE_D_MAX_WEB_SEARCHES=0` 分别关闭 C、D 搜索。
 
-所有 AI 调用统一使用 OpenAI Responses 语义；`AI_REVIEW_API_URL` 可以是 `/v1` 基址或完整的 `/v1/responses` 地址。Stage C 需要 provider 支持 Responses 的 strict function calling 和 hosted `web_search`。网页搜索只能访问候选原始来源域名加 `AI_STAGE_C_TRUSTED_DOMAINS` 中配置的高可信域名；只有 provider 在同一会话的搜索来源或 `open_page` 操作中实际返回的 URL 才能标为“已核验”。对影响事件核心事实的不确定项，Stage C 会先进入核验回合：能确认时收窄表述并保留为候选，只有核验后仍无法解决、搜索不可用或预算耗尽时才保留 `needs_review`。若兼容 provider 执行了搜索却省略来源对象，链接只会保存为 `needs_review` 线索，并自动排除在 Stage D 的自动选稿和导出之外。
+AI 推理调用统一使用 OpenAI Responses 语义；`AI_REVIEW_API_URL` 可以是 `/v1` 基址或完整的 `/v1/responses` 地址。C、D 的网页核验不再依赖 provider hosted search，而是由本地 `TAVILY_API_KEY` 调用 Tavily。搜索不设域名白名单，返回的 URL、摘要、查询和绑定事件/claim 会保存到 agent step 与 evidence 审计记录。Stage C 对每个 `needs_review` 草稿分别核验；搜索后仍无法解决、搜索不可用或预算耗尽时保留待审状态，由 Stage D 终审决定去留。
 
-`AI_ANALYSIS_MIN_SCORE` 默认 `70`，`audience_relevance`（AI 主体相关性）默认不低于 `65`；两者共同构成 Stage B 的本地准入门槛，不再由 Stage C 决定。Stage B 将合格项按来源/主题多样性形成 active 候选池（初始目标 100 条、14 期后动态 60–120 条）和最多 20 条 reserve；Stage C 仅从这两个持久化集合按需取数。Stage C 输出 `candidate_event_ids`，Stage D 只在 `max_selected` 上限内选择其中的有序子集。
+`AI_ANALYSIS_MIN_SCORE` 默认 `70`，`audience_relevance`（AI 主体相关性）默认不低于 `65`；两者共同构成 Stage B 的本地准入门槛，不再由 Stage C 决定。Stage B 将合格项按来源/主题多样性形成 active 候选池（初始目标 100 条、14 期后动态 60–120 条）和最多 20 条 reserve；Stage C 从这两个持久化集合按需取数，按主体、动作、对象、版本/阶段和时间锚点区分同一事件、后续进展与同主题事件。历史旧闻只比较当前日报日期之前三个自然日内的已发布最终日报；草稿、搜索结果和更早日报不扩展去重窗口。Stage C 使用 `candidate`、`needs_review`、`rejected` 三态保存完整审计结果，只把前两态交给 Stage D；Stage D 在 `max_selected` 上限内完成人工式二次审核和有序子集选择。
 
 Stage B1 的 `b1_priority` 只衡量内容价值，由本地 guard 按 `audience_relevance`（AI 主体相关性）45%、`impact_scope`（已确认影响范围）25%、`independent_news_value`（事件级独立新闻价值）20%、`material_change` 5% 和 `specificity` 5% 重算。来源身份、AI 把握度和时间新鲜度不参与该分数：来源归因来自 source registry，Stage A 按日报日期前一天 00:00（Asia/Shanghai）做本地时间筛选。
 
 `AI_REVIEW_CONCURRENCY` 取值为 `1..4`，默认 `4`，表示 Stage A/B provider 请求的并发上限。
-Stage D 与 Stage A/B/C 共用 `AI_REVIEW_*` provider 配置；它只使用不同的提示词和输出 schema，不需要额外的模型、API URL 或 API key。由于 Stage D 一次提交完整事件池，实际请求超时下限为 120 秒，但仍不引入独立的 provider 配置。
+Stage D 与 Stage A/B/C 共用 `AI_REVIEW_*` provider 配置；它使用独立提示词和兼容的选择输出 schema，不需要额外的推理模型配置。Stage D 会优先搜索 `needs_review`、`uncertain`、`repeat` 等争议事件，再按预算检查其他事件；搜索证据随事件输入终审模型。由于 Stage D 一次提交完整事件池，实际请求超时下限为 120 秒。
 
 真实 token、API key、Cookie 和代理地址只放在本地 `.env`，不要写入 README 或提交到 Git。Product Hunt 使用公开 Atom feed，不需要额外 token。
 
@@ -221,10 +224,10 @@ $PYTHON -m app.main source-health --source x_account_openai
 
 1. 正式日报的 `fetch` 从 registry 载入全部当前启用来源，强制完整请求（不使用 HTTP 304 条件请求），把本次响应视为当天完整集合；每个条目只在当前 `draft.db` 内去重。
 2. `stage-a` 先执行来源级确定性初筛，再对保留条目调用结构化 AI；`stage-b1` 对通过 Stage A 的条目做 B1 分析，保存摘要、关键词、主题、实体和经本地 guard 的评分。原始条目、拒绝原因、AI 结果和失败 attempt 都保留在该日期 `draft.db`。
-3. `stage-b1` 完成后，本地规则把条目写成可审计的 `active` / `reserve` / `filtered` 候选准入记录；评分阈值、工作台容量和 reserve 都在 B 生效。`stage-c` 是状态化 Responses agent：它读取 active 候选、正文和近 3 天已发布日报，聚合事件；对影响核心事实的不确定项优先调用受限域名的 hosted web search，并保存可绑定的核验证据。模型可在证据支持后收窄表述并保留事件；只有核验仍无法解决的事件才使用 `needs_review`。本地代码校验每个 active `item_id` 恰好出现一次，并把草稿原子化为事件。超出 agent 预算时，未覆盖的候选会变为 `needs_review` 事件而不是被丢弃。
-4. `stage-d` 只做最终选稿：读取 Stage C 成功任务中的 `candidate_event_ids`，通过一次独立 skill 请求返回 `selected=[{event_id, reason_code, reason}]`。数组顺序就是展示顺序；未选事件由候选集合与入选集合之差推导。Stage D 不改写标题或摘要，不重新评分、聚合、判断新旧或生成观察池；它可看到 C 的待审状态和核验计数，但不自行联网。
+3. `stage-b1` 完成后，本地规则把条目写成可审计的 `active` / `reserve` / `filtered` 候选准入记录；评分阈值、工作台容量和 reserve 都在 B 生效。`stage-c` 是状态化 Responses agent：它读取 active 候选、正文和前三个自然日内的已发布最终日报，按主体、动作、对象、版本/阶段和时间锚点聚合事件；对影响核心事实的不确定项调用本地 Tavily 搜索，并把结果绑定到具体草稿和 claim。模型可在证据支持后收窄表述；核验仍无法解决时保留 `needs_review`。本地代码校验 active 覆盖、精确身份不可拆分，并复核 `repeat`/`updated` 与实质变化证据。超出 agent 预算时，未覆盖的候选会变为 `needs_review` 事件而不是被丢弃。
+4. `stage-d` 做人工式最终复审：读取 Stage C 成功任务中的 `candidate_event_ids`，其中包含 `candidate` 和 `needs_review`，不包含保留在 C 审计池中的 `rejected`。Stage D 优先对争议事件执行 Tavily 核验，再通过独立 skill 返回 `selected=[{event_id, reason_code, reason}]`。数组顺序就是展示顺序；未选事件由可审事件集合与入选集合之差推导。Stage D 不改写标题或摘要，也不重新聚合事件。
 5. `pipeline status --edition-date ...` 同时显示正式日报状态、当前 draft 状态和 retained audit 路径。构建期间 UI/API 始终读取旧的已发布日报；它们不读取 draft。
-6. `export` 是明确的批准动作：只有所有来源和 AI 阶段完整成功时，才把 `draft.db` 提升为 `audit.db`、原子替换 `output/daily/YYYY-MM-DD/`，并在正式库内替换该日期的最终日报条目。任一步失败都会恢复旧 audit 和旧日报；失败 draft 留在原处，可按日期检查、重试或恢复。
+6. `export` 是明确的批准动作：A-D 和导出任务完成后，把 `draft.db` 提升为 `audit.db`、原子替换 `output/daily/YYYY-MM-DD/`，并在正式库内替换该日期的最终日报条目。单个来源抓取失败只写入 `source_warnings` 和日报提示，不再阻止发布；真正的阶段/导出失败仍会恢复旧 audit 和旧日报，失败 draft 留在原处，可按日期检查、重试或恢复。
 7. 同日重新抓取不合并上午结果：下午响应中不存在的资讯、被移除来源的资讯及其派生事件，会在下午成功批准后从当天最终日报和新的 `audit.db` 中消失。新 draft 运行期间，上午已发布的 `audit.db` 仍保留，便于和下午 draft 比对。
 8. UI（`/`、`/search`、`/all`、`/github`）只读日期级最终日报或已生成报告，不在请求中执行抓取或 AI；首页、搜索和“本期精选”默认只展示当前日期的最终入选事件。
 

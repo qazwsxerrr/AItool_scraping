@@ -64,7 +64,7 @@ def test_start_creates_and_freezes_an_isolated_daily_draft(tmp_path):
         assert draft.scope["freshness_github_trending_policy"] == "exempt"
 
 
-def test_failed_fetch_keeps_a_partial_build_open_for_downstream_stages(tmp_path):
+def test_failed_fetch_is_recorded_as_a_warning_without_blocking_the_build(tmp_path):
     settings = Settings(database_url=f"sqlite:///{tmp_path / 'pipeline.db'}")
 
     def fake_fetch(**kwargs):
@@ -92,12 +92,12 @@ def test_failed_fetch_keeps_a_partial_build_open_for_downstream_stages(tmp_path)
         draft = repo.draft_run_for_edition("2026-08-19")
         assert edition is not None and draft is not None
         assert int(draft.id) == int(result.run_id)
-        assert edition.status == "building_with_errors"
-        assert edition.error == "fetch_failed_sources:1"
+        assert edition.status == "building"
+        assert edition.error is None
         assert draft.status == "running"
-        assert draft.error == "fetch_failed_sources:1"
-        assert draft.partial is True
-        assert draft.partial_reason == "fetch_failed_sources:1"
+        assert draft.error is None
+        assert draft.partial is False
+        assert draft.partial_reason is None
         assert draft.finished_at is None
 
     status = orchestrator.pipeline_edition_status_from_settings(
@@ -105,7 +105,7 @@ def test_failed_fetch_keeps_a_partial_build_open_for_downstream_stages(tmp_path)
         edition_date="2026-08-19",
     )
     fetch = next(row for row in status.stages if row["stage"] == "fetch")
-    assert fetch["status"] == "failed"
+    assert fetch["status"] == "succeeded"
     assert fetch["total"] == 1
     assert fetch["failed"] == 1
 

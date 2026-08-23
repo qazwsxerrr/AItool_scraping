@@ -15,7 +15,7 @@ def _payload(**overrides):
         "topic": "product_application",
         "topics": ["product_application"],
         "summary_cn": "Acme 发布 Model X",
-        "keywords": ["Model X"],
+        "keywords": ["模型发布", "开发者可用性"],
         "entities": [],
         "b1_priority": 88,
         "score_components": {
@@ -33,7 +33,7 @@ def _payload(**overrides):
 def test_stage_b_minimal_projection_is_parseable():
     result = parse_analysis_result(_payload())
     assert result.summary_cn == "Acme 发布 Model X"
-    assert result.keywords == ["Model X"]
+    assert result.keywords == ["模型发布", "开发者可用性"]
     assert result.b1_priority == 88
     assert not hasattr(result, "candidate_role")
     assert not hasattr(result, "event_signature")
@@ -88,6 +88,16 @@ def test_provider_schema_contains_only_minimal_analysis_fields():
         "independent_news_value",
         "specificity",
     }
+    assert schema["properties"]["keywords"]["minItems"] == 2
+    assert schema["properties"]["keywords"]["maxItems"] == 4
+
+
+def test_stage_b_locally_limits_keywords_to_four():
+    result = parse_analysis_result(
+        _payload(keywords=["核心动作", "能力变化", "开放范围", "时间节点", "背景概念"])
+    )
+
+    assert result.keywords == ["核心动作", "能力变化", "开放范围", "时间节点"]
 
 
 def test_b1_score_schema_declares_the_zero_to_hundred_scale():

@@ -55,7 +55,8 @@ INTEL_ANALYSIS_SYSTEM_PROMPT = (
     "technology_insight 必须有方法、实验、指标、研究结果或有实际价值的技术分析；"
     "outlook_rumor 用于路线图、即将推出、预告、计划、泄露、传闻或尚未确认的消息。"
     "如果材料的主叙事是未来计划或未确认消息，优先使用 outlook_rumor。"
-    "summary_cn 用中文生成约 50 个汉字的短摘要，只概括输入中明确出现的内容；keywords 只提取材料中出现或明确表达的关键词。"
+    "summary_cn 用中文生成约 50 个汉字的短摘要，只概括输入中明确出现的内容；keywords 只返回 2–4 个直接识别事件核心的概念或动作。"
+    "公司、人物和产品名称优先放入 entities，不要在 keywords 中重复；合并同义词和别名，不要提取背景业务、举例、旁支产品或正文主题词全集。"
     "entities 从材料中明确出现的公司、产品、人物、技术或行业概念中提取；没有实体时返回空数组。"
     "b1_priority 和 score_components 表达条目的内容价值；来源归因、AI 把握度、事实确认状态、日报入选和时间新鲜度由其他字段或本地阶段处理。"
     "b1_priority 以及 audience_relevance、material_change、impact_scope、independent_news_value、specificity 五个分项均为 0–100 的整数分数，五个分项使用同一 0–100 量纲。"
@@ -83,7 +84,12 @@ INTEL_ANALYSIS_JSON_SCHEMA: dict[str, Any] = {
         "topic": {"type": "string", "enum": list(INTEL_TOPICS)},
         "topics": {"type": "array", "items": {"type": "string", "enum": list(INTEL_TOPICS)}},
         "summary_cn": {"type": "string"},
-        "keywords": {"type": "array", "items": {"type": "string"}},
+        "keywords": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 4,
+            "items": {"type": "string"},
+        },
         "entities": {
             "type": "array",
             "items": {

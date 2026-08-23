@@ -1,12 +1,12 @@
 {% extends "base.html" %}
-{% block title %}热点搜索 - AI 热点内容台{% endblock %}
+{% block title %}热点搜索 — AIHOT{% endblock %}
 
 {% block content %}
 <section class="page-head">
   <div>
-    <p class="eyebrow">热点搜索</p>
+    <p class="eyebrow">INTELLIGENCE SEARCH</p>
     <h1>本地 AI 情报搜索</h1>
-    <p class="muted-text">搜索当前日报快照中的最终入选事件与 GitHub 项目；结果只来自本地已持久化数据。</p>
+    <p class="muted-text">检索当前日报快照中的入选事件与 GitHub 项目。</p>
   </div>
 </section>
 
@@ -17,19 +17,19 @@
       <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}</option>
     {% endfor %}
   </select>
-  <input id="search-query" name="q" type="search" placeholder="例如：Claude Code、MCP、Agent、GitHub..." value="{{ query }}" autofocus>
+  <input id="search-query" name="q" type="search" placeholder="输入关键字搜索模型、项目、工具…" value="{{ query }}" autofocus>
   <button type="submit">搜索</button>
 </form>
 
 {% if not query %}
   <div class="empty-state">
     <h3>输入关键词开始搜索</h3>
-    <p>搜索只读取本地数据库与已生成的 GitHub 导出，不会在请求期间调用外部服务。</p>
+    <p>搜索只读取本地已持久化数据库。</p>
   </div>
 {% elif total_count == 0 %}
   <div class="empty-state">
     <h3>没有找到相关内容</h3>
-    <p>可以换一个关键词，或先运行 pipeline run 生成当天日报。</p>
+    <p>请尝试其他关键词。</p>
   </div>
 {% else %}
   <section class="search-summary">
@@ -37,7 +37,6 @@
     <span>{{ total_count }} 条结果</span>
     <span>GitHub {{ github_projects | length }}</span>
     <span>本期精选 {{ results.selected_items | length }}</span>
-    <a class="summary-link" href="/sources">查看来源目录 →</a>
   </section>
 
   {% if github_projects %}

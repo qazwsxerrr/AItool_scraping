@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping, Sequence
 
-from app.ai.responses import AgentRunResult, FunctionTool, ResponsesClient, SupportsPost, hosted_web_search_tool
+from app.ai.responses import AgentRunResult, FunctionTool, ResponsesClient, SupportsPost
 from app.config.settings import Settings
 
 from .prompts import STAGE_C_AGENT_INSTRUCTIONS
@@ -51,10 +51,8 @@ class StageCAgentClient:
         *,
         initial_context: Mapping[str, Any],
         function_tools: Sequence[FunctionTool],
-        allowed_domains: Sequence[str],
         max_turns: int,
         max_tool_calls: int,
-        max_web_searches: int,
         previous_response_id: str | None = None,
         on_response: Callable[[int, Mapping[str, Any]], None] | None = None,
         on_tool: Callable[[int, Mapping[str, Any], Mapping[str, Any]], None] | None = None,
@@ -63,17 +61,13 @@ class StageCAgentClient:
             instructions=STAGE_C_AGENT_INSTRUCTIONS,
             initial_input=initial_context,
             function_tools=function_tools,
-            hosted_tools=[hosted_web_search_tool(allowed_domains=allowed_domains)],
+            hosted_tools=(),
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
-            max_web_searches=max_web_searches,
+            max_web_searches=0,
             previous_response_id=previous_response_id,
             on_response=on_response,
             on_tool=on_tool,
         )
-
-    def verify_web_search(self, *, allowed_domains: Sequence[str]) -> dict[str, Any]:
-        return self._responses.verify_web_search(allowed_domains=allowed_domains)
-
 
 __all__ = ["StageCAgentClient"]
