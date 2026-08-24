@@ -36,23 +36,6 @@ def test_settings_read_ai_review_model(monkeypatch):
     assert settings.ai_review_model == "review-model"
 
 
-def test_settings_read_stage_b_analysis_min_score(monkeypatch):
-    monkeypatch.delenv("AI_ANALYSIS_MIN_SCORE", raising=False)
-    monkeypatch.setenv("AI_ANALYSIS_MIN_SCORE", "72")
-
-    settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
-
-    assert settings.ai_analysis_min_score == 72
-
-
-def test_settings_stage_b_analysis_min_score_defaults_to_70(monkeypatch):
-    monkeypatch.delenv("AI_ANALYSIS_MIN_SCORE", raising=False)
-
-    settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
-
-    assert settings.ai_analysis_min_score == 70
-
-
 def test_settings_stage_d_reuses_ai_review_configuration(monkeypatch):
     for name in ("AI_REVIEW_API_URL", "AI_REVIEW_API_KEY", "AI_REVIEW_MODEL", "REQUEST_RETRIES"):
         monkeypatch.delenv(name, raising=False)

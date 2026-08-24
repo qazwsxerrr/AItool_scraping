@@ -7,7 +7,6 @@
   </div>
   <div class="card-body">
     <div class="source-line">
-      <span class="source-avatar">{{ (card.source_name or '来')[:1] }}</span>
       <span class="source-name">{{ card.source_name or '未知来源' }}</span>
       {% if card.source_group %}<span class="source-group">{{ card.source_group | source_group_label }}</span>{% endif %}
       {% if card.source_transport %}<span class="source-transport">{{ card.source_transport | transport_label }}</span>{% endif %}

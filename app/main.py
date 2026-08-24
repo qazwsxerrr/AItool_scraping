@@ -108,10 +108,13 @@ def fetch_only(
     if result.fetch.not_due_sources:
         typer.echo(f"Not due (use --force to retry): {', '.join(result.fetch.not_due_sources)}")
     for source_id, stats in result.fetch.stats.items():
-        typer.echo(
+        message = (
             f"{source_id}: fetched={stats.fetched} inserted={stats.inserted} "
             f"skipped={stats.skipped} failed={stats.failed} status={stats.status}"
         )
+        if stats.error:
+            message += f" error={stats.error}"
+        typer.echo(message)
     typer.echo(
         f"Totals: fetched={result.fetch.total_fetched} inserted={result.fetch.total_inserted} "
         f"skipped={result.fetch.total_skipped} failed={result.fetch.total_failed}"
@@ -122,51 +125,6 @@ def fetch_only(
     typer.echo(f"json={result.export.json_path}")
     typer.echo(f"jsonl={result.export.jsonl_path}")
     typer.echo(f"markdown={result.export.markdown_path}")
-
-
-@app.command("run-once")
-def run_once(
-    limit: int | None = typer.Option(
-        DEFAULT_FETCH_LIMIT_PER_SOURCE,
-        "--limit",
-        "--fetch-limit",
-        min=1,
-        help="Override every source limit; omitted uses source_registry.yaml default_limit.",
-    ),
-    edition_date: str | None = typer.Option(
-        None,
-        "--edition-date",
-        metavar="YYYY-MM-DD",
-        help="Public daily edition to update; defaults to the current Asia/Shanghai date.",
-    ),
-    output_dir: str = typer.Option("output/intel", help="JSONL/Markdown output directory."),
-    profile: str | None = typer.Option(None, "--profile", help="Daily editorial profile YAML path."),
-    publish: bool = typer.Option(False, "--publish", help="Approve and replace the public daily report after a complete draft."),
-) -> None:
-    configure_logging()
-    result = run_pipeline_from_settings(
-        settings=Settings.from_env(),
-        limit=limit,
-        edition_date=_optional_edition_date(edition_date),
-        output_dir=output_dir,
-        profile_path=profile,
-        publish=publish,
-    )
-    typer.echo(
-        f"fetch: fetched={result.start.fetch.total_fetched} inserted={result.start.fetch.total_inserted} "
-        f"skipped={result.start.fetch.total_skipped} failed={result.start.fetch.total_failed}"
-    )
-    exported = result.resume.results.get("export")
-    if exported is not None:
-        typer.echo(f"export: exported={exported.exported}")
-        _echo_daily_edition(exported.markdown_path)
-    typer.echo(f"status={result.status}")
-    if result.status == "ready_for_publish" and result.start.edition_date:
-        typer.echo(f"next=pipeline export --edition-date {result.start.edition_date}")
-    if result.status in {"failed", "partial", "draft_failed"}:
-        for error in result.resume.errors:
-            typer.echo(f"error={error}")
-        raise typer.Exit(code=1)
 
 
 @pipeline_app.command("start")
@@ -183,6 +141,7 @@ def pipeline_start(
         metavar="YYYY-MM-DD",
         help="Public daily edition to update; defaults to the current Asia/Shanghai date.",
     ),
+    output_dir: str = typer.Option("output/intel", "--output-dir"),
 ) -> None:
     """Create one complete daily draft and perform its fetch stage."""
 
@@ -191,6 +150,7 @@ def pipeline_start(
         settings=Settings.from_env(),
         limit=limit,
         edition_date=_optional_edition_date(edition_date),
+        output_dir=output_dir,
     )
     if result.edition_date:
         typer.echo(f"edition_date={result.edition_date}")
@@ -203,11 +163,13 @@ def pipeline_start(
         typer.echo(f"reference_time={result.reference_time.isoformat()}")
 
 
+@app.command("run-once", help="Compatibility alias for `pipeline run`; uses the same formal pipeline.")
 @pipeline_app.command("run")
 def pipeline_run(
     limit: int | None = typer.Option(
         DEFAULT_FETCH_LIMIT_PER_SOURCE,
         "--limit",
+        "--fetch-limit",
         min=1,
         help="Override every source limit; omitted uses source_registry.yaml default_limit.",
     ),
@@ -221,7 +183,7 @@ def pipeline_run(
     ),
     publish: bool = typer.Option(False, "--publish", help="Approve and replace the public daily report after a complete draft."),
 ) -> None:
-    """Run A-D into a private draft; use --publish only after approval."""
+    """Run A-D and write review artifacts; use --publish only after approval."""
 
     configure_logging()
 
@@ -243,6 +205,12 @@ def pipeline_run(
     export_result = result.resume.results.get("export")
     if export_result is not None:
         _echo_daily_edition(getattr(export_result, "markdown_path", None))
+    draft_export = result.resume.results.get("draft_export")
+    if draft_export is not None:
+        typer.echo(f"draft_markdown={draft_export.markdown_path}")
+        typer.echo(f"draft_jsonl={draft_export.jsonl_path}")
+        if draft_export.manifest_path:
+            typer.echo(f"draft_manifest={draft_export.manifest_path}")
     typer.echo(
         f"fetch: fetched={result.start.fetch.total_fetched} "
         f"inserted={result.start.fetch.total_inserted} "
@@ -367,7 +335,7 @@ def pipeline_export(
     limit: int = typer.Option(DEFAULT_DAILY_REPORT_LIMIT, "--limit", min=1),
     output_dir: str = typer.Option("output/intel", "--output-dir"),
 ) -> None:
-    """Publish the current daily draft's selected Stage-D events."""
+    """Publish the database draft; Markdown remains a presentation artifact."""
 
     configure_logging()
     settings = Settings.from_env()
@@ -393,6 +361,7 @@ def pipeline_export(
 @pipeline_app.command("status")
 def pipeline_status(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to inspect."),
+    output_dir: str = typer.Option("output/intel", "--output-dir"),
 ) -> None:
     """Show public, draft, and retained-audit state for one daily report."""
 
@@ -400,7 +369,11 @@ def pipeline_status(
     settings = Settings.from_env()
     normalized = _required_edition_date(edition_date)
     try:
-        status = pipeline_edition_status_from_settings(settings=settings, edition_date=normalized)
+        status = pipeline_edition_status_from_settings(
+            settings=settings,
+            edition_date=normalized,
+            output_dir=output_dir,
+        )
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--edition-date") from exc
     typer.echo(f"edition_date={status.edition_date}")
@@ -411,6 +384,10 @@ def pipeline_status(
     )
     if status.audit_path:
         typer.echo(f"audit={status.audit_path}")
+    if status.draft_markdown_path:
+        typer.echo(f"draft_markdown={status.draft_markdown_path}")
+    if status.draft_manifest_path:
+        typer.echo(f"draft_manifest={status.draft_manifest_path}")
     for row in status.stages:
         typer.echo(
             f"{row['stage']}: status={row['status']} total={row['total']} "
@@ -482,6 +459,12 @@ def pipeline_resume(
         typer.echo(f"skipped={','.join(result.skipped_stages)}")
     for error in result.errors:
         typer.echo(f"error={error}")
+    draft_export = result.results.get("draft_export")
+    if draft_export is not None:
+        typer.echo(f"draft_markdown={draft_export.markdown_path}")
+        typer.echo(f"draft_jsonl={draft_export.jsonl_path}")
+        if draft_export.manifest_path:
+            typer.echo(f"draft_manifest={draft_export.manifest_path}")
     if result.errors:
         raise typer.Exit(code=1)
 

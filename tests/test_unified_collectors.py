@@ -84,6 +84,35 @@ def test_rsshub_uses_the_same_feed_implementation():
     assert batch.items[0].title == "RSSHub item"
 
 
+def test_empty_rsshub_x_feed_is_degraded_content_health():
+    url = "https://rsshub.example.test/twitter/user/OpenAI"
+    body = b"<rss version='2.0'><channel><title>Twitter @OpenAI</title></channel></rss>"
+    client = _Client([_response(url, body)])
+    source = _feed_source(
+        "x_account_openai",
+        transport="rsshub",
+        url=url,
+        source_group="x_official",
+    )
+
+    batch = FeedCollector(client, sleeper=lambda _: None).collect(source, 10)
+
+    assert batch.status == "degraded"
+    assert batch.error_code == "empty_feed"
+    assert batch.items == []
+
+
+def test_empty_native_feed_remains_successful():
+    url = "https://example.test/feed.xml"
+    body = b"<rss version='2.0'><channel><title>Quiet feed</title></channel></rss>"
+    client = _Client([_response(url, body)])
+
+    batch = FeedCollector(client, sleeper=lambda _: None).collect(_feed_source(url=url), 10)
+
+    assert batch.status == "success"
+    assert batch.error_code is None
+
+
 def test_reddit_feed_uses_standard_registry_url_without_query_rewrite():
     url = "https://www.reddit.com/r/LocalLLaMA/new/.rss"
     source = _feed_source(

@@ -37,7 +37,7 @@ from app.domain.recency import (
     STAGE_A_FRESHNESS_CUTOFF_MODE,
     STAGE_A_FRESHNESS_POLICY_VERSION,
     STAGE_A_FRESHNESS_TIMEZONE,
-    RecentWindowDecision,
+    StageAFreshnessDecision,
     stage_a_cutoff_at,
     stage_a_time_decision,
 )
@@ -99,7 +99,7 @@ class _ItemContext:
 class _TimeFilteredItem:
     item_id: int
     input_fingerprint: str
-    decision: RecentWindowDecision
+    decision: StageAFreshnessDecision
 
 
 class _TaskLeaseLost(RuntimeError):
@@ -262,7 +262,7 @@ def run_stage_a_screen_job(
             repo.complete_stage_task(
                 task,
                 status="skipped",
-                result_ref={"projection": "RecentWindowDecision", "item_id": filtered.item_id},
+                result_ref={"projection": "StageAFreshnessDecision", "item_id": filtered.item_id},
                 result={"decision": "reject", **filtered.decision.metadata()},
                 metadata=filtered.decision.metadata(),
             )
@@ -914,14 +914,11 @@ def _config_fingerprint(
     stage: str,
     model: Any,
     reject_threshold: int,
-    freshness_window_hours: int | None = None,
     freshness_policy: str | None = None,
     freshness_cutoff_mode: str | None = None,
     freshness_timezone: str | None = None,
 ) -> str:
     payload = {"stage": stage, "model": str(model or ""), "reject_threshold": int(reject_threshold)}
-    if freshness_window_hours is not None:
-        payload["freshness_window_hours"] = int(freshness_window_hours)
     if freshness_policy:
         payload["freshness_policy"] = freshness_policy
     if freshness_cutoff_mode:

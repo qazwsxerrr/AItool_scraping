@@ -1117,23 +1117,3 @@ sources:
     adapter: generic
   source_group: official_research
   default_limit: 6
-- id: mistral_news_disabled
-  name: Mistral News (disabled placeholder)
-  transport: rsshub
-  url: ${RSSHUB_BASE_URL}/mistral/news
-  enabled: false
-  priority: 900
-  fetch_interval: 3600
-  feed:
-    format: rss
-    adapter: generic
-- id: perplexity_updates_disabled
-  name: Perplexity Updates (disabled placeholder)
-  transport: rsshub
-  url: ${RSSHUB_BASE_URL}/perplexity/updates
-  enabled: false
-  priority: 910
-  fetch_interval: 3600
-  feed:
-    format: rss
-    adapter: generic

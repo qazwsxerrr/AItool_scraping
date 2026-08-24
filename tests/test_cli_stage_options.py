@@ -111,3 +111,112 @@ def test_formal_daily_commands_reject_source_and_class_overrides():
     ):
         result = runner.invoke(main.app, arguments)
         assert result.exit_code != 0, arguments
+
+
+def test_run_once_compatibility_alias_keeps_fetch_limit(monkeypatch):
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(main.Settings, "from_env", lambda: object())
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return type(
+            "Result",
+            (),
+            {
+                "status": "ready_for_publish",
+                "start": type(
+                    "Start",
+                    (),
+                    {
+                        "scope_frozen": True,
+                        "edition_date": "2026-08-19",
+                        "fetch": type(
+                            "Fetch",
+                            (),
+                            {
+                                "total_fetched": 0,
+                                "total_inserted": 0,
+                                "total_skipped": 0,
+                                "total_failed": 0,
+                            },
+                        )(),
+                    },
+                )(),
+                "resume": type(
+                    "Resume",
+                    (),
+                    {"results": {}, "ran_stages": [], "skipped_stages": [], "errors": []},
+                )(),
+            },
+        )()
+
+    monkeypatch.setattr(main, "run_pipeline_from_settings", fake_run)
+
+    result = runner.invoke(
+        main.app,
+        ["run-once", "--fetch-limit", "7", "--edition-date", "2026-08-19"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["limit"] == 7
+    assert captured["edition_date"] == "2026-08-19"
+
+
+def test_pipeline_run_prints_review_artifact_paths(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.Settings, "from_env", lambda: object())
+    draft_dir = tmp_path / "intel" / "draft" / "2026-08-19"
+    draft_export = type(
+        "DraftExport",
+        (),
+        {
+            "markdown_path": str(draft_dir / "intel_digest.md"),
+            "jsonl_path": str(draft_dir / "intel_items.jsonl"),
+            "manifest_path": str(draft_dir / "manifest.json"),
+        },
+    )()
+    result_value = type(
+        "Result",
+        (),
+        {
+            "status": "ready_for_publish",
+            "start": type(
+                "Start",
+                (),
+                {
+                    "scope_frozen": True,
+                    "edition_date": "2026-08-19",
+                    "fetch": type(
+                        "Fetch",
+                        (),
+                        {
+                            "total_fetched": 0,
+                            "total_inserted": 0,
+                            "total_skipped": 0,
+                            "total_failed": 0,
+                        },
+                    )(),
+                },
+            )(),
+            "resume": type(
+                "Resume",
+                (),
+                {
+                    "results": {"draft_export": draft_export},
+                    "ran_stages": ["draft-export"],
+                    "skipped_stages": [],
+                    "errors": [],
+                },
+            )(),
+        },
+    )()
+    monkeypatch.setattr(main, "run_pipeline_from_settings", lambda **kwargs: result_value)
+
+    result = runner.invoke(
+        main.app,
+        ["pipeline", "run", "--edition-date", "2026-08-19", "--output-dir", str(tmp_path / "intel")],
+    )
+
+    assert result.exit_code == 0
+    assert f"draft_markdown={draft_dir / 'intel_digest.md'}" in result.stdout
+    assert f"draft_jsonl={draft_dir / 'intel_items.jsonl'}" in result.stdout
+    assert f"draft_manifest={draft_dir / 'manifest.json'}" in result.stdout

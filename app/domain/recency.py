@@ -1,9 +1,10 @@
-"""Deterministic build-scoped freshness policies for daily intelligence.
+"""Deterministic Stage-A freshness policy for daily intelligence.
 
-The AI provider must never decide whether an item is recent. Stage A uses the
-daily edition's previous-day midnight in the project timezone, with an
-explicit GitHub Trending project-discovery exemption. The legacy rolling
-72-hour helper remains available for callers that need that independent rule.
+The AI provider must never decide whether an item is recent. Stage A is the
+single admission gate: it uses the daily edition's previous-day midnight in
+the project timezone, with an explicit GitHub Trending discovery exemption.
+Downstream stages consume that frozen decision without applying another time
+window.
 """
 
 from __future__ import annotations
@@ -13,10 +14,6 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.config.limits import RECENT_WINDOW_HOURS
-
-
-FRESHNESS_POLICY_VERSION = "recent_window_v2"
 STAGE_A_FRESHNESS_POLICY_VERSION = "edition_previous_day_midnight_v1"
 STAGE_A_FRESHNESS_CUTOFF_MODE = "edition_previous_day_midnight"
 STAGE_A_FRESHNESS_TIMEZONE = "Asia/Shanghai"
@@ -27,8 +24,8 @@ STAGE_A_TIMEZONE = ZoneInfo(STAGE_A_FRESHNESS_TIMEZONE)
 
 
 @dataclass(frozen=True)
-class RecentWindowDecision:
-    """One explainable eligibility decision for an item in a frozen run."""
+class StageAFreshnessDecision:
+    """One explainable Stage-A time-admission decision for a frozen run."""
 
     eligible: bool
     reason: str
@@ -37,9 +34,9 @@ class RecentWindowDecision:
     reference_time: datetime
     cutoff_at: datetime
     age_hours: float | None
-    window_hours: int | None = RECENT_WINDOW_HOURS
-    cutoff_mode: str = "rolling_hours"
-    cutoff_timezone: str | None = "UTC"
+    window_hours: int | None = None
+    cutoff_mode: str = STAGE_A_FRESHNESS_CUTOFF_MODE
+    cutoff_timezone: str | None = STAGE_A_FRESHNESS_TIMEZONE
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -56,7 +53,7 @@ class RecentWindowDecision:
         }
 
 
-def recent_window_scope(edition_date: date | str | None = None) -> dict[str, Any]:
+def stage_a_freshness_scope(edition_date: date | str | None = None) -> dict[str, Any]:
     """Return immutable run-scope metadata for the Stage A freshness policy."""
 
     scope: dict[str, Any] = {
@@ -72,36 +69,6 @@ def recent_window_scope(edition_date: date | str | None = None) -> dict[str, Any
     if normalized_edition is not None:
         scope["freshness_edition_date"] = normalized_edition.isoformat()
     return scope
-
-
-def recent_window_decision(
-    item: Any,
-    *,
-    reference_time: datetime,
-    source: Any | None = None,
-) -> RecentWindowDecision:
-    """Apply the inclusive legacy ``reference_time - 72h`` admission gate.
-
-    Normal feed/social items must provide ``published_at``. GitHub Trending is
-    an explicitly exempt project-discovery input: it is never admitted or
-    rejected by a news-time window, and its optional ``captured_at`` remains
-    audit-only. No other source may turn a re-fetch timestamp into a new-news
-    timestamp.
-    """
-
-    reference = _as_utc(reference_time)
-    if reference is None:
-        raise ValueError("reference_time must be a valid datetime")
-    cutoff = reference - timedelta(hours=RECENT_WINDOW_HOURS)
-    return _decision_for_cutoff(
-        item,
-        source=source,
-        reference=reference,
-        cutoff=cutoff,
-        window_hours=RECENT_WINDOW_HOURS,
-        cutoff_mode="rolling_hours",
-        cutoff_timezone="UTC",
-    )
 
 
 def stage_a_cutoff_at(edition_date: date | str) -> datetime:
@@ -120,7 +87,7 @@ def stage_a_time_decision(
     reference_time: datetime,
     edition_date: date | str,
     source: Any | None = None,
-) -> RecentWindowDecision:
+) -> StageAFreshnessDecision:
     """Apply Stage A's inclusive previous-day-midnight admission gate."""
 
     reference = _as_utc(reference_time)
@@ -146,9 +113,9 @@ def _decision_for_cutoff(
     window_hours: int | None,
     cutoff_mode: str,
     cutoff_timezone: str | None,
-) -> RecentWindowDecision:
+) -> StageAFreshnessDecision:
     if _is_github_trending(source):
-        return RecentWindowDecision(
+        return StageAFreshnessDecision(
             eligible=True,
             reason="trending_exempt",
             time_basis="captured_at_discovery",
@@ -162,7 +129,7 @@ def _decision_for_cutoff(
         )
     timestamp, basis, missing_reason = _resolve_timestamp(item, source)
     if timestamp is None:
-        return RecentWindowDecision(
+        return StageAFreshnessDecision(
             eligible=False,
             reason=missing_reason,
             time_basis=basis,
@@ -175,7 +142,7 @@ def _decision_for_cutoff(
             cutoff_timezone=cutoff_timezone,
         )
     if timestamp > reference:
-        return RecentWindowDecision(
+        return StageAFreshnessDecision(
             eligible=False,
             reason="future_timestamp",
             time_basis=basis,
@@ -189,7 +156,7 @@ def _decision_for_cutoff(
         )
     age_hours = (reference - timestamp).total_seconds() / 3600
     if timestamp < cutoff:
-        return RecentWindowDecision(
+        return StageAFreshnessDecision(
             eligible=False,
             reason="too_old",
             time_basis=basis,
@@ -201,7 +168,7 @@ def _decision_for_cutoff(
             cutoff_mode=cutoff_mode,
             cutoff_timezone=cutoff_timezone,
         )
-    return RecentWindowDecision(
+    return StageAFreshnessDecision(
         eligible=True,
         reason="within_window",
         time_basis=basis,
@@ -266,17 +233,24 @@ def _as_utc(value: Any) -> datetime | None:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+# Compatibility names for callers that imported the former generic scope and
+# decision types.  The rolling 72-hour decision function is intentionally not
+# retained because it is no longer part of the formal pipeline.
+RecentWindowDecision = StageAFreshnessDecision
+recent_window_scope = stage_a_freshness_scope
+
+
 __all__ = [
     "FRESHNESS_FUTURE_POLICY",
     "FRESHNESS_GITHUB_TRENDING_POLICY",
-    "FRESHNESS_POLICY_VERSION",
     "FRESHNESS_UNDATED_POLICY",
     "STAGE_A_FRESHNESS_CUTOFF_MODE",
     "STAGE_A_FRESHNESS_POLICY_VERSION",
     "STAGE_A_FRESHNESS_TIMEZONE",
     "RecentWindowDecision",
-    "recent_window_decision",
+    "StageAFreshnessDecision",
     "recent_window_scope",
+    "stage_a_freshness_scope",
     "stage_a_cutoff_at",
     "stage_a_time_decision",
 ]

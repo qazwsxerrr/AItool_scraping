@@ -196,6 +196,156 @@ def test_approved_draft_replaces_public_report_and_retains_its_full_audit(tmp_pa
     assert status.audit_path == str(audit_database_path(settings.database_url, "2026-08-19"))
 
 
+def test_completed_draft_renders_review_markdown_without_publishing(tmp_path, monkeypatch):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'daily.db'}")
+    public_engine = create_engine_from_url(settings.database_url)
+    init_db(public_engine)
+    workspace_settings, run_id = _complete_draft(settings, "2026-08-19")
+    output_dir = tmp_path / "intel"
+
+    def fake_export(**kwargs):
+        staging = Path(kwargs["artifact_dir"])
+        staging.mkdir(parents=True, exist_ok=True)
+        for name, value in (
+            ("intel_digest.md", "draft digest"),
+            ("intel_items.jsonl", '{"title":"Draft report"}\n'),
+            ("manifest.json", '{"edition_date":"2026-08-19"}\n'),
+        ):
+            (staging / name).write_text(value, encoding="utf-8")
+        return IntelExportResult(
+            1,
+            str(staging / "intel_items.jsonl"),
+            str(staging / "intel_digest.md"),
+            manifest_path=str(staging / "manifest.json"),
+            records=(
+                {
+                    "event_key": "url:https://daily.example/draft",
+                    "title": "Draft report",
+                    "url": "https://daily.example/draft",
+                },
+            ),
+        )
+
+    monkeypatch.setattr(orchestrator, "run_intel_export_from_settings", fake_export)
+    result = orchestrator.render_daily_draft_from_settings(
+        settings=settings,
+        edition_date="2026-08-19",
+        output_dir=output_dir,
+    )
+
+    draft_dir = output_dir / "draft" / "2026-08-19"
+    assert result.markdown_path == str(draft_dir / "intel_digest.md")
+    assert (draft_dir / "intel_digest.md").read_text(encoding="utf-8") == "draft digest"
+    assert daily_draft_exists(settings, "2026-08-19")
+    assert not daily_audit_exists(settings, "2026-08-19")
+    with create_session_factory(public_engine)() as session:
+        assert session.get(IntelRun, run_id) is None
+        assert session.scalar(select(DailyEdition).where(DailyEdition.edition_date == datetime(2026, 8, 19).date())) is None
+
+    status = orchestrator.pipeline_edition_status_from_settings(
+        settings=settings,
+        edition_date="2026-08-19",
+        output_dir=output_dir,
+    )
+    assert status.status == "ready_for_publish"
+    assert status.draft_status == "ready_for_publish"
+    assert status.draft_markdown_path == str(draft_dir / "intel_digest.md")
+
+
+def test_resume_generates_review_bundle_after_stage_d_completes(tmp_path, monkeypatch):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'daily.db'}")
+    workspace_settings, run_id = _complete_draft(settings, "2026-08-19")
+    rendered = IntelExportResult(
+        0,
+        str(tmp_path / "intel" / "draft" / "2026-08-19" / "intel_items.jsonl"),
+        str(tmp_path / "intel" / "draft" / "2026-08-19" / "intel_digest.md"),
+        manifest_path=str(tmp_path / "intel" / "draft" / "2026-08-19" / "manifest.json"),
+        records=(),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_render(**kwargs):
+        captured.update(kwargs)
+        return rendered
+
+    monkeypatch.setattr(orchestrator, "_render_daily_draft_for_run_from_settings", fake_render)
+    result = orchestrator.resume_pipeline_from_settings(
+        settings=workspace_settings,
+        run_id=run_id,
+        output_dir=tmp_path / "intel",
+    )
+
+    assert result.errors == []
+    assert result.ran_stages[-1] == "draft-export"
+    assert result.results["draft_export"] is rendered
+    assert captured["settings"] == workspace_settings
+    assert captured["run_id"] == run_id
+    assert captured["output_dir"] == tmp_path / "intel"
+
+
+def test_publish_uses_database_records_not_edited_draft_markdown(tmp_path, monkeypatch):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'daily.db'}")
+    public_engine = create_engine_from_url(settings.database_url)
+    init_db(public_engine)
+    _complete_draft(settings, "2026-08-19")
+    output_dir = tmp_path / "intel"
+    calls: list[dict[str, object]] = []
+
+    def fake_export(**kwargs):
+        calls.append(dict(kwargs))
+        staging = Path(kwargs["artifact_dir"])
+        staging.mkdir(parents=True, exist_ok=True)
+        if len(calls) == 1:
+            digest = "review copy"
+            record = {
+                "event_key": "url:https://daily.example/review",
+                "title": "Review copy",
+                "url": "https://daily.example/review",
+            }
+        else:
+            digest = "published from database"
+            record = {
+                "event_key": "url:https://daily.example/database",
+                "title": "Database truth",
+                "url": "https://daily.example/database",
+            }
+        (staging / "intel_digest.md").write_text(digest, encoding="utf-8")
+        (staging / "intel_items.jsonl").write_text("{}\n", encoding="utf-8")
+        (staging / "manifest.json").write_text('{"edition_date":"2026-08-19"}\n', encoding="utf-8")
+        return IntelExportResult(
+            1,
+            str(staging / "intel_items.jsonl"),
+            str(staging / "intel_digest.md"),
+            manifest_path=str(staging / "manifest.json"),
+            records=(record,),
+        )
+
+    monkeypatch.setattr(orchestrator, "run_intel_export_from_settings", fake_export)
+    orchestrator.render_daily_draft_from_settings(
+        settings=settings,
+        edition_date="2026-08-19",
+        output_dir=output_dir,
+    )
+    draft_markdown = output_dir / "draft" / "2026-08-19" / "intel_digest.md"
+    draft_markdown.write_text("manually edited markdown", encoding="utf-8")
+
+    orchestrator.publish_daily_draft_from_settings(
+        settings=settings,
+        edition_date="2026-08-19",
+        output_dir=output_dir,
+    )
+
+    assert len(calls) == 2
+    assert calls[0].get("record_stage") is None
+    assert calls[1].get("record_stage") is None
+    assert (tmp_path / "daily" / "2026-08-19" / "intel_digest.md").read_text(encoding="utf-8") == (
+        "published from database"
+    )
+    with create_session_factory(public_engine)() as session:
+        entries = list(session.scalars(select(DailyEditionReportEntry)).all())
+        assert [entry.title for entry in entries] == ["Database truth"]
+
+
 def test_new_draft_keeps_the_prior_audit_until_its_own_publication(tmp_path, monkeypatch):
     settings = Settings(database_url=f"sqlite:///{tmp_path / 'daily.db'}")
     public_engine = create_engine_from_url(settings.database_url)

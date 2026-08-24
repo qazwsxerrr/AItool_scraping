@@ -74,7 +74,6 @@
       {% for member in detail.members %}
         <article class="member-card">
           <div class="source-line">
-            <span class="source-avatar">{{ (member.source_name or '来')[:1] }}</span>
             <span class="source-name">{{ member.source_name or member.source_id or '未知来源' }}</span>
             {% if member.source_group %}<span class="source-group">{{ member.source_group | source_group_label }}</span>{% endif %}
             {% if member.is_primary %}<span class="badge primary">主来源</span>{% endif %}

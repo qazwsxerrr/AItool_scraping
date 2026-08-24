@@ -29,15 +29,15 @@ from app.ai.skills.intel_triage import (
     strict_parse_analysis,
 )
 from app.config.limits import (
-    DEFAULT_AI_AUDIENCE_RELEVANCE_MIN,
-    DEFAULT_AI_ANALYSIS_MIN_SCORE,
     DEFAULT_AI_REVIEW_CONCURRENCY,
     DEFAULT_AI_REVIEW_LIMIT,
     DEFAULT_STAGE_B_ACTIVE_MAX,
     DEFAULT_STAGE_B_ACTIVE_MIN,
     DEFAULT_STAGE_B_ACTIVE_TARGET,
     DEFAULT_STAGE_B_RESERVE_LIMIT,
+    STAGE_B_ANALYSIS_MIN_SCORE,
     STAGE_B_ADMISSION_POLICY_VERSION,
+    STAGE_B_AUDIENCE_RELEVANCE_MIN,
 )
 from app.domain.models import SourceSpec
 from app.jobs.provider_retry import ProviderResponseFailure, call_with_provider_retries
@@ -137,11 +137,9 @@ def run_stage_b_analysis_job(
     include_blocked: bool = False,
     item_ids: Iterable[int] | None = None,
     task_ids: Iterable[int] | None = None,
-    analysis_min_score: int = DEFAULT_AI_ANALYSIS_MIN_SCORE,
     reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT,
     concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY,
     owner: str | None = None,
-    **_: Any,
 ) -> StageBAnalysisResult:
     """Run only persisted Stage-A eligible work for ``run_id``."""
 
@@ -149,7 +147,6 @@ def run_stage_b_analysis_job(
     if retry is not None:
         retry_failed = bool(retry)
     selected_limit = _normalise_limit(ai_limit if ai_limit is not None else limit)
-    min_score = _bounded_score(analysis_min_score, DEFAULT_AI_ANALYSIS_MIN_SCORE)
     resolved_reserve_limit = _bounded_positive(reserve_limit, DEFAULT_STAGE_B_RESERVE_LIMIT, maximum=100)
     result = StageBAnalysisResult(run_id=run_id)
     owner = owner or f"stage-b1-{uuid4().hex}"
@@ -166,7 +163,7 @@ def run_stage_b_analysis_job(
     config_fingerprint = _config_fingerprint(
         stage="analyze_b1_content_value_v2",
         model=getattr(ai_client, "model", None),
-        reject_threshold=min_score,
+        reject_threshold=STAGE_B_ANALYSIS_MIN_SCORE,
     )
     contexts: list[_AnalysisContext] = []
     task_ids_by_item: dict[int, int] = {}
@@ -192,8 +189,8 @@ def run_stage_b_analysis_job(
             config_fingerprint=config_fingerprint,
             force=stage_force if existing_stage is not None else False,
             metadata={
-                "analysis_min_score": min_score,
-                "audience_relevance_min": DEFAULT_AI_AUDIENCE_RELEVANCE_MIN,
+                "analysis_min_score": STAGE_B_ANALYSIS_MIN_SCORE,
+                "audience_relevance_min": STAGE_B_AUDIENCE_RELEVANCE_MIN,
             },
         )
         # An admission is a complete run-level projection.  Never let C read
@@ -350,7 +347,7 @@ def run_stage_b_analysis_job(
             "analyze",
             config_fingerprint=config_fingerprint,
             metadata={
-                "analysis_min_score": min_score,
+                "analysis_min_score": STAGE_B_ANALYSIS_MIN_SCORE,
                 "eligible_total": len(eligible_contexts),
                 "runnable_total": len(runnable_contexts),
                 "processed": len(contexts),
@@ -405,7 +402,7 @@ def run_stage_b_analysis_job(
         try:
             guard_reason = analysis_guard_failure(analysis)
             score = int(analysis.b1_priority or 0)
-            analysis_tier = "low_signal" if score < min_score else "enriched"
+            analysis_tier = "low_signal" if score < STAGE_B_ANALYSIS_MIN_SCORE else "enriched"
             with session_factory() as session:
                 repo = IntelRepository(session)
                 task = session.get(IntelRunStageTask, task_id)
@@ -538,7 +535,7 @@ def run_stage_b_analysis_job(
                         stage,
                         status="succeeded",
                         metadata={
-                            "analysis_min_score": min_score,
+                            "analysis_min_score": STAGE_B_ANALYSIS_MIN_SCORE,
                             "eligible": 0,
                             "reason": "stage_a_no_eligible_items",
                         },
@@ -547,7 +544,6 @@ def run_stage_b_analysis_job(
     admission = materialize_stage_b_admission(
         session_factory=session_factory,
         run_id=run_id,
-        min_score=min_score,
         reserve_limit=resolved_reserve_limit,
     )
     if admission is not None:
@@ -564,7 +560,6 @@ def materialize_stage_b_admission(
     *,
     session_factory: sessionmaker[Session],
     run_id: int,
-    min_score: int = DEFAULT_AI_ANALYSIS_MIN_SCORE,
     reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT,
 ) -> StageBAdmissionResult | None:
     """Create B's deterministic active/reserve/filtered workbench.
@@ -574,11 +569,8 @@ def materialize_stage_b_admission(
     grouping events.
     """
 
-    threshold = _bounded_score(min_score, DEFAULT_AI_ANALYSIS_MIN_SCORE)
-    audience_threshold = _bounded_score(
-        DEFAULT_AI_AUDIENCE_RELEVANCE_MIN,
-        DEFAULT_AI_AUDIENCE_RELEVANCE_MIN,
-    )
+    threshold = STAGE_B_ANALYSIS_MIN_SCORE
+    audience_threshold = STAGE_B_AUDIENCE_RELEVANCE_MIN
     reserve_cap = _bounded_positive(reserve_limit, DEFAULT_STAGE_B_RESERVE_LIMIT, maximum=100)
     with session_factory() as session:
         repo = IntelRepository(session)

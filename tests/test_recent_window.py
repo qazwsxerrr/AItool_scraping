@@ -8,16 +8,13 @@ from sqlalchemy import select
 
 from app.ai.responses import AgentRunResult
 from app.ai.skills.intel_triage import ScreenResult
-from app.ai.skills.stage_d_selection import STAGE_D_SELECTION_SCHEMA_VERSION
 from app.domain.models import FetchItem, SourceSpec
 from app.domain.recency import (
-    recent_window_decision,
-    recent_window_scope,
+    stage_a_freshness_scope,
     stage_a_cutoff_at,
     stage_a_time_decision,
 )
 from app.jobs.event_cluster_job import run_event_cluster_job
-from app.jobs.export_job import run_intel_export_job
 from app.jobs import pipeline_orchestrator
 from app.jobs.stage_a_screen_job import run_stage_a_screen_job
 from app.jobs.stage_b_analysis_job import run_stage_b_analysis_job
@@ -53,45 +50,6 @@ def _feed_source() -> SourceSpec:
     )
 
 
-def test_recent_window_is_inclusive_and_trending_is_exempt_from_time_filter():
-    source = _feed_source()
-    exact_boundary = SimpleNamespace(
-        published_at=REFERENCE - timedelta(hours=72),
-        captured_at=REFERENCE,
-    )
-    stale = SimpleNamespace(
-        published_at=REFERENCE - timedelta(hours=72, seconds=1),
-        captured_at=REFERENCE,
-    )
-    missing = SimpleNamespace(published_at=None, captured_at=REFERENCE)
-    future = SimpleNamespace(published_at=REFERENCE + timedelta(seconds=1), captured_at=REFERENCE)
-
-    assert recent_window_decision(exact_boundary, source=source, reference_time=REFERENCE).eligible is True
-    assert recent_window_decision(stale, source=source, reference_time=REFERENCE).reason == "too_old"
-    assert recent_window_decision(missing, source=source, reference_time=REFERENCE).reason == "missing_published_at"
-    assert recent_window_decision(future, source=source, reference_time=REFERENCE).reason == "future_timestamp"
-
-    trending = SourceSpec(
-        id="recent-window-trending",
-        name="Recent Window Trending",
-        transport="github",
-        url="https://github.com/trending",
-        github={"mode": "trending", "period": "daily"},
-        content_class="project_tool",
-    )
-    trending_item = SimpleNamespace(
-        published_at=None,
-        # A pipeline freezes its reference before fetch, so Trending discovery
-        # time naturally lands after the frozen run reference.
-        captured_at=REFERENCE + timedelta(hours=1),
-    )
-    decision = recent_window_decision(trending_item, source=trending, reference_time=REFERENCE)
-    assert decision.eligible is True
-    assert decision.reason == "trending_exempt"
-    assert decision.time_basis == "captured_at_discovery"
-    assert decision.age_hours is None
-
-
 def test_stage_a_cutoff_uses_previous_day_midnight_in_shanghai():
     cutoff = stage_a_cutoff_at("2026-08-22")
     assert cutoff == datetime(2026, 8, 20, 16, tzinfo=timezone.utc)
@@ -111,6 +69,28 @@ def test_stage_a_cutoff_uses_previous_day_midnight_in_shanghai():
         reference_time=datetime(2026, 8, 22, 8, tzinfo=timezone.utc),
         edition_date="2026-08-22",
     ).reason == "too_old"
+
+    trending = SourceSpec(
+        id="recent-window-trending",
+        name="Recent Window Trending",
+        transport="github",
+        url="https://github.com/trending",
+        github={"mode": "trending", "period": "daily"},
+        content_class="project_tool",
+    )
+    trending_item = SimpleNamespace(
+        published_at=None,
+        captured_at=datetime(2026, 8, 22, 9, tzinfo=timezone.utc),
+    )
+    decision = stage_a_time_decision(
+        trending_item,
+        source=trending,
+        reference_time=datetime(2026, 8, 22, 8, tzinfo=timezone.utc),
+        edition_date="2026-08-22",
+    )
+    assert decision.eligible is True
+    assert decision.reason == "trending_exempt"
+    assert decision.time_basis == "captured_at_discovery"
 
 
 class _ScreenProvider:
@@ -180,7 +160,7 @@ def test_stage_a_does_not_time_filter_github_trending_projects(tmp_path):
         _, run = repo.start_daily_build(
             edition_date="2026-08-16",
             reference_time=REFERENCE,
-            scope=recent_window_scope(),
+            scope=stage_a_freshness_scope(),
         )
         repo.insert_item(
             FetchItem(
@@ -224,7 +204,7 @@ def test_stage_a_keeps_only_recent_items_and_records_run_local_audit(tmp_path):
         _, run = repo.start_daily_build(
             edition_date="2026-08-16",
             reference_time=REFERENCE,
-            scope=recent_window_scope(),
+            scope=stage_a_freshness_scope(),
         )
         cutoff = stage_a_cutoff_at("2026-08-16")
         for index, (title, published_at) in enumerate(
@@ -311,7 +291,7 @@ def test_stage_c_uses_successful_stage_b_items_without_reapplying_recency(tmp_pa
         _, run = repo.start_daily_build(
             edition_date="2026-08-16",
             reference_time=REFERENCE,
-            scope=recent_window_scope(),
+            scope=stage_a_freshness_scope(),
         )
         analyze_stage = repo.ensure_stage(run.id, "analyze")
         item_ids: dict[str, int] = {}
@@ -404,7 +384,7 @@ def test_all_time_filtered_items_advance_the_empty_pipeline_path(tmp_path):
         _, run = repo.start_daily_build(
             edition_date="2026-08-16",
             reference_time=REFERENCE,
-            scope=recent_window_scope(),
+            scope=stage_a_freshness_scope(),
         )
         repo.insert_item(
             FetchItem(
@@ -447,93 +427,3 @@ def test_all_time_filtered_items_advance_the_empty_pipeline_path(tmp_path):
         stage = IntelRepository(session).get_stage(run_id, "analyze")
         assert stage is not None and stage.status == "succeeded"
     assert pipeline_orchestrator._stage_needs_resume(session_factory, run_id, "cluster") is True
-
-
-def test_daily_build_export_cannot_leak_a_stale_primary_item(tmp_path):
-    session_factory = _factory(tmp_path)
-    source = _feed_source()
-    with session_factory() as session:
-        repo = IntelRepository(session)
-        repo.upsert_source(source)
-        _, run = repo.start_daily_build(
-            edition_date="2026-08-16",
-            reference_time=REFERENCE,
-            scope=recent_window_scope(),
-        )
-        inserted = repo.insert_item(
-            FetchItem(
-                source_id=source.id,
-                external_id="stale-selected-event",
-                title="stale selected event",
-                url="https://example.test/stale-selected-event",
-                content_class=source.content_class,
-                published_at=REFERENCE - timedelta(hours=73),
-                captured_at=REFERENCE,
-            ),
-            run_id=run.id,
-        )
-        assert inserted.item_id is not None
-        stale = session.get(IntelItem, inserted.item_id)
-        assert stale is not None
-        stale.status = "candidate"
-        event = repo.upsert_event(
-            run_id=run.id,
-            event_key="url:https://example.test/stale-selected-event",
-            canonical_url=stale.canonical_url,
-            title="stale selected event",
-            summary_cn="stale",
-            topic="model_release",
-            display_score=90,
-            novelty_status="new",
-            primary_item_id=stale.id,
-            first_seen_at=stale.published_at,
-            last_seen_at=stale.published_at,
-        )
-        repo.upsert_event_item(event.id, stale.id, source_id=source.id, is_primary=True)
-        cluster = repo.ensure_stage(run.id, "cluster")
-        cluster_task = repo.ensure_stage_task(
-            cluster, subject_type="run", subject_id=run.id, target_run_id=run.id
-        )
-        repo.complete_stage_task(
-            cluster_task,
-            result={
-                "current_event_ids": [event.id],
-                "candidate_event_ids": [event.id],
-            },
-        )
-        repo.finish_stage(cluster, status="succeeded")
-        stage_d = repo.ensure_stage(run.id, "stage_d")
-        stage_d_task = repo.ensure_stage_task(
-            stage_d, subject_type="run", subject_id=run.id, target_run_id=run.id
-        )
-        repo.complete_stage_task(
-            stage_d_task,
-            result={
-                "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
-                "candidate_event_ids": [event.id],
-                "selected": [
-                    {
-                        "event_id": event.id,
-                        "reason_code": "test_selection",
-                        "reason": "用于验证导出端仍会拒绝超出时间窗的异常候选。",
-                    }
-                ],
-                "input_fingerprint": "test-input",
-                "config_fingerprint": "test-config",
-                "provider_attempts": 1,
-            },
-        )
-        repo.finish_stage(stage_d, status="succeeded")
-        repo.freeze_run_scope(run.id)
-        session.commit()
-        run_id = int(run.id)
-
-    result = run_intel_export_job(
-        session_factory=session_factory,
-        output_dir=tmp_path / "intel",
-        artifact_dir=tmp_path / "draft",
-        run_id=run_id,
-    )
-
-    assert result.exported == 0
-    assert "保留条目：0" in (tmp_path / "draft" / "intel_digest.md").read_text(encoding="utf-8")

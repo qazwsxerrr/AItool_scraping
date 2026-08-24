@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 from app.domain.models import FetchBatch, FetchItem, SourceSpec
 from app.jobs.fetch_job import run_intel_fetch_job
 from app.jobs.fetch_only_job import run_fetch_only_job
+from app.storage.db import create_engine_from_url, create_session_factory, init_db
+from app.storage.models import FetchAttempt, Source
+from app.storage.repository import IntelRepository
 
 
 def _source(
@@ -143,6 +146,83 @@ def test_fetch_only_isolates_one_failed_source_from_successful_sources(tmp_path)
     assert result.fetch.stats[bad.id].failed == 1
     assert result.fetch.total_failed == 1
     assert result.export.exported == 1
+
+
+def test_fetch_only_reports_degraded_source_without_counting_failure(tmp_path):
+    source = _source("x_account_empty", group="x_official").model_copy(
+        update={"transport": "rsshub"}
+    )
+    degraded = FetchBatch(
+        source=source,
+        items=[],
+        status="degraded",
+        error_code="empty_feed",
+        error_message="RSSHub X returned a valid feed with no entries",
+        http_status=200,
+        transport="httpx",
+    )
+
+    result = run_fetch_only_job(
+        sources=[source],
+        router=_Router({source.id: degraded}),
+        output_dir=tmp_path / "out",
+        force=True,
+    )
+
+    stats = result.fetch.stats[source.id]
+    assert stats.status == "degraded"
+    assert stats.error == "RSSHub X returned a valid feed with no entries"
+    assert result.fetch.total_failed == 0
+    assert result.fetch.total_degraded == 1
+    assert result.export.exported == 0
+
+
+def test_persisted_degraded_fetch_records_content_warning_without_backoff(tmp_path):
+    source = _source("x_account_empty", group="x_official").model_copy(
+        update={"transport": "rsshub"}
+    )
+    degraded = FetchBatch(
+        source=source,
+        items=[],
+        status="degraded",
+        error_code="empty_feed",
+        error_message="RSSHub X returned a valid feed with no entries",
+        http_status=200,
+        response_bytes=846,
+        transport="httpx",
+    )
+    engine = create_engine_from_url(f"sqlite:///{tmp_path / 'fetch.db'}")
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        _, run = repo.start_daily_build(edition_date="2026-08-24", source_ids=[source.id])
+        session.commit()
+        run_id = run.id
+
+    result = run_intel_fetch_job(
+        session_factory=session_factory,
+        sources=[source],
+        router=_Router({source.id: degraded}),
+        source_filter=source.id,
+        force=True,
+        run_id=run_id,
+    )
+
+    assert result.stats[source.id].status == "degraded"
+    assert result.total_failed == 0
+    with session_factory() as session:
+        source_row = session.get(Source, source.id)
+        attempt = session.query(FetchAttempt).filter_by(source_id=source.id).one()
+        assert source_row is not None
+        assert source_row.health_status == "degraded"
+        assert source_row.last_error_code == "empty_feed"
+        assert source_row.consecutive_failures == 0
+        assert source_row.backoff_until is None
+        assert attempt.status == "degraded"
+        assert attempt.error_code == "empty_feed"
+        assert attempt.items_fetched == 0
+        assert attempt.response_bytes == 846
 
 
 def test_diagnostic_fetch_uses_unconditional_requests(tmp_path):

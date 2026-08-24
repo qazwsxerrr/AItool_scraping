@@ -42,6 +42,7 @@ class IntelSourceStats:
     retry_count: int = 0
     transport: str | None = None
     error: str | None = None
+    error_code: str | None = None
     attempt_id: int | None = None
     duration_seconds: float | None = None
     etag: str | None = None
@@ -82,6 +83,10 @@ class IntelFetchResult:
     @property
     def total_failed(self) -> int:
         return sum(v.failed for v in self.stats.values())
+
+    @property
+    def total_degraded(self) -> int:
+        return sum(1 for value in self.stats.values() if value.status == "degraded")
 
 
 def run_intel_fetch_job(
@@ -194,6 +199,8 @@ def run_intel_fetch_job(
                 continue
             stats.status = batch.status
             stats.fetched = len(batch.items)
+            if batch.status == "degraded":
+                stats.error = batch.error_message
             if dry_run:
                 result.diagnostic_items.extend(
                     DiagnosticFetchedItem(
@@ -231,6 +238,9 @@ def run_intel_fetch_job(
                         IntelRepository(session).update_source_health(
                             spec.id,
                             success=True,
+                            degraded=batch.status == "degraded",
+                            error_code=batch.error_code,
+                            error_message=batch.error_message,
                             etag=batch.etag,
                             last_modified=batch.last_modified,
                         )
@@ -241,6 +251,7 @@ def run_intel_fetch_job(
                         items_fetched=stats.fetched,
                         items_inserted=stats.inserted,
                         items_skipped=stats.skipped,
+                        error=batch.error_message if batch.status == "degraded" else None,
                     )
                     session.commit()
             else:
@@ -356,6 +367,7 @@ def _apply_batch_stats(stats: IntelSourceStats, batch: FetchBatch) -> None:
     stats.response_bytes = batch.response_bytes
     stats.retry_count = batch.retry_count
     stats.transport = batch.transport
+    stats.error_code = batch.error_code
 
 
 def _finish_attempt(

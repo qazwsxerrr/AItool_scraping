@@ -9,17 +9,17 @@ DEFAULT_AI_REVIEW_LIMIT: int | None = None
 DEFAULT_AI_SCREEN_REJECT_THRESHOLD = 90
 """Minimum Stage-A confidence required for a hard rejection."""
 
-DEFAULT_AI_ANALYSIS_MIN_SCORE = 70
-"""Minimum deterministic Stage-B score admitted to the C-agent workbench."""
+STAGE_B_ANALYSIS_MIN_SCORE = 60
+"""Fixed deterministic Stage-B score admitted to the C-agent workbench."""
 
-DEFAULT_AI_AUDIENCE_RELEVANCE_MIN = 65
-"""Minimum AI subject relevance required before a B1 item can enter C."""
+STAGE_B_AUDIENCE_RELEVANCE_MIN = 60
+"""Fixed AI subject relevance required before a B1 item can enter C."""
 
 DEFAULT_STAGE_B_ACTIVE_TARGET = 100
 DEFAULT_STAGE_B_ACTIVE_MIN = 60
 DEFAULT_STAGE_B_ACTIVE_MAX = 120
 DEFAULT_STAGE_B_RESERVE_LIMIT = 20
-STAGE_B_ADMISSION_POLICY_VERSION = "stage_b_admission_v3"
+STAGE_B_ADMISSION_POLICY_VERSION = "stage_b_admission_v4"
 
 DEFAULT_AI_REVIEW_CONCURRENCY = 4
 """Maximum concurrent provider calls for Stage A or Stage B."""
@@ -37,13 +37,7 @@ DEFAULT_STAGE_D_MAX_WEB_SEARCHES = 6
 DEFAULT_DAILY_REPORT_LIMIT = 30
 """Hard maximum number of selected events in one daily report."""
 
-RECENT_WINDOW_HOURS = 72
-"""Legacy rolling freshness window used by independent export/freshness checks."""
-
-
 __all__ = [
-    "DEFAULT_AI_ANALYSIS_MIN_SCORE",
-    "DEFAULT_AI_AUDIENCE_RELEVANCE_MIN",
     "DEFAULT_AI_REVIEW_CONCURRENCY",
     "DEFAULT_AI_REVIEW_LIMIT",
     "DEFAULT_AI_SCREEN_REJECT_THRESHOLD",
@@ -58,7 +52,8 @@ __all__ = [
     "DEFAULT_STAGE_C_AGENT_MAX_TURNS",
     "DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES",
     "DEFAULT_STAGE_D_MAX_WEB_SEARCHES",
-    "RECENT_WINDOW_HOURS",
+    "STAGE_B_ANALYSIS_MIN_SCORE",
     "STAGE_B_ADMISSION_POLICY_VERSION",
+    "STAGE_B_AUDIENCE_RELEVANCE_MIN",
     "STAGE_C_AGENT_VERSION",
 ]

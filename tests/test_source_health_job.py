@@ -61,3 +61,29 @@ def test_source_health_persists_failure_backoff_and_success_reset(tmp_path):
     assert healthy.consecutive_failures == 0
     assert healthy.error_code is None
     assert healthy.next_fetch_at is None
+
+
+def test_source_health_persists_degraded_without_failure_backoff(tmp_path):
+    engine = create_engine_from_url(f"sqlite:///{tmp_path / 'degraded.db'}")
+    init_db(engine)
+    session_factory = create_session_factory(engine)
+    now = datetime(2026, 8, 24, 5, 0, tzinfo=timezone.utc)
+
+    with session_factory() as session:
+        repo = IntelRepository(session)
+        repo.upsert_source(_source())
+        repo.update_source_health(
+            "health_test",
+            success=True,
+            degraded=True,
+            error_code="empty_feed",
+            error_message="RSSHub X returned a valid feed with no entries",
+            now=now,
+        )
+        session.commit()
+
+    degraded = run_source_health_job(session_factory=session_factory, source_filter="health_test")[0]
+    assert degraded.status == "degraded"
+    assert degraded.consecutive_failures == 0
+    assert degraded.error_code == "empty_feed"
+    assert degraded.next_fetch_at is None

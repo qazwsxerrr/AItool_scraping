@@ -78,7 +78,7 @@ def test_b_admission_applies_score_gate_and_keeps_duplicate_support_as_reserve()
         ],
     )
 
-    result = materialize_stage_b_admission(session_factory=session_factory, run_id=run_id, min_score=60, reserve_limit=20)
+    result = materialize_stage_b_admission(session_factory=session_factory, run_id=run_id, reserve_limit=20)
 
     assert result is not None
     assert result.target == 100
@@ -104,7 +104,7 @@ def test_b_admission_uses_calibrated_dynamic_target_after_fourteen_editions():
     rows = [(f"event {index}", 80, f"https://b.example/{index}") for index in range(70)]
     run_id, _ = _seed_analysis(session_factory, rows)
 
-    result = materialize_stage_b_admission(session_factory=session_factory, run_id=run_id, min_score=60, reserve_limit=20)
+    result = materialize_stage_b_admission(session_factory=session_factory, run_id=run_id, reserve_limit=20)
 
     assert result is not None
     # 30 * P75(40 / 30) is below the lower bound, so the active workbench
@@ -120,28 +120,41 @@ def test_b_admission_rejects_high_total_score_when_ai_subject_relevance_is_below
         session_factory,
         [
             ("generic cloud update", 95, "https://b.example/cloud"),
+            ("boundary ai update", 60, "https://b.example/boundary"),
             ("direct model release", 80, "https://b.example/model"),
         ],
     )
     with session_factory() as session:
-        review = session.get(AIItemReview, ids["generic cloud update"])
-        assert review is not None
-        review.score_components_json = json.dumps(
+        below_gate = session.get(AIItemReview, ids["generic cloud update"])
+        at_gate = session.get(AIItemReview, ids["boundary ai update"])
+        assert below_gate is not None
+        assert at_gate is not None
+        below_gate.score_components_json = json.dumps(
             {
-                "audience_relevance": 64,
+                "audience_relevance": 59,
                 "material_change": 100,
                 "impact_scope": 100,
                 "independent_news_value": 100,
                 "specificity": 100,
             }
         )
+        at_gate.score_components_json = json.dumps(
+            {
+                "audience_relevance": 60,
+                "material_change": 60,
+                "impact_scope": 60,
+                "independent_news_value": 60,
+                "specificity": 60,
+            }
+        )
         session.commit()
 
-    result = materialize_stage_b_admission(session_factory=session_factory, run_id=run_id, min_score=60)
+    result = materialize_stage_b_admission(session_factory=session_factory, run_id=run_id)
 
     assert result is not None
     assert ids["generic cloud update"] not in result.active_ids
     assert ids["generic cloud update"] not in result.reserve_ids
+    assert ids["boundary ai update"] in result.active_ids
     with session_factory() as session:
         rows = IntelRepository(session).list_candidate_admissions(run_id)
         row = next(item for item in rows if item.item_id == ids["generic cloud update"])

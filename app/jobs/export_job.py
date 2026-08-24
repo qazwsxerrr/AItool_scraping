@@ -23,7 +23,7 @@ from app.ai.skills.stage_d_selection import (
 )
 from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT
 from app.config.settings import Settings
-from app.domain.recency import RecentWindowDecision, recent_window_decision
+from app.domain.recency import StageAFreshnessDecision, stage_a_time_decision
 from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
@@ -73,6 +73,7 @@ def run_intel_export_job(
     github_report_dir: str | Path | None = None,
     run_id: int,
     artifact_dir: str | Path | None = None,
+    artifact_reference_dir: str | Path | None = None,
     allow_partial: bool = False,
 ) -> IntelExportResult:
     final_output = Path(output_dir)
@@ -90,16 +91,17 @@ def run_intel_export_job(
                 raise ValueError("export requires the current daily edition build")
             stage_d_selection = _load_stage_d_selection(repo, int(run_id))
             artifact_output = Path(artifact_dir) if artifact_dir is not None else _daily_output_dir(final_output, run)
-            stage = repo.ensure_stage(
-                int(run_id),
-                "export",
-                metadata={"artifact_dir": str(artifact_output)},
+            artifact_reference = (
+                Path(artifact_reference_dir)
+                if artifact_reference_dir is not None
+                else artifact_output
             )
             records = _list_export_events(
                 session,
                 selection=stage_d_selection,
                 limit=effective_limit,
                 run_id=run_id,
+                edition_date=run.edition_date,
                 reference_time=run.reference_time,
             )
             # ``partial`` is a retained audit label for explicit downstream
@@ -122,6 +124,11 @@ def run_intel_export_job(
             )
             if is_partial_build and not allow_partial:
                 raise RuntimeError(f"daily build is not publishable: {run.partial_reason or run.status}")
+            stage = repo.ensure_stage(
+                int(run_id),
+                "export",
+                metadata={"artifact_dir": str(artifact_reference)},
+            )
             input_fingerprint = _export_input_fingerprint(records, int(run_id))
             stage_task = repo.ensure_stage_task(
                 stage,
@@ -208,7 +215,7 @@ def run_intel_export_job(
                     repo.complete_stage_task(
                         state_task,
                         owner=owner,
-                        result={"exported": len(records), "artifact_dir": str(artifact_output)},
+                        result={"exported": len(records), "artifact_dir": str(artifact_reference)},
                     )
                 session.commit()
     except Exception as exc:
@@ -257,6 +264,7 @@ def run_intel_export_from_settings(
     github_report_dir: str | Path | None = None,
     run_id: int,
     artifact_dir: str | Path | None = None,
+    artifact_reference_dir: str | Path | None = None,
     allow_partial: bool = False,
 ) -> IntelExportResult:
     database_url = _readable_database_url(settings.database_url, dry_run=dry_run)
@@ -272,6 +280,7 @@ def run_intel_export_from_settings(
             github_report_dir=github_report_dir,
             run_id=run_id,
             artifact_dir=artifact_dir,
+            artifact_reference_dir=artifact_reference_dir,
             allow_partial=allow_partial,
         )
     finally:
@@ -287,12 +296,29 @@ def daily_output_dir_for_run(output_dir: str | Path, run: IntelRun) -> Path:
     return _daily_output_dir(Path(output_dir), run)
 
 
+def draft_output_dir_for_run(output_dir: str | Path, run: IntelRun) -> Path:
+    """Return the persistent, human-readable artifact directory for a draft."""
+
+    return _draft_output_dir(Path(output_dir), run)
+
+
 def create_daily_bundle_staging_dir(output_dir: str | Path, run: IntelRun) -> Path:
     """Create an adjacent temporary directory safe to rename into place."""
 
     final_dir = daily_output_dir_for_run(output_dir, run)
+    return _create_bundle_staging_dir(final_dir, run_id=int(run.id))
+
+
+def create_draft_bundle_staging_dir(output_dir: str | Path, run: IntelRun) -> Path:
+    """Create an adjacent staging directory for one persistent draft bundle."""
+
+    final_dir = draft_output_dir_for_run(output_dir, run)
+    return _create_bundle_staging_dir(final_dir, run_id=int(run.id))
+
+
+def _create_bundle_staging_dir(final_dir: Path, *, run_id: int) -> Path:
     final_dir.parent.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.build-{int(run.id)}-", dir=str(final_dir.parent)))
+    return Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.build-{int(run_id)}-", dir=str(final_dir.parent)))
 
 
 def promote_daily_bundle(*, staging_dir: str | Path, final_dir: str | Path) -> DailyBundlePromotion:
@@ -346,6 +372,15 @@ def _daily_output_dir(final_output: Path, run: IntelRun) -> Path:
     if not edition_date:
         raise ValueError(f"run {run.id} has no valid edition_date")
     return base / "daily" / edition_date
+
+
+def _draft_output_dir(output_root: Path, run: IntelRun) -> Path:
+    """Return the review-only projection for the current database draft."""
+
+    edition_date = run.edition_date
+    if not edition_date:
+        raise ValueError(f"run {run.id} has no valid edition_date")
+    return output_root / "draft" / edition_date
 
 
 def _edition_report_date(run: IntelRun) -> date:
@@ -479,9 +514,10 @@ def _list_export_events(
     selection: list[dict[str, Any]],
     limit: int | None,
     run_id: int,
+    edition_date: str | None = None,
     reference_time: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Serialize selected events in the exact order returned by Stage D."""
+    """Serialize the validated Stage-D subset without applying another gate."""
 
     if not selection:
         return []
@@ -510,11 +546,11 @@ def _list_export_events(
     records: list[dict[str, Any]] = []
     for display_order, decision in enumerate(selection, start=1):
         event = by_id[int(decision["event_id"])]
-        freshness = _event_freshness(event, reference_time=reference_time)
-        # Stage D is fed by the frozen build scope; repeat the freshness check
-        # only to defend against malformed transient rows.
-        if freshness is not None and not freshness.eligible:
-            continue
+        freshness = _event_stage_a_freshness(
+            event,
+            edition_date=edition_date,
+            reference_time=reference_time,
+        )
         record = _serialize_event(
             event,
             decision=decision,
@@ -532,7 +568,7 @@ def _serialize_event(
     *,
     decision: dict[str, Any],
     display_order: int,
-    freshness: RecentWindowDecision | None = None,
+    freshness: StageAFreshnessDecision | None = None,
 ) -> dict[str, Any]:
     source_ids = _json_list(event.source_ids_json)
     source_groups = _json_list(event.source_groups_json)
@@ -635,16 +671,20 @@ def _serialize_event(
         "last_seen_at": _date(event.last_seen_at),
         "published_at": _date(primary_item.published_at) if primary_item is not None else None,
         "captured_at": _date(primary_item.captured_at) if primary_item is not None else None,
+        # Retain the public audit field, but never use it as an Export gate.
         "freshness": freshness.metadata() if freshness is not None else None,
     }
 
 
-def _event_freshness(
+def _event_stage_a_freshness(
     event: IntelEvent,
     *,
+    edition_date: str | None,
     reference_time: datetime | None,
-) -> RecentWindowDecision | None:
-    if reference_time is None:
+) -> StageAFreshnessDecision | None:
+    """Reproduce Stage A metadata for export audit without filtering rows."""
+
+    if not edition_date or reference_time is None:
         return None
     primary = next(
         (
@@ -656,10 +696,11 @@ def _event_freshness(
     )
     if primary is None:
         return None
-    return recent_window_decision(
+    return stage_a_time_decision(
         primary,
         source=primary.source,
         reference_time=reference_time,
+        edition_date=edition_date,
     )
 
 

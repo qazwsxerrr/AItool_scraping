@@ -5,7 +5,6 @@
   </div>
   <div class="card-body">
     <div class="source-line">
-      <span class="source-avatar">GH</span>
       <span class="source-name">{{ 'GitHub Trending' if project.trending else 'GitHub Search API' }}</span>
       {% if project.primary_language %}<span class="source-group">{{ project.primary_language }}</span>{% endif %}
       {% if project.trending.weekly %}<span class="source-transport">周榜 #{{ project.trending.weekly.get('rank') }}</span>{% endif %}

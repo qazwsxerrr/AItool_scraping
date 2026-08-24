@@ -119,10 +119,17 @@ class FeedCollector(Collector):
                 response_bytes=len(body),
             )
         items = [_feed_item_to_domain(item, source) for item in parsed[: max(0, int(limit))]]
+        status = "success"
+        error_code = None
+        error_message = None
+        if not items and _is_rsshub_x_source(source):
+            status = "degraded"
+            error_code = "empty_feed"
+            error_message = "RSSHub X returned a valid feed with no entries"
         return FetchBatch(
             source=source,
             items=items,
-            status="success",
+            status=status,
             http_status=status_code,
             request_url=request_url,
             final_url=final_url,
@@ -131,6 +138,8 @@ class FeedCollector(Collector):
             transport="httpx",
             etag=_response_header(response, "etag"),
             last_modified=_response_header(response, "last-modified"),
+            error_code=error_code,
+            error_message=error_message,
         )
 
 
@@ -251,6 +260,14 @@ def _response_header(response: Any, name: str) -> str | None:
         return None
     text = str(value).strip() if value is not None else ""
     return text or None
+
+
+def _is_rsshub_x_source(source: SourceSpec) -> bool:
+    return source.transport == "rsshub" and str(source.source_group or "").casefold() in {
+        "x_official",
+        "x_social",
+        "x_search",
+    }
 
 
 __all__ = ["FeedCollector", "ProductHuntCollector"]

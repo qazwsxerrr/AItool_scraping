@@ -19,12 +19,11 @@
     {% for source in sources %}
       <article class="source-card">
         <div class="source-card-head">
-          <div class="source-avatar source-avatar-large">{{ source.name[:1] }}</div>
           <div>
             <h2>{{ source.name }}</h2>
             <p class="source-id">{{ source.source_id }}</p>
           </div>
-          <span class="health-pill {{ 'healthy' if source.health_status == 'healthy' else 'warning' if source.health_status == 'failed' or source.consecutive_failures else 'neutral' }}">{{ source.health_status or 'unknown' }}</span>
+          <span class="health-pill {{ 'healthy' if source.health_status == 'healthy' else 'warning' if source.health_status in ['failed', 'degraded'] or source.consecutive_failures else 'neutral' }}">{{ source.health_status or 'unknown' }}</span>
         </div>
         <div class="source-card-tags">
           {% if source.source_group %}<span class="badge primary">{{ source.source_group | source_group_label }}</span>{% endif %}

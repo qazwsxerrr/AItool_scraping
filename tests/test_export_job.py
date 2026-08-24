@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -9,7 +9,7 @@ from app.ai.skills.stage_d_selection import STAGE_D_SELECTION_SCHEMA_VERSION
 from app.domain.models import FetchItem
 from app.jobs.export_job import _markdown, _verification_markdown_line, run_intel_export_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, IntelItem, Source
+from app.storage.models import AIItemReview, IntelEvent, IntelItem, Source
 from app.storage.repository import IntelRepository
 
 
@@ -189,6 +189,30 @@ def test_export_uses_stage_d_order_but_stage_c_content(tmp_path):
     assert "来源：[Export source](https://example.test/export-1)" in digest
     assert "来源组：" not in digest
     assert not (tmp_path / "public-intel" / "daily" / "2026-08-19").exists()
+
+
+def test_export_does_not_reapply_stage_a_time_admission(tmp_path):
+    session_factory = _db()
+    run_id, event_ids = _exportable_build(session_factory)
+    with session_factory() as session:
+        event = session.get(IntelEvent, event_ids[1])
+        assert event is not None and event.primary_item_id is not None
+        primary = session.get(IntelItem, event.primary_item_id)
+        assert primary is not None
+        primary.published_at = NOW - timedelta(days=30)
+        session.commit()
+
+    result = run_intel_export_job(
+        session_factory=session_factory,
+        output_dir=tmp_path / "public-intel",
+        artifact_dir=tmp_path / "draft-artifacts",
+        run_id=run_id,
+    )
+
+    assert result.exported == 2
+    assert [record["event_id"] for record in result.records] == [event_ids[1], event_ids[0]]
+    assert result.records[0]["freshness"]["eligible"] is False
+    assert result.records[0]["freshness"]["cutoff_mode"] == "edition_previous_day_midnight"
 
 
 def test_export_rejects_a_build_without_a_completed_stage_d(tmp_path):

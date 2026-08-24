@@ -94,8 +94,10 @@ def build_daily_build_summary(
         # remain visible in the manifest but do not become a build failure.
         fetch_warning = (
             stage_name == "fetch"
-            and isinstance(details.get("failed_sources"), list)
-            and bool(details.get("failed_sources"))
+            and (
+                (isinstance(details.get("failed_sources"), list) and bool(details.get("failed_sources")))
+                or (isinstance(details.get("source_warnings"), list) and bool(details.get("source_warnings")))
+            )
         )
         if (status in {"failed", "blocked", "partial"} or error is not None) and not fetch_warning:
             _append_failure(failure_reasons, stage=stage_name, status=status, error=error)
@@ -176,7 +178,11 @@ def build_daily_build_summary(
     funnel["full_rebuild_items"] = frozen
     source_warnings = []
     fetch_details = stages_payload.get("fetch", {}).get("details", {})
-    if isinstance(fetch_details, dict) and isinstance(fetch_details.get("failed_sources"), list):
+    if isinstance(fetch_details, dict) and isinstance(fetch_details.get("source_warnings"), list):
+        source_warnings = [
+            dict(row) for row in fetch_details["source_warnings"] if isinstance(row, dict)
+        ]
+    elif isinstance(fetch_details, dict) and isinstance(fetch_details.get("failed_sources"), list):
         source_warnings = [
             dict(row) for row in fetch_details["failed_sources"] if isinstance(row, dict)
         ]
@@ -247,13 +253,18 @@ def _stage_details(
     if stage_name == "fetch":
         details: dict[str, Any] = {
             key: _as_nonnegative_int(metadata.get(key))
-            for key in ("fetched", "inserted", "failed")
+            for key in ("fetched", "inserted", "failed", "degraded")
             if metadata.get(key) is not None
         }
         failed_sources = metadata.get("failed_sources")
         if isinstance(failed_sources, (list, tuple)):
             details["failed_sources"] = [
                 dict(row) for row in failed_sources if isinstance(row, dict)
+            ]
+        source_warnings = metadata.get("source_warnings")
+        if isinstance(source_warnings, (list, tuple)):
+            details["source_warnings"] = [
+                dict(row) for row in source_warnings if isinstance(row, dict)
             ]
         return details
     if stage_name == "screen":

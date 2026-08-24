@@ -148,6 +148,7 @@ class IntelRepository:
         source_id: str,
         *,
         success: bool,
+        degraded: bool = False,
         error_code: str | None = None,
         error_message: str | None = None,
         etag: str | None = None,
@@ -169,11 +170,11 @@ class IntelRepository:
         if current.tzinfo is None:
             current = current.replace(tzinfo=timezone.utc)
         if success:
-            row.health_status = "healthy"
+            row.health_status = "degraded" if degraded else "healthy"
             row.consecutive_failures = 0
             row.backoff_until = None
-            row.last_error_code = None
-            row.last_error_message = None
+            row.last_error_code = str(error_code or "empty_feed")[:128] if degraded else None
+            row.last_error_message = (str(error_message or "")[:4000] or None) if degraded else None
             row.last_fetched_at = current
             if etag:
                 row.etag = str(etag)[:512]

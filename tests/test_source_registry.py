@@ -198,6 +198,7 @@ def test_default_registry_physically_removes_rejected_daily_sources():
         "marktechpost_ai", "the_verge_ai", "ars_technica_ai", "tomer_tunguz_blog",
         "simon_willison_blog", "interconnects_ai", "bytebytego_ai", "linux_do_top",
         "reddit_local_llama_top_day", "reddit_local_llama_top_week",
+        "mistral_news_disabled", "perplexity_updates_disabled",
     }
 
     assert removed_ids.isdisjoint(raw_ids)

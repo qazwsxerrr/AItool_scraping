@@ -3,18 +3,17 @@
 本项目支持一条可重复执行、可恢复的 AI-only 文字情报链路：
 
 ```text
-source registry
-→ fetch（抓取、解析、标准化、去重、来源健康记录）
-→ Stage A screen（确定性初筛与轻量 AI 筛选）
-→ Stage B analyze + admission（短摘要、关键词、主题分类、评分与候选池准入）
-→ Stage C agent（读取候选/正文/历史聚合事件，对影响事实结论的不确定项优先受限联网核验）
-→ Stage D select（仅从 Stage C 候选中选择有序子集）
-→ draft 审计工作区（按日期保留完整抓取与 A-D 决策）
-→ export / approval（成功后发布为该日期唯一日报）
-→ UI（首页、搜索、全部动态只读展示）
+信息源配置
+→ 抓取与标准化
+→ Stage A 初筛
+→ Stage B1 分析、评分、准入
+→ Stage C 事件聚合与核验
+→ Stage D 人工式二次审核
+→ Export 导出
+→ 正式发布
 ```
 
-Stage B1 对每个通过 Stage A 的条目执行一次结构化分析，只输出来源归因、主题分类、中文短摘要、关键词、实体和编辑优先级评分。随后本地 deterministic guard 以 `AI_ANALYSIS_MIN_SCORE=70` 和 `audience_relevance>=65` 为下限生成 `active`、`reserve`、`filtered` 候选池：初始 active 目标为 100 条、reserve 默认 20 条；积累 14 期日报后，active 目标按已发布的候选/入选比例动态校准在 60–120 条。Stage C 不再接收一大段全文提示词，而是运行可审计的 Responses agent，按需读取候选、正文和近 3 天历史，再由独立的 Stage D 编辑 skill 选择当天最终组合。
+Stage A 是唯一的时间准入和初筛阶段；低置信度结果保留给后续分析。Stage B1 对每个 Stage A 合格条目执行一次结构化分析，输出主题分类、中文短摘要、关键词、实体和编辑优先级评分。随后本地 deterministic guard 以固定的总分 `60` 和 `audience_relevance>=60` 为下限生成 `active`、`reserve`、`filtered` 候选池：初始 active 目标为 100 条、reserve 默认 20 条；积累 14 期日报后，active 目标按已发布的候选/入选比例动态校准在 60–120 条。Stage C 运行可审计的 Responses agent，按需读取候选、正文和近 3 天历史；Stage D 选择当天最终有序子集。Export 只校验并序列化 Stage D 结果，不再次筛选。
 
 `content_class` 描述来源/信号类型（官方发布、媒体报道、项目/工具、社区线索），`topic_category` 使用橘鸦日报的六类编辑主题（开发生态、模型发布、产品应用、行业动态、技术与洞察、前瞻与传闻）。两者分开保存，UI 和导出会同时展示，避免把第三方媒体报道误读成“官方产品发布”。
 
@@ -71,6 +70,8 @@ data/
 
 `draft.db` 和 `audit.db` 都包含原始资讯、`intel_runs`、A/B 结果、Stage C 事件、Stage D 的候选 ID 与有序入选结果、通用阶段任务、attempt 和 provider 响应。Stage D 不再维护独立快照表，也不保存未选事件记录。`draft.db` 仅有一份；同日期重新 `pipeline start` / `pipeline run` 时会从头替换它。成功 `export` 后，`draft.db` 会整体替换 `audit.db`，因此每个日期默认只保留一份最近成功日报的完整审计，不累计旧版本。
 
+`draft.db` 和正式数据库是权威数据。`pipeline run` 完成后会从 `draft.db` 生成 `output/intel/draft/YYYY-MM-DD/` 下的 Markdown、JSONL 和 manifest，供人工审核；这些文件只是展示投影，修改它们不会改变发布结果。`pipeline export` 发布前会重新从 `draft.db` 生成结构化记录，再更新正式数据库和 `output/daily/YYYY-MM-DD/`。
+
 旧正式库中的历史 raw / stage 数据不会在启动时自动迁移、删除或改写。包含旧 `intel_event_stage_d_snapshots` 表的 draft/audit 数据库与当前结构不兼容，启动时会明确报错；需要先备份，再显式删除并重建对应工作区。本项目不保留旧 Stage D 兼容读取或自动迁移代码。
 
 ## 安装与配置
@@ -101,7 +102,6 @@ AI_REVIEW_MODEL=
 AI_REVIEW_TIMEOUT_SECONDS=30
 AI_REVIEW_CONCURRENCY=4
 AI_REVIEW_CATEGORIES=开发生态,模型发布,产品应用,行业动态,技术与洞察,前瞻与传闻
-AI_ANALYSIS_MIN_SCORE=70
 AI_STAGE_B_RESERVE_LIMIT=20
 AI_STAGE_C_TIMEOUT_SECONDS=120
 AI_STAGE_C_AGENT_MAX_TURNS=32
@@ -117,7 +117,7 @@ Stage C 每次 Responses 请求默认超时 `120` 秒，独立于 Stage A/B 使�
 
 AI 推理调用统一使用 OpenAI Responses 语义；`AI_REVIEW_API_URL` 可以是 `/v1` 基址或完整的 `/v1/responses` 地址。C、D 的网页核验不再依赖 provider hosted search，而是由本地 `TAVILY_API_KEY` 调用 Tavily。搜索不设域名白名单，返回的 URL、摘要、查询和绑定事件/claim 会保存到 agent step 与 evidence 审计记录。Stage C 对每个 `needs_review` 草稿分别核验；搜索后仍无法解决、搜索不可用或预算耗尽时保留待审状态，由 Stage D 终审决定去留。
 
-`AI_ANALYSIS_MIN_SCORE` 默认 `70`，`audience_relevance`（AI 主体相关性）默认不低于 `65`；两者共同构成 Stage B 的本地准入门槛，不再由 Stage C 决定。Stage B 将合格项按来源/主题多样性形成 active 候选池（初始目标 100 条、14 期后动态 60–120 条）和最多 20 条 reserve；Stage C 从这两个持久化集合按需取数，按主体、动作、对象、版本/阶段和时间锚点区分同一事件、后续进展与同主题事件。历史旧闻只比较当前日报日期之前三个自然日内的已发布最终日报；草稿、搜索结果和更早日报不扩展去重窗口。Stage C 使用 `candidate`、`needs_review`、`rejected` 三态保存完整审计结果，只把前两态交给 Stage D；Stage D 在 `max_selected` 上限内完成人工式二次审核和有序子集选择。
+Stage B 的本地准入门槛固定为：`b1_priority>=60`，且 `audience_relevance>=60`。这两个业务规则不由 `.env` 配置，也不再由 Stage C 决定。Stage B 将合格项按来源/主题多样性形成 active 候选池（初始目标 100 条、14 期后动态 60–120 条）和最多 20 条 reserve；Stage C 从这两个持久化集合按需取数，按主体、动作、对象、版本/阶段和时间锚点区分同一事件、后续进展与同主题事件。历史旧闻只比较当前日报日期之前三个自然日内的已发布最终日报；草稿、搜索结果和更早日报不扩展去重窗口。Stage C 使用 `candidate`、`needs_review`、`rejected` 三态保存完整审计结果，只把前两态交给 Stage D；Stage D 在 `max_selected` 上限内完成人工式二次审核和有序子集选择。
 
 Stage B1 的 `b1_priority` 只衡量内容价值，由本地 guard 按 `audience_relevance`（AI 主体相关性）45%、`impact_scope`（已确认影响范围）25%、`independent_news_value`（事件级独立新闻价值）20%、`material_change` 5% 和 `specificity` 5% 重算。来源身份、AI 把握度和时间新鲜度不参与该分数：来源归因来自 source registry，Stage A 按日报日期前一天 00:00（Asia/Shanghai）做本地时间筛选。
 
@@ -133,8 +133,8 @@ Stage D 与 Stage A/B/C 共用 `AI_REVIEW_*` provider 配置；它使用独立�
 ```bash
 python -m app.main fetch [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
 python -m app.main fetch-only [--source SOURCE_ID] [--class CONTENT_CLASS] [--limit N] [--force]
-python -m app.main run-once [--limit N] [--edition-date YYYY-MM-DD] [--publish]
 python -m app.main source-health [--source SOURCE_ID]
+python -m app.main run-once [--limit N|--fetch-limit N] [--edition-date YYYY-MM-DD] [--publish]  # pipeline run 兼容别名
 
 # 正式的日期级可恢复链路
 python -m app.main pipeline run [--limit N] [--output-dir DIR] [--edition-date YYYY-MM-DD] [--publish]
@@ -152,7 +152,7 @@ python -m app.main pipeline status --edition-date YYYY-MM-DD
 以下命令在 WSL 项目根目录执行。`Settings.from_env()` 会自动读取当前目录的 `.env`；`--force` 仅用于诊断抓取命令以忽略来源冷却时间。
 
 ```bash
-cd /mnt/d/ai_code/ai_vibecode/aitool_scraping
+cd /mnt/d/ai_code/ai_vibecode/AItool_scraping
 PYTHON=.venv/bin/python
 
 # 首次安装后，或明确删除旧库后，按当前 ORM 创建新数据库
@@ -164,15 +164,14 @@ bash scripts/start_rsshub.sh
 # 查看来源健康状态和最近一次抓取结果
 $PYTHON -m app.main source-health
 
-# 简化入口：完整重建到 draft；确认后增加 --publish 才会替换正式日报
-$PYTHON -m app.main run-once \
+# 正式全量入口。完成 A-D 后生成可审核的 draft Markdown，但不更新正式数据库。
+$PYTHON -m app.main pipeline run \
   --limit 20 \
   --edition-date 2026-08-18 \
   --output-dir output/intel
 
-# 完整的正式可恢复链路。对外唯一标识是日报日期；默认停在待发布 draft。
-$PYTHON -m app.main pipeline run \
-  --limit 20 \
+# 查看 draft 状态和审核文件路径
+$PYTHON -m app.main pipeline status \
   --edition-date 2026-08-18 \
   --output-dir output/intel
 
@@ -226,8 +225,8 @@ $PYTHON -m app.main source-health --source x_account_openai
 2. `stage-a` 先执行来源级确定性初筛，再对保留条目调用结构化 AI；`stage-b1` 对通过 Stage A 的条目做 B1 分析，保存摘要、关键词、主题、实体和经本地 guard 的评分。原始条目、拒绝原因、AI 结果和失败 attempt 都保留在该日期 `draft.db`。
 3. `stage-b1` 完成后，本地规则把条目写成可审计的 `active` / `reserve` / `filtered` 候选准入记录；评分阈值、工作台容量和 reserve 都在 B 生效。`stage-c` 是状态化 Responses agent：它读取 active 候选、正文和前三个自然日内的已发布最终日报，按主体、动作、对象、版本/阶段和时间锚点聚合事件；对影响核心事实的不确定项调用本地 Tavily 搜索，并把结果绑定到具体草稿和 claim。模型可在证据支持后收窄表述；核验仍无法解决时保留 `needs_review`。本地代码校验 active 覆盖、精确身份不可拆分，并复核 `repeat`/`updated` 与实质变化证据。超出 agent 预算时，未覆盖的候选会变为 `needs_review` 事件而不是被丢弃。
 4. `stage-d` 做人工式最终复审：读取 Stage C 成功任务中的 `candidate_event_ids`，其中包含 `candidate` 和 `needs_review`，不包含保留在 C 审计池中的 `rejected`。Stage D 优先对争议事件执行 Tavily 核验，再通过独立 skill 返回 `selected=[{event_id, reason_code, reason}]`。数组顺序就是展示顺序；未选事件由可审事件集合与入选集合之差推导。Stage D 不改写标题或摘要，也不重新聚合事件。
-5. `pipeline status --edition-date ...` 同时显示正式日报状态、当前 draft 状态和 retained audit 路径。构建期间 UI/API 始终读取旧的已发布日报；它们不读取 draft。
-6. `export` 是明确的批准动作：A-D 和导出任务完成后，把 `draft.db` 提升为 `audit.db`、原子替换 `output/daily/YYYY-MM-DD/`，并在正式库内替换该日期的最终日报条目。单个来源抓取失败只写入 `source_warnings` 和日报提示，不再阻止发布；真正的阶段/导出失败仍会恢复旧 audit 和旧日报，失败 draft 留在原处，可按日期检查、重试或恢复。
+5. A-D 完成后，`pipeline run` / `pipeline resume` 从 `draft.db` 生成 `output/intel/draft/YYYY-MM-DD/intel_digest.md`、`intel_items.jsonl` 和 `manifest.json`。`pipeline status --edition-date ...` 会显示 draft 状态和审核文件路径。构建期间 UI/API 始终读取旧的已发布日报；它们不读取 draft 文件或 draft 数据库。
+6. `export` 是明确的批准动作：发布逻辑仍以 `draft.db` 为准，不解析审核 Markdown；它重新生成结构化结果和公开文件，把 `draft.db` 提升为 `audit.db`、原子替换 `output/daily/YYYY-MM-DD/`，并在正式库内替换该日期的最终日报条目。单个来源抓取失败只写入 `source_warnings` 和日报提示，不再阻止发布；真正的阶段/导出失败仍会恢复旧 audit 和旧日报，失败 draft 留在原处，可按日期检查、重试或恢复。
 7. 同日重新抓取不合并上午结果：下午响应中不存在的资讯、被移除来源的资讯及其派生事件，会在下午成功批准后从当天最终日报和新的 `audit.db` 中消失。新 draft 运行期间，上午已发布的 `audit.db` 仍保留，便于和下午 draft 比对。
 8. UI（`/`、`/search`、`/all`、`/github`）只读日期级最终日报或已生成报告，不在请求中执行抓取或 AI；首页、搜索和“本期精选”默认只展示当前日期的最终入选事件。
 
@@ -292,19 +291,19 @@ sqlite3 "$AUDIT" \
 $PYTHON -m uvicorn app.web.app:app --host 127.0.0.1 --port 8000
 ```
 
-`run-once` 和 `pipeline run` 都会执行同一套日期级全量重建，并默认停在可审计的 draft；使用 `--publish` 或单独执行 `pipeline export --edition-date ...` 才会替换正式日报。前者适合一次完成，后者保留明确的阶段恢复入口。`fetch-only` 只抓取并输出标准化条目及来源归因，不调用 AI，也不代表正式日报。
+`pipeline run` 是正式的日期级全量重建入口，默认停在可审计、可查看 Markdown 的 draft；`run-once` 作为兼容别名注册到同一个 CLI 函数，不维护独立流程，并继续接受旧的 `--fetch-limit` 参数名。使用 `--publish` 或单独执行 `pipeline export --edition-date ...` 才会替换正式数据库和公开日报。`fetch-only` 只抓取并输出标准化条目及来源归因，不调用 AI，也不代表正式日报。
 
 Stage A/B 对每条 AI provider 任务执行瞬态错误自动重试：首次调用失败后最多再重试 5 次（最多 6 次 provider 调用）。429、5xx、timeout 和 rate-limit 属于可重试错误；永久性 4xx、鉴权失败和 schema 错误不会重复请求。达到上限后 draft 保留为失败状态，旧日报不被替换，修复后可使用同一 `edition_date` 恢复。
 
-默认数量策略为：抓取层使用 `source_registry.yaml` 中每个来源自己的 `default_limit`，Stage A/B 处理当前完整 build；B 只让本地 guard 总分不低于 70 且 AI 主体相关性不低于 65 的条目进入 C 工作台，初始 active 上限为 100、reserve 为 20，14 期后 active 动态控制在 60–120；日报最终导出最多 30 条。`run-once --limit`（或 `--fetch-limit`）仅用于人工统一覆盖每来源抓取量；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
+默认数量策略为：抓取层使用 `source_registry.yaml` 中每个来源自己的 `default_limit`，Stage A/B 处理当前完整 build；B 只让本地 guard 总分不低于 60 且 AI 主体相关性不低于 60 的条目进入 C 工作台，初始 active 上限为 100、reserve 为 20，14 期后 active 动态控制在 60–120；日报最终导出最多 30 条。`pipeline run --limit` 仅用于人工统一覆盖每来源抓取量；导出阶段的显式 `--limit` 可以覆盖默认日报数量。
 
-`export` 的日报产物默认写入 `output/daily/YYYY-MM-DD/`：
+draft 审核产物默认写入 `output/intel/draft/YYYY-MM-DD/`，正式发布产物默认写入 `output/daily/YYYY-MM-DD/`；两者文件结构一致：
 
 - `intel_items.jsonl`：AI 选择结果与来源归因。
 - `intel_digest.md`：分类、状态、指标、风险和链接摘要。
 - `manifest.json`：日报日期、公开状态、完整筛选漏斗、阶段状态/失败原因和文件校验信息；不包含内部 build ID。
 
-GitHub 项目保留抓取到的 stars、forks、Trending 周期指标、topics 和 README 摘要；AI 不替代项目指标筛选，也不会生成未提供的增长数据。
+独立 GitHub 项目抓取仍保留 stars、forks、topics 和 README 摘要等能力；正式日报当前只启用 Release 路由，Trending 周期指标仅在对应项目专栏重新启用后产生。AI 不替代项目指标筛选，也不会生成未提供的增长数据。
 
 本地 RSSHub 启动：
 
