@@ -36,7 +36,7 @@ from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
 STAGE_D_NAME = "stage_d"
-STAGE_D_VERSION = "stage-d-editorial-review-v4"
+STAGE_D_VERSION = "stage-d-editorial-review-v8"
 
 
 class StageDExecutionError(RuntimeError):

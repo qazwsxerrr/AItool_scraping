@@ -26,14 +26,20 @@ REFERENCE = datetime(2026, 8, 19, 8, tzinfo=timezone.utc)
 def test_stage_d_prompt_reviews_stage_c_candidates_against_daily_requirements():
     prompt = STAGE_D_SELECTION_SYSTEM_PROMPT
 
-    assert STAGE_D_SELECTION_PROMPT_VERSION == "stage_d_editorial_review_v2"
-    assert "Stage C 的输出是待审候选，不是入选结论" in prompt
-    assert "只有目标、计划、预测、自我评价或营销表态" in prompt
-    assert "不为凑满数量而保留边缘内容" in prompt
-    assert "`needs_review` 不自动淘汰，也不自动通过" in prompt
+    assert STAGE_D_SELECTION_PROMPT_VERSION == "stage_d_editorial_review_v6"
+    assert "Stage C 输出的是待审候选事件池" in prompt
+    assert "隔离编辑限定词（editorial_caveats）" in prompt
+    assert "保护开发者实用信息" in prompt
+    assert "必须返回所有候选事件的终审结果" in prompt
 
     payload = build_stage_d_provider_payload([], max_selected=30)
     assert payload["input"][0]["content"] == prompt
+
+
+def test_stage_d_input_preserves_editorial_caveats_for_research_and_eval_events():
+    prompt = STAGE_D_SELECTION_SYSTEM_PROMPT
+    assert "editorial_caveats" in prompt
+    assert "绝不能作为淘汰或降级该事件的理由" in prompt
 
 
 def _db():
