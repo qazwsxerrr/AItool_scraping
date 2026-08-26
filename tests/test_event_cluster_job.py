@@ -210,24 +210,23 @@ class _ToolAgent:
                 "topics": [item.get("topic") or "technology_insight"],
                 "keywords": item.get("keywords") or [],
                 "entities": item.get("entities") or [],
-                "event_action": "release",
-                "lifecycle_state": "ga",
-                "aggregation_basis": [],
-                "novelty_status": "repeat" if self.repeat else "new",
-                "prior_event_key": f"url:{item['canonical_url']}" if self.repeat else None,
-                "novelty_reason": "当前候选与近三期事件相同且没有实质变化。" if self.repeat else "当前候选未匹配近三期已发布日报。",
-                "material_changes": [],
-                "substance_status": "intent_only" if self.intent_only else "concrete",
-                "substantive_facts": [] if self.intent_only else [
+                "event_family_key": f"fixture-release-{item['id']}",
+                "event_claim": item["title"],
+                "aggregation_reason": "单条候选构成一个事件包。",
+                "facts": [
                     {
-                        "fact_type": "product",
-                        "claim": "候选正文确认产品已正式发布。",
+                        "claim": "候选正文确认产品已正式发布。" if not self.intent_only else "候选正文确认发布方提出了具体计划。",
                         "supporting_item_ids": [item["id"]],
                     }
                 ],
-                "review_state": "candidate",
+                "history_status": "repeat" if self.repeat else "new",
+                "prior_event_key": f"url:{item['canonical_url']}" if self.repeat else None,
+                "history_reason": "当前候选与近三期事件相同且没有实质变化。" if self.repeat else "当前候选未匹配近三期已发布日报。",
+                "meaningful_updates": [],
+                "publishability": "candidate",
+                "split_reason": None,
                 "confidence": 88,
-                "risk_flags": [],
+                "caveats": ["intent_only_event"] if self.intent_only else [],
             }
             for item in active
         ]
@@ -289,6 +288,69 @@ class _InvalidCoverageAgent:
         return AgentRunResult("invalid-response", 1, 1, 0, False, {"id": "invalid-response", "output": []})
 
 
+class _SplitFamilyAgent:
+    model = "stage-c-split-family-fixture"
+    transport = "responses"
+
+    def __init__(self) -> None:
+        self.first_finalize: dict[str, Any] | None = None
+
+    def run(self, *, function_tools, on_response, on_tool, **_kwargs):
+        tools = {tool.name: tool for tool in function_tools}
+        calls = 0
+
+        def invoke(name: str, args: Mapping[str, Any]):
+            nonlocal calls
+            calls += 1
+            call = {"name": name, "call_id": f"split-{calls}", "arguments": json.dumps(args)}
+            result = dict(tools[name].handler(dict(args)))
+            on_tool(1, call, result)
+            return result
+
+        on_response(1, {"id": "split-family", "output": []})
+        items = invoke("list_candidates", {"bucket": "active", "offset": 0, "limit": 30})["items"]
+
+        def draft(item):
+            return {
+                "draft_key": f"wan-{item['id']}",
+                "event_family_key": "alibaba_wan_3_0_release_wave",
+                "item_ids": [item["id"]],
+                "title": item["title"],
+                "summary_cn": item.get("summary_cn") or item["title"],
+                "event_claim": "Wan 3.0 发布窗口内的平台可用性扩散。",
+                "aggregation_reason": "错误地把同一发布窗口的平台接入拆开。",
+                "topic": item.get("topic") or "model_release",
+                "topics": [item.get("topic") or "model_release"],
+                "keywords": item.get("keywords") or [],
+                "entities": item.get("entities") or [],
+                "facts": [{"claim": item["title"], "supporting_item_ids": [item["id"]]}],
+                "history_status": "new",
+                "prior_event_key": None,
+                "history_reason": "近三期未见同一事件。",
+                "meaningful_updates": [],
+                "publishability": "candidate",
+                "split_reason": None,
+                "confidence": 85,
+                "caveats": [],
+            }
+
+        assert invoke("save_event_drafts", {"drafts": [draft(item) for item in items]})["ok"] is True
+        self.first_finalize = invoke("finalize_event_drafts", {})
+        assert self.first_finalize["ok"] is False
+        assert "event_family_key alibaba_wan_3_0_release_wave" in self.first_finalize["errors"][0]
+
+        merged = draft(items[0])
+        merged["draft_key"] = "wan-3-release-wave"
+        merged["item_ids"] = [item["id"] for item in items]
+        merged["title"] = "Wan 3.0 发布并在多个平台上线"
+        merged["summary_cn"] = "Wan 3.0 在同一发布窗口内完成能力披露和多平台可用性扩散。"
+        merged["aggregation_reason"] = "这些候选均围绕同一模型、同一版本和同一发布窗口，应合并为一个事件包。"
+        merged["facts"] = [{"claim": item["title"], "supporting_item_ids": [item["id"]]} for item in items]
+        assert invoke("save_event_drafts", {"drafts": [merged]})["ok"] is True
+        assert invoke("finalize_event_drafts", {})["ok"] is True
+        return AgentRunResult("split-family", 1, calls, 0, True, {"id": "split-family", "output": []})
+
+
 class _ReviewFlowAgent:
     model = "stage-c-review-flow-fixture"
     transport = "responses"
@@ -321,24 +383,23 @@ class _ReviewFlowAgent:
             "topics": [item.get("topic") or "technology_insight"],
             "keywords": item.get("keywords") or [],
             "entities": item.get("entities") or [],
-            "event_action": "release",
-            "lifecycle_state": "ga",
-            "aggregation_basis": [],
-            "novelty_status": "new",
-            "prior_event_key": None,
-            "novelty_reason": "当前候选未匹配近三期已发布日报。",
-            "material_changes": [],
-            "substance_status": "concrete",
-            "substantive_facts": [
+            "event_family_key": f"review-fixture-{item['id']}",
+            "event_claim": item["title"],
+            "aggregation_reason": "单条候选构成一个需核验事件包。",
+            "facts": [
                 {
-                    "fact_type": "product",
                     "claim": "候选正文确认产品已正式发布。",
                     "supporting_item_ids": [item["id"]],
                 }
             ],
-            "review_state": "needs_review",
+            "history_status": "new",
+            "prior_event_key": None,
+            "history_reason": "当前候选未匹配近三期已发布日报。",
+            "meaningful_updates": [],
+            "publishability": "needs_review",
+            "split_reason": None,
             "confidence": 80,
-            "risk_flags": ["claim_requires_confirmation"],
+            "caveats": ["claim_requires_confirmation"],
         }
         assert invoke(1, "save_event_drafts", {"drafts": [draft]})["ok"] is True
         self.first_finalize = invoke(1, "finalize_event_drafts", {})
@@ -368,8 +429,8 @@ class _ReviewFlowAgent:
                 },
             )
             assert evidence["status"] == "verified"
-            draft["review_state"] = "candidate"
-            draft["risk_flags"] = []
+            draft["publishability"] = "candidate"
+            draft["caveats"] = []
             saved = invoke(2, "save_event_drafts", {"drafts": [draft]})
             assert saved["ok"] is True, saved
         assert invoke(2, "finalize_event_drafts", {})["ok"] is True
@@ -400,7 +461,7 @@ def test_stage_c_agent_reads_b_workbench_and_materializes_events():
         assert agent_session.finalization_requested is True
 
 
-def test_stage_c_rejects_intent_only_event_but_keeps_it_in_the_audit_pool():
+def test_stage_c_passes_intent_only_event_to_stage_d_as_candidate():
     session_factory = _db()
     run_id, _ = _seed_build(
         session_factory,
@@ -416,17 +477,18 @@ def test_stage_c_rejects_intent_only_event_but_keeps_it_in_the_audit_pool():
 
     assert result.unresolved == 0
     assert len(result.current_event_ids) == 1
-    assert result.candidate_event_ids == []
+    # intent_only events now pass through to Stage D as candidates
+    assert result.candidate_event_ids == result.current_event_ids
     with session_factory() as session:
         event = session.scalar(select(IntelEvent).where(IntelEvent.build_id == run_id))
         assert event is not None
         assert event.novelty_status == "new"
-        assert event.review_state == "rejected"
+        assert event.review_state == "candidate"
         assert "intent_only_event" in json.loads(event.risk_flags_json)
         metadata = json.loads(event.resolution_raw_json)["draft_metadata"]
-        assert metadata["substance_status"] == "intent_only"
-        assert metadata["substantive_facts"] == []
-        assert metadata["substance_guard"]["applied_review_state"] == "rejected"
+        assert metadata["publishability"] == "candidate"
+        assert metadata["facts"][0]["claim"] == "候选正文确认发布方提出了具体计划。"
+        assert "intent_only_event" in metadata["caveats"]
 
 
 def test_stage_c_does_not_send_confirmed_repeat_without_material_change_to_stage_d():

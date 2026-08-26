@@ -526,6 +526,7 @@ def test_source_fetch_warning_does_not_block_publication(tmp_path):
                 "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
                 "candidate_event_ids": [],
                 "selected": [],
+                "unselected": [],
             },
         )
         session.commit()

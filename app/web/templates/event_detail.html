@@ -21,7 +21,7 @@
   <section class="detail-panel">
     <div class="section-heading">
       <div>
-        <h2>来源、风险与关联标签</h2>
+        <h2>来源、编辑提示与关联标签</h2>
       </div>
     </div>
     <div class="event-detail-grid">
@@ -48,10 +48,10 @@
         </ul>
       </div>
       <div>
-        <h3>风险提示</h3>
+        <h3>编辑提示</h3>
         {% if detail.event.risk_flags %}
           <div class="badges">{% for flag in detail.event.risk_flags %}<span class="badge warning">{{ flag }}</span>{% endfor %}</div>
-        {% else %}<p class="muted-text">本事件没有结构化风险标记。</p>{% endif %}
+        {% else %}<p class="muted-text">本事件没有编辑备注。</p>{% endif %}
         {% if detail.event.keywords %}<h3>关键词</h3><div class="badges">{% for keyword in detail.event.keywords %}<span class="badge">{{ keyword }}</span>{% endfor %}</div>{% endif %}
       </div>
       <div>

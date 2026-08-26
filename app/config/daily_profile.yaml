@@ -1,4 +1,4 @@
-version: stage-d-editorial-review-v4
+version: stage-d-editorial-review-v10
 
 # Stage D reviews Stage C's candidate and needs_review events against the daily
 # editorial requirements, then returns only the ordered events worth keeping.

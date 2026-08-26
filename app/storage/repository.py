@@ -12,7 +12,7 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.domain.models import SourceSpec
@@ -1208,6 +1208,7 @@ class IntelRepository:
         risk_flags: Iterable[str] | None,
         metadata: Mapping[str, Any] | None = None,
         member_relations: Mapping[int, str] | None = None,
+        allow_member_reassignment: bool = False,
     ) -> IntelEventDraft:
         key = _text(draft_key)
         if not key:
@@ -1234,7 +1235,19 @@ class IntelRepository:
                 )
             )
             if relation is not None and int(relation.draft_id) != int(draft.id):
-                raise ValueError(f"item {item_id} is already assigned to another agent draft")
+                if not allow_member_reassignment:
+                    raise ValueError(f"item {item_id} is already assigned to another agent draft")
+                old_draft = relation.draft
+                self.session.delete(relation)
+                self.session.flush()
+                remaining = self.session.scalar(
+                    select(func.count()).select_from(IntelEventDraftItem).where(
+                        IntelEventDraftItem.draft_id == int(old_draft.id) if old_draft is not None else False
+                    )
+                )
+                if old_draft is not None and int(old_draft.id) != int(draft.id) and int(remaining or 0) == 0:
+                    self.session.delete(old_draft)
+                    self.session.flush()
         for relation in list(draft.members):
             self.session.delete(relation)
         # An agent may revise a persisted draft after a verification pass.

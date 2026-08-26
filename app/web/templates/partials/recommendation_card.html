@@ -29,7 +29,7 @@
       {% if card.content_class %}<span class="badge badge-source">{{ card.content_class | content_class_label }}</span>{% endif %}
       {% if card.risk_flags %}
         <details class="risk-details">
-          <summary class="badge warning">风险提示 {{ card.risk_flags | length }}</summary>
+          <summary class="badge info">编辑提示 {{ card.risk_flags | length }}</summary>
           <ul class="risk-list">
             {% for flag in card.risk_flags %}<li>{{ flag }}</li>{% endfor %}
           </ul>

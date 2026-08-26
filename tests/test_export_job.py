@@ -131,12 +131,22 @@ def _exportable_build(session_factory) -> tuple[int, list[int]]:
                 "reason": "对目标读者最有帮助。",
             },
         ]
+        selected_ids = {int(row["event_id"]) for row in selected}
         repo.complete_stage_task(
             stage_d_task,
             result={
                 "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
                 "candidate_event_ids": event_ids,
                 "selected": selected,
+                "unselected": [
+                    {
+                        "event_id": event_id,
+                        "reason_code": "not_in_final_subset",
+                        "reason": "未进入最终有序子集。",
+                    }
+                    for event_id in event_ids
+                    if int(event_id) not in selected_ids
+                ],
                 "input_fingerprint": "selection-input",
                 "config_fingerprint": "selection-config",
                 "provider_attempts": 1,

@@ -581,16 +581,7 @@ class _StageCAgentTools:
         return {
             "ok": True,
             "drafts": [
-                {
-                    "draft_key": draft.draft_key,
-                    "title": draft.title,
-                    "item_ids": [int(member.item_id) for member in draft.members],
-                    "novelty_status": draft.novelty_status,
-                    "review_state": draft.review_state,
-                    "confidence": int(draft.confidence),
-                    "risk_flags": _json_strings(draft.risk_flags_json),
-                    "metadata": _json_mapping(draft.metadata_json),
-                }
+                _draft_tool_view(draft)
                 for draft in drafts
             ],
         }
@@ -652,38 +643,45 @@ class _StageCAgentTools:
                     return {"ok": False, "error": f"item {item_id} appears in both {prior_key} and {draft_key}"}
                 assigned[item_id] = draft_key
             try:
-                novelty = _prepare_draft_novelty(
+                history = _prepare_draft_history(
                     draft_args,
                     item_ids=ids,
                     admissions=self.by_item_id,
                     history_by_key=self.history_by_key,
                     history_identity_index=self.history_identity_index,
                 )
-                substance = _prepare_draft_substance(
+                publishability = _prepare_draft_publishability(
                     draft_args,
                     item_ids=ids,
-                    novelty_status=str(novelty["novelty_status"]),
+                    novelty_status=str(history["novelty_status"]),
                 )
             except ValueError as exc:
                 return {"ok": False, "error": str(exc)}
-            prepared.append((draft_args, ids, novelty, substance))
-
-        for existing in self.repo.list_agent_drafts(int(self.agent_session.id)):
-            for member in existing.members:
-                new_key = assigned.get(int(member.item_id))
-                if new_key is not None and new_key != existing.draft_key:
-                    return {
-                        "ok": False,
-                        "error": f"item {member.item_id} is already assigned to existing draft {existing.draft_key}",
-                    }
+            prepared.append((draft_args, ids, history, publishability))
 
         saved: list[dict[str, Any]] = []
         try:
             with self.session.begin_nested():
-                for draft_args, ids, novelty, substance in prepared:
-                    risk_flags = _strings(draft_args.get("risk_flags"))
-                    risk_flags.extend(value for value in novelty["risk_flags"] if value not in risk_flags)
-                    risk_flags.extend(value for value in substance["risk_flags"] if value not in risk_flags)
+                for draft_args, ids, history, publishability in prepared:
+                    caveats = _strings(draft_args.get("caveats"))
+                    caveats.extend(value for value in history["risk_flags"] if value not in caveats)
+                    caveats.extend(value for value in publishability["risk_flags"] if value not in caveats)
+                    metadata = {
+                        "saved_by": "responses_agent_batch",
+                        "batch_size": len(prepared),
+                        "event_family_key": _event_family_key(draft_args),
+                        "event_claim": _text(draft_args.get("event_claim")),
+                        "aggregation_reason": _text(draft_args.get("aggregation_reason")),
+                        "facts": publishability["facts"],
+                        "history_status": history["history_status"],
+                        "history_reason": _text(draft_args.get("history_reason")),
+                        "meaningful_updates": history["meaningful_updates"],
+                        "history_guard": history["guard"],
+                        "publishability": publishability["publishability"],
+                        "publishability_guard": publishability["guard"],
+                        "split_reason": _text(draft_args.get("split_reason")),
+                        "caveats": caveats,
+                    }
                     draft = self.repo.upsert_agent_draft(
                         int(self.agent_session.id),
                         draft_key=str(draft_args.get("draft_key") or ""),
@@ -698,24 +696,13 @@ class _StageCAgentTools:
                             for value in draft_args.get("entities", [])
                             if isinstance(value, Mapping)
                         ],
-                        novelty_status=str(novelty["novelty_status"]),
-                        prior_event_key=_text(novelty.get("prior_event_key")),
-                        review_state=str(substance["review_state"]),
+                        novelty_status=str(history["novelty_status"]),
+                        prior_event_key=_text(history.get("prior_event_key")),
+                        review_state=str(publishability["review_state"]),
                         confidence=_bounded_score(draft_args.get("confidence"), 0),
-                        risk_flags=risk_flags,
-                        metadata={
-                            "saved_by": "responses_agent_batch",
-                            "batch_size": len(prepared),
-                            "event_action": draft_args.get("event_action"),
-                            "lifecycle_state": draft_args.get("lifecycle_state"),
-                            "aggregation_basis": _strings(draft_args.get("aggregation_basis")),
-                            "novelty_reason": _text(draft_args.get("novelty_reason")),
-                            "material_changes": novelty["material_changes"],
-                            "novelty_guard": novelty["guard"],
-                            "substance_status": substance["substance_status"],
-                            "substantive_facts": substance["substantive_facts"],
-                            "substance_guard": substance["guard"],
-                        },
+                        risk_flags=caveats,
+                        metadata=metadata,
+                        allow_member_reassignment=True,
                     )
                     saved.append(
                         {
@@ -723,7 +710,8 @@ class _StageCAgentTools:
                             "draft_id": int(draft.id),
                             "item_ids": ids,
                             "review_state": draft.review_state,
-                            "substance_status": substance["substance_status"],
+                            "publishability": publishability["publishability"],
+                            "event_family_key": metadata["event_family_key"],
                         }
                     )
         except Exception as exc:
@@ -858,19 +846,12 @@ class _StageCAgentTools:
                 "ok": False,
                 "errors": errors,
                 "missing_active_ids": validation["missing_active_ids"],
-                "verification_pending": [
-                    {
-                        "draft_key": draft.draft_key,
-                        "title": draft.title,
-                        "risk_flags": _json_strings(draft.risk_flags_json),
-                    }
-                    for draft in verification_pending
-                ]
+                "verification_pending": [_pending_verification_view(draft) for draft in verification_pending]
                 if verification_pending
                 else [],
                 "next_action": (
                     "Use search_web for each unresolved draft, attach returned sources to its claims, and revise the draft. "
-                    "Keep needs_review only when the research pass still cannot resolve it."
+                    "Keep publishability=needs_review only when the research pass still cannot resolve it."
                     if verification_pending
                     else None
                 ),
@@ -927,6 +908,31 @@ def _load_published_daily_history(
             }
         )
     return result
+
+
+def _draft_tool_view(draft: IntelEventDraft) -> dict[str, Any]:
+    metadata = _json_mapping(draft.metadata_json)
+    return {
+        "draft_key": draft.draft_key,
+        "title": draft.title,
+        "item_ids": [int(member.item_id) for member in draft.members],
+        "event_family_key": metadata.get("event_family_key"),
+        "history_status": metadata.get("history_status") or draft.novelty_status,
+        "publishability": metadata.get("publishability") or draft.review_state,
+        "confidence": int(draft.confidence),
+        "caveats": metadata.get("caveats") or _json_strings(draft.risk_flags_json),
+        "metadata": metadata,
+    }
+
+
+def _pending_verification_view(draft: IntelEventDraft) -> dict[str, Any]:
+    view = _draft_tool_view(draft)
+    return {
+        "draft_key": view["draft_key"],
+        "title": view["title"],
+        "event_family_key": view.get("event_family_key"),
+        "caveats": view.get("caveats") or [],
+    }
 
 
 def _materialize_agent_events(
@@ -1098,7 +1104,19 @@ def _save_unresolved_draft(
             review_state="needs_review",
             confidence=0,
             risk_flags=["needs_review", reason],
-            metadata={"reason": reason},
+            metadata={
+                "event_family_key": _normalize_event_family_key(key),
+                "event_claim": primary.title,
+                "aggregation_reason": reason,
+                "facts": [],
+                "history_status": "uncertain",
+                "history_reason": reason,
+                "meaningful_updates": [],
+                "publishability": "needs_review",
+                "split_reason": None,
+                "caveats": [reason],
+                "reason": reason,
+            },
         )
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -1140,7 +1158,48 @@ def _validate_agent_drafts(
                         errors.append(
                             f"active candidates with exact identity {identity} are split across {owner} and {draft.draft_key}"
                         )
+    family_errors = _event_family_split_errors(drafts)
+    errors.extend(family_errors)
     return {"errors": errors, "missing_active_ids": missing, "draft_count": len(drafts)}
+
+
+_ALLOWED_STAGE_C_SPLIT_REASONS = frozenset({
+    "different_model_or_major_version",
+    "separate_time_window_actionable",
+    "independent_security_policy_or_breaking_change",
+    "platform_released_independent_product",
+    "standalone_pricing_quota_access_change",
+})
+
+
+def _event_family_split_errors(drafts: Sequence[IntelEventDraft]) -> list[str]:
+    by_family: dict[str, list[IntelEventDraft]] = {}
+    for draft in drafts:
+        if str(draft.review_state or "").casefold() not in {"candidate", "needs_review"}:
+            continue
+        metadata = _json_mapping(draft.metadata_json)
+        family = _normalize_event_family_key(metadata.get("event_family_key") or draft.draft_key)
+        if not family:
+            continue
+        by_family.setdefault(family, []).append(draft)
+
+    errors: list[str] = []
+    for family, rows in sorted(by_family.items()):
+        if len(rows) <= 1:
+            continue
+        missing_or_invalid: list[str] = []
+        for draft in rows:
+            metadata = _json_mapping(draft.metadata_json)
+            reason = str(metadata.get("split_reason") or "").strip()
+            if reason not in _ALLOWED_STAGE_C_SPLIT_REASONS:
+                missing_or_invalid.append(draft.draft_key)
+        if missing_or_invalid:
+            errors.append(
+                "event_family_key "
+                f"{family} has multiple publishable drafts without allowed split_reason: {missing_or_invalid}. "
+                "Merge them into one event package, or use one allowed split_reason per remaining draft."
+            )
+    return errors
 
 
 def _clear_build_events(session: Session, *, run_id: int) -> None:
@@ -1306,7 +1365,7 @@ def _history_identity_index(history: Sequence[Mapping[str, Any]]) -> dict[str, l
     return result
 
 
-def _prepare_draft_novelty(
+def _prepare_draft_history(
     draft: Mapping[str, Any],
     *,
     item_ids: Sequence[int],
@@ -1314,22 +1373,22 @@ def _prepare_draft_novelty(
     history_by_key: Mapping[str, Mapping[str, Any]],
     history_identity_index: Mapping[str, Sequence[str]],
 ) -> dict[str, Any]:
-    if len(item_ids) > 1 and not _strings(draft.get("aggregation_basis")):
-        raise ValueError(f"multi-member draft {draft.get('draft_key')} requires aggregation_basis")
-    material_changes: list[dict[str, Any]] = []
-    for raw in draft.get("material_changes") or ():
+    meaningful_updates: list[dict[str, Any]] = []
+    for raw in draft.get("meaningful_updates") or ():
         if not isinstance(raw, Mapping):
-            raise ValueError("material_changes must contain objects")
+            raise ValueError("meaningful_updates must contain objects")
         supporting = _unique_positive_ids(raw.get("supporting_item_ids"), limit=40)
         outside = [item_id for item_id in supporting if item_id not in item_ids]
         if outside:
-            raise ValueError(f"material change references non-member item ids: {outside}")
+            raise ValueError(f"meaningful update references non-member item ids: {outside}")
         if not supporting:
-            raise ValueError("every material change requires supporting_item_ids")
-        material_changes.append(
+            raise ValueError("every meaningful update requires supporting_item_ids")
+        claim = _text(raw.get("claim"))
+        if not claim:
+            raise ValueError("every meaningful update requires a claim")
+        meaningful_updates.append(
             {
-                "change_type": str(raw.get("change_type") or "other"),
-                "claim": _text(raw.get("claim")),
+                "claim": claim,
                 "supporting_item_ids": supporting,
             }
         )
@@ -1341,7 +1400,7 @@ def _prepare_draft_novelty(
                 if event_key not in exact_prior_keys:
                     exact_prior_keys.append(event_key)
     requested_prior = _text(draft.get("prior_event_key"))
-    requested_status = str(draft.get("novelty_status") or "uncertain").casefold()
+    requested_status = str(draft.get("history_status") or "uncertain").casefold()
     risk_flags: list[str] = []
     guard: dict[str, Any] = {
         "requested_status": requested_status,
@@ -1352,122 +1411,94 @@ def _prepare_draft_novelty(
 
     if requested_prior and requested_prior not in history_by_key:
         prior_event_key = None
-        novelty_status = "uncertain"
+        history_status = "uncertain"
         risk_flags.append("prior_event_outside_history_window")
     else:
         prior_event_key = requested_prior or (exact_prior_keys[0] if exact_prior_keys else None)
         if prior_event_key:
-            novelty_status = "updated" if material_changes else "repeat"
-        elif requested_status in {"repeat", "updated"}:
-            novelty_status = "uncertain"
+            history_status = "meaningful_update" if meaningful_updates else "repeat"
+        elif requested_status in {"repeat", "meaningful_update"}:
+            history_status = "uncertain"
             risk_flags.append("history_match_not_found")
         elif requested_status in {"new", "uncertain"}:
-            novelty_status = requested_status
+            history_status = requested_status
         else:
-            novelty_status = "uncertain"
+            history_status = "uncertain"
             risk_flags.append("invalid_novelty_status")
-    guard["applied_status"] = novelty_status
+    novelty_status = "updated" if history_status == "meaningful_update" else history_status
+    guard["applied_status"] = history_status
     guard["applied_prior_event_key"] = prior_event_key
     return {
+        "history_status": history_status,
         "novelty_status": novelty_status,
         "prior_event_key": prior_event_key,
-        "material_changes": material_changes,
+        "meaningful_updates": meaningful_updates,
         "risk_flags": risk_flags,
         "guard": guard,
     }
 
 
-def _prepare_draft_substance(
+def _prepare_draft_publishability(
     draft: Mapping[str, Any],
     *,
     item_ids: Sequence[int],
     novelty_status: str,
 ) -> dict[str, Any]:
-    """Validate event substance independently from recent-history novelty.
+    """Validate the simplified event-package publishability contract."""
 
-    A previously unseen event is not automatically a normal candidate.  This
-    guard only enforces the generic three-state contract; the model decides the
-    event semantics from the complete claim rather than local keyword rules.
-    """
-
-    allowed_fact_types = {
-        "product",
-        "model",
-        "capability",
-        "timeline",
-        "commercial",
-        "organization",
-        "policy",
-        "research",
-        "availability",
-        "data",
-        "other",
-    }
-    substantive_facts: list[dict[str, Any]] = []
-    for raw in draft.get("substantive_facts") or ():
+    facts: list[dict[str, Any]] = []
+    for raw in draft.get("facts") or ():
         if not isinstance(raw, Mapping):
-            raise ValueError("substantive_facts must contain objects")
-        fact_type = str(raw.get("fact_type") or "").casefold()
-        if fact_type not in allowed_fact_types:
-            raise ValueError(f"unsupported substantive fact type: {fact_type or 'empty'}")
+            raise ValueError("facts must contain objects")
         claim = _text(raw.get("claim"))
         if not claim:
-            raise ValueError("every substantive fact requires a claim")
+            raise ValueError("every fact requires a claim")
         supporting = _unique_positive_ids(raw.get("supporting_item_ids"), limit=40)
         outside = [item_id for item_id in supporting if item_id not in item_ids]
         if outside:
-            raise ValueError(f"substantive fact references non-member item ids: {outside}")
+            raise ValueError(f"fact references non-member item ids: {outside}")
         if not supporting:
-            raise ValueError("every substantive fact requires supporting_item_ids")
-        substantive_facts.append(
+            raise ValueError("every fact requires supporting_item_ids")
+        facts.append(
             {
-                "fact_type": fact_type,
                 "claim": claim,
                 "supporting_item_ids": supporting,
             }
         )
 
-    requested_status = str(draft.get("substance_status") or "uncertain").casefold()
-    requested_review_state = str(draft.get("review_state") or "candidate").casefold()
+    requested_publishability = str(draft.get("publishability") or "candidate").casefold()
     risk_flags: list[str] = []
-    if requested_status not in {"concrete", "intent_only", "uncertain"}:
-        applied_status = "uncertain"
-        risk_flags.append("invalid_substance_status")
-    else:
-        applied_status = requested_status
-
-    if applied_status == "concrete" and not substantive_facts:
-        applied_status = "uncertain"
-        risk_flags.append("concrete_event_without_substantive_facts")
-    if requested_review_state not in {"candidate", "needs_review", "rejected"}:
+    if requested_publishability not in {"candidate", "needs_review", "rejected"}:
         review_state = "needs_review"
-        risk_flags.append("invalid_review_state")
+        applied_publishability = "needs_review"
+        risk_flags.append("invalid_publishability")
     else:
-        review_state = requested_review_state
+        review_state = requested_publishability
+        applied_publishability = requested_publishability
 
     normalized_novelty_status = str(novelty_status).casefold()
     if normalized_novelty_status == "repeat":
         review_state = "rejected"
+        applied_publishability = "rejected"
         risk_flags.append("confirmed_repeat_without_material_change")
-    elif applied_status == "intent_only":
-        review_state = "rejected"
-        risk_flags.append("intent_only_event")
-    elif applied_status == "uncertain":
+    elif applied_publishability == "candidate" and not facts:
         review_state = "needs_review"
+        applied_publishability = "needs_review"
+        risk_flags.append("candidate_without_facts")
+    elif applied_publishability == "needs_review":
         risk_flags.append("uncertain_event_core")
 
     guard = {
-        "requested_status": requested_status,
-        "applied_status": applied_status,
-        "requested_review_state": requested_review_state,
+        "requested_publishability": requested_publishability,
+        "applied_publishability": applied_publishability,
         "applied_review_state": review_state,
         "novelty_status": normalized_novelty_status,
-        "substantive_fact_count": len(substantive_facts),
-        "policy": "three_state_substance_consistency_v2",
+        "fact_count": len(facts),
+        "policy": "event_package_publishability_v1",
     }
     return {
-        "substance_status": applied_status,
-        "substantive_facts": substantive_facts,
+        "publishability": applied_publishability,
+        "facts": facts,
         "review_state": review_state,
         "risk_flags": risk_flags,
         "guard": guard,
@@ -1557,6 +1588,15 @@ def _item_mapping(item: IntelItem) -> dict[str, Any]:
         "external_id": item.external_id,
         "title": item.title,
     }
+
+
+def _event_family_key(draft: Mapping[str, Any]) -> str:
+    return _normalize_event_family_key(draft.get("event_family_key") or draft.get("draft_key"))
+
+
+def _normalize_event_family_key(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().casefold()).strip("_")
+    return text[:120] or "other"
 
 
 def _normalize_external_id(value: Any) -> str | None:

@@ -34,7 +34,7 @@
       {% for topic in project.search_topics[:6] %}<span class="badge">topic:{{ topic }}</span>{% endfor %}
       {% if project.risk_flags %}
         <details class="risk-details">
-          <summary class="badge warning">风险提示 {{ project.risk_flags | length }}</summary>
+          <summary class="badge info">编辑提示 {{ project.risk_flags | length }}</summary>
           <ul class="risk-list">
             {% for flag in project.risk_flags %}<li>{{ flag }}</li>{% endfor %}
           </ul>

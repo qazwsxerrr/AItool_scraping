@@ -77,6 +77,7 @@ class _Client:
         self.calls.append([dict(event) for event in events])
         if self.error is not None:
             raise self.error
+        selected = list(reversed(events[:max_selected]))
         return {
             "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
             "selected": [
@@ -85,7 +86,16 @@ class _Client:
                     "reason_code": "balanced_daily",
                     "reason": "适合进入本期组合。",
                 }
-                for event in reversed(events[:max_selected])
+                for event in selected
+            ],
+            "unselected": [
+                {
+                    "event_id": int(event["event_id"]),
+                    "reason_code": "lower_editorial_value",
+                    "reason": "本期组合中优先级较低。",
+                }
+                for event in events
+                if event not in selected
             ],
         }
 

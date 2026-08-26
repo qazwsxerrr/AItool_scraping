@@ -192,6 +192,18 @@ sources:
     adapter: generic
   source_group: tech_media
   default_limit: 15
+- id: doctorofcredit_ai_deals
+  name: Doctor of Credit AI Deals
+  transport: feed
+  url: https://www.doctorofcredit.com/tag/ai/feed/
+  enabled: true
+  priority: 54
+  fetch_interval: 3600
+  feed:
+    format: rss
+    adapter: generic
+  source_group: tech_media
+  default_limit: 15
 - id: github_blog_ai
   name: GitHub Blog AI
   transport: feed

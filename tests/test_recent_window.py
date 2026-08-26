@@ -135,8 +135,18 @@ class _StageCClient:
                 "draft_key": f"recent-{item['id']}", "item_ids": [item["id"]], "title": item["title"],
                 "summary_cn": item.get("summary_cn") or item["title"], "topic": item.get("topic") or "technology_insight",
                 "topics": [item.get("topic") or "technology_insight"], "keywords": item.get("keywords") or [],
-                "entities": item.get("entities") or [], "novelty_status": "new", "prior_event_key": None,
-                "review_state": "candidate", "confidence": 90, "risk_flags": [],
+                "entities": item.get("entities") or [],
+                "event_family_key": f"recent-window-{item['id']}", "event_claim": item["title"],
+                "aggregation_reason": "单条候选构成一个事件包。",
+                "facts": [
+                    {
+                        "claim": "候选正文确认项目有新的可用状态。",
+                        "supporting_item_ids": [item["id"]],
+                    }
+                ],
+                "history_status": "new", "prior_event_key": None,
+                "history_reason": "当前候选未匹配近三期已发布日报。", "meaningful_updates": [],
+                "publishability": "candidate", "split_reason": None, "confidence": 90, "caveats": [],
             }
             for item in rows
         ]})

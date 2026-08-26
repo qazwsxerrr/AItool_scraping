@@ -143,8 +143,10 @@ class StageDSelectionClient:
         self.last_raw_response = None
         self.last_error_metadata = None
         last_error: StageDSelectionProviderError | None = None
+        repair_attempts = 0
         for attempt in range(self.max_retries + 1):
             raw_payload: Any | None = None
+            schema_repair_scheduled = False
             try:
                 raw_payload = self._responses.create(payload)
                 parsed = strict_parse_stage_d_selection(
@@ -154,6 +156,8 @@ class StageDSelectionClient:
                 )
                 completed = dict(request_metadata)
                 completed["provider_attempts"] = attempt + 1
+                if repair_attempts:
+                    completed["schema_repair_attempts"] = repair_attempts
                 self.last_raw_response = raw_payload
                 return StageDSelectionCallResult(
                     parsed=parsed,
@@ -172,6 +176,7 @@ class StageDSelectionClient:
                     cause=exc,
                 )
             except (TypeError, ValueError) as exc:
+                repair_attempts += 1
                 last_error = StageDSelectionProviderError(
                     f"Stage D response failed schema validation: {exc}",
                     error_code="schema_validation_failed",
@@ -179,6 +184,14 @@ class StageDSelectionClient:
                     request_metadata=request_metadata,
                     cause=exc,
                 )
+                if attempt < self.max_retries:
+                    payload = _schema_repair_payload(
+                        payload,
+                        candidate_event_ids=candidate_ids,
+                        validation_error=str(exc),
+                        invalid_response=raw_payload,
+                    )
+                    schema_repair_scheduled = True
             except BaseException as exc:
                 last_error = StageDSelectionProviderError(
                     str(exc),
@@ -186,6 +199,8 @@ class StageDSelectionClient:
                     request_metadata=request_metadata,
                     cause=exc,
                 )
+            if schema_repair_scheduled:
+                continue
             if not last_error.retryable or attempt >= self.max_retries:
                 self.last_raw_response = last_error.raw_response
                 self.last_error_metadata = last_error.audit_payload()
@@ -228,6 +243,48 @@ def _safe_url(value: str) -> str:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
     except ValueError:
         return str(value or "").strip()[:512]
+
+
+def _schema_repair_payload(
+    payload: Mapping[str, Any],
+    *,
+    candidate_event_ids: Sequence[int],
+    validation_error: str,
+    invalid_response: Any,
+) -> dict[str, Any]:
+    repaired = dict(payload)
+    base_input = repaired.get("input")
+    messages = [dict(item) for item in base_input if isinstance(item, Mapping)] if isinstance(base_input, list) else []
+    feedback = {
+        "repair_instruction": (
+            "上一轮 Stage D 输出未通过本地契约校验。请重新返回完整 JSON。"
+            "每个 candidate_event_id 必须且只能出现在 selected 或 unselected 之一；"
+            "不要返回候选池外 event_id；selected 数量不得超过 max_selected。"
+        ),
+        "validation_error": validation_error,
+        "candidate_event_ids": [int(event_id) for event_id in candidate_event_ids],
+        "previous_invalid_response": _compact_json_value(invalid_response, limit=12_000),
+    }
+    messages.append(
+        {
+            "role": "user",
+            "content": json.dumps(feedback, ensure_ascii=False, default=str),
+        }
+    )
+    repaired["input"] = messages
+    return repaired
+
+
+def _compact_json_value(value: Any, *, limit: int) -> Any:
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key in ("output_text", "output", "result", "data", "response", "id"):
+            if key in value:
+                result[key] = value[key]
+        if result:
+            return result
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= limit else text[:limit] + "...[truncated]"
 
 
 __all__ = [

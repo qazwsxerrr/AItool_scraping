@@ -245,7 +245,7 @@ def test_default_registry_applies_every_enabled_source_limit():
         },
         12: {"cursor_changelog", "hacker_news_ai", "linux_do_hot", "reddit_local_llama_hot"},
         15: {
-            "ithome_ai_news", "the_decoder_ai_news", "techcrunch_ai",
+            "ithome_ai_news", "the_decoder_ai_news", "techcrunch_ai", "doctorofcredit_ai_deals",
             "x_account_claude_devs", "x_account_pvncher", "x_account_thdxr",
             "x_account_xhyctf", "x_account_devin_desktop", "x_account_cursor_ai",
             "x_account_openai_devs", "x_account_opencode", "x_account_exa_ai_labs",
@@ -257,5 +257,5 @@ def test_default_registry_applies_every_enabled_source_limit():
     assert set(source_by_id) == expected_ids
     for expected_limit, source_ids in expected_by_limit.items():
         assert all(source_by_id[source_id].default_limit == expected_limit for source_id in source_ids)
-    assert len(source_by_id) == 69
-    assert sum(source.default_limit for source in result.sources) == 668
+    assert len(source_by_id) == 70
+    assert sum(source.default_limit for source in result.sources) == 683

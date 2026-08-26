@@ -24,14 +24,18 @@ def strict_parse_stage_d_selection(
     result_data, _raw = unwrap_provider_response(data)
     parsed = StageDSelectionResponse.model_validate(result_data)
     candidate_set = set(candidate_ids)
-    unknown = sorted(row.event_id for row in parsed.selected if row.event_id not in candidate_set)
+    returned_ids = [row.event_id for row in parsed.selected] + [row.event_id for row in parsed.unselected]
+    unknown = sorted(event_id for event_id in returned_ids if event_id not in candidate_set)
     if unknown:
-        raise ValueError(f"Stage D selected unknown candidate event_ids: {unknown}")
+        raise ValueError(f"Stage D returned unknown candidate event_ids: {unknown}")
     limit = max(0, int(max_selected))
     if len(parsed.selected) > limit:
         raise ValueError(
             f"Stage D selected {len(parsed.selected)} events, exceeding max_selected={limit}"
         )
+    missing = [event_id for event_id in candidate_ids if event_id not in set(returned_ids)]
+    if missing:
+        raise ValueError(f"Stage D did not return decisions for candidate event_ids: {missing}")
     return parsed
 
 

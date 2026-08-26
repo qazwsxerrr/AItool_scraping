@@ -426,6 +426,7 @@ def _load_stage_d_selection(repo: IntelRepository, run_id: int) -> list[dict[str
             {
                 "schema_version": result.get("schema_version"),
                 "selected": result.get("selected"),
+                "unselected": result.get("unselected", []),
             },
             candidate_event_ids=candidate_event_ids,
             max_selected=len(candidate_event_ids),

@@ -36,7 +36,8 @@ from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
 STAGE_D_NAME = "stage_d"
-STAGE_D_VERSION = "stage-d-editorial-review-v8"
+STAGE_D_VERSION = "stage-d-editorial-review-v11"
+STAGE_D_SOFT_SELECTED_TARGET = 22
 
 
 class StageDExecutionError(RuntimeError):
@@ -144,6 +145,8 @@ def run_stage_d_job(
                 "edition_date": run.edition_date,
                 "candidate_count": len(event_payload),
                 "withheld_needs_review_count": result.withheld_needs_review,
+                "max_selected": policy.max_selected,
+                "soft_selected_target": min(policy.max_selected, STAGE_D_SOFT_SELECTED_TARGET),
             }
             provider_payload = build_stage_d_provider_payload(
                 event_payload,
@@ -265,10 +268,25 @@ def run_stage_d_job(
                         {
                             "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
                             "selected": [],
+                            "unselected": [
+                                {
+                                    "event_id": int(event["event_id"]),
+                                    "reason_code": "selection_limit_zero",
+                                    "reason": "Stage D selection limit is zero.",
+                                }
+                                for event in event_payload
+                            ],
                         }
                     )
                     attempts = 0
                 selected_rows = [row.model_dump(mode="json") for row in parsed.selected]
+                unselected_rows = [row.model_dump(mode="json") for row in parsed.unselected]
+                completion_metadata = {
+                    **request_metadata,
+                    "search_provider": "tavily" if search_client is not None and search_client.is_configured else "disabled",
+                    "search_audit": search_audit,
+                    "agent_session_id": int(agent_session.id),
+                }
                 completed = repo.complete_stage_task(
                     task,
                     owner=owner,
@@ -282,6 +300,7 @@ def run_stage_d_job(
                         "withheld_needs_review_event_ids": withheld_needs_review_ids,
                         "all_stage_c_candidate_event_ids": candidate_event_ids,
                         "selected": selected_rows,
+                        "unselected": unselected_rows,
                         "input_fingerprint": input_fingerprint,
                         "config_fingerprint": config_fingerprint,
                         "provider_attempts": attempts,
@@ -289,12 +308,7 @@ def run_stage_d_job(
                         "agent_session_id": int(agent_session.id),
                     },
                     raw_response=raw_response,
-                    metadata={
-                        **request_metadata,
-                        "search_provider": "tavily" if search_client is not None and search_client.is_configured else "disabled",
-                        "search_audit": search_audit,
-                        "agent_session_id": int(agent_session.id),
-                    },
+                    metadata=completion_metadata,
                 )
                 if completed is None:
                     raise StageDExecutionError(
@@ -460,6 +474,49 @@ def _load_candidate_events(
     return [by_id[event_id] for event_id in event_ids]
 
 
+_ELIGIBILITY_BLOCKER_CODES = frozenset({
+    "confirmed_repeat_without_material_change",
+    "candidate_without_facts",
+    "source_conflict_on_event_core",
+})
+
+_AUDIT_FLAG_CODES = frozenset({
+    "prior_event_outside_history_window",
+    "history_match_not_found",
+    "invalid_novelty_status",
+    "invalid_publishability",
+    "search_not_configured",
+    "search_budget_exhausted",
+    "needs_review",
+})
+
+
+def _classify_risk_flags(
+    flags: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    """Split raw risk_flags into (eligibility_blockers, editorial_caveats, audit_flags).
+
+    * ``eligibility_blockers`` – genuine disqualification conditions.
+    * ``editorial_caveats`` – natural-language notes that constrain phrasing
+      but must *never* trigger elimination (includes ``intent_only_event``
+      and ``uncertain_event_core``).
+    * ``audit_flags`` – internal pipeline states; NOT sent to the model.
+    """
+    blockers: list[str] = []
+    caveats: list[str] = []
+    audits: list[str] = []
+    for flag in flags:
+        if flag in _ELIGIBILITY_BLOCKER_CODES:
+            blockers.append(flag)
+        elif flag in _AUDIT_FLAG_CODES:
+            audits.append(flag)
+        else:
+            # Natural-language editorial notes, intent_only_event,
+            # uncertain_event_core, etc.
+            caveats.append(flag)
+    return blockers, caveats, audits
+
+
 def _selection_event(
     event: IntelEvent,
     *,
@@ -470,12 +527,28 @@ def _selection_event(
         source_groups = [event.source_group]
     evidence = list(getattr(event, "evidence", ()) or ())
     verified = [row for row in evidence if str(row.status or "").casefold() == "verified"]
-    substance_status = _event_substance_status(event)
-    return {
+    draft_metadata = _event_draft_metadata(event)
+    raw_flags = _json_strings(event.risk_flags_json)
+    blockers, caveats, _audits = _classify_risk_flags(raw_flags)
+    package_caveats = _strings(draft_metadata.get("caveats"))
+    for caveat in package_caveats:
+        if caveat not in caveats:
+            caveats.append(caveat)
+    payload = {
         "event_id": int(event.id),
         "title": str(event.title or ""),
         "summary_cn": str(event.summary_cn or ""),
+        "event_family_key": str(draft_metadata.get("event_family_key") or ""),
+        "event_claim": str(draft_metadata.get("event_claim") or ""),
+        "facts": _mapping_list(draft_metadata.get("facts")),
+        "publishability": str(draft_metadata.get("publishability") or event.review_state or ""),
+        "history_status": str(draft_metadata.get("history_status") or event.novelty_status or ""),
+        "history_reason": str(draft_metadata.get("history_reason") or ""),
+        "meaningful_updates": _mapping_list(draft_metadata.get("meaningful_updates")),
+        "aggregation_reason": str(draft_metadata.get("aggregation_reason") or ""),
+        "split_reason": draft_metadata.get("split_reason"),
         "topic": event.topic,
+        "topics": _json_strings(event.topics_json),
         "content_class": event.content_class,
         "keywords": _json_strings(event.keywords_json),
         "entities": _json_value(event.entities_json, []),
@@ -483,24 +556,21 @@ def _selection_event(
         "display_score": float(event.display_score or 0.0),
         "source_groups": source_groups,
         "novelty_status": event.novelty_status,
-        "risk_flags": _json_strings(event.risk_flags_json),
+        "eligibility_blockers": blockers,
+        "editorial_caveats": caveats,
         "resolution_confidence": int(event.resolution_confidence or 0),
         "review_state": event.review_state,
         "verification_count": len(evidence),
         "verification_status": "verified" if verified else ("unverified" if evidence else "not_checked"),
-        "substance_status": substance_status,
         "search_status": "searched" if search_evidence else "not_searched",
         "search_evidence": [dict(row) for row in search_evidence],
     }
+    return payload
 
 
 def _event_draft_metadata(event: IntelEvent) -> dict[str, Any]:
     resolution = _json_value(event.resolution_raw_json, {})
     return _mapping(_mapping(resolution).get("draft_metadata"))
-
-
-def _event_substance_status(event: IntelEvent) -> str:
-    return str(_event_draft_metadata(event).get("substance_status") or "unknown").strip().casefold() or "unknown"
 
 
 def _run_stage_d_searches(
@@ -693,6 +763,7 @@ def _stored_selection(
         {
             "schema_version": stored.get("schema_version"),
             "selected": stored.get("selected"),
+            "unselected": stored.get("unselected", []),
         },
         candidate_event_ids=candidate_event_ids,
         max_selected=max_selected,
@@ -809,6 +880,11 @@ def _json_value(value: Any, default: Any) -> Any:
 
 def _json_strings(value: Any) -> list[str]:
     raw = _json_value(value, [])
+    return _strings(raw)
+
+
+def _strings(value: Any) -> list[str]:
+    raw = value
     if isinstance(raw, str):
         raw = [raw]
     if not isinstance(raw, list):
@@ -819,6 +895,11 @@ def _json_strings(value: Any) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _mapping_list(value: Any) -> list[dict[str, Any]]:
+    raw = _json_value(value, [])
+    return [dict(item) for item in raw if isinstance(item, Mapping)] if isinstance(raw, list) else []
 
 
 def _response_hash(value: Any) -> str:

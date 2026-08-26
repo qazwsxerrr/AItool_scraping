@@ -94,8 +94,18 @@ class _StageCAgent:
                 "draft_key": f"item-{item['id']}", "item_ids": [item["id"]], "title": item["title"],
                 "summary_cn": item.get("summary_cn") or item["title"], "topic": item.get("topic") or "technology_insight",
                 "topics": [item.get("topic") or "technology_insight"], "keywords": item.get("keywords") or [],
-                "entities": item.get("entities") or [], "novelty_status": "new", "prior_event_key": None,
-                "review_state": "candidate", "confidence": 90, "risk_flags": [],
+                "entities": item.get("entities") or [],
+                "event_family_key": f"current-build-update-{item['id']}", "event_claim": item["title"],
+                "aggregation_reason": "单条候选构成一个事件包。",
+                "facts": [
+                    {
+                        "claim": "候选正文确认产品状态发生更新。",
+                        "supporting_item_ids": [item["id"]],
+                    }
+                ],
+                "history_status": "new", "prior_event_key": None,
+                "history_reason": "当前候选未匹配近三期已发布日报。", "meaningful_updates": [],
+                "publishability": "candidate", "split_reason": None, "confidence": 90, "caveats": [],
             }
             for item in candidates
         ]})
@@ -117,11 +127,17 @@ class _SelectionClient:
     max_retries = 0
 
     def select(self, events, *, edition, max_selected):
+        selected = list(events[:max_selected])
         return {
             "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
             "selected": [
                 {"event_id": int(event["event_id"]), "reason_code": "material_change", "reason": "测试事件适合进入日报。"}
-                for event in events[:max_selected]
+                for event in selected
+            ],
+            "unselected": [
+                {"event_id": int(event["event_id"]), "reason_code": "not_in_final_subset", "reason": "未进入最终子集。"}
+                for event in events
+                if event not in selected
             ],
         }
 

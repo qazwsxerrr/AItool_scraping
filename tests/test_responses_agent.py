@@ -209,6 +209,75 @@ def test_stage_d_schema_failure_keeps_the_full_responses_payload_for_audit():
     assert client.last_raw_response == raw_payload
 
 
+def test_stage_d_schema_failure_retries_with_missing_candidate_feedback():
+    invalid_payload = {
+        "id": "selection-invalid",
+        "output_text": json.dumps(
+            {
+                "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+                "selected": [
+                    {
+                        "event_id": 1,
+                        "reason_code": "daily_value",
+                        "reason": "事件 1 入选。",
+                    }
+                ],
+                "unselected": [],
+            },
+            ensure_ascii=False,
+        ),
+    }
+    repaired_payload = {
+        "id": "selection-repaired",
+        "output_text": json.dumps(
+            {
+                "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
+                "selected": [
+                    {
+                        "event_id": 1,
+                        "reason_code": "daily_value",
+                        "reason": "事件 1 入选。",
+                    }
+                ],
+                "unselected": [
+                    {
+                        "event_id": 2,
+                        "reason_code": "lower_editorial_value",
+                        "reason": "事件 2 不进入最终子集。",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    }
+    http = _Http([invalid_payload, repaired_payload])
+    client = StageDSelectionClient(
+        api_url="https://ai.example.test",
+        api_key="secret",
+        model="test",
+        max_retries=1,
+        http_client=http,
+    )
+
+    result = client.select(
+        [
+            {"event_id": 1, "title": "候选事件一"},
+            {"event_id": 2, "title": "候选事件二"},
+        ],
+        max_selected=1,
+    )
+
+    assert [row.event_id for row in result.parsed.selected] == [1]
+    assert [row.event_id for row in result.parsed.unselected] == [2]
+    assert result.request_metadata["provider_attempts"] == 2
+    assert result.request_metadata["schema_repair_attempts"] == 1
+    repair_message = http.calls[1]["json"]["input"][-1]
+    assert repair_message["role"] == "user"
+    feedback = json.loads(repair_message["content"])
+    assert feedback["candidate_event_ids"] == [1, 2]
+    assert "did not return decisions" in feedback["validation_error"]
+
+
 def test_web_search_capability_probe_requires_an_actual_hosted_search_call():
     raw_payload = {"id": "probe-without-search", "output_text": '{"web_search_available":true}'}
     client = ResponsesClient(
