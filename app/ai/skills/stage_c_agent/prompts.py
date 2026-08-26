@@ -7,7 +7,7 @@ from typing import Any
 from app.ai.skills.intel_triage import INTEL_TOPICS
 
 
-STAGE_C_AGENT_PROMPT_VERSION = "stage_c_agent_v14"
+STAGE_C_AGENT_PROMPT_VERSION = "stage_c_agent_v15"
 
 STAGE_C_AGENT_INSTRUCTIONS = """
 <role>
@@ -19,7 +19,7 @@ STAGE_C_AGENT_INSTRUCTIONS = """
 - 只有存在明确独立事件核心时才拆分：不同模型或大版本；明显不同发布时间窗口且后一条改变用户行动；独立重大安全/政策/下架/破坏性变更；平台自身发布了独立产品而不只是接入同一模型；单独的价格/额度/访问范围变化足以让读者采取行动。
 - 若必须拆分同一 event_family_key 下的多个 candidate/needs_review 草稿，每个草稿都必须填写 split_reason。只允许这些值：different_model_or_major_version、separate_time_window_actionable、independent_security_policy_or_breaking_change、platform_released_independent_product、standalone_pricing_quota_access_change。常规“上线多个平台”“某平台给了折扣”“媒体补充能力和价格”不是充分拆分理由。
 - event_family_key 是同一日报事件包的稳定短码。它用于本地校验和 Stage D 去刷屏，不是分类标签。
-- 标题和 summary_cn 只综合成员原文中可追溯的事实，不得用常识补齐。
+- 标题和 summary_cn 只综合成员原文中可追溯的事实，不得用常识补齐。不要另写 keywords 或 entities；检索和导出继续使用 Stage B 已有字段。
 - 标题必须包含明确事件主体，优先使用公司、项目、模型、产品、机构、研究团队、论文或报告名称；不得以“研究提出”“调查发现”“报告称”“论文显示”“业内认为”等泛主体开头。若来源只是一项研究或调查，标题应写成“XX 研究/XX 报告称...”或“来自 XX 的调查显示...”，不能省略主体。
 - facts 是事件包的事实清单；每条 fact 必须有 supporting_item_ids，且只能引用本草稿成员。candidate 必须至少有一条 fact；needs_review 或 rejected 可为空，但不得编造事实补齐。
 - 只用 read_recent_history 判断最近三期已发布日报是否报道过；网页搜索结果不得扩大历史去重窗口。
@@ -108,20 +108,6 @@ EVENT_DRAFT_PROPERTIES: dict[str, Any] = {
     "title": {"type": "string", "minLength": 1, "maxLength": 300},
     "summary_cn": {"type": "string", "minLength": 1, "maxLength": 600},
     "topic": {"type": "string", "enum": list(INTEL_TOPICS)},
-    "keywords": {"type": "array", "items": {"type": "string"}},
-    "entities": {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["name", "type", "aliases"],
-            "properties": {
-                "name": {"type": "string"},
-                "type": {"type": "string"},
-                "aliases": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-    },
     "facts": {
         "type": "array",
         "items": object_schema(
@@ -156,7 +142,7 @@ EVENT_DRAFT_PROPERTIES: dict[str, Any] = {
 
 EVENT_DRAFT_REQUIRED = [
     "draft_key", "event_family_key", "item_ids", "title", "summary_cn",
-    "topic", "keywords", "entities", "facts", "history_status", "prior_event_key",
+    "topic", "facts", "history_status", "prior_event_key",
     "publishability", "split_reason", "caveats",
 ]
 

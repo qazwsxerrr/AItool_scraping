@@ -26,6 +26,7 @@ from app.ai.skills.stage_d_selection import (
     build_stage_d_provider_payload,
     strict_parse_stage_d_selection,
 )
+from app.ai.skills.event_package import build_candidate_event_package
 from app.ai.tavily import TavilySearchClient, TavilySearchError
 from app.config.limits import DEFAULT_DAILY_REPORT_LIMIT, DEFAULT_STAGE_D_MAX_WEB_SEARCHES
 from app.config.settings import Settings
@@ -36,7 +37,7 @@ from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
 STAGE_D_NAME = "stage_d"
-STAGE_D_VERSION = "stage-d-editorial-review-v11"
+STAGE_D_VERSION = "stage-d-editorial-review-v12"
 STAGE_D_SOFT_SELECTED_TARGET = 22
 
 
@@ -232,7 +233,7 @@ def run_stage_d_job(
             raw_response: Any | None = None
             request_metadata: dict[str, Any] = {}
             try:
-                search_evidence, search_audit, agent_session = _run_stage_d_searches(
+                _search_evidence, search_audit, agent_session = _run_stage_d_searches(
                     session=session,
                     repo=repo,
                     run_id=int(run_id),
@@ -245,13 +246,6 @@ def run_stage_d_job(
                     model=getattr(ai_client, "model", None),
                     reset=bool(force),
                 )
-                event_payload = [
-                    _selection_event(
-                        event,
-                        search_evidence=search_evidence.get(int(event.id), ()),
-                    )
-                    for event in selectable_events
-                ]
                 result.web_searches = len(search_audit)
                 # Search calls and their source records are durable even when
                 # the subsequent editorial model request fails.
@@ -471,97 +465,10 @@ def _load_candidate_events(
     return [by_id[event_id] for event_id in event_ids]
 
 
-_ELIGIBILITY_BLOCKER_CODES = frozenset({
-    "confirmed_repeat_without_material_change",
-    "candidate_without_facts",
-    "source_conflict_on_event_core",
-})
-
-_AUDIT_FLAG_CODES = frozenset({
-    "prior_event_outside_history_window",
-    "history_match_not_found",
-    "invalid_novelty_status",
-    "invalid_publishability",
-    "search_not_configured",
-    "search_budget_exhausted",
-    "needs_review",
-})
-
-
-def _classify_risk_flags(
-    flags: list[str],
-) -> tuple[list[str], list[str], list[str]]:
-    """Split raw risk_flags into (eligibility_blockers, editorial_caveats, audit_flags).
-
-    * ``eligibility_blockers`` – genuine disqualification conditions.
-    * ``editorial_caveats`` – natural-language notes that constrain phrasing
-      but must *never* trigger elimination (includes ``intent_only_event``
-      and ``uncertain_event_core``).
-    * ``audit_flags`` – internal pipeline states; NOT sent to the model.
-    """
-    blockers: list[str] = []
-    caveats: list[str] = []
-    audits: list[str] = []
-    for flag in flags:
-        if flag in _ELIGIBILITY_BLOCKER_CODES:
-            blockers.append(flag)
-        elif flag in _AUDIT_FLAG_CODES:
-            audits.append(flag)
-        else:
-            # Natural-language editorial notes, intent_only_event,
-            # uncertain_event_core, etc.
-            caveats.append(flag)
-    return blockers, caveats, audits
-
-
 def _selection_event(
     event: IntelEvent,
-    *,
-    search_evidence: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    source_groups = _json_strings(event.source_groups_json)
-    if not source_groups and event.source_group:
-        source_groups = [event.source_group]
-    evidence = list(getattr(event, "evidence", ()) or ())
-    verified = [row for row in evidence if str(row.status or "").casefold() == "verified"]
-    draft_metadata = _event_draft_metadata(event)
-    raw_flags = _json_strings(event.risk_flags_json)
-    blockers, caveats, _audits = _classify_risk_flags(raw_flags)
-    package_caveats = _strings(draft_metadata.get("caveats"))
-    for caveat in package_caveats:
-        if caveat not in caveats:
-            caveats.append(caveat)
-    payload = {
-        "event_id": int(event.id),
-        "title": str(event.title or ""),
-        "summary_cn": str(event.summary_cn or ""),
-        "event_family_key": str(draft_metadata.get("event_family_key") or ""),
-        "facts": _mapping_list(draft_metadata.get("facts")),
-        "publishability": str(draft_metadata.get("publishability") or event.review_state or ""),
-        "history_status": str(draft_metadata.get("history_status") or event.novelty_status or ""),
-        "split_reason": draft_metadata.get("split_reason"),
-        "topic": event.topic,
-        "content_class": event.content_class,
-        "keywords": _json_strings(event.keywords_json),
-        "entities": _json_value(event.entities_json, []),
-        "published_at": _iso_datetime(event.last_seen_at or event.first_seen_at),
-        "display_score": float(event.display_score or 0.0),
-        "source_groups": source_groups,
-        "novelty_status": event.novelty_status,
-        "eligibility_blockers": blockers,
-        "editorial_caveats": caveats,
-        "review_state": event.review_state,
-        "verification_count": len(evidence),
-        "verification_status": "verified" if verified else ("unverified" if evidence else "not_checked"),
-        "search_status": "searched" if search_evidence else "not_searched",
-        "search_evidence": [dict(row) for row in search_evidence],
-    }
-    return payload
-
-
-def _event_draft_metadata(event: IntelEvent) -> dict[str, Any]:
-    resolution = _json_value(event.resolution_raw_json, {})
-    return _mapping(_mapping(resolution).get("draft_metadata"))
+    return build_candidate_event_package(event)
 
 
 def _run_stage_d_searches(
@@ -888,18 +795,9 @@ def _strings(value: Any) -> list[str]:
     return result
 
 
-def _mapping_list(value: Any) -> list[dict[str, Any]]:
-    raw = _json_value(value, [])
-    return [dict(item) for item in raw if isinstance(item, Mapping)] if isinstance(raw, list) else []
-
-
 def _response_hash(value: Any) -> str:
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _iso_datetime(value: Any) -> str | None:
-    return value.isoformat() if value is not None and hasattr(value, "isoformat") else None
 
 
 def _bounded_int(value: Any, default: int, *, lower: int, upper: int) -> int:

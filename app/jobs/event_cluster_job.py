@@ -23,6 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.ai.responses import AgentBudgetExceeded, AgentProtocolError, FunctionTool
+from app.ai.skills.event_package import build_candidate_event_package
 from app.ai.skills.intel_triage import normalize_url
 from app.ai.skills.stage_c_agent import StageCAgentClient
 from app.ai.skills.stage_c_agent.prompts import (
@@ -64,7 +65,7 @@ from app.storage.repository import IntelRepository
 
 
 DAILY_HISTORY_DAYS = DEFAULT_STAGE_C_AGENT_HISTORY_DAYS
-STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_events_v6"
+STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_events_v8"
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
 _PRIMARY_POLICY_VERSION = "source_then_b1_priority_v2"
 _VERIFICATION_POLICY_VERSION = "tavily_per_event_verification_v2"
@@ -685,12 +686,8 @@ class _StageCAgentTools:
                         title=str(draft_args.get("title") or ""),
                         summary_cn=_text(draft_args.get("summary_cn")),
                         topic=str(draft_args.get("topic") or "technology_insight"),
-                        keywords=_strings(draft_args.get("keywords")),
-                        entities=[
-                            dict(value)
-                            for value in draft_args.get("entities", [])
-                            if isinstance(value, Mapping)
-                        ],
+                        keywords=(),
+                        entities=(),
                         novelty_status=str(history["novelty_status"]),
                         prior_event_key=_text(history.get("prior_event_key")),
                         review_state=str(publishability["review_state"]),
@@ -990,8 +987,8 @@ def _materialize_agent_events(
             title=draft.title,
             summary_cn=draft.summary_cn,
             topic=draft.topic or (review_topics[0] if review_topics else "technology_insight"),
-            keywords=_unique_strings([*_json_strings(draft.keywords_json), *review_keywords]),
-            entities=_unique_json_objects([*_json_objects(draft.entities_json), *review_entities]),
+            keywords=_unique_strings(review_keywords),
+            entities=_unique_json_objects(review_entities),
             content_class=primary.content_class,
             source_group=getattr(primary.source, "source_group", None),
             source_ids=source_ids,
@@ -1034,6 +1031,9 @@ def _materialize_agent_events(
             )
         ).all():
             evidence.event_id = int(event.id)
+        resolution = _json_mapping(event.resolution_raw_json)
+        resolution["event_package"] = build_candidate_event_package(event)
+        event.resolution_raw_json = json.dumps(resolution, ensure_ascii=False)
         result.current_event_ids.append(int(event.id))
         result.merged += max(0, len(members) - 1)
         novelty = str(draft.novelty_status or "uncertain")

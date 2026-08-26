@@ -479,6 +479,15 @@ def test_stage_c_passes_intent_only_event_to_stage_d_as_candidate():
         assert metadata["publishability"] == "candidate"
         assert metadata["facts"][0]["claim"] == "候选正文确认发布方提出了具体计划。"
         assert "intent_only_event" in metadata["caveats"]
+        package = json.loads(event.resolution_raw_json)["event_package"]
+        assert package["event_id"] == int(event.id)
+        assert package["publishability"] == "candidate"
+        assert "intent_only_event" in package["editorial_caveats"]
+        assert "keywords" not in package
+        assert "display_score" not in package
+        assert "split_reason" in metadata
+        assert "split_reason" not in package
+        assert "published_at" not in package
 
 
 def test_stage_c_does_not_send_confirmed_repeat_without_material_change_to_stage_d():

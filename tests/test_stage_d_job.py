@@ -13,6 +13,7 @@ from app.ai.skills.stage_d_selection import (
     build_stage_d_provider_payload,
     strict_parse_stage_d_selection,
 )
+from app.ai.skills.event_package import CANDIDATE_EVENT_PACKAGE_FIELDS
 from app.ai.tavily import TavilySearchResponse, TavilySearchResult
 from app.jobs.stage_d_job import StageDExecutionError, StageDProfile, run_stage_d_job
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
@@ -26,7 +27,7 @@ REFERENCE = datetime(2026, 8, 19, 8, tzinfo=timezone.utc)
 def test_stage_d_prompt_reviews_stage_c_candidates_against_daily_requirements():
     prompt = STAGE_D_SELECTION_SYSTEM_PROMPT
 
-    assert STAGE_D_SELECTION_PROMPT_VERSION == "stage_d_editorial_review_v13"
+    assert STAGE_D_SELECTION_PROMPT_VERSION == "stage_d_editorial_review_v14"
     assert "Stage C 已完成时间准入" in prompt
     assert "editorial_caveats" in prompt
     assert "模型、API 和开发工具" in prompt
@@ -36,6 +37,12 @@ def test_stage_d_prompt_reviews_stage_c_candidates_against_daily_requirements():
     assert "不要只因标题命中某些词就保留" in prompt
     assert "priority_tier" not in prompt
     assert "editorial_lane" not in prompt
+    assert "display_score" not in prompt
+    assert "review_state" not in prompt
+    assert "search_evidence" not in prompt
+    assert "novelty_status" not in prompt
+    assert "split_reason" not in prompt
+    assert "published_at" not in prompt
     assert "soft_selected_target" in prompt
     assert "每个 candidate_events 中的 event_id 必须且只能出现在 selected 或 unselected 之一" in prompt
     assert "eligibility_blockers" in prompt
@@ -539,9 +546,17 @@ def test_stage_d_input_uses_stage_c_event_package_fields_without_local_priority_
     assert infra["event_family_key"] == "nvidia_nvlink_fusion"
     assert price_cut["publishability"] == "candidate"
     assert price_cut["facts"]
+    assert set(price_cut) == set(CANDIDATE_EVENT_PACKAGE_FIELDS)
+    assert set(infra) == set(CANDIDATE_EVENT_PACKAGE_FIELDS)
     assert "priority_tier" not in price_cut
     assert "editorial_lane" not in price_cut
     assert "priority_policy" not in price_cut
+    assert "display_score" not in price_cut
+    assert "keywords" not in price_cut
+    assert "entities" not in price_cut
+    assert "review_state" not in price_cut
+    assert "novelty_status" not in price_cut
+    assert "content_class" not in price_cut
     assert "priority_tier" not in infra
     assert "editorial_lane" not in infra
     assert "priority_policy" not in infra
@@ -653,7 +668,7 @@ def test_stage_d_does_not_trim_provider_selection_to_the_soft_target():
         assert "selection_guard" not in attempts[0].metadata_dict
 
 
-def test_stage_d_tavily_sources_are_passed_to_review_and_persisted_for_audit():
+def test_stage_d_tavily_sources_are_persisted_for_audit_but_not_sent_to_review():
     _engine, session_factory = _db()
     run_id, event_ids = _build(session_factory, event_count=2, needs_review_indexes=[1])
     client = _SelectionClient(selected_indexes=[1])
@@ -671,8 +686,9 @@ def test_stage_d_tavily_sources_are_passed_to_review_and_persisted_for_audit():
     assert len(search.calls) == 1
     reviewed = client.calls[0]["events"]
     needs_review = next(row for row in reviewed if row["event_id"] == event_ids[1])
-    assert needs_review["search_status"] == "searched"
-    assert needs_review["search_evidence"][0]["url"] == "https://verify.example/1"
+    assert "search_status" not in needs_review
+    assert "search_evidence" not in needs_review
+    assert set(needs_review) == set(CANDIDATE_EVENT_PACKAGE_FIELDS)
     with session_factory() as session:
         agent = session.scalar(select(IntelAgentSession).where(IntelAgentSession.stage_name == "stage_d"))
         assert agent is not None and agent.web_search_count == 1

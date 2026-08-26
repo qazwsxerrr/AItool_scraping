@@ -10,7 +10,7 @@ from app.ai.skills.intel_triage.prompts import preflight_strict_schema
 from .models import STAGE_D_SELECTION_SCHEMA_VERSION
 
 
-STAGE_D_SELECTION_PROMPT_VERSION = "stage_d_editorial_review_v13"
+STAGE_D_SELECTION_PROMPT_VERSION = "stage_d_editorial_review_v14"
 STAGE_D_SELECTION_TASK = "stage_d_event_selection"
 
 STAGE_D_SELECTION_SYSTEM_PROMPT = """<role>
@@ -35,7 +35,7 @@ STAGE_D_SELECTION_SYSTEM_PROMPT = """<role>
 3. 再是 AI 基建、芯片、算力、产业链和研发突破；重大事件可进入前列，但同一故事族不要连续占满头部。
 4. 之后是行业合作、融资、治理、安全和研究趋势。
 5. 社区转述、单方 benchmark、薄演示、轻量文档更新、低信息榜单通常靠后或不选。
-综合使用标题、摘要、facts、event_family_key、topic、keywords、entities、display_score、source_groups、history_status、publishability、review_state、search_evidence 和内容互补性。排序不改变事件是否合格的独立判断。
+综合使用标题、摘要、facts、event_family_key、topic、source_groups、history_status、publishability、eligibility_blockers、editorial_caveats 和内容互补性。不要把分数、过程态核验或关键词命中当成独立淘汰规则。排序不改变事件是否合格的独立判断。
 </ranking>
 
 <output_rules>
