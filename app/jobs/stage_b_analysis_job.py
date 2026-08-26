@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import hashlib
 import json
-import math
 from uuid import uuid4
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -31,9 +30,6 @@ from app.ai.skills.intel_triage import (
 from app.config.limits import (
     DEFAULT_AI_REVIEW_CONCURRENCY,
     DEFAULT_AI_REVIEW_LIMIT,
-    DEFAULT_STAGE_B_ACTIVE_MAX,
-    DEFAULT_STAGE_B_ACTIVE_MIN,
-    DEFAULT_STAGE_B_ACTIVE_TARGET,
     DEFAULT_STAGE_B_RESERVE_LIMIT,
     STAGE_B_ANALYSIS_MIN_SCORE,
     STAGE_B_ADMISSION_POLICY_VERSION,
@@ -41,7 +37,7 @@ from app.config.limits import (
 )
 from app.domain.models import SourceSpec
 from app.jobs.provider_retry import ProviderResponseFailure, call_with_provider_retries
-from app.storage.models import DailyEdition, IntelCandidateAdmission, IntelItem, IntelRun, IntelRunStage, IntelRunStageTask
+from app.storage.models import IntelCandidateAdmission, IntelItem, IntelRun, IntelRunStage, IntelRunStageTask
 from app.storage.repository import IntelRepository
 
 from .stage_a_screen_job import (
@@ -147,8 +143,8 @@ def run_stage_b_analysis_job(
     if retry is not None:
         retry_failed = bool(retry)
     selected_limit = _normalise_limit(ai_limit if ai_limit is not None else limit)
-    resolved_reserve_limit = _bounded_positive(reserve_limit, DEFAULT_STAGE_B_RESERVE_LIMIT, maximum=100)
     result = StageBAnalysisResult(run_id=run_id)
+    del reserve_limit
     owner = owner or f"stage-b1-{uuid4().hex}"
     specs = dict(source_specs or {})
     requested_ids = {int(value) for value in item_ids} if item_ids is not None else None
@@ -189,8 +185,7 @@ def run_stage_b_analysis_job(
             config_fingerprint=config_fingerprint,
             force=stage_force if existing_stage is not None else False,
             metadata={
-                "analysis_min_score": STAGE_B_ANALYSIS_MIN_SCORE,
-                "audience_relevance_min": STAGE_B_AUDIENCE_RELEVANCE_MIN,
+                "admission_policy_version": STAGE_B_ADMISSION_POLICY_VERSION,
             },
         )
         # An admission is a complete run-level projection.  Never let C read
@@ -347,7 +342,7 @@ def run_stage_b_analysis_job(
             "analyze",
             config_fingerprint=config_fingerprint,
             metadata={
-                "analysis_min_score": STAGE_B_ANALYSIS_MIN_SCORE,
+                "admission_policy_version": STAGE_B_ADMISSION_POLICY_VERSION,
                 "eligible_total": len(eligible_contexts),
                 "runnable_total": len(runnable_contexts),
                 "processed": len(contexts),
@@ -412,8 +407,8 @@ def run_stage_b_analysis_job(
                 if heartbeated is None:
                     raise _TaskLeaseLost(f"stage B task {task_id} lease/owner lost before persistence")
                 # Structural validity remains item-local. The deterministic
-                # score gate is applied once all B tasks are terminal, when
-                # the active/reserve C workbench is materialized below.
+                # score and AI-relevance gates are applied once all B tasks
+                # are terminal, when the C workbench is materialized below.
                 filtered = bool(guard_reason)
                 persisted = analysis
                 task_result = persisted.model_dump(mode="json")
@@ -535,7 +530,7 @@ def run_stage_b_analysis_job(
                         stage,
                         status="succeeded",
                         metadata={
-                            "analysis_min_score": STAGE_B_ANALYSIS_MIN_SCORE,
+                            "admission_policy_version": STAGE_B_ADMISSION_POLICY_VERSION,
                             "eligible": 0,
                             "reason": "stage_a_no_eligible_items",
                         },
@@ -544,7 +539,6 @@ def run_stage_b_analysis_job(
     admission = materialize_stage_b_admission(
         session_factory=session_factory,
         run_id=run_id,
-        reserve_limit=resolved_reserve_limit,
     )
     if admission is not None:
         result.candidate = len(admission.active_ids)
@@ -562,16 +556,14 @@ def materialize_stage_b_admission(
     run_id: int,
     reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT,
 ) -> StageBAdmissionResult | None:
-    """Create B's deterministic active/reserve/filtered workbench.
+    """Project structurally valid B analyses into the C workbench.
 
-    The admission is deliberately a post-analysis projection.  It never asks
-    a model, so C cannot quietly change editorial score gating while it is
-    grouping events.
+    The admission never asks a model.  It keeps the fixed score and
+    AI-relevance gates, and no longer applies quota, diversity, or reserve
+    cuts.  ``reserve_limit`` is accepted only so existing callers keep working.
     """
 
-    threshold = STAGE_B_ANALYSIS_MIN_SCORE
-    audience_threshold = STAGE_B_AUDIENCE_RELEVANCE_MIN
-    reserve_cap = _bounded_positive(reserve_limit, DEFAULT_STAGE_B_RESERVE_LIMIT, maximum=100)
+    del reserve_limit
     with session_factory() as session:
         repo = IntelRepository(session)
         run = session.get(IntelRun, int(run_id))
@@ -601,29 +593,33 @@ def materialize_stage_b_admission(
                 filtered[item_id] = ("analysis_projection_missing", "Stage B projection is missing", 0)
                 continue
             score = _bounded_score(review.b1_priority, 0)
-            if item.status == "analysis_filtered":
+            # Do not trust leftover item.status from a previous admission.
+            # Only a missing/empty analysis projection is structurally invalid.
+            if not str(review.summary_cn or "").strip():
                 filtered[item_id] = ("analysis_structural_invalid", "Stage B output failed structural guard", score)
             elif (
                 (audience_relevance := _review_audience_relevance(review)) is not None
-                and audience_relevance < audience_threshold
+                and audience_relevance < STAGE_B_AUDIENCE_RELEVANCE_MIN
             ):
                 filtered[item_id] = (
                     "below_ai_relevance_threshold",
-                    f"audience relevance {audience_relevance} is below {audience_threshold}",
+                    f"audience relevance {audience_relevance} is below {STAGE_B_AUDIENCE_RELEVANCE_MIN}",
                     score,
                 )
-            elif score < threshold:
-                filtered[item_id] = ("below_score_threshold", f"guarded score {score} is below {threshold}", score)
+            elif score < STAGE_B_ANALYSIS_MIN_SCORE:
+                filtered[item_id] = (
+                    "below_score_threshold",
+                    f"guarded score {score} is below {STAGE_B_ANALYSIS_MIN_SCORE}",
+                    score,
+                )
             else:
                 candidates.append((item, score))
 
-        target = _dynamic_admission_target(session)
         policy_payload = {
             "version": STAGE_B_ADMISSION_POLICY_VERSION,
-            "min_score": threshold,
-            "min_audience_relevance": audience_threshold,
-            "target": target,
-            "reserve_limit": reserve_cap,
+            "gate": "score_and_relevance",
+            "min_score": STAGE_B_ANALYSIS_MIN_SCORE,
+            "min_audience_relevance": STAGE_B_AUDIENCE_RELEVANCE_MIN,
             "items": [
                 {
                     "id": int(item.id),
@@ -640,27 +636,8 @@ def materialize_stage_b_admission(
             json.dumps(policy_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
-        groups: dict[str, list[tuple[IntelItem, int]]] = {}
-        for item, score in candidates:
-            groups.setdefault(_admission_identity(item), []).append((item, score))
-        leaders: list[tuple[IntelItem, int]] = []
-        support: list[tuple[IntelItem, int]] = []
-        for members in groups.values():
-            ordered = sorted(members, key=_admission_sort_key)
-            leaders.append(ordered[0])
-            support.extend(ordered[1:])
-        selected_leaders = _select_diverse_leaders(leaders, target=target)
-        active_ids = {int(item.id) for item, _ in selected_leaders}
-        remaining_leaders = [row for row in leaders if int(row[0].id) not in active_ids]
-        reserve_pool = sorted(
-            [*support, *remaining_leaders],
-            key=_admission_sort_key,
-        )
-        reserve_rows = reserve_pool[:reserve_cap]
-        reserve_ids = {int(item.id) for item, _ in reserve_rows}
-
         records: list[dict[str, Any]] = []
-        active_ordered = sorted(selected_leaders, key=_admission_sort_key)
+        active_ordered = sorted(candidates, key=_admission_sort_key)
         for rank, (item, score) in enumerate(active_ordered, start=1):
             records.append(
                 {
@@ -668,37 +645,8 @@ def materialize_stage_b_admission(
                     "decision": "active",
                     "rank": rank,
                     "guarded_score": score,
-                    "reason_code": "admitted_ranked",
-                    "reason": "Passed deterministic B AI-relevance and score gates and active diversity budget",
-                    "policy_version": STAGE_B_ADMISSION_POLICY_VERSION,
-                    "policy_fingerprint": policy_fingerprint,
-                }
-            )
-        for rank, (item, score) in enumerate(reserve_rows, start=1):
-            records.append(
-                {
-                    "item_id": int(item.id),
-                    "decision": "reserve",
-                    "rank": rank,
-                    "guarded_score": score,
-                    "reason_code": "reserve_or_duplicate_support",
-                    "reason": "Passed deterministic B AI-relevance and score gates; kept for C-agent inspection without consuming the active budget",
-                    "policy_version": STAGE_B_ADMISSION_POLICY_VERSION,
-                    "policy_fingerprint": policy_fingerprint,
-                }
-            )
-        for item, score in candidates:
-            item_id = int(item.id)
-            if item_id in active_ids or item_id in reserve_ids:
-                continue
-            records.append(
-                {
-                    "item_id": item_id,
-                    "decision": "filtered",
-                    "rank": None,
-                    "guarded_score": score,
-                    "reason_code": "outside_active_and_reserve_budget",
-                    "reason": "Passed score gate but did not fit the current workbench budget",
+                    "reason_code": "analysis_ready",
+                    "reason": "Passed Stage B score and AI-relevance gates; handed to Stage C without a quota or reserve cut",
                     "policy_version": STAGE_B_ADMISSION_POLICY_VERSION,
                     "policy_fingerprint": policy_fingerprint,
                 }
@@ -736,9 +684,9 @@ def materialize_stage_b_admission(
                 **current_metadata,
                 "admission_policy_version": STAGE_B_ADMISSION_POLICY_VERSION,
                 "admission_policy_fingerprint": policy_fingerprint,
-                "admission_target": target,
+                "admission_target": len(active_ordered),
                 "active": len(active_ordered),
-                "reserve": len(reserve_rows),
+                "reserve": 0,
                 "filtered": sum(1 for row in records if row["decision"] == "filtered"),
             },
             ensure_ascii=False,
@@ -748,35 +696,11 @@ def materialize_stage_b_admission(
         return StageBAdmissionResult(
             run_id=int(run_id),
             active_ids=tuple(int(item.id) for item, _ in active_ordered),
-            reserve_ids=tuple(int(item.id) for item, _ in reserve_rows),
+            reserve_ids=(),
             filtered_count=sum(1 for row in records if row["decision"] == "filtered"),
-            target=target,
+            target=len(active_ordered),
             policy_fingerprint=policy_fingerprint,
         )
-
-
-def _dynamic_admission_target(session: Session) -> int:
-    editions = list(
-        session.scalars(
-            select(DailyEdition)
-            .where(DailyEdition.published_at.is_not(None))
-            .order_by(DailyEdition.edition_date.desc())
-            .limit(14)
-        ).all()
-    )
-    if len(editions) < 14:
-        return DEFAULT_STAGE_B_ACTIVE_TARGET
-    ratios = [
-        float(edition.candidate_count) / float(edition.selected_count)
-        for edition in editions
-        if int(edition.candidate_count or 0) > 0 and int(edition.selected_count or 0) > 0
-    ]
-    if len(ratios) < 7:
-        return DEFAULT_STAGE_B_ACTIVE_TARGET
-    values = sorted(ratios)
-    index = min(len(values) - 1, math.ceil((len(values) - 1) * 0.75))
-    estimated = int(round(30 * values[index]))
-    return max(DEFAULT_STAGE_B_ACTIVE_MIN, min(DEFAULT_STAGE_B_ACTIVE_MAX, estimated))
 
 
 def _admission_identity(item: IntelItem) -> str:
@@ -794,34 +718,6 @@ def _admission_sort_key(value: tuple[IntelItem, int]) -> tuple[int, int, float, 
     }.get(str(item.content_class or "").casefold(), 4)
     timestamp = item.published_at or item.captured_at
     return (-int(score), source_rank, -(timestamp.timestamp() if timestamp is not None else 0.0), int(item.id))
-
-
-def _select_diverse_leaders(
-    leaders: Iterable[tuple[IntelItem, int]],
-    *,
-    target: int,
-) -> list[tuple[IntelItem, int]]:
-    ordered = sorted(leaders, key=_admission_sort_key)
-    by_topic: dict[str, list[tuple[IntelItem, int]]] = {}
-    for row in ordered:
-        topic = str(row[0].ai_review.topic if row[0].ai_review is not None else "unknown") or "unknown"
-        by_topic.setdefault(topic, []).append(row)
-    selected: list[tuple[IntelItem, int]] = []
-    # First round prevents a large single-topic source burst from consuming
-    # the whole candidate pool; remaining slots revert to pure quality order.
-    first_round = sorted((rows[0] for rows in by_topic.values() if rows), key=_admission_sort_key)
-    for row in first_round:
-        if len(selected) >= target:
-            break
-        selected.append(row)
-    selected_ids = {int(item.id) for item, _ in selected}
-    for row in ordered:
-        if len(selected) >= target:
-            break
-        if int(row[0].id) not in selected_ids:
-            selected.append(row)
-            selected_ids.add(int(row[0].id))
-    return selected
 
 
 def _screen_task_is_eligible(task: IntelRunStageTask, *, run_id: int, session: Session) -> bool:
@@ -1083,13 +979,7 @@ def _bounded_score(value: Any, default: int) -> int:
 
 
 def _review_audience_relevance(review: Any) -> int | None:
-    """Read B1's direct-AI relevance component without changing old rows.
-
-    Older locally seeded/replayed reviews may not have score components.  A
-    missing component is left untouched for backward compatibility; newly
-    produced structured B1 reviews always carry it and therefore receive the
-    deterministic relevance gate in :func:`materialize_stage_b_admission`.
-    """
+    """Read B1's audience-relevance component for the local C-admission gate."""
 
     components = getattr(review, "score_components", None)
     if not isinstance(components, Mapping) or "audience_relevance" not in components:
@@ -1099,14 +989,6 @@ def _review_audience_relevance(review: Any) -> int | None:
         return max(0, min(100, int(float(value))))
     except (TypeError, ValueError, OverflowError):
         return 0
-
-
-def _bounded_positive(value: Any, default: int, *, maximum: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError, OverflowError):
-        parsed = default
-    return max(1, min(int(maximum), parsed))
 
 
 def _bounded_concurrency(value: Any) -> int:

@@ -24,7 +24,7 @@ source_registry.yaml 信息源
 
 - 抓取：读取 `app/config/source_registry.yaml` 中启用的 Feed、RSSHub 和 GitHub 来源，标准化后写入当日 `draft.db`。
 - Stage A：执行时间范围检查和硬性初筛。
-- Stage B1：生成摘要、主题、关键词和评分，将资讯划分为 `active`、`reserve` 或 `filtered`。
+- Stage B1：生成摘要、主题、关键词和评分；分数和 AI 主体相关度低于 60 的条目停止，其余全部交给 Stage C。
 - Stage C：把相关资讯聚合为事件，结合近期日报去重，并核验争议事实。
 - Stage D：从候选事件中选择最终有序子集。
 

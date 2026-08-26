@@ -10,16 +10,14 @@ DEFAULT_AI_SCREEN_REJECT_THRESHOLD = 90
 """Minimum Stage-A confidence required for a hard rejection."""
 
 STAGE_B_ANALYSIS_MIN_SCORE = 60
-"""Fixed deterministic Stage-B score admitted to the C-agent workbench."""
+"""Minimum guarded B1 score required before an item can enter Stage C."""
 
 STAGE_B_AUDIENCE_RELEVANCE_MIN = 60
-"""Fixed AI subject relevance required before a B1 item can enter C."""
+"""Minimum AI-subject relevance required before an item can enter Stage C."""
 
-DEFAULT_STAGE_B_ACTIVE_TARGET = 100
-DEFAULT_STAGE_B_ACTIVE_MIN = 60
-DEFAULT_STAGE_B_ACTIVE_MAX = 120
 DEFAULT_STAGE_B_RESERVE_LIMIT = 20
-STAGE_B_ADMISSION_POLICY_VERSION = "stage_b_admission_v4"
+"""Unused compatibility default for the retired reserve budget argument."""
+STAGE_B_ADMISSION_POLICY_VERSION = "stage_b_admission_v6"
 
 DEFAULT_AI_REVIEW_CONCURRENCY = 4
 """Maximum concurrent provider calls for Stage A or Stage B."""
@@ -43,9 +41,6 @@ __all__ = [
     "DEFAULT_AI_SCREEN_REJECT_THRESHOLD",
     "DEFAULT_DAILY_REPORT_LIMIT",
     "DEFAULT_FETCH_LIMIT_PER_SOURCE",
-    "DEFAULT_STAGE_B_ACTIVE_MAX",
-    "DEFAULT_STAGE_B_ACTIVE_MIN",
-    "DEFAULT_STAGE_B_ACTIVE_TARGET",
     "DEFAULT_STAGE_B_RESERVE_LIMIT",
     "DEFAULT_STAGE_C_AGENT_HISTORY_DAYS",
     "DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS",

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 from app.domain.models import FetchItem
 from app.jobs.stage_b_analysis_job import _admission_sort_key, materialize_stage_b_admission
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import AIItemReview, DailyEdition, IntelItem, Source
+from app.storage.models import AIItemReview, IntelItem, Source
 from app.storage.repository import IntelRepository
 
 
@@ -66,7 +66,7 @@ def _seed_analysis(session_factory, rows: list[tuple[str, int, str]]) -> tuple[i
         return int(run.id), ids
 
 
-def test_b_admission_applies_score_gate_and_keeps_duplicate_support_as_reserve():
+def test_b_admission_filters_low_score_but_keeps_duplicate_url_items_active():
     session_factory = _db()
     run_id, ids = _seed_analysis(
         session_factory,
@@ -81,9 +81,13 @@ def test_b_admission_applies_score_gate_and_keeps_duplicate_support_as_reserve()
     result = materialize_stage_b_admission(session_factory=session_factory, run_id=run_id, reserve_limit=20)
 
     assert result is not None
-    assert result.target == 100
-    assert set(result.active_ids) == {ids["high leader"], ids["threshold pass"]}
-    assert result.reserve_ids == (ids["duplicate support"],)
+    assert result.target == 3
+    assert set(result.active_ids) == {
+        ids["high leader"],
+        ids["duplicate support"],
+        ids["threshold pass"],
+    }
+    assert result.reserve_ids == ()
     assert result.filtered_count == 1
     with session_factory() as session:
         rows = IntelRepository(session).list_candidate_admissions(run_id)
@@ -92,29 +96,21 @@ def test_b_admission_applies_score_gate_and_keeps_duplicate_support_as_reserve()
         assert session.get(IntelItem, ids["threshold fail"]).status == "analysis_filtered"
 
 
-def test_b_admission_uses_calibrated_dynamic_target_after_fourteen_editions():
+def test_b_admission_keeps_all_structurally_valid_items_without_a_quota():
     session_factory = _db()
-    with session_factory() as session:
-        for day in range(1, 15):
-            session.add(DailyEdition(
-                edition_date=date(2026, 8, day), status="published", published_at=NOW,
-                candidate_count=40, selected_count=30,
-            ))
-        session.commit()
     rows = [(f"event {index}", 80, f"https://b.example/{index}") for index in range(70)]
     run_id, _ = _seed_analysis(session_factory, rows)
 
     result = materialize_stage_b_admission(session_factory=session_factory, run_id=run_id, reserve_limit=20)
 
     assert result is not None
-    # 30 * P75(40 / 30) is below the lower bound, so the active workbench
-    # uses the planned minimum rather than silently expanding to every item.
-    assert result.target == 60
-    assert len(result.active_ids) == 60
-    assert len(result.reserve_ids) == 10
+    assert result.target == 70
+    assert len(result.active_ids) == 70
+    assert result.reserve_ids == ()
+    assert result.filtered_count == 0
 
 
-def test_b_admission_rejects_high_total_score_when_ai_subject_relevance_is_below_gate():
+def test_b_admission_filters_low_ai_subject_relevance():
     session_factory = _db()
     run_id, ids = _seed_analysis(
         session_factory,
@@ -153,10 +149,33 @@ def test_b_admission_rejects_high_total_score_when_ai_subject_relevance_is_below
 
     assert result is not None
     assert ids["generic cloud update"] not in result.active_ids
-    assert ids["generic cloud update"] not in result.reserve_ids
     assert ids["boundary ai update"] in result.active_ids
     with session_factory() as session:
         rows = IntelRepository(session).list_candidate_admissions(run_id)
         row = next(item for item in rows if item.item_id == ids["generic cloud update"])
         assert row.decision == "filtered"
         assert row.reason_code == "below_ai_relevance_threshold"
+
+
+def test_b_admission_does_not_treat_previous_filtered_status_as_structural():
+    session_factory = _db()
+    run_id, ids = _seed_analysis(
+        session_factory,
+        [("previously filtered", 80, "https://b.example/old-gate")],
+    )
+    with session_factory() as session:
+        item = session.get(IntelItem, ids["previously filtered"])
+        assert item is not None
+        item.status = "analysis_filtered"
+        item.selection_reason = "below_score_threshold"
+        session.commit()
+
+    result = materialize_stage_b_admission(session_factory=session_factory, run_id=run_id)
+
+    assert result is not None
+    assert result.active_ids == (ids["previously filtered"],)
+    assert result.filtered_count == 0
+    with session_factory() as session:
+        item = session.get(IntelItem, ids["previously filtered"])
+        assert item is not None
+        assert item.status == "candidate"
