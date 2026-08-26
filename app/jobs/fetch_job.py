@@ -6,7 +6,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -25,6 +25,7 @@ from app.storage.repository import IntelRepository
 from app.storage.models import FetchAttempt, IntelRun, Source
 
 LOGGER = logging.getLogger(__name__)
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass
@@ -100,6 +101,7 @@ def run_intel_fetch_job(
     force: bool = False,
     dry_run: bool = False,
     run_id: int | None = None,
+    progress: ProgressCallback | None = None,
 ) -> IntelFetchResult:
     """Fetch a daily build or collect in-memory diagnostic data."""
 
@@ -111,6 +113,13 @@ def run_intel_fetch_job(
         and (content_class is None or spec.content_class == content_class)
     ]
     result = IntelFetchResult(run_id=run_id, dry_run=dry_run)
+    _emit_fetch_progress(
+        progress,
+        result=result,
+        total=len(selected),
+        current=0,
+        action="prepare_sources",
+    )
     if not dry_run and run_id is None:
         raise ValueError("persisted fetch requires the current daily edition build")
     if not dry_run:
@@ -134,7 +143,7 @@ def run_intel_fetch_job(
                 source_state[spec.id] = (source_row, latest)
             session.commit()
 
-    for spec in selected:
+    for index, spec in enumerate(selected, start=1):
         stats = IntelSourceStats(source_id=spec.id, content_class=spec.content_class)
         result.stats[spec.id] = stats
         if not dry_run:
@@ -158,11 +167,27 @@ def run_intel_fetch_job(
                     )
                     stats.attempt_id = attempt.id
                     session.commit()
+                _emit_fetch_progress(
+                    progress,
+                    result=result,
+                    total=len(selected),
+                    current=index,
+                    source=spec,
+                    action="source_skipped",
+                )
                 continue
 
         started = time.monotonic()
         attempt_id: int | None = None
         try:
+            _emit_fetch_progress(
+                progress,
+                result=result,
+                total=len(selected),
+                current=index,
+                source=spec,
+                action="fetch_source",
+            )
             if not dry_run:
                 with session_factory() as session:
                     attempt = IntelRepository(session).create_attempt(
@@ -265,6 +290,14 @@ def run_intel_fetch_job(
                 _finish_attempt(session_factory, attempt_id, batch=None, status="failed", error=exc)
         finally:
             stats.duration_seconds = time.monotonic() - started
+            _emit_fetch_progress(
+                progress,
+                result=result,
+                total=len(selected),
+                current=index,
+                source=spec,
+                action=_fetch_progress_action(stats),
+            )
 
     return result
 
@@ -279,6 +312,7 @@ def run_intel_fetch_from_settings(
     force: bool = False,
     dry_run: bool = False,
     run_id: int | None = None,
+    progress: ProgressCallback | None = None,
 ) -> IntelFetchResult:
     registry = load_source_registry(registry_path, env={"RSSHUB_BASE_URL": settings.rsshub_base_url or ""})
     # A fetch dry-run never needs the target database; use an in-memory schema
@@ -335,6 +369,7 @@ def run_intel_fetch_from_settings(
             force=force,
             dry_run=dry_run,
             run_id=run_id,
+            progress=progress,
         )
     finally:
         external_client.close()
@@ -368,6 +403,51 @@ def _apply_batch_stats(stats: IntelSourceStats, batch: FetchBatch) -> None:
     stats.retry_count = batch.retry_count
     stats.transport = batch.transport
     stats.error_code = batch.error_code
+
+
+def _emit_fetch_progress(
+    progress: ProgressCallback | None,
+    *,
+    result: IntelFetchResult,
+    total: int,
+    current: int,
+    source: SourceSpec | None = None,
+    action: str,
+) -> None:
+    if progress is None:
+        return
+    data: dict[str, Any] = {
+        "total": int(total),
+        "current": int(current),
+        "current_action": action,
+        "metrics": _fetch_progress_metrics(result, total=total),
+    }
+    if source is not None:
+        data["current_source_id"] = source.id
+        data["current_source_name"] = source.name
+    progress({"type": "stage_update", "stage": "fetch", "data": data})
+
+
+def _fetch_progress_metrics(result: IntelFetchResult, *, total: int) -> dict[str, int]:
+    return {
+        "source_count": int(total),
+        "fetched_items": int(result.total_fetched),
+        "inserted_items": int(result.total_inserted),
+        "skipped_items": int(result.total_skipped),
+        "failed_sources": int(result.total_failed),
+        "degraded_sources": int(result.total_degraded),
+    }
+
+
+def _fetch_progress_action(stats: IntelSourceStats) -> str:
+    status = str(getattr(stats, "status", "") or "").casefold()
+    if status == "failed" or int(getattr(stats, "failed", 0) or 0) > 0:
+        return "source_failed"
+    if status == "skipped":
+        return "source_skipped"
+    if status == "degraded":
+        return "source_degraded"
+    return "source_succeeded"
 
 
 def _finish_attempt(

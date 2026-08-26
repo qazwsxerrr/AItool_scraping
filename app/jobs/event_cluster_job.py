@@ -1,4 +1,4 @@
-"""Stage C: stateful Responses agent for event-level aggregation.
+"""Stage C: transcript-backed Responses agent for event-level aggregation.
 
 Unlike the removed batch prompt, this job gives the model a bounded workbench
 and durable tools. The model aggregates, researches material uncertainty, and
@@ -16,7 +16,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import select
@@ -69,6 +69,7 @@ STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_events_v8"
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
 _PRIMARY_POLICY_VERSION = "source_then_b1_priority_v2"
 _VERIFICATION_POLICY_VERSION = "tavily_per_event_verification_v2"
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 class StageCDownstreamBusyError(RuntimeError):
@@ -182,6 +183,7 @@ def run_event_cluster_job(
     max_tool_calls: int = DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS,
     max_web_searches: int = DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES,
     search_client: TavilySearchClient | None = None,
+    progress: ProgressCallback | None = None,
 ) -> EventClusterResult:
     """Run C as an auditable multi-turn tool session for one daily build."""
 
@@ -340,6 +342,21 @@ def run_event_cluster_job(
                 search_client=search_client,
                 max_web_searches=max_web_searches,
             )
+            _emit_progress(
+                progress,
+                "stage_update",
+                stage="cluster",
+                data={
+                    "total": len(admissions["active"]),
+                    "current": _covered_active_count(repo, int(agent_session.id), tools.active_ids),
+                    "metrics": {
+                        "input_items": len(admissions["active"]),
+                        "reserve_items": len(admissions["reserve"]),
+                        "history_events": len(history),
+                    },
+                    "current_action": "prepare_workspace",
+                },
+            )
 
             def on_response(turn: int, response: Mapping[str, Any]) -> None:
                 if repo.heartbeat_stage_task(task, owner=owner, lease_seconds=lease_seconds) is None:
@@ -353,8 +370,15 @@ def run_event_cluster_job(
                 agent_session.response_id = _text(response.get("id")) or agent_session.response_id
                 agent_session.turn_count = max(agent_session.turn_count, int(turn))
                 session.commit()
+                _emit_progress(
+                    progress,
+                    "stage_c_response",
+                    stage="cluster",
+                    data={"turn": int(turn), "response_id": _text(response.get("id"))},
+                )
 
             def on_tool(turn: int, call: Mapping[str, Any], output: Mapping[str, Any]) -> None:
+                arguments = _parse_call_arguments(call.get("arguments"))
                 if repo.heartbeat_stage_task(task, owner=owner, lease_seconds=lease_seconds) is None:
                     raise StageCLeaseLostError("Stage C task lease was lost while saving an agent tool call")
                 repo.append_agent_step(
@@ -363,7 +387,7 @@ def run_event_cluster_job(
                     kind="tool_call",
                     tool_name=_text(call.get("name")),
                     call_id=_text(call.get("call_id")),
-                    input_value=_parse_call_arguments(call.get("arguments")),
+                    input_value=arguments,
                     output_value=output,
                     status="success" if output.get("ok", True) else "error",
                     error_message=_text(output.get("error")),
@@ -372,6 +396,19 @@ def run_event_cluster_job(
                 if str(call.get("name") or "") == "search_web":
                     agent_session.web_search_count += 1
                 session.commit()
+                _emit_progress(
+                    progress,
+                    "stage_c_tool",
+                    stage="cluster",
+                    data=_stage_c_tool_progress(
+                        repo,
+                        int(agent_session.id),
+                        tools.active_ids,
+                        tool_name=_text(call.get("name")),
+                        arguments=arguments,
+                        output=output,
+                    ),
+                )
 
             if not agent_session.finalization_requested:
                 agent_result = ai_client.run(
@@ -390,9 +427,6 @@ def run_event_cluster_job(
                     function_tools=tools.function_tools,
                     max_turns=max_turns,
                     max_tool_calls=max_tool_calls,
-                    # A retry starts a fresh model turn but reads persisted
-                    # drafts/tools; this avoids replaying an interrupted call.
-                    previous_response_id=None,
                     on_response=on_response,
                     on_tool=on_tool,
                 )
@@ -486,6 +520,7 @@ def run_event_cluster_from_settings(
     force: bool = False,
     now: datetime | None = None,
     reference_time: datetime | None = None,
+    progress: ProgressCallback | None = None,
 ) -> EventClusterResult:
     engine = create_engine_from_url(settings.database_url)
     init_db(engine)
@@ -499,6 +534,7 @@ def run_event_cluster_from_settings(
         max_turns=settings.stage_c_agent_max_turns,
         max_tool_calls=settings.stage_c_agent_max_tool_calls,
         max_web_searches=settings.stage_c_agent_max_web_searches,
+        progress=progress,
         search_client=TavilySearchClient(
             api_key=settings.tavily_api_key,
             api_url=settings.tavily_api_url,
@@ -1266,6 +1302,83 @@ def _task_result(result: EventClusterResult, agent_session: IntelAgentSession) -
         "web_searches": result.web_searches or int(agent_session.web_search_count),
         "unresolved": result.unresolved,
     }
+
+
+def _emit_progress(
+    progress: ProgressCallback | None,
+    event_type: str,
+    *,
+    stage: str | None = None,
+    message: str | None = None,
+    data: Mapping[str, Any] | None = None,
+) -> None:
+    if progress is None:
+        return
+    progress({"type": event_type, "stage": stage, "message": message, "data": dict(data or {})})
+
+
+def _stage_c_tool_progress(
+    repo: IntelRepository,
+    session_id: int,
+    active_ids: set[int],
+    *,
+    tool_name: str | None,
+    arguments: Mapping[str, Any],
+    output: Mapping[str, Any],
+) -> dict[str, Any]:
+    drafts = repo.list_agent_drafts(int(session_id))
+    title = _stage_c_current_title(tool_name, arguments, output)
+    return {
+        "tool": tool_name,
+        "ok": bool(output.get("ok", True)),
+        "error": _text(output.get("error")),
+        "title": title,
+        "active_total": len(active_ids),
+        "covered_items": _covered_active_count_from_drafts(drafts, active_ids),
+        "draft_count": len(drafts),
+        "needs_review": sum(1 for draft in drafts if str(draft.review_state or "").casefold() == "needs_review"),
+        "rejected": sum(1 for draft in drafts if str(draft.review_state or "").casefold() == "rejected"),
+    }
+
+
+def _covered_active_count(repo: IntelRepository, session_id: int, active_ids: set[int]) -> int:
+    return _covered_active_count_from_drafts(repo.list_agent_drafts(int(session_id)), active_ids)
+
+
+def _covered_active_count_from_drafts(drafts: Sequence[IntelEventDraft], active_ids: set[int]) -> int:
+    covered = {
+        int(member.item_id)
+        for draft in drafts
+        for member in draft.members
+        if int(member.item_id) in active_ids
+    }
+    return len(covered)
+
+
+def _stage_c_current_title(
+    tool_name: str | None,
+    arguments: Mapping[str, Any],
+    output: Mapping[str, Any],
+) -> str | None:
+    if tool_name == "read_items":
+        items = output.get("items")
+        if isinstance(items, list) and items:
+            first = items[0]
+            if isinstance(first, Mapping):
+                return _text(first.get("title"))
+    if tool_name == "save_event_drafts":
+        drafts = output.get("drafts")
+        if isinstance(drafts, list) and drafts:
+            first = drafts[0]
+            if isinstance(first, Mapping):
+                return _text(first.get("draft_key"))
+    if tool_name == "search_web":
+        return _text(arguments.get("claim")) or _text(arguments.get("query"))
+    if tool_name == "attach_search_evidence":
+        return _text(arguments.get("claim")) or _text(arguments.get("draft_key"))
+    if tool_name == "mark_unresolved":
+        return _text(arguments.get("reason"))
+    return None
 
 
 def _compact_admission(admission: IntelCandidateAdmission) -> dict[str, Any]:

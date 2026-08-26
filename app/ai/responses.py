@@ -186,7 +186,6 @@ class ResponsesClient:
         max_turns: int,
         max_tool_calls: int,
         max_web_searches: int,
-        previous_response_id: str | None = None,
         on_response: Callable[[int, Mapping[str, Any]], None] | None = None,
         on_tool: Callable[[int, Mapping[str, Any], Mapping[str, Any]], None] | None = None,
     ) -> AgentRunResult:
@@ -199,19 +198,8 @@ class ResponsesClient:
         turns = 0
         tool_calls = 0
         web_searches = 0
-        response_id = previous_response_id
-        next_input: Any = _initial_input(instructions, initial_input) if previous_response_id is None else []
-        # Most Responses providers retain tool-call state through
-        # ``previous_response_id``. Keep a complete replayable transcript as
-        # well: a few OpenAI-compatible gateways accept the parameter but do
-        # not persist function calls, then reject a valid output-only
-        # continuation with "No tool call found". The transcript is used only
-        # for that narrow, safe retry path.
-        replay_input: list[dict[str, Any]] | None = (
-            [dict(item) for item in next_input if isinstance(item, Mapping)]
-            if previous_response_id is None
-            else None
-        )
+        response_id: str | None = None
+        transcript_input = [dict(item) for item in _initial_input(instructions, initial_input)]
         last_response: dict[str, Any] = {}
         while turns < max_turns:
             turns += 1
@@ -219,43 +207,23 @@ class ResponsesClient:
             web_search_enabled = bool(hosted_tools) and web_searches < max_web_searches
             if web_search_enabled:
                 provider_tools.extend(dict(tool) for tool in hosted_tools)
-            # Responses does not inherit top-level instructions across a
-            # previous_response_id chain. Re-send the immutable agent policy
-            # on every turn so a tool-result continuation has the same safety
-            # and stage boundaries as the opening turn.
             payload: dict[str, Any] = {
                 "instructions": instructions,
-                "input": next_input,
+                "input": [dict(item) for item in transcript_input],
                 "tools": provider_tools,
             }
             if web_search_enabled:
                 # Retain the source list in the auditable raw response so C
                 # can bind a later verification record to an actual search.
                 payload["include"] = ["web_search_call.action.sources"]
-            if response_id:
-                payload["previous_response_id"] = response_id
-            try:
-                response = self.create(payload)
-            except ResponsesProviderError as exc:
-                if not _requires_function_call_replay(exc) or not replay_input:
-                    raise
-                # Retry exactly once without previous_response_id, replaying
-                # the prior model output (including the function_call) and
-                # its local function_call_output in order. This follows the
-                # stateless Responses function-calling shape and keeps a
-                # partially compatible gateway from blocking the C workflow.
-                replay_payload = dict(payload)
-                replay_payload.pop("previous_response_id", None)
-                replay_payload["input"] = [dict(item) for item in replay_input]
-                response = self.create(replay_payload)
+            response = self.create(payload)
             last_response = response
             response_id = _text(response.get("id")) or response_id
             if on_response is not None:
                 on_response(turns, response)
 
             output = _output_items(response)
-            if replay_input is not None:
-                replay_input.extend(output)
+            transcript_input.extend(output)
             web_searches += sum(1 for item in output if str(item.get("type") or "") == "web_search_call")
             if web_searches > max_web_searches:
                 raise AgentBudgetExceeded("C agent exhausted its hosted web-search budget")
@@ -263,18 +231,14 @@ class ResponsesClient:
             if not calls:
                 # A hosted tool can complete independently and return a text
                 # turn before the model makes its next local function call.
-                # Continue the same Responses chain once, instead of treating
-                # a successful web-search turn as a terminal agent failure.
-                if not response_id:
-                    raise AgentProtocolError("Responses API response did not include an id for continuation")
-                next_input = [
+                # Continue the agent loop instead of treating a successful
+                # web-search turn as a terminal agent failure.
+                transcript_input.extend([
                     {
                         "role": "user",
                         "content": "Continue the Stage C workflow using local tools. Do not answer in prose; call a tool, and finalize only after active coverage is complete.",
                     }
-                ]
-                if replay_input is not None:
-                    replay_input.extend(next_input)
+                ])
                 continue
             if tool_calls + len(calls) > max_tool_calls:
                 raise AgentBudgetExceeded("C agent exhausted its local tool-call budget")
@@ -315,11 +279,7 @@ class ResponsesClient:
                     finalized=True,
                     last_response=last_response,
                 )
-            if not response_id:
-                raise AgentProtocolError("Responses API response did not include an id for continuation")
-            next_input = outputs
-            if replay_input is not None:
-                replay_input.extend(outputs)
+            transcript_input.extend(outputs)
         raise AgentBudgetExceeded("C agent exhausted its turn budget")
 
     def verify_web_search(self, *, allowed_domains: Sequence[str]) -> dict[str, Any]:
@@ -430,16 +390,6 @@ def _arguments(value: Any) -> dict[str, Any]:
         if isinstance(parsed, Mapping):
             return dict(parsed)
     raise AgentProtocolError("function_call arguments must be an object")
-
-
-def _requires_function_call_replay(exc: ResponsesProviderError) -> bool:
-    """Whether a gateway lost the function call behind previous_response_id."""
-
-    message = str(exc).casefold()
-    return (
-        int(exc.status_code or 0) == 400
-        and "no tool call found for function call output" in message
-    )
 
 
 def _provider_error(payload: Any) -> str | None:

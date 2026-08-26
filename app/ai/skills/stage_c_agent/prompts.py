@@ -1,4 +1,4 @@
-"""Prompt and local function schemas for the stateful Stage-C agent."""
+"""Prompt and local function schemas for the transcript-backed Stage-C agent."""
 
 from __future__ import annotations
 

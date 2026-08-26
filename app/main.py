@@ -5,6 +5,7 @@ from pathlib import Path
 
 import typer
 
+from app.cli.progress import PipelineConsoleReporter
 from app.config.limits import (
     DEFAULT_AI_REVIEW_LIMIT,
     DEFAULT_DAILY_REPORT_LIMIT,
@@ -186,44 +187,21 @@ def pipeline_run(
     """Run A-D and write review artifacts; use --publish only after approval."""
 
     configure_logging()
-
-    def announce_start(start) -> None:
-        typer.echo(f"scope_frozen={start.scope_frozen}")
-        if start.edition_date:
-            typer.echo(f"edition_date={start.edition_date}")
-
-    result = run_pipeline_from_settings(
-        settings=Settings.from_env(),
-        limit=limit,
-        edition_date=_optional_edition_date(edition_date),
+    normalized_edition_date = _optional_edition_date(edition_date)
+    with PipelineConsoleReporter(
+        edition_date=normalized_edition_date,
         output_dir=output_dir,
-        profile_path=profile,
-        on_start=announce_start,
-        publish=publish,
-    )
-    typer.echo(f"status={result.status}")
-    export_result = result.resume.results.get("export")
-    if export_result is not None:
-        _echo_daily_edition(getattr(export_result, "markdown_path", None))
-    draft_export = result.resume.results.get("draft_export")
-    if draft_export is not None:
-        typer.echo(f"draft_markdown={draft_export.markdown_path}")
-        typer.echo(f"draft_jsonl={draft_export.jsonl_path}")
-        if draft_export.manifest_path:
-            typer.echo(f"draft_manifest={draft_export.manifest_path}")
-    typer.echo(
-        f"fetch: fetched={result.start.fetch.total_fetched} "
-        f"inserted={result.start.fetch.total_inserted} "
-        f"skipped={result.start.fetch.total_skipped} "
-        f"failed={result.start.fetch.total_failed}"
-    )
-    typer.echo(f"stages={','.join(result.resume.ran_stages) or '-'}")
-    if result.resume.skipped_stages:
-        typer.echo(f"skipped={','.join(result.resume.skipped_stages)}")
-    for error in result.resume.errors:
-        typer.echo(f"error={error}")
-    if result.status == "ready_for_publish" and result.start.edition_date:
-        typer.echo(f"next=pipeline export --edition-date {result.start.edition_date}")
+        mode="完整执行并发布" if publish else "完整执行",
+    ) as reporter:
+        result = run_pipeline_from_settings(
+            settings=Settings.from_env(),
+            limit=limit,
+            edition_date=normalized_edition_date,
+            output_dir=output_dir,
+            profile_path=profile,
+            publish=publish,
+            progress=reporter.emit,
+        )
     if result.status in {"failed", "partial", "draft_failed"} or result.resume.errors:
         raise typer.Exit(code=1)
 
@@ -289,7 +267,7 @@ def pipeline_stage_c(
     edition_date: str = typer.Option(..., "--edition-date", metavar="YYYY-MM-DD", help="Daily edition to process."),
     force: bool = typer.Option(False, "--force", help="Re-run Stage C only."),
 ) -> None:
-    """Run the stateful Stage C event-aggregation agent for the current draft."""
+    """Run the Stage C event-aggregation agent for the current draft."""
 
     configure_logging()
     settings = Settings.from_env()

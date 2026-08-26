@@ -14,7 +14,7 @@ from datetime import date, datetime, timezone
 import logging
 from pathlib import Path
 import shutil
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import httpx
 from sqlalchemy import select
@@ -66,6 +66,7 @@ from app.storage.repository import DAILY_EDITION_TIMEZONE, IntelRepository, Stag
 
 
 logger = logging.getLogger(__name__)
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 PUBLIC_STAGE_NAMES: dict[str, str] = {
@@ -747,6 +748,7 @@ def start_pipeline_run_from_settings(
     output_dir: str | Path | None = None,
     registry_path=DEFAULT_REGISTRY_PATH,
     fetch_runner: Callable[..., IntelFetchResult] | None = None,
+    progress: ProgressCallback | None = None,
 ) -> PipelineStartResult:
     """Create a fresh, fully isolated draft for one public edition date."""
 
@@ -785,6 +787,7 @@ def start_pipeline_run_from_settings(
         force=True,
         dry_run=False,
         run_id=run_id,
+        progress=progress,
     )
 
     # Freeze membership after fetch, even when one or more sources failed.
@@ -817,6 +820,7 @@ def run_pipeline_stage_a_from_settings(
     task_ids: Iterable[int] | None = None,
     ai_client: Any | None = None,
     registry_path=DEFAULT_REGISTRY_PATH,
+    progress: ProgressCallback | None = None,
 ) -> StageAScreenResult:
     _, session_factory = _engine_and_factory(settings)
     specs = _registry(settings, registry_path)
@@ -836,6 +840,7 @@ def run_pipeline_stage_a_from_settings(
             task_ids=task_ids,
             screen_reject_threshold=settings.ai_screen_reject_threshold,
             concurrency=settings.ai_review_concurrency,
+            progress=progress,
         )
     _sync_pipeline_run_status(
         session_factory,
@@ -859,6 +864,7 @@ def run_pipeline_stage_b_from_settings(
     task_ids: Iterable[int] | None = None,
     ai_client: Any | None = None,
     registry_path=DEFAULT_REGISTRY_PATH,
+    progress: ProgressCallback | None = None,
 ) -> StageBAnalysisResult:
     _, session_factory = _engine_and_factory(settings)
     specs = _registry(settings, registry_path)
@@ -878,6 +884,7 @@ def run_pipeline_stage_b_from_settings(
             task_ids=task_ids,
             reserve_limit=settings.stage_b_reserve_limit,
             concurrency=settings.ai_review_concurrency,
+            progress=progress,
         )
     _sync_pipeline_run_status(
         session_factory,
@@ -895,6 +902,7 @@ def run_pipeline_stage_c_from_settings(
     run_id: int,
     force: bool = False,
     ai_client: Any | None = None,
+    progress: ProgressCallback | None = None,
 ) -> EventClusterResult:
     _, session_factory = _engine_and_factory(settings)
     result = run_event_cluster_from_settings(
@@ -902,6 +910,7 @@ def run_pipeline_stage_c_from_settings(
         run_id=int(run_id),
         force=force,
         ai_client=ai_client,
+        progress=progress,
     )
     _sync_pipeline_run_status(session_factory, int(run_id), finalize=False)
     return result
@@ -1368,6 +1377,7 @@ def resume_pipeline_from_settings(
     output_dir: str | Path = "output/intel",
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
+    progress: ProgressCallback | None = None,
 ) -> PipelineResumeResult:
     """Resume the one pending daily build in dependency order."""
 
@@ -1386,6 +1396,7 @@ def resume_pipeline_from_settings(
             repo.mark_daily_build_failed(int(run_id), error=reason)
             session.commit()
             result.errors.append(reason)
+            _emit_progress(progress, "stage_error", stage="fetch", message=reason)
             return result
         # A fetch failure, including a run with zero usable items, is only a
         # source warning.  Downstream stages may produce an empty but fully
@@ -1394,14 +1405,17 @@ def resume_pipeline_from_settings(
     for stage_name in PIPELINE_STAGES:
         if not _stage_needs_resume(session_factory, run_id, stage_name, settings=settings):
             result.skipped_stages.append(stage_name)
+            _emit_progress(progress, "stage_skip", stage=stage_name)
             continue
         try:
+            _emit_progress(progress, "stage_start", stage=stage_name)
             if stage_name == "screen":
                 value = run_pipeline_stage_a_from_settings(
                     settings=settings,
                     run_id=run_id,
                     limit=limit if limit is not None else DEFAULT_AI_REVIEW_LIMIT,
                     ai_client=ai_client,
+                    progress=progress,
                 )
             elif stage_name == "analyze":
                 value = run_pipeline_stage_b_from_settings(
@@ -1409,12 +1423,14 @@ def resume_pipeline_from_settings(
                     run_id=run_id,
                     limit=limit if limit is not None else DEFAULT_AI_REVIEW_LIMIT,
                     ai_client=ai_client,
+                    progress=progress,
                 )
             elif stage_name == "cluster":
                 value = run_pipeline_stage_c_from_settings(
                     settings=settings,
                     run_id=run_id,
                     ai_client=ai_client,
+                    progress=progress,
                 )
             elif stage_name == "stage_d":
                 value = run_pipeline_stage_d_from_settings(
@@ -1430,10 +1446,19 @@ def resume_pipeline_from_settings(
             stage_errors = _daily_stage_result_errors(stage_name, value)
             if stage_errors:
                 result.errors.extend(f"{stage_name}: {error}" for error in stage_errors)
+                _emit_progress(
+                    progress,
+                    "stage_error",
+                    stage=stage_name,
+                    message="; ".join(stage_errors),
+                    data=_stage_result_progress(stage_name, value),
+                )
                 _mark_daily_build_failed(session_factory, int(run_id), "; ".join(result.errors))
                 break
+            _emit_progress(progress, "stage_complete", stage=stage_name, data=_stage_result_progress(stage_name, value))
         except Exception as exc:
             result.errors.append(f"{stage_name}: {exc}")
+            _emit_progress(progress, "stage_error", stage=stage_name, message=str(exc))
             break
 
     # Keep the run summary useful to operators without changing the frozen
@@ -1450,6 +1475,7 @@ def resume_pipeline_from_settings(
         run_status = _sync_pipeline_run_status(session_factory, int(run_id), finalize=True)
         if run_status == "completed":
             try:
+                _emit_progress(progress, "stage_start", stage="draft-export")
                 result.results["draft_export"] = _render_daily_draft_for_run_from_settings(
                     settings=settings,
                     run_id=int(run_id),
@@ -1457,8 +1483,15 @@ def resume_pipeline_from_settings(
                     output_dir=output_dir,
                 )
                 result.ran_stages.append("draft-export")
+                _emit_progress(
+                    progress,
+                    "stage_complete",
+                    stage="draft-export",
+                    data=_stage_result_progress("draft-export", result.results["draft_export"]),
+                )
             except Exception as exc:
                 result.errors.append(f"draft-export: {exc}")
+                _emit_progress(progress, "stage_error", stage="draft-export", message=str(exc))
                 _mark_daily_build_failed(session_factory, int(run_id), str(exc))
     return result
 
@@ -1474,23 +1507,35 @@ def run_pipeline_from_settings(
     registry_path=DEFAULT_REGISTRY_PATH,
     on_start: Callable[[PipelineStartResult], None] | None = None,
     publish: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> PipelineExecutionResult:
     """Fully rebuild one date-addressed draft, optionally publishing it."""
 
+    resolved_input_date = _resolved_edition_date(edition_date)
+    _emit_progress(
+        progress,
+        "pipeline_start",
+        data={"edition_date": resolved_input_date, "output_dir": str(output_dir), "mode": "完整执行并发布" if publish else "完整执行"},
+    )
+    _emit_progress(progress, "stage_start", stage="fetch")
     start = start_pipeline_run_from_settings(
         settings=settings,
         limit=limit,
         edition_date=edition_date,
         output_dir=output_dir,
         registry_path=registry_path,
+        progress=progress,
     )
     if not start.scope_frozen:
+        _emit_progress(progress, "stage_error", stage="fetch", message="daily build did not freeze its fetched scope")
         raise RuntimeError("daily build did not freeze its fetched scope")
     if on_start is not None:
         on_start(start)
+    _emit_progress(progress, "stage_complete", stage="fetch", data=_fetch_progress(start.fetch))
 
     resolved_date = start.edition_date or _normalize_edition_date(edition_date)
     if resolved_date is None:
+        _emit_progress(progress, "pipeline_error", message="daily build did not resolve an edition date")
         raise RuntimeError("daily build did not resolve an edition date")
     workspace_settings = draft_settings_for_edition(settings=settings, edition_date=resolved_date)
     resumed = resume_pipeline_from_settings(
@@ -1502,6 +1547,7 @@ def run_pipeline_from_settings(
         output_dir=output_dir,
         profile_path=profile_path,
         ai_client=ai_client,
+        progress=progress,
     )
     if publish and not resumed.errors:
         draft_run_status = pipeline_status_from_settings(
@@ -1509,6 +1555,7 @@ def run_pipeline_from_settings(
             run_id=int(start.run_id),
         ).run_status
         if draft_run_status == "completed":
+            _emit_progress(progress, "stage_start", stage="export")
             resumed.results["export"] = publish_daily_draft_from_settings(
                 settings=settings,
                 edition_date=resolved_date,
@@ -1516,6 +1563,12 @@ def run_pipeline_from_settings(
                 output_dir=output_dir,
             )
             resumed.ran_stages.append("export")
+            _emit_progress(
+                progress,
+                "stage_complete",
+                stage="export",
+                data=_stage_result_progress("export", resumed.results["export"]),
+            )
     status = pipeline_edition_status_from_settings(
         settings=settings,
         edition_date=resolved_date,
@@ -1527,6 +1580,105 @@ def run_pipeline_from_settings(
         resume=resumed,
         status=status,
     )
+
+
+def _emit_progress(
+    progress: ProgressCallback | None,
+    event_type: str,
+    *,
+    stage: str | None = None,
+    message: str | None = None,
+    data: Mapping[str, Any] | None = None,
+) -> None:
+    if progress is None:
+        return
+    progress({"type": event_type, "stage": stage, "message": message, "data": dict(data or {})})
+
+
+def _stage_result_progress(stage_name: str, value: Any) -> dict[str, Any]:
+    if stage_name == "screen":
+        return {
+            "total": int(getattr(value, "processed", 0) or 0),
+            "current": int(getattr(value, "processed", 0) or 0),
+            "metrics": {
+                "processed": int(getattr(value, "processed", 0) or 0),
+                "time_filtered": int(getattr(value, "time_filtered", 0) or 0),
+                "screened": int(getattr(value, "screened", 0) or 0),
+                "screened_out": int(getattr(value, "screened_out", 0) or 0),
+                "screen_failed": int(getattr(value, "screen_failed", 0) or 0),
+            },
+        }
+    if stage_name == "analyze":
+        return {
+            "total": int(getattr(value, "processed", 0) or 0),
+            "current": int(getattr(value, "processed", 0) or 0),
+            "metrics": {
+                "processed": int(getattr(value, "processed", 0) or 0),
+                "analyzed": int(getattr(value, "analyzed", 0) or 0),
+                "candidate": int(getattr(value, "candidate", 0) or 0),
+                "analysis_filtered": int(getattr(value, "analysis_filtered", 0) or 0),
+                "analysis_failed": int(getattr(value, "analysis_failed", 0) or 0),
+            },
+        }
+    if stage_name == "cluster":
+        return {
+            "total": int(getattr(value, "processed", 0) or 0),
+            "current": int(getattr(value, "processed", 0) or 0),
+            "metrics": {
+                "processed": int(getattr(value, "processed", 0) or 0),
+                "event_count": int(getattr(value, "events", 0) or 0),
+                "merged": int(getattr(value, "merged", 0) or 0),
+                "repeats": int(getattr(value, "repeats", 0) or 0),
+                "updated": int(getattr(value, "updated", 0) or 0),
+                "needs_review": int(getattr(value, "unresolved", 0) or 0),
+                "turns": int(getattr(value, "turns", 0) or 0),
+                "tool_calls": int(getattr(value, "tool_calls", 0) or 0),
+                "web_searches": int(getattr(value, "web_searches", 0) or 0),
+            },
+        }
+    if stage_name == "stage_d":
+        return {
+            "total": int(getattr(value, "candidates", 0) or 0),
+            "current": int(getattr(value, "candidates", 0) or 0),
+            "metrics": {
+                "candidates": int(getattr(value, "candidates", 0) or 0),
+                "selected": int(getattr(value, "selected", 0) or 0),
+                "unselected": int(getattr(value, "unselected", 0) or 0),
+                "provider_attempts": int(getattr(value, "provider_attempts", 0) or 0),
+                "web_searches": int(getattr(value, "web_searches", 0) or 0),
+                "ai_failed": int(getattr(value, "ai_failed", 0) or 0),
+            },
+        }
+    if stage_name in {"draft-export", "export"}:
+        return {
+            "total": int(getattr(value, "exported", 0) or 0),
+            "current": int(getattr(value, "exported", 0) or 0),
+            "metrics": {
+                "exported": int(getattr(value, "exported", 0) or 0),
+                "markdown_path": getattr(value, "markdown_path", None),
+                "jsonl_path": getattr(value, "jsonl_path", None),
+                "manifest_path": getattr(value, "manifest_path", None),
+            },
+        }
+    return {}
+
+
+def _fetch_progress(fetch: IntelFetchResult) -> dict[str, Any]:
+    total_sources = len(fetch.stats)
+    return {
+        "total": total_sources,
+        "current": total_sources,
+        "metrics": {
+            "source_count": total_sources,
+            "fetched_items": int(fetch.total_fetched),
+            "inserted_items": int(fetch.total_inserted),
+            "skipped_items": int(fetch.total_skipped),
+            "failed_sources": int(fetch.total_failed),
+            "degraded_sources": int(fetch.total_degraded),
+        },
+    }
+
+
 def _summary_dict(summary: StageStateSummary) -> dict[str, Any]:
     return {
         "stage_id": summary.stage_id,

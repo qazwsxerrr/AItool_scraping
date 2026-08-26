@@ -14,7 +14,7 @@ from uuid import uuid4
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import httpx
 from pydantic import ValidationError
@@ -46,6 +46,7 @@ from app.storage.models import IntelItem, IntelRun, IntelRunStageTask
 from app.storage.repository import IntelRepository
 
 LOGGER = logging.getLogger(__name__)
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass
@@ -125,6 +126,7 @@ def run_stage_a_screen_job(
     dry_run: bool = False,
     now: Any | None = None,
     owner: str | None = None,
+    progress: ProgressCallback | None = None,
     **_: Any,
 ) -> StageAScreenResult:
     """Run Stage A with durable per-item state.
@@ -299,6 +301,15 @@ def run_stage_a_screen_job(
             repo.finish_stage(stage, status="succeeded", metadata=stage_metadata)
         session.commit()
 
+    progress_current = 0
+    progress_total = len(contexts)
+    _emit_screen_progress(progress, total=progress_total, current=progress_current)
+
+    def advance_progress() -> None:
+        nonlocal progress_current
+        progress_current += 1
+        _emit_screen_progress(progress, total=progress_total, current=progress_current)
+
     def persist_outcome(
         context: _ItemContext,
         task_id: int,
@@ -414,10 +425,12 @@ def run_stage_a_screen_job(
                     _structural_screen(context.item_id, context.structural_error),
                     None,
                 )
+                advance_progress()
             else:
                 result.skipped += 1
                 if _task_is_eligible(session_factory, task_id):
                     result.eligible_item_ids.append(context.item_id)
+                advance_progress()
             continue
         provider_contexts.append((context, task_id))
 
@@ -441,6 +454,7 @@ def run_stage_a_screen_job(
                         result.skipped += 1
                         if _task_is_eligible(session_factory, task_id):
                             result.eligible_item_ids.append(context.item_id)
+                        advance_progress()
                         continue
                     futures[executor.submit(
                         _screen_provider_outcome,
@@ -459,6 +473,7 @@ def run_stage_a_screen_job(
                     context, task_id = futures.pop(future)
                     screen, failure = future.result()
                     persist_outcome(context, task_id, screen, failure)
+                    advance_progress()
                     submit_next()
 
     with session_factory() as session:
@@ -926,6 +941,21 @@ def _config_fingerprint(
     if freshness_timezone:
         payload["freshness_timezone"] = freshness_timezone
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _emit_screen_progress(progress: ProgressCallback | None, *, total: int, current: int) -> None:
+    if progress is None:
+        return
+    progress(
+        {
+            "type": "stage_update",
+            "stage": "screen",
+            "data": {
+                "total": int(total),
+                "current": int(current),
+            },
+        }
+    )
 
 
 def _bounded_score(value: Any, default: int) -> int:

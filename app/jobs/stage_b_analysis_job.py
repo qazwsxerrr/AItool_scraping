@@ -13,7 +13,7 @@ import json
 from uuid import uuid4
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -51,6 +51,7 @@ from .stage_a_screen_job import (
 )
 
 LOGGER = logging.getLogger(__name__)
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass
@@ -136,6 +137,7 @@ def run_stage_b_analysis_job(
     reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT,
     concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY,
     owner: str | None = None,
+    progress: ProgressCallback | None = None,
 ) -> StageBAnalysisResult:
     """Run only persisted Stage-A eligible work for ``run_id``."""
 
@@ -353,6 +355,14 @@ def run_stage_b_analysis_job(
 
     result.item_ids = [context.item_id for context in contexts]
     result.processed = len(contexts)
+    progress_current = 0
+    progress_total = len(contexts)
+    _emit_analysis_progress(progress, total=progress_total, current=progress_current)
+
+    def advance_progress() -> None:
+        nonlocal progress_current
+        progress_current += 1
+        _emit_analysis_progress(progress, total=progress_total, current=progress_current)
 
     def persist_outcome(
         context: _AnalysisContext,
@@ -497,6 +507,7 @@ def run_stage_b_analysis_job(
                         config_fingerprint=config_fingerprint,
                     ):
                         result.skipped += 1
+                        advance_progress()
                         continue
                     futures[executor.submit(_analysis_provider_outcome, ai_client, context)] = (context, task_id)
                     return True
@@ -510,6 +521,7 @@ def run_stage_b_analysis_job(
                     context, task_id = futures.pop(future)
                     analysis, failure = future.result()
                     persist_outcome(context, task_id, analysis, failure)
+                    advance_progress()
                     submit_next()
 
     with session_factory() as session:
@@ -792,6 +804,21 @@ def _analysis_task_needs_provider_call(
     ):
         return False
     return task.status in {"pending", "retry_waiting", "failed"}
+
+
+def _emit_analysis_progress(progress: ProgressCallback | None, *, total: int, current: int) -> None:
+    if progress is None:
+        return
+    progress(
+        {
+            "type": "stage_update",
+            "stage": "analyze",
+            "data": {
+                "total": int(total),
+                "current": int(current),
+            },
+        }
+    )
 
 
 def _call_analysis(client: Any, envelope: RawIntelEnvelope) -> AnalysisResult:

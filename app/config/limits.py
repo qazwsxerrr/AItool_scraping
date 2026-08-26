@@ -23,7 +23,7 @@ DEFAULT_AI_REVIEW_CONCURRENCY = 4
 """Maximum concurrent provider calls for Stage A or Stage B."""
 
 STAGE_C_AGENT_VERSION = "stage_c_agent_v8"
-# These are deliberately roomy defaults for the stateful verification flow.
+# These are deliberately roomy defaults for the agent verification flow.
 # Operators can configure a larger value when a run needs it; web search uses
 # 0 as its explicit disable switch.
 DEFAULT_STAGE_C_AGENT_MAX_TURNS = 32

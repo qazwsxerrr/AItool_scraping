@@ -1,4 +1,4 @@
-"""Responses-backed runtime for the stateful Stage-C event agent."""
+"""Responses-backed runtime for the transcript-backed Stage-C event agent."""
 
 from __future__ import annotations
 
@@ -53,7 +53,6 @@ class StageCAgentClient:
         function_tools: Sequence[FunctionTool],
         max_turns: int,
         max_tool_calls: int,
-        previous_response_id: str | None = None,
         on_response: Callable[[int, Mapping[str, Any]], None] | None = None,
         on_tool: Callable[[int, Mapping[str, Any], Mapping[str, Any]], None] | None = None,
     ) -> AgentRunResult:
@@ -65,7 +64,6 @@ class StageCAgentClient:
             max_turns=max_turns,
             max_tool_calls=max_tool_calls,
             max_web_searches=0,
-            previous_response_id=previous_response_id,
             on_response=on_response,
             on_tool=on_tool,
         )
