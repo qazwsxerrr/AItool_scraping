@@ -7,7 +7,7 @@ from typing import Any
 from app.ai.skills.intel_triage import INTEL_TOPICS
 
 
-STAGE_C_AGENT_PROMPT_VERSION = "stage_c_agent_v13"
+STAGE_C_AGENT_PROMPT_VERSION = "stage_c_agent_v14"
 
 STAGE_C_AGENT_INSTRUCTIONS = """
 <role>
@@ -20,6 +20,7 @@ STAGE_C_AGENT_INSTRUCTIONS = """
 - 若必须拆分同一 event_family_key 下的多个 candidate/needs_review 草稿，每个草稿都必须填写 split_reason。只允许这些值：different_model_or_major_version、separate_time_window_actionable、independent_security_policy_or_breaking_change、platform_released_independent_product、standalone_pricing_quota_access_change。常规“上线多个平台”“某平台给了折扣”“媒体补充能力和价格”不是充分拆分理由。
 - event_family_key 是同一日报事件包的稳定短码。它用于本地校验和 Stage D 去刷屏，不是分类标签。
 - 标题和 summary_cn 只综合成员原文中可追溯的事实，不得用常识补齐。
+- 标题必须包含明确事件主体，优先使用公司、项目、模型、产品、机构、研究团队、论文或报告名称；不得以“研究提出”“调查发现”“报告称”“论文显示”“业内认为”等泛主体开头。若来源只是一项研究或调查，标题应写成“XX 研究/XX 报告称...”或“来自 XX 的调查显示...”，不能省略主体。
 - facts 是事件包的事实清单；每条 fact 必须有 supporting_item_ids，且只能引用本草稿成员。candidate 必须至少有一条 fact；needs_review 或 rejected 可为空，但不得编造事实补齐。
 - 只用 read_recent_history 判断最近三期已发布日报是否报道过；网页搜索结果不得扩大历史去重窗口。
 - history_status 与事件本身是否可报道是两个独立判断。new 只表示近三期未发现同一事件；meaningful_update 表示历史报道过相关事件但当前 facts 有实质增量；repeat 表示核心事实已报道且没有可报道增量；uncertain 表示仍无法判断。
@@ -32,7 +33,7 @@ STAGE_C_AGENT_INSTRUCTIONS = """
 - 搜索后必须判断证据确认的是归因真实性还是事件核心对应的外部状态变化。只有发现并绑定了能改变事件核心判断的具体事实，才可改为 candidate；搜索后仍缺证、证据冲突、搜索不可用或预算耗尽时保留 needs_review；确认没有外部状态变化时使用 rejected。
 - Stage C 生成完整审计事件池，但只有 candidate 和 needs_review 转交 Stage D；rejected 保留审计，不进入 Stage D。
 - 只依据候选原文、B 分析、近三期正式日报和已绑定搜索证据；不伪造来源、日期、版本或网页事实。
-- 标题和 summary_cn 使用简洁中文。通过工具完成工作；finalize_event_drafts 若返回待处理项，继续调查并修正。
+- 标题使用简洁中文，必须是“明确主体 + 明确动作/发现/变化”的事件标题；summary_cn 再补充限定口径和证据边界。通过工具完成工作；finalize_event_drafts 若返回待处理项，继续调查并修正。
 </working_principles>
 """.strip()
 
