@@ -60,6 +60,10 @@
           <span class="nav-icon"><svg class="icon icon-sm" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6" stroke="currentColor" stroke-width="2"/><line x1="8" y1="12" x2="21" y2="12" stroke="currentColor" stroke-width="2"/><line x1="8" y1="18" x2="21" y2="18" stroke="currentColor" stroke-width="2"/><line x1="3" y1="6" x2="3.01" y2="6" stroke="currentColor" stroke-width="3"/><line x1="3" y1="12" x2="3.01" y2="12" stroke="currentColor" stroke-width="3"/><line x1="3" y1="18" x2="3.01" y2="18" stroke="currentColor" stroke-width="3"/></svg></span>
           <span>本期精选</span>
         </a>
+        <a class="nav-item {{ 'active' if active_nav == 'dynamics' else '' }}" href="/dynamics{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">
+          <span class="nav-icon"><svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12" fill="none" stroke="currentColor" stroke-width="2"/></svg></span>
+          <span>全部 AI 动态</span>
+        </a>
         <a class="nav-item {{ 'active' if active_nav == 'search' else '' }}" href="/search{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">
           <span class="nav-icon"><svg class="icon icon-sm" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8" fill="none" stroke="currentColor" stroke-width="2"/><line x1="21" y1="21" x2="16.65" y2="16.65" stroke="currentColor" stroke-width="2"/></svg></span>
           <span>热点搜索</span>

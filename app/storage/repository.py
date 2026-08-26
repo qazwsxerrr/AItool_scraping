@@ -1198,13 +1198,11 @@ class IntelRepository:
         title: str,
         summary_cn: str | None,
         topic: str,
-        topics: Iterable[str] | None,
         keywords: Iterable[str] | None,
         entities: Iterable[Mapping[str, Any]] | None,
         novelty_status: str,
         prior_event_key: str | None,
         review_state: str,
-        confidence: int,
         risk_flags: Iterable[str] | None,
         metadata: Mapping[str, Any] | None = None,
         member_relations: Mapping[int, str] | None = None,
@@ -1257,13 +1255,11 @@ class IntelRepository:
         draft.title = _text(title) or "(untitled)"
         draft.summary_cn = _text(summary_cn)
         draft.topic = _text(topic) or "technology_insight"
-        draft.topics_json = _dump_json(_unique_strings(topics or ()))
         draft.keywords_json = _dump_json(_unique_strings(keywords or ()))
         draft.entities_json = _dump_json([dict(item) for item in (entities or ()) if isinstance(item, Mapping)])
         draft.novelty_status = _text(novelty_status) or "uncertain"
         draft.prior_event_key = _text(prior_event_key)
         draft.review_state = _text(review_state) or "candidate"
-        draft.confidence = max(0, min(100, int(confidence)))
         draft.risk_flags_json = _dump_json(_unique_strings(risk_flags or ()))
         draft.metadata_json = _dump_json(dict(metadata or {}))
         draft.state = "draft"
@@ -1274,7 +1270,6 @@ class IntelRepository:
                     draft_id=int(draft.id),
                     item_id=item_id,
                     relation=_text((member_relations or {}).get(item_id)) or "related",
-                    confidence=max(0, min(100, int(confidence))),
                 )
             )
         self.session.flush()

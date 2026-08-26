@@ -93,10 +93,9 @@ class _StageCAgent:
             {
                 "draft_key": f"item-{item['id']}", "item_ids": [item["id"]], "title": item["title"],
                 "summary_cn": item.get("summary_cn") or item["title"], "topic": item.get("topic") or "technology_insight",
-                "topics": [item.get("topic") or "technology_insight"], "keywords": item.get("keywords") or [],
+                "keywords": item.get("keywords") or [],
                 "entities": item.get("entities") or [],
-                "event_family_key": f"current-build-update-{item['id']}", "event_claim": item["title"],
-                "aggregation_reason": "单条候选构成一个事件包。",
+                "event_family_key": f"current-build-update-{item['id']}",
                 "facts": [
                     {
                         "claim": "候选正文确认产品状态发生更新。",
@@ -104,8 +103,7 @@ class _StageCAgent:
                     }
                 ],
                 "history_status": "new", "prior_event_key": None,
-                "history_reason": "当前候选未匹配近三期已发布日报。", "meaningful_updates": [],
-                "publishability": "candidate", "split_reason": None, "confidence": 90, "caveats": [],
+                "publishability": "candidate", "split_reason": None, "caveats": [],
             }
             for item in candidates
         ]})

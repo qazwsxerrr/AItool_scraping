@@ -436,15 +436,12 @@ def _load_stage_c_candidate_event_ids(repo: IntelRepository, run_id: int) -> lis
             "precondition",
             "Stage C run task must succeed before Stage D",
         )
-    # Current C contracts publish only candidate and needs_review rows here.
-    # Fall back to the former all-event field for already-completed old builds.
-    source_field = "candidate_event_ids" if "candidate_event_ids" in task.result else "current_event_ids"
-    if source_field not in task.result:
+    if "candidate_event_ids" not in task.result:
         raise StageDExecutionError(
             "precondition",
             "Stage C result is missing candidate_event_ids; rerun Stage C",
         )
-    return _strict_event_ids(task.result.get(source_field))
+    return _strict_event_ids(task.result.get("candidate_event_ids"))
 
 
 def _load_candidate_events(
@@ -539,16 +536,11 @@ def _selection_event(
         "title": str(event.title or ""),
         "summary_cn": str(event.summary_cn or ""),
         "event_family_key": str(draft_metadata.get("event_family_key") or ""),
-        "event_claim": str(draft_metadata.get("event_claim") or ""),
         "facts": _mapping_list(draft_metadata.get("facts")),
         "publishability": str(draft_metadata.get("publishability") or event.review_state or ""),
         "history_status": str(draft_metadata.get("history_status") or event.novelty_status or ""),
-        "history_reason": str(draft_metadata.get("history_reason") or ""),
-        "meaningful_updates": _mapping_list(draft_metadata.get("meaningful_updates")),
-        "aggregation_reason": str(draft_metadata.get("aggregation_reason") or ""),
         "split_reason": draft_metadata.get("split_reason"),
         "topic": event.topic,
-        "topics": _json_strings(event.topics_json),
         "content_class": event.content_class,
         "keywords": _json_strings(event.keywords_json),
         "entities": _json_value(event.entities_json, []),
@@ -558,7 +550,6 @@ def _selection_event(
         "novelty_status": event.novelty_status,
         "eligibility_blockers": blockers,
         "editorial_caveats": caveats,
-        "resolution_confidence": int(event.resolution_confidence or 0),
         "review_state": event.review_state,
         "verification_count": len(evidence),
         "verification_status": "verified" if verified else ("unverified" if evidence else "not_checked"),

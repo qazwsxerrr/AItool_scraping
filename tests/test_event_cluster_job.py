@@ -207,12 +207,9 @@ class _ToolAgent:
                 "title": item["title"],
                 "summary_cn": item.get("summary_cn") or item["title"],
                 "topic": item.get("topic") or "technology_insight",
-                "topics": [item.get("topic") or "technology_insight"],
                 "keywords": item.get("keywords") or [],
                 "entities": item.get("entities") or [],
                 "event_family_key": f"fixture-release-{item['id']}",
-                "event_claim": item["title"],
-                "aggregation_reason": "单条候选构成一个事件包。",
                 "facts": [
                     {
                         "claim": "候选正文确认产品已正式发布。" if not self.intent_only else "候选正文确认发布方提出了具体计划。",
@@ -221,11 +218,8 @@ class _ToolAgent:
                 ],
                 "history_status": "repeat" if self.repeat else "new",
                 "prior_event_key": f"url:{item['canonical_url']}" if self.repeat else None,
-                "history_reason": "当前候选与近三期事件相同且没有实质变化。" if self.repeat else "当前候选未匹配近三期已发布日报。",
-                "meaningful_updates": [],
                 "publishability": "candidate",
                 "split_reason": None,
-                "confidence": 88,
                 "caveats": ["intent_only_event"] if self.intent_only else [],
             }
             for item in active
@@ -317,20 +311,14 @@ class _SplitFamilyAgent:
                 "item_ids": [item["id"]],
                 "title": item["title"],
                 "summary_cn": item.get("summary_cn") or item["title"],
-                "event_claim": "Wan 3.0 发布窗口内的平台可用性扩散。",
-                "aggregation_reason": "错误地把同一发布窗口的平台接入拆开。",
                 "topic": item.get("topic") or "model_release",
-                "topics": [item.get("topic") or "model_release"],
                 "keywords": item.get("keywords") or [],
                 "entities": item.get("entities") or [],
                 "facts": [{"claim": item["title"], "supporting_item_ids": [item["id"]]}],
                 "history_status": "new",
                 "prior_event_key": None,
-                "history_reason": "近三期未见同一事件。",
-                "meaningful_updates": [],
                 "publishability": "candidate",
                 "split_reason": None,
-                "confidence": 85,
                 "caveats": [],
             }
 
@@ -344,7 +332,6 @@ class _SplitFamilyAgent:
         merged["item_ids"] = [item["id"] for item in items]
         merged["title"] = "Wan 3.0 发布并在多个平台上线"
         merged["summary_cn"] = "Wan 3.0 在同一发布窗口内完成能力披露和多平台可用性扩散。"
-        merged["aggregation_reason"] = "这些候选均围绕同一模型、同一版本和同一发布窗口，应合并为一个事件包。"
         merged["facts"] = [{"claim": item["title"], "supporting_item_ids": [item["id"]]} for item in items]
         assert invoke("save_event_drafts", {"drafts": [merged]})["ok"] is True
         assert invoke("finalize_event_drafts", {})["ok"] is True
@@ -380,12 +367,9 @@ class _ReviewFlowAgent:
             "title": item["title"],
             "summary_cn": item.get("summary_cn") or item["title"],
             "topic": item.get("topic") or "technology_insight",
-            "topics": [item.get("topic") or "technology_insight"],
             "keywords": item.get("keywords") or [],
             "entities": item.get("entities") or [],
             "event_family_key": f"review-fixture-{item['id']}",
-            "event_claim": item["title"],
-            "aggregation_reason": "单条候选构成一个需核验事件包。",
             "facts": [
                 {
                     "claim": "候选正文确认产品已正式发布。",
@@ -394,11 +378,8 @@ class _ReviewFlowAgent:
             ],
             "history_status": "new",
             "prior_event_key": None,
-            "history_reason": "当前候选未匹配近三期已发布日报。",
-            "meaningful_updates": [],
             "publishability": "needs_review",
             "split_reason": None,
-            "confidence": 80,
             "caveats": ["claim_requires_confirmation"],
         }
         assert invoke(1, "save_event_drafts", {"drafts": [draft]})["ok"] is True

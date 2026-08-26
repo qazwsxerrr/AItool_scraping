@@ -64,7 +64,7 @@ from app.storage.repository import IntelRepository
 
 
 DAILY_HISTORY_DAYS = DEFAULT_STAGE_C_AGENT_HISTORY_DAYS
-STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_events_v4"
+STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_events_v5"
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
 _PRIMARY_POLICY_VERSION = "source_then_b1_priority_v2"
 _VERIFICATION_POLICY_VERSION = "tavily_per_event_verification_v2"
@@ -670,12 +670,8 @@ class _StageCAgentTools:
                         "saved_by": "responses_agent_batch",
                         "batch_size": len(prepared),
                         "event_family_key": _event_family_key(draft_args),
-                        "event_claim": _text(draft_args.get("event_claim")),
-                        "aggregation_reason": _text(draft_args.get("aggregation_reason")),
                         "facts": publishability["facts"],
                         "history_status": history["history_status"],
-                        "history_reason": _text(draft_args.get("history_reason")),
-                        "meaningful_updates": history["meaningful_updates"],
                         "history_guard": history["guard"],
                         "publishability": publishability["publishability"],
                         "publishability_guard": publishability["guard"],
@@ -689,7 +685,6 @@ class _StageCAgentTools:
                         title=str(draft_args.get("title") or ""),
                         summary_cn=_text(draft_args.get("summary_cn")),
                         topic=str(draft_args.get("topic") or "technology_insight"),
-                        topics=_strings(draft_args.get("topics")),
                         keywords=_strings(draft_args.get("keywords")),
                         entities=[
                             dict(value)
@@ -699,7 +694,6 @@ class _StageCAgentTools:
                         novelty_status=str(history["novelty_status"]),
                         prior_event_key=_text(history.get("prior_event_key")),
                         review_state=str(publishability["review_state"]),
-                        confidence=_bounded_score(draft_args.get("confidence"), 0),
                         risk_flags=caveats,
                         metadata=metadata,
                         allow_member_reassignment=True,
@@ -919,7 +913,6 @@ def _draft_tool_view(draft: IntelEventDraft) -> dict[str, Any]:
         "event_family_key": metadata.get("event_family_key"),
         "history_status": metadata.get("history_status") or draft.novelty_status,
         "publishability": metadata.get("publishability") or draft.review_state,
-        "confidence": int(draft.confidence),
         "caveats": metadata.get("caveats") or _json_strings(draft.risk_flags_json),
         "metadata": metadata,
     }
@@ -997,7 +990,6 @@ def _materialize_agent_events(
             title=draft.title,
             summary_cn=draft.summary_cn,
             topic=draft.topic or (review_topics[0] if review_topics else "technology_insight"),
-            topics=_unique_strings([*_json_strings(draft.topics_json), *review_topics]),
             keywords=_unique_strings([*_json_strings(draft.keywords_json), *review_keywords]),
             entities=_unique_json_objects([*_json_objects(draft.entities_json), *review_entities]),
             content_class=primary.content_class,
@@ -1010,7 +1002,6 @@ def _materialize_agent_events(
             state="candidate",
             review_state=draft.review_state,
             resolution_method="responses_agent",
-            resolution_confidence=max(0, min(100, int(draft.confidence))),
             resolution_raw={
                 "agent_session_id": int(agent_session.id),
                 "draft_key": draft.draft_key,
@@ -1033,7 +1024,6 @@ def _materialize_agent_events(
                 source_group=getattr(item.source, "source_group", None),
                 identity_key=next(iter(exact_identity_keys(_item_mapping(item))), None),
                 match_type=relation,
-                match_confidence=max(0, min(100, int(draft.confidence))),
                 is_primary=relation == "primary",
                 lineage={"agent_session_id": int(agent_session.id), "draft_key": draft.draft_key, "relation": relation},
             )
@@ -1096,22 +1086,16 @@ def _save_unresolved_draft(
             title=primary.title,
             summary_cn=(primary.ai_review.summary_cn if primary.ai_review is not None else primary.summary) or primary.title,
             topic=(primary.ai_review.topic if primary.ai_review is not None else "technology_insight") or "technology_insight",
-            topics=(primary.ai_review.topics if primary.ai_review is not None else ()),
             keywords=(primary.ai_review.keywords if primary.ai_review is not None else ()),
             entities=(primary.ai_review.entities if primary.ai_review is not None else ()),
             novelty_status="uncertain",
             prior_event_key=None,
             review_state="needs_review",
-            confidence=0,
             risk_flags=["needs_review", reason],
             metadata={
                 "event_family_key": _normalize_event_family_key(key),
-                "event_claim": primary.title,
-                "aggregation_reason": reason,
                 "facts": [],
                 "history_status": "uncertain",
-                "history_reason": reason,
-                "meaningful_updates": [],
                 "publishability": "needs_review",
                 "split_reason": None,
                 "caveats": [reason],
@@ -1373,26 +1357,6 @@ def _prepare_draft_history(
     history_by_key: Mapping[str, Mapping[str, Any]],
     history_identity_index: Mapping[str, Sequence[str]],
 ) -> dict[str, Any]:
-    meaningful_updates: list[dict[str, Any]] = []
-    for raw in draft.get("meaningful_updates") or ():
-        if not isinstance(raw, Mapping):
-            raise ValueError("meaningful_updates must contain objects")
-        supporting = _unique_positive_ids(raw.get("supporting_item_ids"), limit=40)
-        outside = [item_id for item_id in supporting if item_id not in item_ids]
-        if outside:
-            raise ValueError(f"meaningful update references non-member item ids: {outside}")
-        if not supporting:
-            raise ValueError("every meaningful update requires supporting_item_ids")
-        claim = _text(raw.get("claim"))
-        if not claim:
-            raise ValueError("every meaningful update requires a claim")
-        meaningful_updates.append(
-            {
-                "claim": claim,
-                "supporting_item_ids": supporting,
-            }
-        )
-
     exact_prior_keys: list[str] = []
     for item_id in item_ids:
         for identity in exact_identity_keys(_item_mapping(admissions[int(item_id)].item)):
@@ -1416,7 +1380,11 @@ def _prepare_draft_history(
     else:
         prior_event_key = requested_prior or (exact_prior_keys[0] if exact_prior_keys else None)
         if prior_event_key:
-            history_status = "meaningful_update" if meaningful_updates else "repeat"
+            history_status = (
+                "meaningful_update"
+                if requested_status == "meaningful_update" and draft.get("facts")
+                else "repeat"
+            )
         elif requested_status in {"repeat", "meaningful_update"}:
             history_status = "uncertain"
             risk_flags.append("history_match_not_found")
@@ -1432,7 +1400,6 @@ def _prepare_draft_history(
         "history_status": history_status,
         "novelty_status": novelty_status,
         "prior_event_key": prior_event_key,
-        "meaningful_updates": meaningful_updates,
         "risk_flags": risk_flags,
         "guard": guard,
     }

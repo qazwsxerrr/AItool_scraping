@@ -314,6 +314,50 @@ class UIReadRepository:
         sources = self._sources_by_id(entries)
         return [self._card_from_entry(entry, sources) for entry in entries]
 
+    def list_all_dynamics(
+        self,
+        *,
+        edition: DailyEditionView | None = None,
+        edition_date: str | None = None,
+        query: str | None = None,
+        source_group: str | None = None,
+        content_class: str | None = None,
+        topic_category: str | None = None,
+        offset: int = 0,
+        limit: int = 30,
+    ) -> tuple[list[EventMemberRow], int]:
+        active = edition or self.resolve_edition(edition_date=edition_date)
+        if active is None or limit <= 0:
+            return [], 0
+
+        entries = self._query_entries(
+            active.edition_date,
+            category=topic_category,
+            source_group=source_group,
+            content_class=content_class,
+            query=query,
+            offset=0,
+            limit=1000,
+        )
+
+        all_members = []
+        for entry in entries:
+            all_members.extend(self._members_from_entry(entry))
+
+        seen = set()
+        unique_members = []
+        for member in all_members:
+            if member.item_id not in seen:
+                seen.add(member.item_id)
+                unique_members.append(member)
+
+        unique_members.sort(key=lambda x: (-(x.review_score or 0), x.item_id))
+
+        total = len(unique_members)
+        paginated = unique_members[offset:offset + limit]
+
+        return paginated, total
+
     def list_featured_events(
         self,
         *,

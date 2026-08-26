@@ -56,7 +56,7 @@ def test_history_window_reads_only_previous_three_calendar_dates_and_published_r
         assert [row.event_key for row in rows] == ["event:d1", "event:d3"]
 
 
-def test_history_guard_uses_identity_and_requires_meaningful_update_for_updated():
+def test_history_guard_uses_identity_and_requires_facts_for_meaningful_update():
     current_url = "https://vendor.example/releases/v2"
     history = [
         {
@@ -81,7 +81,7 @@ def test_history_guard_uses_identity_and_requires_meaningful_update_for_updated(
     }
 
     repeated = _prepare_draft_history(
-        {**common, "meaningful_updates": []},
+        {**common, "facts": []},
         item_ids=[11],
         admissions={11: admission},
         history_by_key={"event:previous": history[0]},
@@ -90,7 +90,8 @@ def test_history_guard_uses_identity_and_requires_meaningful_update_for_updated(
     updated = _prepare_draft_history(
         {
             **common,
-            "meaningful_updates": [
+            "history_status": "meaningful_update",
+            "facts": [
                 {
                     "claim": "开放范围发生变化。",
                     "supporting_item_ids": [11],
@@ -108,7 +109,6 @@ def test_history_guard_uses_identity_and_requires_meaningful_update_for_updated(
     assert repeated["prior_event_key"] == "event:previous"
     assert updated["history_status"] == "meaningful_update"
     assert updated["novelty_status"] == "updated"
-    assert updated["meaningful_updates"][0]["supporting_item_ids"] == [11]
 
 
 def test_history_guard_rejects_history_keys_outside_the_loaded_window():
@@ -127,7 +127,7 @@ def test_history_guard_rejects_history_keys_outside_the_loaded_window():
             "event_family_key": "vendor_current",
             "history_status": "repeat",
             "prior_event_key": "event:older-than-three-days",
-            "meaningful_updates": [],
+            "facts": [],
         },
         item_ids=[12],
         admissions={12: admission},

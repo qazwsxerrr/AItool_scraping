@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.web.routes import all_items, api, events, github, home, search, sources
+from app.web.routes import all_items, api, dynamics, events, github, home, search, sources
 
 
 def create_app(
@@ -39,6 +39,7 @@ def create_app(
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
     app.include_router(home.router)
     app.include_router(all_items.router)
+    app.include_router(dynamics.router)
     app.include_router(events.router)
     app.include_router(github.router)
     app.include_router(search.router)

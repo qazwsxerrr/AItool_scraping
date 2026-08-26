@@ -1,0 +1,24 @@
+<article class="member-card">
+  <div class="source-line">
+    <span class="source-name">{{ member.source_name or member.source_id or '未知来源' }}</span>
+    {% if member.source_group %}<span class="source-group">{{ member.source_group | source_group_label }}</span>{% endif %}
+    {% if member.is_primary %}<span class="badge primary">主来源</span>{% endif %}
+    {% if member.published_at %}<time>{{ member.published_at | datetime }}</time>{% endif %}
+  </div>
+  <h3>{% if member.url %}<a href="{{ member.url }}" target="_blank" rel="noopener noreferrer">{{ member.title }}</a>{% else %}{{ member.title }}{% endif %}</h3>
+  {% if member.summary %}<p class="summary-clamp">{{ member.summary }}</p>{% endif %}
+  <div class="badges">
+    {% if member.match_type %}<span class="badge">聚类 {{ member.match_type }}{% if member.match_confidence is not none %} · {{ member.match_confidence }}%{% endif %}</span>{% endif %}
+    {% if member.screen_decision %}<span class="badge">Stage A {{ member.screen_decision }}</span>{% endif %}
+    {% if member.review_status %}<span class="badge">Stage B {{ member.review_status }}</span>{% endif %}
+    {% if member.review_score %}<span class="badge info">评分 {{ member.review_score }}</span>{% endif %}
+    {% if member.review_topic %}<span class="badge topic-badge">{{ member.review_topic | topic_label }}</span>{% endif %}
+  </div>
+  <details class="member-trace">
+    <summary>查看筛选追溯</summary>
+    <div class="trace-grid">
+      <p><strong>Stage A：</strong>{{ member.screen_decision or '未记录' }}{% if member.screen_confidence is not none %} · {{ member.screen_confidence }}%{% endif %}{% if member.screen_reason %}<br>{{ member.screen_reason }}{% endif %}</p>
+      <p><strong>Stage B：</strong>{{ member.review_status or '未记录' }}{% if member.review_score is not none %} · 评分 {{ member.review_score }}{% endif %}{% if member.review_reason %}<br>{{ member.review_reason }}{% endif %}</p>
+    </div>
+  </details>
+</article>

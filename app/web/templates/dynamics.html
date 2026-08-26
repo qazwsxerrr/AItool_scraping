@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}全部 AI 动态 — AIHOT{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">ALL AI DYNAMICS / STAGE B OUTPUTS</p>
+    <h1>全部 AI 动态</h1>
+    <p class="muted-text">展示 {{ active_edition_date or '当前' }} 日报所处理的所有 AI 资讯评估结果。</p>
+  </div>
+  <a class="button button-quiet" href="/sources">来源目录 →</a>
+</section>
+
+<form class="filters" action="/dynamics" method="get">
+  <select name="edition_date" aria-label="日报">
+    {% for option in edition_options %}
+      <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}</option>
+    {% endfor %}
+  </select>
+  <label class="sr-only" for="all-query">搜索动态</label>
+  <input id="all-query" name="q" type="search" placeholder="搜索标题、摘要..." value="{{ filters.query or '' }}">
+  <select name="source_group">
+    <option value="">全部来源</option>
+    {% for group in filter_options.source_groups %}
+      <option value="{{ group }}" {{ 'selected' if filters.source_group == group else '' }}>{{ group }}</option>
+    {% endfor %}
+  </select>
+  <select name="content_class">
+    <option value="">全部类别</option>
+    {% for value in filter_options.content_classes %}
+      <option value="{{ value }}" {{ 'selected' if filters.content_class == value else '' }}>{{ value | content_class_label }}</option>
+    {% endfor %}
+  </select>
+  <select name="topic_category">
+    <option value="">全部主题</option>
+    {% for value in filter_options.topic_categories %}
+      <option value="{{ value }}" {{ 'selected' if filters.topic_category == value else '' }}>{{ value | topic_label }}</option>
+    {% endfor %}
+  </select>
+  <button type="submit">应用筛选</button>
+  {% if filters.query or filters.source_group or filters.content_class or filters.topic_category %}
+    <a class="button secondary" href="/dynamics{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">清除</a>
+  {% endif %}
+</form>
+
+<section class="timeline">
+  {% if items %}
+    <div class="member-list">
+    {% for item in items %}
+      {% with member=item %}{% include "partials/member_card.html" %}{% endwith %}
+    {% endfor %}
+    </div>
+    <nav class="pagination">
+      {% if page > 1 %}
+        <a class="button secondary" href="{{ request.url.include_query_params(page=page - 1) }}">上一页</a>
+      {% endif %}
+      <span>第 {{ page }} 页 (共 {{ total_count }} 条)</span>
+      {% if has_next_page %}
+        <a class="button secondary" href="{{ request.url.include_query_params(page=page + 1) }}">下一页</a>
+      {% endif %}
+    </nav>
+  {% else %}
+    <div class="empty-state">
+      <h3>暂无符合条件的动态</h3>
+      <p>可以调整日期或筛选条件。</p>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

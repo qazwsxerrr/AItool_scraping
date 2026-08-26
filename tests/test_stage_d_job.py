@@ -26,7 +26,7 @@ REFERENCE = datetime(2026, 8, 19, 8, tzinfo=timezone.utc)
 def test_stage_d_prompt_reviews_stage_c_candidates_against_daily_requirements():
     prompt = STAGE_D_SELECTION_SYSTEM_PROMPT
 
-    assert STAGE_D_SELECTION_PROMPT_VERSION == "stage_d_editorial_review_v12"
+    assert STAGE_D_SELECTION_PROMPT_VERSION == "stage_d_editorial_review_v13"
     assert "Stage C 已完成时间准入" in prompt
     assert "editorial_caveats" in prompt
     assert "模型、API 和开发工具" in prompt
@@ -151,13 +151,9 @@ def _update_event_for_stage_d(
             {
                 "draft_metadata": {
                     "event_family_key": event_family_key,
-                    "event_claim": title,
-                    "aggregation_reason": "Stage C fixture event package.",
                     "facts": [{"claim": summary_cn, "supporting_item_ids": [int(event_id)]}],
                     "publishability": review_state,
                     "history_status": "new",
-                    "history_reason": "fixture",
-                    "meaningful_updates": [],
                     "split_reason": None,
                     "caveats": [],
                 }
@@ -472,8 +468,6 @@ def test_stage_d_leaves_intent_only_event_judgment_to_the_final_reviewer():
             {
                 "draft_metadata": {
                     "event_family_key": "nvidia_vera_rubin_infra_push",
-                    "event_claim": "公司宣布将优化组织并持续投入。",
-                    "aggregation_reason": "Stage C fixture event package.",
                     "facts": [
                         {
                             "claim": "公司宣布将优化组织并引进人才。",
@@ -486,8 +480,6 @@ def test_stage_d_leaves_intent_only_event_judgment_to_the_final_reviewer():
                     ],
                     "publishability": "needs_review",
                     "history_status": "new",
-                    "history_reason": "fixture",
-                    "meaningful_updates": [],
                     "split_reason": None,
                     "caveats": [],
                 }
