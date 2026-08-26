@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from app.ai.skills.intel_triage import INTEL_TOPICS
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import Source
 from app.storage.read_repository import UIReadRepository
@@ -115,6 +116,26 @@ def test_read_repository_has_no_raw_item_or_snapshot_fallback():
         assert reader.list_featured_cards() == []
         assert reader.list_featured_events() == []
         assert reader.get_dashboard_stats().selected_items == 0
+
+
+def test_filter_options_keep_only_official_topic_categories():
+    session_factory = _db()
+    _publish(
+        session_factory,
+        edition_date="2026-08-18",
+        title="Infrastructure edition",
+        event_key="url:https://ui.example/infrastructure",
+    )
+    with session_factory() as session:
+        entry = IntelRepository(session).list_daily_report_entries(edition_date="2026-08-18")[0]
+        entry.topic = "AI基础设施"
+        session.commit()
+
+    with session_factory() as session:
+        reader = UIReadRepository(session)
+        options = reader.list_filter_options()
+
+    assert options.topic_categories == INTEL_TOPICS
 
 
 def test_same_date_republication_replaces_the_public_read_model():

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.ai.skills.intel_triage import INTEL_TOPICS
+
 
 STAGE_C_AGENT_PROMPT_VERSION = "stage_c_agent_v13"
 
@@ -104,7 +106,7 @@ EVENT_DRAFT_PROPERTIES: dict[str, Any] = {
     "item_ids": {"type": "array", "minItems": 1, "maxItems": 40, "items": {"type": "integer", "minimum": 1}},
     "title": {"type": "string", "minLength": 1, "maxLength": 300},
     "summary_cn": {"type": "string", "minLength": 1, "maxLength": 600},
-    "topic": {"type": "string", "minLength": 1, "maxLength": 64},
+    "topic": {"type": "string", "enum": list(INTEL_TOPICS)},
     "keywords": {"type": "array", "items": {"type": "string"}},
     "entities": {
         "type": "array",

@@ -105,20 +105,6 @@ def test_settings_can_disable_stage_c_web_search(monkeypatch):
     assert settings.stage_c_agent_max_web_searches == 0
 
 
-def test_settings_read_category_taxonomy(monkeypatch):
-    monkeypatch.delenv("AI_REVIEW_CATEGORIES", raising=False)
-    monkeypatch.setenv("AI_REVIEW_CATEGORIES", "论文，产品与工具,观点")
-    settings = Settings.from_env(dotenv_path="/path/that/does/not/exist")
-    assert settings.ai_review_categories == (
-        "开发生态",
-        "模型发布",
-        "产品应用",
-        "行业动态",
-        "技术与洞察",
-        "前瞻与传闻",
-    )
-
-
 def test_init_db_rejects_incompatible_legacy_schema_without_backfill(tmp_path):
     path = tmp_path / "legacy.db"
     connection = sqlite3.connect(path)

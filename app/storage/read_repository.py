@@ -16,7 +16,6 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.ai.skills.intel_triage import INTEL_TOPICS, normalize_topic
-from app.config.settings import DEFAULT_AI_REVIEW_CATEGORIES
 from app.storage.models import DailyEdition, DailyEditionReportEntry, Source
 
 
@@ -216,15 +215,8 @@ class SourceRow:
 class UIReadRepository:
     """Stable UI boundary backed exclusively by final daily reports."""
 
-    def __init__(self, session: Session, topic_categories: Sequence[str] | None = None) -> None:
+    def __init__(self, session: Session) -> None:
         self.session = session
-        configured: list[str] = []
-        for item in (topic_categories or DEFAULT_AI_REVIEW_CATEGORIES):
-            raw = str(item).strip()
-            if not raw:
-                continue
-            configured.append(normalize_topic(raw) or raw)
-        self.topic_categories = tuple(dict.fromkeys(configured)) or INTEL_TOPICS
 
     def list_daily_editions(self) -> tuple[DailyEditionView, ...]:
         rows = self.session.execute(
@@ -284,7 +276,7 @@ class UIReadRepository:
             source_groups=tuple(sorted({entry.source_group for entry in entries if entry.source_group})),
             content_classes=tuple(sorted(set(CONTENT_CLASSES).union(entry.content_class for entry in entries if entry.content_class))),
             statuses=("selected",),
-            topic_categories=tuple(dict.fromkeys((*self.topic_categories, *(entry.topic for entry in entries if entry.topic)))),
+            topic_categories=INTEL_TOPICS,
         )
 
     def list_featured_cards(

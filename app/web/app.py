@@ -33,7 +33,6 @@ def create_app(
     app.state.session_factory = session_factory
     app.state.github_data_path = github_data_path
     app.state.intel_output_root = intel_output_root
-    app.state.topic_categories = settings.ai_review_categories
 
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")

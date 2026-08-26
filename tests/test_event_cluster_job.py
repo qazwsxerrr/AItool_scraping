@@ -8,6 +8,8 @@ import pytest
 from sqlalchemy import select
 
 from app.ai.responses import AgentBudgetExceeded, AgentProtocolError, AgentRunResult
+from app.ai.skills.intel_triage import INTEL_TOPICS
+from app.ai.skills.stage_c_agent.prompts import SAVE_DRAFTS_SCHEMA
 from app.ai.tavily import TavilySearchResponse, TavilySearchResult
 from app.domain.models import FetchItem
 from app.jobs.event_cluster_job import _primary_sort_key, _stage_c_lease_seconds, run_event_cluster_job
@@ -53,6 +55,13 @@ def _db():
     engine = create_engine_from_url("sqlite:///:memory:")
     init_db(engine)
     return create_session_factory(engine)
+
+
+def test_stage_c_draft_schema_uses_only_official_topic_taxonomy():
+    topic_schema = SAVE_DRAFTS_SCHEMA["properties"]["drafts"]["items"]["properties"]["topic"]
+
+    assert topic_schema == {"type": "string", "enum": list(INTEL_TOPICS)}
+    assert "AI基础设施" not in topic_schema["enum"]
 
 
 def test_stage_c_primary_source_uses_group_and_content_class_only():

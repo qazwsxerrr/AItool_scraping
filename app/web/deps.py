@@ -135,7 +135,7 @@ def get_repository(request: Request) -> Iterator[UIReadRepository]:
     if session_factory is None:
         session_factory = get_default_session_factory()
     with session_factory() as session:
-        yield UIReadRepository(session, topic_categories=getattr(request.app.state, "topic_categories", None))
+        yield UIReadRepository(session)
 
 
 def get_github_project_reader(request: Request) -> GitHubProjectReader:

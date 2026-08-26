@@ -4,7 +4,6 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.domain.categories import DEFAULT_TOPIC_CATEGORIES
 from app.config.limits import (
     DEFAULT_AI_REVIEW_CONCURRENCY,
     DEFAULT_AI_SCREEN_REJECT_THRESHOLD,
@@ -18,7 +17,6 @@ from app.config.limits import (
 
 DEFAULT_DATABASE_URL = "sqlite:///./data/ai_tool_intel.db"
 DEFAULT_USER_AGENT = "AItool_scraping/0.1 (+https://example.local)"
-DEFAULT_AI_REVIEW_CATEGORIES = DEFAULT_TOPIC_CATEGORIES
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -54,7 +52,6 @@ class Settings:
     ai_review_timeout_seconds: float = 30.0
     ai_screen_reject_threshold: int = DEFAULT_AI_SCREEN_REJECT_THRESHOLD
     ai_review_concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY
-    ai_review_categories: tuple[str, ...] = DEFAULT_AI_REVIEW_CATEGORIES
     stage_b_reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT
     stage_c_timeout_seconds: float = 120.0
     stage_c_agent_max_turns: int = DEFAULT_STAGE_C_AGENT_MAX_TURNS
@@ -70,7 +67,6 @@ class Settings:
         load_dotenv(dotenv_path)
         rsshub_base_url = _env_value("RSSHUB_BASE_URL")
         ai_review_model = os.getenv("AI_REVIEW_MODEL") or None
-        categories = _parse_categories(os.getenv("AI_REVIEW_CATEGORIES"))
         return cls(
             database_url=os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL),
             rsshub_base_url=rsshub_base_url.rstrip("/") if rsshub_base_url else None,
@@ -92,7 +88,6 @@ class Settings:
                 1,
                 _bounded_int(os.getenv("AI_REVIEW_CONCURRENCY"), DEFAULT_AI_REVIEW_CONCURRENCY),
             ),
-            ai_review_categories=categories,
             stage_b_reserve_limit=_positive_int(
                 os.getenv("AI_STAGE_B_RESERVE_LIMIT"), DEFAULT_STAGE_B_RESERVE_LIMIT, maximum=100
             ),
@@ -118,17 +113,6 @@ class Settings:
 def _env_value(name: str) -> str | None:
     value = os.getenv(name)
     return value.strip() if value and value.strip() else None
-
-
-def _parse_categories(value: str | None) -> tuple[str, ...]:
-    if not value:
-        return DEFAULT_AI_REVIEW_CATEGORIES
-    parts = [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
-    # Stage B1 has one fixed six-label editorial taxonomy.  Ignore removed or
-    # ad-hoc labels instead of allowing configuration to reintroduce them.
-    allowed = set(DEFAULT_AI_REVIEW_CATEGORIES)
-    unique = tuple(dict.fromkeys(part for part in parts if part in allowed))
-    return unique or DEFAULT_AI_REVIEW_CATEGORIES
 
 
 def _bounded_int(value: str | None, default: int) -> int:

@@ -64,7 +64,7 @@ from app.storage.repository import IntelRepository
 
 
 DAILY_HISTORY_DAYS = DEFAULT_STAGE_C_AGENT_HISTORY_DAYS
-STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_events_v5"
+STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_events_v6"
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
 _PRIMARY_POLICY_VERSION = "source_then_b1_priority_v2"
 _VERIFICATION_POLICY_VERSION = "tavily_per_event_verification_v2"
