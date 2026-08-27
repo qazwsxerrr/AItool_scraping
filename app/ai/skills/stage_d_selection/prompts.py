@@ -92,7 +92,7 @@ STAGE_D_SELECTION_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
-def build_openai_responses_stage_d_selection_payload(
+def build_stage_d_provider_payload(
     events: Sequence[Mapping[str, Any]],
     *,
     edition: Mapping[str, Any] | None = None,
@@ -144,15 +144,11 @@ def build_stage_d_selection_input(
     return json.dumps(user_payload, ensure_ascii=False, default=str)
 
 
-build_stage_d_provider_payload = build_openai_responses_stage_d_selection_payload
-
-
 __all__ = [
     "STAGE_D_SELECTION_JSON_SCHEMA",
     "STAGE_D_SELECTION_PROMPT_VERSION",
     "STAGE_D_SELECTION_SYSTEM_PROMPT",
     "STAGE_D_SELECTION_TASK",
-    "build_openai_responses_stage_d_selection_payload",
     "build_stage_d_provider_payload",
     "build_stage_d_selection_input",
     "preflight_stage_d_selection_schema",

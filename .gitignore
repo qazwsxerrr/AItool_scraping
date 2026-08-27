@@ -1,8 +1,6 @@
 # Python caches
 __pycache__/
 *.py[cod]
-.pytest_cache/
-/tests/
 
 # Local Codex runtime config
 .codex/

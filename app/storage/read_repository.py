@@ -16,6 +16,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.ai.skills.intel_triage import INTEL_TOPICS, normalize_topic
+from app.ai.skills.intel_triage.normalize import normalize_text
 from app.storage.models import DailyEdition, DailyEditionReportEntry, Source
 
 
@@ -131,6 +132,8 @@ class EventMemberRow:
     review_score: int | None = None
     review_confidence: int | None = None
     review_risk_flags: tuple[str, ...] = ()
+    ai_summary: str | None = None
+    content_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -566,15 +569,21 @@ class UIReadRepository:
     def _members_from_entry(entry: DailyEditionReportEntry) -> tuple[EventMemberRow, ...]:
         rows: list[EventMemberRow] = []
         for position, ref in enumerate(entry.source_refs, start=1):
+            raw_summary = _text(ref.get("ai_summary")) or _text(ref.get("summary")) or entry.summary
+            ai_summary = normalize_text(raw_summary) if raw_summary else None
+            raw_content = _text(ref.get("content_text"))
+            content_text = normalize_text(raw_content) if raw_content else None
             rows.append(EventMemberRow(
                 item_id=_int(ref.get("item_id")) or -(int(entry.id) * 1000 + position),
                 title=_text(ref.get("title")) or entry.original_title or entry.title,
-                summary=entry.summary, url=_safe_url(_text(ref.get("source_url"))) or _safe_url(entry.url),
+                summary=ai_summary, url=_safe_url(_text(ref.get("source_url"))) or _safe_url(entry.url),
                 published_at=entry.published_at, captured_at=None, source_id=_text(ref.get("source_id")),
                 source_name=_text(ref.get("source_name")), source_group=_text(ref.get("source_group")) or entry.source_group,
                 source_url=_safe_url(_text(ref.get("source_url"))), is_primary=bool(ref.get("is_primary")),
                 match_type=_text(ref.get("match_type")), match_confidence=_int(ref.get("match_confidence")),
                 review_topic=entry.topic, review_summary=entry.summary,
+                ai_summary=ai_summary,
+                content_text=content_text,
             ))
         return tuple(sorted(rows, key=lambda row: (not row.is_primary, row.item_id)))
 

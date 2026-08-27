@@ -56,7 +56,7 @@ system / user 初始上下文
 - `app/ai/responses.py`：`ResponsesClient.run_function_agent()` 维护并发送完整 `transcript_input`
 - `app/ai/skills/stage_c_agent/client.py`：Stage C 不再传递 `previous_response_id`
 - `app/jobs/event_cluster_job.py`：C 任务入口不再注入空的 `previous_response_id`
-- `tests/test_responses_agent.py`：测试覆盖每轮不带 `previous_response_id`，且完整 transcript 中包含 `function_call` 与 `function_call_output`
+- 通过 Stage C 正常入口验证每轮不带 `previous_response_id`，且完整 transcript 中包含 `function_call` 与 `function_call_output`
 
 ## 4. 会话语义
 
@@ -82,7 +82,7 @@ system / user 初始上下文
 
 结果：
 
-- 单元测试验证后续工具回合不再包含 `previous_response_id`
+- 正常入口验证后续工具回合不再包含 `previous_response_id`
 - 2026-08-26 draft 副本的 3 条 active 小样本 Stage C 跑完
 - 实测结果：`processed=3 events=3 turns=7 tools=10 web=1`
 - 运行期间所有 8317 `/v1/responses` 日志均为 `200 OK`，未再出现原来的第二轮 400

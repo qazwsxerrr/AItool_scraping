@@ -6,7 +6,20 @@
     {% if member.published_at %}<time>{{ member.published_at | datetime }}</time>{% endif %}
   </div>
   <h3>{% if member.url %}<a href="{{ member.url }}" target="_blank" rel="noopener noreferrer">{{ member.title }}</a>{% else %}{{ member.title }}{% endif %}</h3>
-  {% if member.summary %}<p class="summary-clamp">{{ member.summary }}</p>{% endif %}
+  <div class="member-content-sections">
+    {% if member.ai_summary or member.summary %}
+      <section class="member-section member-ai-summary">
+        <h4 class="member-section-title">AI总结</h4>
+        <p class="summary-text">{{ member.ai_summary or member.summary }}</p>
+      </section>
+    {% endif %}
+    {% if member.content_text %}
+      <section class="member-section member-raw-content">
+        <h4 class="member-section-title">正文</h4>
+        <div class="raw-content-body">{{ member.content_text }}</div>
+      </section>
+    {% endif %}
+  </div>
   <div class="badges">
     {% if member.match_type %}<span class="badge">聚类 {{ member.match_type }}{% if member.match_confidence is not none %} · {{ member.match_confidence }}%{% endif %}</span>{% endif %}
     {% if member.screen_decision %}<span class="badge">Stage A {{ member.screen_decision }}</span>{% endif %}

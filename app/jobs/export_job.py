@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
+from app.ai.skills.intel_triage.normalize import normalize_text
 from app.ai.skills.stage_d_selection import (
     STAGE_D_SELECTION_SCHEMA_VERSION,
     strict_parse_stage_d_selection,
@@ -601,6 +602,13 @@ def _serialize_event(
                         "status": screen.status,
                     }
                 )
+        raw_summary = (
+            item.ai_review.summary_cn
+            if item is not None and item.ai_review is not None and item.ai_review.summary_cn
+            else (item.summary if item is not None else None)
+        )
+        ai_summary = normalize_text(raw_summary) if raw_summary else None
+        content_text = normalize_text(item.content_text) if item is not None and item.content_text else None
         source_refs.append(
             {
                 "item_id": item.id if item is not None else relation.item_id,
@@ -613,6 +621,8 @@ def _serialize_event(
                 "match_confidence": relation.match_confidence,
                 "is_primary": bool(relation.is_primary),
                 "lineage": _public_value(_json(relation.lineage_json, {})),
+                "ai_summary": ai_summary,
+                "content_text": content_text,
             }
         )
     risk_flags = _json_list(event.risk_flags_json)
