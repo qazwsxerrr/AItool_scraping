@@ -219,14 +219,22 @@ def pipeline_stage_a(
     configure_logging()
     settings = Settings.from_env()
     workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
-    result = run_pipeline_stage_a_from_settings(
-        settings=workspace_settings,
-        run_id=run_id,
-        limit=limit,
-        force=force,
-        retry_failed=retry_failed,
-        include_blocked=include_blocked,
-    )
+    with PipelineConsoleReporter(
+        edition_date=edition_date,
+        output_dir="output/intel",
+        mode="单独执行 Stage A",
+    ) as reporter:
+        reporter.emit({"type": "stage_start", "stage": "screen"})
+        result = run_pipeline_stage_a_from_settings(
+            settings=workspace_settings,
+            run_id=run_id,
+            limit=limit,
+            force=force,
+            retry_failed=retry_failed,
+            include_blocked=include_blocked,
+            progress=reporter.emit,
+        )
+        reporter.emit(_standalone_stage_complete("screen", result))
     typer.echo(
         f"stage-a: processed={result.processed} screened={result.screened} "
         f"screened_out={result.screened_out} failed={result.screen_failed} skipped={result.skipped}"
@@ -246,14 +254,22 @@ def pipeline_stage_b1(
     configure_logging()
     settings = Settings.from_env()
     workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
-    result = run_pipeline_stage_b_from_settings(
-        settings=workspace_settings,
-        run_id=run_id,
-        limit=limit,
-        force=force,
-        retry_failed=retry_failed,
-        include_blocked=include_blocked,
-    )
+    with PipelineConsoleReporter(
+        edition_date=edition_date,
+        output_dir="output/intel",
+        mode="单独执行 Stage B1",
+    ) as reporter:
+        reporter.emit({"type": "stage_start", "stage": "analyze"})
+        result = run_pipeline_stage_b_from_settings(
+            settings=workspace_settings,
+            run_id=run_id,
+            limit=limit,
+            force=force,
+            retry_failed=retry_failed,
+            include_blocked=include_blocked,
+            progress=reporter.emit,
+        )
+        reporter.emit(_standalone_stage_complete("analyze", result))
     typer.echo(
         f"stage-b1: processed={result.processed} analyzed={result.analyzed} "
         f"structurally_filtered={result.analysis_filtered} "
@@ -272,11 +288,19 @@ def pipeline_stage_c(
     configure_logging()
     settings = Settings.from_env()
     workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
-    result = run_pipeline_stage_c_from_settings(
-        settings=workspace_settings,
-        run_id=run_id,
-        force=force,
-    )
+    with PipelineConsoleReporter(
+        edition_date=edition_date,
+        output_dir="output/intel",
+        mode="单独执行 Stage C",
+    ) as reporter:
+        reporter.emit({"type": "stage_start", "stage": "cluster"})
+        result = run_pipeline_stage_c_from_settings(
+            settings=workspace_settings,
+            run_id=run_id,
+            force=force,
+            progress=reporter.emit,
+        )
+        reporter.emit(_standalone_stage_complete("cluster", result))
     typer.echo(
         f"stage-c: processed={result.processed} events={result.events} "
         f"merged={result.merged} repeats={result.repeats} updated={result.updated} "
@@ -295,12 +319,19 @@ def pipeline_stage_d(
     configure_logging()
     settings = Settings.from_env()
     workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
-    result = run_pipeline_stage_d_from_settings(
-        settings=workspace_settings,
-        run_id=run_id,
-        force=force,
-        profile_path=profile,
-    )
+    with PipelineConsoleReporter(
+        edition_date=edition_date,
+        output_dir="output/intel",
+        mode="单独执行 Stage D",
+    ) as reporter:
+        reporter.emit({"type": "stage_start", "stage": "stage_d"})
+        result = run_pipeline_stage_d_from_settings(
+            settings=workspace_settings,
+            run_id=run_id,
+            force=force,
+            profile_path=profile,
+        )
+        reporter.emit(_standalone_stage_complete("stage_d", result))
     typer.echo(
         f"stage-d: candidates={result.candidates} selected={result.selected} "
         f"unselected={result.unselected} reused={result.reused} failed={result.ai_failed}"
@@ -392,16 +423,31 @@ def pipeline_retry(
     workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
     try:
         canonical = normalize_stage(stage)
-        result = retry_pipeline_stage_from_settings(
-            settings=workspace_settings,
-            run_id=run_id,
-            stage=canonical,
-            include_blocked=include_blocked,
-            force=force,
-            limit=limit,
+        with PipelineConsoleReporter(
+            edition_date=edition_date,
             output_dir=output_dir,
-            profile_path=profile,
-        )
+            mode=f"重试 {canonical}",
+        ) as reporter:
+            reporter.emit({"type": "stage_start", "stage": canonical})
+            result = retry_pipeline_stage_from_settings(
+                settings=workspace_settings,
+                run_id=run_id,
+                stage=canonical,
+                include_blocked=include_blocked,
+                force=force,
+                limit=limit,
+                output_dir=output_dir,
+                profile_path=profile,
+                progress=reporter.emit,
+            )
+            reporter.emit(
+                {
+                    "type": "stage_skip" if result is None else "stage_complete",
+                    "stage": canonical,
+                    "message": "没有可重试任务" if result is None else None,
+                    "data": _standalone_stage_progress(canonical, result) if result is not None else {},
+                }
+            )
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--stage") from exc
     if result is None:
@@ -425,13 +471,19 @@ def pipeline_resume(
     configure_logging()
     settings = Settings.from_env()
     workspace_settings, run_id = _resolve_pending_draft(settings, edition_date)
-    result = resume_pipeline_from_settings(
-        settings=workspace_settings,
-        run_id=run_id,
-        limit=limit,
+    with PipelineConsoleReporter(
+        edition_date=edition_date,
         output_dir=output_dir,
-        profile_path=profile,
-    )
+        mode="继续未完成阶段",
+    ) as reporter:
+        result = resume_pipeline_from_settings(
+            settings=workspace_settings,
+            run_id=run_id,
+            limit=limit,
+            output_dir=output_dir,
+            profile_path=profile,
+            progress=reporter.emit,
+        )
     typer.echo(f"resumed={','.join(result.ran_stages) or '-'}")
     if result.skipped_stages:
         typer.echo(f"skipped={','.join(result.skipped_stages)}")
@@ -492,6 +544,55 @@ def _echo_daily_edition(markdown_path: str | None) -> None:
     except (TypeError, ValueError):
         return
     typer.echo(f"edition_date={edition_date}")
+
+
+def _standalone_stage_complete(stage: str, result: object) -> dict[str, object]:
+    return {"type": "stage_complete", "stage": stage, "data": _standalone_stage_progress(stage, result)}
+
+
+def _standalone_stage_progress(stage: str, result: object) -> dict[str, object]:
+    if stage == "screen":
+        metrics = {
+            "processed": getattr(result, "processed", 0),
+            "time_filtered": getattr(result, "time_filtered", 0),
+            "screened": getattr(result, "screened", 0),
+            "screened_out": getattr(result, "screened_out", 0),
+            "screen_failed": getattr(result, "screen_failed", 0),
+        }
+        total = metrics["processed"]
+    elif stage == "analyze":
+        metrics = {
+            "processed": getattr(result, "processed", 0),
+            "analyzed": getattr(result, "analyzed", 0),
+            "candidate": getattr(result, "candidate", 0),
+            "analysis_filtered": getattr(result, "analysis_filtered", 0),
+            "analysis_failed": getattr(result, "analysis_failed", 0),
+        }
+        total = metrics["processed"]
+    elif stage == "cluster":
+        metrics = {
+            "processed": getattr(result, "processed", 0),
+            "event_count": getattr(result, "events", 0),
+            "merged": getattr(result, "merged", 0),
+            "repeats": getattr(result, "repeats", 0),
+            "updated": getattr(result, "updated", 0),
+            "needs_review": getattr(result, "unresolved", 0),
+            "turns": getattr(result, "turns", 0),
+            "tool_calls": getattr(result, "tool_calls", 0),
+            "web_searches": getattr(result, "web_searches", 0),
+        }
+        total = metrics["processed"]
+    else:
+        metrics = {
+            "candidates": getattr(result, "candidates", 0),
+            "selected": getattr(result, "selected", 0),
+            "unselected": getattr(result, "unselected", 0),
+            "provider_attempts": getattr(result, "provider_attempts", 0),
+            "web_searches": getattr(result, "web_searches", 0),
+            "ai_failed": getattr(result, "ai_failed", 0),
+        }
+        total = metrics["candidates"]
+    return {"total": total, "current": total, "metrics": metrics}
 
 
 if __name__ == "__main__":

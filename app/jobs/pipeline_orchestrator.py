@@ -1246,6 +1246,7 @@ def retry_pipeline_stage_from_settings(
     output_dir: str | Path = "output/intel",
     profile_path: str | Path | None = None,
     ai_client: Any | None = None,
+    progress: ProgressCallback | None = None,
 ) -> Any:
     """Reset only retryable tasks for one named stage, then run that stage."""
 
@@ -1287,6 +1288,7 @@ def retry_pipeline_stage_from_settings(
             retry_failed=False,
             task_ids=task_ids,
             ai_client=ai_client,
+            progress=progress,
         )
     if canonical == "analyze":
         return run_pipeline_stage_b_from_settings(
@@ -1297,6 +1299,7 @@ def retry_pipeline_stage_from_settings(
             retry_failed=False,
             task_ids=task_ids,
             ai_client=ai_client,
+            progress=progress,
         )
     if canonical == "cluster":
         return run_pipeline_stage_c_from_settings(
@@ -1304,6 +1307,7 @@ def retry_pipeline_stage_from_settings(
             run_id=run_id,
             force=force,
             ai_client=ai_client,
+            progress=progress,
         )
     if canonical == "stage_d":
         return run_pipeline_stage_d_from_settings(

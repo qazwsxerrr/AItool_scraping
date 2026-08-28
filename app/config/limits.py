@@ -26,7 +26,7 @@ STAGE_C_AGENT_VERSION = "stage_c_agent_v9"
 # These are deliberately roomy defaults for the agent verification flow.
 # Operators can configure a larger value when a run needs it; web search uses
 # 0 as its explicit disable switch.
-DEFAULT_STAGE_C_AGENT_MAX_TURNS = 32
+DEFAULT_STAGE_C_AGENT_MAX_TURNS = 64
 DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS = 240
 DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES = 50
 DEFAULT_STAGE_C_AGENT_HISTORY_DAYS = 3

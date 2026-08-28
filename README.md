@@ -104,3 +104,33 @@ $PYTHON -m app.main pipeline export \
 ```
 
 浏览器访问：<http://127.0.0.1:8000>
+
+## 分阶段运行与断点续跑
+
+基于已有抓取结果分步骤运行 Stage A-D：
+
+```bash
+PYTHON=./.venv/bin/python
+EDITION_DATE=$(TZ=Asia/Shanghai date +%F)
+
+$PYTHON -m app.main pipeline stage-a \
+  --edition-date "$EDITION_DATE" \
+  --force && \
+$PYTHON -m app.main pipeline stage-b1 \
+  --edition-date "$EDITION_DATE" \
+  --force && \
+$PYTHON -m app.main pipeline stage-c \
+  --edition-date "$EDITION_DATE" \
+  --force && \
+$PYTHON -m app.main pipeline stage-d \
+  --edition-date "$EDITION_DATE" \
+  --force
+```
+
+若流水线中断，使用 `resume` 从断点继续。它会跳过已成功阶段，按顺序运行未完成或可重试阶段，并在完成后生成审核稿：
+
+```bash
+$PYTHON -m app.main pipeline resume \
+  --edition-date "$EDITION_DATE" \
+  --output-dir output/intel
+```
