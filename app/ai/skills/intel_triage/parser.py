@@ -1,11 +1,23 @@
-"""Strict business parsers for independent Stage A and Stage B calls."""
+"""Strict provider-response parsers for independent Stage A and Stage B calls."""
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Mapping
 
 from .guards import apply_analysis_guards, apply_screen_guard
 from .models import AnalysisResult, RawIntelEnvelope, ScreenResult, normalize_content_class
+
+
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", flags=re.IGNORECASE | re.DOTALL)
+
+
+def unwrap_provider_response(data: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return ``(result_mapping, raw_mapping)`` for common JSON providers."""
+
+    raw_mapping = _coerce_mapping(data, label="intel")
+    return _unwrap_mapping(raw_mapping), raw_mapping
 
 
 def strict_parse_screen(
@@ -15,10 +27,8 @@ def strict_parse_screen(
     source_content_class: str | None = None,
     reject_threshold: int = 85,
 ) -> ScreenResult:
-    if not isinstance(data, Mapping):
-        raise ValueError("Intel screen response must be a JSON object")
-    raw_mapping = dict(data)
-    result_data = dict(raw_mapping)
+    result_data, raw_mapping = unwrap_provider_response(data)
+    result_data = dict(result_data)
     missing = [key for key in ("decision", "reason_code", "reason", "confidence", "risk_flags") if key not in result_data]
     if missing:
         raise ValueError("Intel screen response is missing required fields: " + ", ".join(missing))
@@ -49,10 +59,8 @@ def strict_parse_analysis(
     *,
     envelope: RawIntelEnvelope | Mapping[str, Any] | None = None,
 ) -> AnalysisResult:
-    if not isinstance(data, Mapping):
-        raise ValueError("Intel analysis response must be a JSON object")
-    raw_mapping = dict(data)
-    result_data = dict(raw_mapping)
+    result_data, raw_mapping = unwrap_provider_response(data)
+    result_data = dict(result_data)
     required_fields = ("topic", "topics", "summary_cn", "keywords", "entities", "b1_priority", "score_components")
     missing = [name for name in required_fields if name not in result_data]
     if missing:
@@ -88,65 +96,130 @@ def parse_analysis_result(
     return strict_parse_analysis(data, envelope=envelope)
 
 
-def normalize_screen_provider_output(data: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Apply only unambiguous Stage-A provider compatibility repairs."""
-
-    result = dict(data)
-    transformations: list[str] = []
-    if "risk_flags" not in result and "risks" in result:
-        result["risk_flags"] = result.pop("risks")
-        transformations.append("alias:risks->risk_flags")
-    confidence = _number(result.get("confidence"))
-    if confidence is not None and 0 < confidence < 1:
-        result["confidence"] = int(round(confidence * 100))
-        transformations.append("scale:confidence:0-1->0-100")
-    return result, transformations
-
-
-def normalize_analysis_provider_output(data: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Normalize a clearly consistent 0-1 Stage-B score vector."""
-
-    result = dict(data)
-    components = result.get("score_components")
-    if not isinstance(components, Mapping):
-        return result, []
-    fields = (
-        "audience_relevance",
-        "material_change",
-        "impact_scope",
-        "independent_news_value",
-        "specificity",
-    )
-    values = [_number(components.get(field)) for field in fields]
-    if any(value is None or value < 0 or value > 1 for value in values):
-        return result, []
-    if not any(value not in {0.0, 1.0} for value in values if value is not None):
-        raise ValueError("Intel analysis score_components use an ambiguous 0/1 scale; return explicit 0-100 scores")
-    normalized_components = dict(components)
-    for field, value in zip(fields, values, strict=True):
-        normalized_components[field] = int(round(float(value) * 100))
-    result["score_components"] = normalized_components
-    priority = _number(result.get("b1_priority"))
-    if priority is not None and 0 <= priority <= 1:
-        result["b1_priority"] = int(round(priority * 100))
-    return result, ["scale:score_components:0-1->0-100"]
-
-
 def _as_envelope(value: RawIntelEnvelope | Mapping[str, Any]) -> RawIntelEnvelope:
     return value if isinstance(value, RawIntelEnvelope) else RawIntelEnvelope.model_validate(value)
 
 
-def _number(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
+def _coerce_mapping(data: Any, *, label: str) -> dict[str, Any]:
+    if isinstance(data, Mapping):
+        return dict(data)
+    if isinstance(data, str):
+        parsed = _parse_json_text(data, label=label)
+        if isinstance(parsed, Mapping):
+            return dict(parsed)
+    raise ValueError(f"Intel {label} API response must be a JSON object")
+
+
+def _unwrap_mapping(data: dict[str, Any]) -> dict[str, Any]:
+    for key in ("result", "data", "response"):
+        if key not in data:
+            continue
+        value = data[key]
+        if isinstance(value, Mapping):
+            nested = dict(value)
+            return _unwrap_mapping(nested) if not _looks_like_result(nested) else nested
+        if isinstance(value, str):
+            parsed = _parse_json_text(value, label="provider")
+            if isinstance(parsed, Mapping):
+                return dict(parsed)
+        raise ValueError(f"Intel provider {key} must be a JSON object")
+    if "output" in data:
+        value = data["output"]
+        if isinstance(value, Mapping):
+            nested = dict(value)
+            return _unwrap_mapping(nested) if not _looks_like_result(nested) else nested
+        if isinstance(value, str):
+            parsed = _parse_json_text(value, label="provider")
+            if isinstance(parsed, Mapping):
+                return dict(parsed)
+        if isinstance(value, list):
+            text = _output_text(value)
+            if text is not None:
+                parsed = _parse_json_text(text, label="provider")
+                if isinstance(parsed, Mapping):
+                    return dict(parsed)
+        raise ValueError("Intel Responses response has no output JSON")
+    if "choices" in data:
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("Intel OpenAI response has no choices")
+        first = choices[0]
+        if not isinstance(first, Mapping):
+            raise ValueError("Intel OpenAI choices[0] must be an object")
+        message = first.get("message")
+        content = message.get("content") if isinstance(message, Mapping) else first.get("text")
+        if isinstance(message, Mapping) and isinstance(message.get("parsed"), Mapping):
+            return dict(message["parsed"])
+        if isinstance(content, Mapping) and isinstance(content.get("parsed"), Mapping):
+            return dict(content["parsed"])
+        text = _content_to_text(content)
+        if text is None:
+            raise ValueError("Intel OpenAI response has no JSON content")
+        parsed = _parse_json_text(text, label="provider")
+        if isinstance(parsed, Mapping):
+            return dict(parsed)
+        raise ValueError("Intel OpenAI content must be a JSON object")
+    if "output_text" in data:
+        text = _content_to_text(data.get("output_text"))
+        if text is None:
+            raise ValueError("Intel output_text is empty")
+        parsed = _parse_json_text(text, label="provider")
+        if isinstance(parsed, Mapping):
+            return dict(parsed)
+        raise ValueError("Intel output_text must be a JSON object")
+    return data
+
+
+def _looks_like_result(value: Mapping[str, Any]) -> bool:
+    return any(key in value for key in ("decision", "reason_code", "topic", "topics", "summary_cn", "summary"))
+
+
+def _output_text(value: list[Any]) -> str | None:
+    parts: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        if isinstance(item.get("text"), str):
+            parts.append(item["text"])
+        content = item.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+    text = "".join(parts).strip()
+    return text or None
+
+
+def _content_to_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        text = value.get("text")
+        return text if isinstance(text, str) else None
+    if isinstance(value, list):
+        parts: list[str] = []
+        for part in value:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "".join(parts) or None
+    return None
+
+
+def _parse_json_text(value: str, *, label: str) -> Any:
+    text = value.strip()
+    match = _JSON_FENCE_RE.match(text)
+    if match:
+        text = match.group(1).strip()
     try:
-        return float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
+        return json.loads(text)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Intel {label} API returned invalid JSON content") from exc
 
 
 __all__ = [
-    "normalize_analysis_provider_output", "normalize_screen_provider_output",
     "parse_analysis_result", "parse_screen_result",
     "strict_parse_analysis", "strict_parse_screen",
+    "unwrap_provider_response",
 ]

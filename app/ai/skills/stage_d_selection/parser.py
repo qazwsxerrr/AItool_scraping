@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from app.ai.skills.intel_triage.parser import unwrap_provider_response
+
 from .models import StageDSelectionResponse
 
 
@@ -19,7 +21,8 @@ def strict_parse_stage_d_selection(
     if len(candidate_ids) != len(set(candidate_ids)):
         raise ValueError("Stage D candidate_event_ids contain duplicate IDs")
 
-    parsed = StageDSelectionResponse.model_validate(data)
+    result_data, _raw = unwrap_provider_response(data)
+    parsed = StageDSelectionResponse.model_validate(result_data)
     candidate_set = set(candidate_ids)
     returned_ids = [row.event_id for row in parsed.selected] + [row.event_id for row in parsed.unselected]
     unknown = sorted(event_id for event_id in returned_ids if event_id not in candidate_set)

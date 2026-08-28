@@ -8,7 +8,6 @@ and the same HTTP transport used by the rest of the pipeline.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -43,10 +42,6 @@ class AgentBudgetExceeded(AgentProtocolError):
     pass
 
 
-class StructuredOutputError(ResponsesProviderError):
-    """A Responses provider exhausted the safe structured-output modes."""
-
-
 @dataclass(frozen=True)
 class FunctionTool:
     name: str
@@ -72,15 +67,6 @@ class AgentRunResult:
     web_searches: int
     finalized: bool
     last_response: Mapping[str, Any]
-
-
-@dataclass(frozen=True)
-class StructuredCallResult:
-    value: Any
-    raw_response: Mapping[str, Any]
-    mode: str
-    attempts: int
-    validation_failures: int
 
 
 class ResponsesClient:
@@ -167,96 +153,28 @@ class ResponsesClient:
             raise ResponsesProviderError("Responses API returned a non-object payload", status_code=status_code, raw_response=data)
         return dict(data)
 
-    def create_structured(
+    def structured(
         self,
         *,
-        payload: Mapping[str, Any],
+        instructions: str,
+        input_value: Mapping[str, Any] | Sequence[Any] | str,
+        schema_name: str,
         schema: Mapping[str, Any],
-        validate: Callable[[Mapping[str, Any]], Any],
-        normalize: Callable[[Mapping[str, Any]], tuple[dict[str, Any], Sequence[str]]] | None = None,
-    ) -> StructuredCallResult:
-        """Try supported output modes, accepting only locally validated JSON."""
-
-        modes = ("json_schema", "json_object", "text_json")
-        attempts: list[dict[str, Any]] = []
-        validation_failures = 0
-        repair: dict[str, Any] | None = None
-        last_error: BaseException | None = None
-
-        for mode in modes:
-            request_payload = _structured_mode_payload(
-                payload,
-                schema=schema,
-                mode=mode,
-                repair=repair,
-            )
-            response: dict[str, Any] | None = None
-            record: dict[str, Any] = {"mode": mode}
-            try:
-                response = self.create(request_payload)
-                record["raw_response"] = response
-                extracted = extract_json_output(response)
-                normalized = dict(extracted)
-                transformations: list[str] = []
-                if normalize is not None:
-                    normalized, applied = normalize(normalized)
-                    transformations.extend(str(value) for value in applied)
-                normalized, pruned = _normalize_json_for_schema(normalized, schema)
-                transformations.extend(pruned)
-                value = validate(normalized)
-                if transformations:
-                    record["normalizations"] = transformations
-                    record["normalized_output"] = normalized
-                attempts.append(record)
-                return StructuredCallResult(
-                    value=value,
-                    raw_response=_structured_audit_response(
-                        response,
-                        attempts,
-                        accepted_mode=mode,
-                    ),
-                    mode=mode,
-                    attempts=len(attempts),
-                    validation_failures=validation_failures,
-                )
-            except ResponsesProviderError as exc:
-                last_error = exc
-                record["error"] = _error_record(exc)
-                if exc.raw_response is not None and "raw_response" not in record:
-                    record["raw_response"] = exc.raw_response
-                attempts.append(record)
-                if response is not None:
-                    validation_failures += 1
-                    repair = {
-                        "validation_error": str(exc)[:4000],
-                        "invalid_response": _compact_json_value(response, limit=12_000),
+    ) -> dict[str, Any]:
+        response = self.create(
+            {
+                "input": _initial_input(instructions, input_value),
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": dict(schema),
                     }
-                    continue
-                if not _is_structured_mode_compatibility_error(exc):
-                    raise
-                repair = None
-            except (TypeError, ValueError) as exc:
-                last_error = exc
-                validation_failures += 1
-                record["error"] = {
-                    "code": "schema_validation_failed",
-                    "message": str(exc)[:4000],
-                }
-                attempts.append(record)
-                repair = {
-                    "validation_error": str(exc)[:4000],
-                    "invalid_response": _compact_json_value(response, limit=12_000),
-                }
-
-        raw_response = _structured_audit_response(None, attempts, accepted_mode=None)
-        status_code = getattr(last_error, "status_code", None)
-        error_code = getattr(last_error, "error_code", None) or "schema_validation_failed"
-        raise StructuredOutputError(
-            f"Responses structured output failed after {len(attempts)} attempts: {last_error or 'no valid output'}",
-            status_code=status_code,
-            error_code=error_code,
-            raw_response=raw_response,
-        ) from last_error
+                },
+            }
+        )
+        return extract_json_output(response)
 
     def run_function_agent(
         self,
@@ -420,47 +338,14 @@ def hosted_web_search_tool(*, allowed_domains: Sequence[str]) -> dict[str, Any]:
 def extract_json_output(response: Mapping[str, Any]) -> dict[str, Any]:
     text = _response_output_text(response)
     if not text:
-        if "output" not in response and "output_text" not in response and response.get("object") != "response":
-            return dict(response)
         raise ResponsesProviderError("Responses API returned no output_text", raw_response=dict(response))
     try:
-        value = json.loads(_unwrap_json_fence(text))
+        value = json.loads(text)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ResponsesProviderError("Responses API output is not valid JSON", raw_response=dict(response)) from exc
     if not isinstance(value, Mapping):
         raise ResponsesProviderError("Responses API JSON output must be an object", raw_response=dict(response))
     return dict(value)
-
-
-def _normalize_json_for_schema(
-    value: Mapping[str, Any],
-    schema: Mapping[str, Any],
-) -> tuple[dict[str, Any], list[str]]:
-    """Drop schema-unknown object fields without changing business values."""
-
-    transformations: list[str] = []
-
-    def walk(current: Any, current_schema: Any, path: str) -> Any:
-        if not isinstance(current_schema, Mapping):
-            return current
-        properties = current_schema.get("properties")
-        if isinstance(current, Mapping) and isinstance(properties, Mapping):
-            result: dict[str, Any] = {}
-            for key, child in current.items():
-                if key not in properties:
-                    transformations.append(f"drop_extra:{path}.{key}")
-                    continue
-                result[str(key)] = walk(child, properties[key], f"{path}.{key}")
-            return result
-        items = current_schema.get("items")
-        if isinstance(current, list) and isinstance(items, Mapping):
-            return [walk(child, items, f"{path}[{index}]") for index, child in enumerate(current)]
-        if current_schema.get("type") == "integer" and isinstance(current, str) and re.fullmatch(r"[+-]?\d+", current.strip()):
-            transformations.append(f"coerce_integer:{path}")
-            return int(current.strip())
-        return current
-
-    return dict(walk(dict(value), schema, "$")), transformations
 
 
 def _initial_input(instructions: str, value: Mapping[str, Any] | Sequence[Any] | str) -> list[dict[str, str]]:
@@ -492,85 +377,6 @@ def _response_output_text(response: Mapping[str, Any]) -> str:
                 if text:
                     return text
     return ""
-
-
-def _structured_mode_payload(
-    payload: Mapping[str, Any],
-    *,
-    schema: Mapping[str, Any],
-    mode: str,
-    repair: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    result = {key: value for key, value in dict(payload).items() if value is not None}
-    if mode == "json_schema":
-        return result
-    if mode == "json_object":
-        result["text"] = {"format": {"type": "json_object"}}
-    else:
-        result.pop("text", None)
-    base_input = result.get("input")
-    messages = [dict(item) for item in base_input if isinstance(item, Mapping)] if isinstance(base_input, list) else []
-    instruction: dict[str, Any] = {
-        "structured_output_instruction": (
-            "Return exactly one complete JSON object and no prose. Preserve the requested business meaning and "
-            "satisfy every required field, type, enum, range, and additionalProperties rule in json_schema."
-        ),
-        "json_schema": dict(schema),
-    }
-    if repair:
-        instruction["repair_instruction"] = "The previous output failed local validation. Recreate the complete object."
-        instruction.update(dict(repair))
-    messages.append({"role": "user", "content": json.dumps(instruction, ensure_ascii=False, default=str)})
-    result["input"] = messages
-    return result
-
-
-def _structured_audit_response(
-    accepted_response: Mapping[str, Any] | None,
-    attempts: Sequence[Mapping[str, Any]],
-    *,
-    accepted_mode: str | None,
-) -> dict[str, Any]:
-    if len(attempts) == 1 and accepted_mode == "json_schema" and "normalizations" not in attempts[0]:
-        raw = attempts[0].get("raw_response")
-        if isinstance(raw, Mapping):
-            return dict(raw)
-    if len(attempts) == 1 and accepted_mode is None:
-        raw = attempts[0].get("raw_response")
-        if isinstance(raw, Mapping):
-            return dict(raw)
-    result = dict(accepted_response or {})
-    result["_structured_compat"] = {
-        "accepted_mode": accepted_mode,
-        "provider_attempts": len(attempts),
-        "attempts": [dict(item) for item in attempts],
-    }
-    return result
-
-
-def _error_record(exc: ResponsesProviderError) -> dict[str, Any]:
-    return {
-        "status_code": exc.status_code,
-        "code": exc.error_code or exc.__class__.__name__,
-        "message": str(exc)[:4000],
-    }
-
-
-def _is_structured_mode_compatibility_error(exc: ResponsesProviderError) -> bool:
-    return exc.status_code in {400, 422}
-
-
-def _compact_json_value(value: Any, *, limit: int) -> Any:
-    if value is None:
-        return None
-    text = json.dumps(value, ensure_ascii=False, default=str)
-    return value if len(text) <= limit else text[:limit] + "...[truncated]"
-
-
-def _unwrap_json_fence(value: str) -> str:
-    text = value.strip()
-    match = re.fullmatch(r"```(?:json)?\s*\n?(.*?)\n?```", text, flags=re.IGNORECASE | re.DOTALL)
-    return match.group(1).strip() if match else text
 
 
 def _arguments(value: Any) -> dict[str, Any]:
@@ -616,8 +422,6 @@ __all__ = [
     "FunctionTool",
     "ResponsesClient",
     "ResponsesProviderError",
-    "StructuredCallResult",
-    "StructuredOutputError",
     "SupportsPost",
     "extract_json_output",
     "hosted_web_search_tool",

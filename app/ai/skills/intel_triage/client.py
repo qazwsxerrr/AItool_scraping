@@ -5,24 +5,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Mapping
 
-from app.ai.responses import ResponsesClient, StructuredOutputError, SupportsPost
+from app.ai.responses import ResponsesClient, SupportsPost
 from app.config.settings import Settings
 
 from .guards import apply_analysis_guards, apply_screen_guard
 from .models import AnalysisResult, RawIntelEnvelope, ScreenResult
-from .parser import (
-    normalize_analysis_provider_output,
-    normalize_screen_provider_output,
-    strict_parse_analysis,
-    strict_parse_screen,
-)
-from .prompts import (
-    INTEL_ANALYSIS_JSON_SCHEMA,
-    INTEL_SCREEN_JSON_SCHEMA,
-    build_analysis_provider_payload,
-    build_screen_provider_payload,
-    preflight_intel_triage_schemas,
-)
+from .parser import strict_parse_analysis, strict_parse_screen
+from .prompts import build_analysis_provider_payload, build_screen_provider_payload, preflight_intel_triage_schemas
 
 
 LOGGER = logging.getLogger(__name__)
@@ -33,17 +22,8 @@ ANALYSIS_FAILURE_STATUS = "analysis_failed"
 class IntelTriageResponseParseError(ValueError):
     """A provider returned a response that failed local schema parsing."""
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        raw_response: Mapping[str, Any] | None,
-        error_code: str = "schema_validation_failed",
-        status_code: int | None = None,
-    ) -> None:
+    def __init__(self, message: str, *, raw_response: Mapping[str, Any] | None) -> None:
         self.raw_response = dict(raw_response) if isinstance(raw_response, Mapping) else None
-        self.error_code = error_code
-        self.status_code = status_code
         super().__init__(message)
 
 
@@ -87,39 +67,25 @@ class IntelTriageClient:
     def screen(self, envelope: RawIntelEnvelope | dict[str, Any]) -> ScreenResult:
         item = _as_envelope(envelope)
         preflight_intel_triage_schemas()
+        response = self._responses.create(build_screen_provider_payload(item, model=self.model))
         try:
-            call = self._responses.create_structured(
-                payload=build_screen_provider_payload(item, model=self.model),
-                schema=INTEL_SCREEN_JSON_SCHEMA,
-                normalize=normalize_screen_provider_output,
-                validate=lambda value: strict_parse_screen(value, envelope=item),
-            )
-            return call.value.model_copy(update={"raw_response": dict(call.raw_response)})
-        except StructuredOutputError as exc:
+            return strict_parse_screen(response, envelope=item)
+        except Exception as exc:
             raise IntelTriageResponseParseError(
                 f"Stage A response failed schema validation: {exc}",
-                raw_response=exc.raw_response if isinstance(exc.raw_response, Mapping) else None,
-                error_code=exc.error_code or "schema_validation_failed",
-                status_code=exc.status_code,
+                raw_response=response,
             ) from exc
 
     def analyze(self, envelope: RawIntelEnvelope | dict[str, Any]) -> AnalysisResult:
         item = _as_envelope(envelope)
         preflight_intel_triage_schemas()
+        response = self._responses.create(build_analysis_provider_payload(item, model=self.model))
         try:
-            call = self._responses.create_structured(
-                payload=build_analysis_provider_payload(item, model=self.model),
-                schema=INTEL_ANALYSIS_JSON_SCHEMA,
-                normalize=normalize_analysis_provider_output,
-                validate=lambda value: strict_parse_analysis(value, envelope=item),
-            )
-            return call.value.model_copy(update={"raw_response": dict(call.raw_response)})
-        except StructuredOutputError as exc:
+            return strict_parse_analysis(response, envelope=item)
+        except Exception as exc:
             raise IntelTriageResponseParseError(
                 f"Stage B response failed schema validation: {exc}",
-                raw_response=exc.raw_response if isinstance(exc.raw_response, Mapping) else None,
-                error_code=exc.error_code or "schema_validation_failed",
-                status_code=exc.status_code,
+                raw_response=response,
             ) from exc
 
     def screen_batch(self, envelopes: Iterable[RawIntelEnvelope | dict[str, Any]]) -> list[ScreenResult]:

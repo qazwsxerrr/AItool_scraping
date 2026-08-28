@@ -8,7 +8,7 @@ import re
 from uuid import uuid4
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -1189,97 +1189,132 @@ class IntelRepository:
         )
         return list(self.session.scalars(stmt).unique().all())
 
-    def upsert_agent_draft(
+    def replace_agent_drafts(
         self,
         session_id: int,
-        *,
-        draft_key: str,
-        item_ids: Iterable[int],
-        title: str,
-        summary_cn: str | None,
-        topic: str,
-        keywords: Iterable[str] | None,
-        entities: Iterable[Mapping[str, Any]] | None,
-        novelty_status: str,
-        prior_event_key: str | None,
-        review_state: str,
-        risk_flags: Iterable[str] | None,
-        metadata: Mapping[str, Any] | None = None,
-        member_relations: Mapping[int, str] | None = None,
-        allow_member_reassignment: bool = False,
-    ) -> IntelEventDraft:
-        key = _text(draft_key)
-        if not key:
-            raise ValueError("draft_key is required")
-        ids = list(dict.fromkeys(int(value) for value in item_ids))
-        if not ids:
-            raise ValueError("event draft must contain at least one item")
-        draft = self.session.scalar(
-            select(IntelEventDraft).where(
-                IntelEventDraft.session_id == int(session_id), IntelEventDraft.draft_key == key
+        drafts: Sequence[Mapping[str, Any]],
+    ) -> list[IntelEventDraft]:
+        """Atomically replace every draft in one agent session.
+
+        Stage C plan/commit writes the accepted event plan once. Prior draft
+        rows and membership are deleted first so partial multi-turn edits cannot
+        leave conflicting members behind.
+        """
+
+        session_id = int(session_id)
+        prepared: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        seen_items: set[int] = set()
+        for raw in drafts:
+            if not isinstance(raw, Mapping):
+                raise ValueError("every draft must be an object")
+            key = _text(raw.get("draft_key") or raw.get("event_key"))
+            if not key:
+                raise ValueError("draft_key is required")
+            if key in seen_keys:
+                raise ValueError(f"duplicate draft_key: {key}")
+            seen_keys.add(key)
+            ids = list(dict.fromkeys(int(value) for value in (raw.get("item_ids") or ())))
+            if not ids:
+                raise ValueError(f"event draft must contain at least one item: {key}")
+            overlap = seen_items.intersection(ids)
+            if overlap:
+                raise ValueError(f"item {sorted(overlap)[0]} appears in more than one draft")
+            seen_items.update(ids)
+            prepared.append(
+                {
+                    "draft_key": key,
+                    "item_ids": ids,
+                    "title": _text(raw.get("title")) or "(untitled)",
+                    "summary_cn": _text(raw.get("summary_cn")),
+                    "topic": _text(raw.get("topic")) or "technology_insight",
+                    "keywords": _unique_strings(raw.get("keywords") or ()),
+                    "entities": [dict(item) for item in (raw.get("entities") or ()) if isinstance(item, Mapping)],
+                    "novelty_status": _text(raw.get("novelty_status")) or "uncertain",
+                    "prior_event_key": _text(raw.get("prior_event_key")),
+                    "review_state": _text(raw.get("review_state")) or "candidate",
+                    "risk_flags": _unique_strings(raw.get("risk_flags") or ()),
+                    "metadata": dict(raw.get("metadata") or {}),
+                    "member_relations": {
+                        int(item_id): _text(relation) or "related"
+                        for item_id, relation in dict(raw.get("member_relations") or {}).items()
+                    },
+                }
             )
+
+        existing = list(
+            self.session.scalars(
+                select(IntelEventDraft).where(IntelEventDraft.session_id == session_id)
+            ).all()
         )
-        if draft is None:
-            draft = IntelEventDraft(session_id=int(session_id), draft_key=key)
+        evidence_rows = list(
+            self.session.scalars(
+                select(IntelEventEvidence).where(IntelEventEvidence.session_id == session_id)
+            ).all()
+        )
+        # Keep evidence rows across the atomic rewrite; detach draft FKs first,
+        # then reattach by previous draft_key or event_key claim prefix.
+        evidence_by_old_key: dict[str, list[IntelEventEvidence]] = {}
+        for draft in existing:
+            evidence_by_old_key[draft.draft_key] = []
+        for row in evidence_rows:
+            if row.draft_id is None:
+                continue
+            old_draft = next((draft for draft in existing if int(draft.id) == int(row.draft_id)), None)
+            if old_draft is not None:
+                evidence_by_old_key.setdefault(old_draft.draft_key, []).append(row)
+            row.draft_id = None
+        for draft in existing:
+            self.session.delete(draft)
+        self.session.flush()
+
+        key_to_draft: dict[str, IntelEventDraft] = {}
+        for spec in prepared:
+            draft = IntelEventDraft(
+                session_id=session_id,
+                draft_key=spec["draft_key"],
+                title=spec["title"],
+                summary_cn=spec["summary_cn"],
+                topic=spec["topic"],
+                keywords_json=_dump_json(spec["keywords"]),
+                entities_json=_dump_json(spec["entities"]),
+                novelty_status=spec["novelty_status"],
+                prior_event_key=spec["prior_event_key"],
+                review_state=spec["review_state"],
+                risk_flags_json=_dump_json(spec["risk_flags"]),
+                metadata_json=_dump_json(spec["metadata"]),
+                state="draft",
+            )
             self.session.add(draft)
             self.session.flush()
-        # Validate membership before deleting the existing rows so a failed
-        # update cannot leave a resumable draft empty.
-        for item_id in ids:
-            relation = self.session.scalar(
-                select(IntelEventDraftItem).where(
-                    IntelEventDraftItem.session_id == int(session_id),
-                    IntelEventDraftItem.item_id == item_id,
-                )
-            )
-            if relation is not None and int(relation.draft_id) != int(draft.id):
-                if not allow_member_reassignment:
-                    raise ValueError(f"item {item_id} is already assigned to another agent draft")
-                old_draft = relation.draft
-                self.session.delete(relation)
-                self.session.flush()
-                remaining = self.session.scalar(
-                    select(func.count()).select_from(IntelEventDraftItem).where(
-                        IntelEventDraftItem.draft_id == int(old_draft.id) if old_draft is not None else False
+            for item_id in spec["item_ids"]:
+                self.session.add(
+                    IntelEventDraftItem(
+                        session_id=session_id,
+                        draft_id=int(draft.id),
+                        item_id=int(item_id),
+                        relation=spec["member_relations"].get(int(item_id)) or "related",
                     )
                 )
-                if old_draft is not None and int(old_draft.id) != int(draft.id) and int(remaining or 0) == 0:
-                    self.session.delete(old_draft)
-                    self.session.flush()
-        for relation in list(draft.members):
-            self.session.delete(relation)
-        # An agent may revise a persisted draft after a verification pass.
-        # Flush removals before adding its replacement members so SQLite does
-        # not see the same (session_id, item_id) uniqueness key twice.
+            key_to_draft[spec["draft_key"]] = draft
+
+        for old_key, rows in evidence_by_old_key.items():
+            target = key_to_draft.get(old_key)
+            if target is None:
+                continue
+            for row in rows:
+                row.draft_id = int(target.id)
         self.session.flush()
-        draft.title = _text(title) or "(untitled)"
-        draft.summary_cn = _text(summary_cn)
-        draft.topic = _text(topic) or "technology_insight"
-        draft.keywords_json = _dump_json(_unique_strings(keywords or ()))
-        draft.entities_json = _dump_json([dict(item) for item in (entities or ()) if isinstance(item, Mapping)])
-        draft.novelty_status = _text(novelty_status) or "uncertain"
-        draft.prior_event_key = _text(prior_event_key)
-        draft.review_state = _text(review_state) or "candidate"
-        draft.risk_flags_json = _dump_json(_unique_strings(risk_flags or ()))
-        draft.metadata_json = _dump_json(dict(metadata or {}))
-        draft.state = "draft"
-        for item_id in ids:
-            self.session.add(
-                IntelEventDraftItem(
-                    session_id=int(session_id),
-                    draft_id=int(draft.id),
-                    item_id=item_id,
-                    relation=_text((member_relations or {}).get(item_id)) or "related",
-                )
-            )
-        self.session.flush()
-        return draft
+        self.reattach_agent_evidence_by_event_keys(session_id)
+        self.session.expire_all()
+        return self.list_agent_drafts(session_id)
 
     def record_agent_evidence(
         self,
         session_id: int,
         *,
-        draft_key: str | None,
+        draft_key: str | None = None,
+        event_key: str | None = None,
         url: str,
         final_url: str | None = None,
         title: str | None = None,
@@ -1289,22 +1324,27 @@ class IntelRepository:
         status: str = "recorded",
         item_id: int | None = None,
     ) -> IntelEventEvidence:
+        key = _text(draft_key) or _text(event_key)
         draft = None
-        if draft_key:
+        if key:
             draft = self.session.scalar(
                 select(IntelEventDraft).where(
                     IntelEventDraft.session_id == int(session_id),
-                    IntelEventDraft.draft_key == str(draft_key),
+                    IntelEventDraft.draft_key == key,
                 )
             )
-            if draft is None:
-                raise ValueError(f"unknown agent draft: {draft_key}")
         final = _text(final_url) or _text(url)
         parsed = urlsplit(final or "")
         host = (parsed.hostname or "").casefold()
         if not host:
             raise ValueError("evidence URL must be absolute")
         excerpt_text = (_text(excerpt) or "")[:4_000] or None
+        # When drafts are not yet committed, keep the plan event_key in the
+        # claim envelope so materialize can reattach after replace_agent_drafts.
+        claim_text = _text(verification_claim)
+        if key and draft is None:
+            prefix = f"event_key:{key}"
+            claim_text = f"{prefix}\n{claim_text}" if claim_text else prefix
         evidence = IntelEventEvidence(
             session_id=int(session_id),
             draft_id=int(draft.id) if draft is not None else None,
@@ -1316,12 +1356,43 @@ class IntelRepository:
             title=_text(title),
             excerpt=excerpt_text,
             content_hash=(hashlib.sha256(excerpt_text.encode("utf-8")).hexdigest() if excerpt_text else None),
-            verification_claim=_text(verification_claim),
+            verification_claim=claim_text,
             status=_text(status) or "recorded",
         )
         self.session.add(evidence)
         self.session.flush()
         return evidence
+
+    def reattach_agent_evidence_by_event_keys(self, session_id: int) -> int:
+        """Bind detached evidence rows to drafts using event_key claim prefixes."""
+
+        drafts = {
+            draft.draft_key: draft
+            for draft in self.session.scalars(
+                select(IntelEventDraft).where(IntelEventDraft.session_id == int(session_id))
+            ).all()
+        }
+        attached = 0
+        for row in self.session.scalars(
+            select(IntelEventEvidence).where(
+                IntelEventEvidence.session_id == int(session_id),
+                IntelEventEvidence.draft_id.is_(None),
+            )
+        ).all():
+            claim = _text(row.verification_claim) or ""
+            if not claim.startswith("event_key:"):
+                continue
+            first_line, _, remainder = claim.partition("\n")
+            event_key = first_line.removeprefix("event_key:").strip()
+            draft = drafts.get(event_key)
+            if draft is None:
+                continue
+            row.draft_id = int(draft.id)
+            row.verification_claim = remainder or None
+            attached += 1
+        if attached:
+            self.session.flush()
+        return attached
 
     def upsert_ai_screen(
         self,
@@ -1477,14 +1548,24 @@ class IntelRepository:
         canonical = _canonical_url(canonical_url)
         external = _normalize_event_external_id(external_id)
         norm_title = _normalize_event_title(normalized_title or title)
-        aliases = _unique_strings(
-            [
-                *(value for value in (identity_keys or ()) if not str(value).strip().casefold().startswith("title:")),
-                _identity_alias_url(canonical),
-                _identity_alias_external(external),
-                key if key.startswith(("url:", "external:")) else None,
-            ]
+        # Stage C plan/commit already normalized identity. Persist one event
+        # per committed event_key; do not re-merge by URL or external id here.
+        weak_repo_root = bool(canonical and _is_github_repo_root_url(canonical))
+        strong_github_external = bool(
+            external
+            and (
+                external.startswith("github_release:")
+                or external.startswith("github_repo:")
+            )
         )
+        alias_candidates = [
+            *(value for value in (identity_keys or ()) if not str(value).strip().casefold().startswith("title:")),
+            _identity_alias_external(external),
+            key if key.startswith(("url:", "external:")) else None,
+        ]
+        if canonical and not (weak_repo_root and strong_github_external):
+            alias_candidates.append(_identity_alias_url(canonical))
+        aliases = _unique_strings(alias_candidates)
 
         row = self.session.scalar(
             select(IntelEvent).where(
@@ -1492,45 +1573,6 @@ class IntelRepository:
                 IntelEvent.event_key == key,
             )
         )
-        if row is None and primary_item_id is not None:
-            row = self.session.scalar(
-                select(IntelEvent)
-                .join(IntelEventItem, IntelEventItem.event_id == IntelEvent.id)
-                .where(
-                    IntelEvent.build_id == build_id,
-                    IntelEventItem.item_id == int(primary_item_id),
-                )
-                .order_by(IntelEvent.id.asc())
-            )
-        if row is None and canonical:
-            row = self.session.scalar(
-                select(IntelEvent).where(
-                    IntelEvent.build_id == build_id,
-                    IntelEvent.canonical_url == canonical,
-                )
-            )
-        if row is None and external:
-            row = self.session.scalar(
-                select(IntelEvent).where(
-                    IntelEvent.build_id == build_id,
-                    IntelEvent.external_id == external,
-                )
-            )
-        if row is None and aliases:
-            alias_set = {alias for alias in aliases if alias.startswith(("url:", "external:"))}
-            for candidate in self.session.scalars(
-                select(IntelEvent)
-                .where(IntelEvent.build_id == build_id)
-                .order_by(IntelEvent.id.asc())
-            ).all():
-                existing_aliases = {
-                    alias
-                    for alias in _load_json(candidate.identity_keys_json, [])
-                    if isinstance(alias, str) and alias.startswith(("url:", "external:"))
-                }
-                if existing_aliases & alias_set:
-                    row = candidate
-                    break
         if row is None:
             row = IntelEvent(event_key=key, build_id=build_id)
             self.session.add(row)
@@ -3323,6 +3365,21 @@ def _merge_github_raw_payload(previous: Any, current: Any) -> dict[str, Any]:
     if isinstance(current, Mapping):
         merged.update(dict(current))
     return merged
+
+
+def _is_github_repo_root_url(value: Any) -> bool:
+    text = _text(value)
+    if not text:
+        return False
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").casefold()
+    if host not in {"github.com", "www.github.com"}:
+        return False
+    parts = [part for part in (parsed.path or "").split("/") if part]
+    return len(parts) == 2
 
 
 def _canonical_github_url(value: Any) -> str | None:

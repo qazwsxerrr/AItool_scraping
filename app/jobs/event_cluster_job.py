@@ -1,15 +1,13 @@
-"""Stage C: transcript-backed Responses agent for event-level aggregation.
+"""Stage C: plan/commit Responses agent for event-level aggregation.
 
-Unlike the removed batch prompt, this job gives the model a bounded workbench
-and durable tools. The model aggregates, researches material uncertainty, and
-keeps unresolved claims auditable; deterministic code owns score admission,
-coverage validation, persistence, and downstream contracts.
+The model researches candidates with read-only tools and submits one complete
+event plan. Deterministic code owns identity normalization, coverage repair,
+atomic draft replacement, score admission contracts, and downstream materialization.
 """
 
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
 import math
 import re
@@ -20,7 +18,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, joinedload, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.responses import AgentBudgetExceeded, AgentProtocolError, FunctionTool
 from app.ai.skills.event_package import build_candidate_event_package
@@ -28,16 +26,14 @@ from app.ai.skills.intel_triage import normalize_url
 from app.ai.skills.stage_c_agent import StageCAgentClient
 from app.ai.skills.stage_c_agent.prompts import (
     ATTACH_SEARCH_EVIDENCE_SCHEMA,
-    FINALIZE_DRAFTS_SCHEMA,
     LIST_CANDIDATES_SCHEMA,
-    LIST_DRAFTS_SCHEMA,
-    MARK_UNRESOLVED_SCHEMA,
+    LIST_PLAN_SNAPSHOT_SCHEMA,
     READ_HISTORY_SCHEMA,
     READ_ITEMS_SCHEMA,
-    SAVE_DRAFTS_SCHEMA,
     SEARCH_CANDIDATES_SCHEMA,
     SEARCH_WEB_SCHEMA,
     STAGE_C_AGENT_PROMPT_VERSION,
+    SUBMIT_EVENT_PLAN_SCHEMA,
 )
 from app.ai.tavily import TavilySearchClient, TavilySearchError, TavilySearchResult
 from app.config.limits import (
@@ -50,7 +46,6 @@ from app.config.limits import (
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.models import (
-    DailyEditionReportEntry,
     IntelAgentSession,
     IntelCandidateAdmission,
     IntelEvent,
@@ -58,17 +53,17 @@ from app.storage.models import (
     IntelEventEvidence,
     IntelItem,
     IntelRun,
-    IntelRunStage,
     IntelRunStageTask,
 )
 from app.storage.repository import IntelRepository
 
 
 DAILY_HISTORY_DAYS = DEFAULT_STAGE_C_AGENT_HISTORY_DAYS
-STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_events_v8"
+STAGE_C_CANDIDATE_CONTRACT_VERSION = "stage_c_events_v9"
 _TRACKING_QUERY_KEYS = {"ref", "source", "src", "campaign", "fbclid", "gclid", "mc_cid", "mc_eid"}
 _PRIMARY_POLICY_VERSION = "source_then_b1_priority_v2"
-_VERIFICATION_POLICY_VERSION = "tavily_per_event_verification_v2"
+_VERIFICATION_POLICY_VERSION = "tavily_per_event_verification_v3"
+_GITHUB_REPO_ROOT_RE = re.compile(r"^https?://(www\.)?github\.com/[^/]+/[^/]+/?$", re.IGNORECASE)
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -77,7 +72,7 @@ class StageCDownstreamBusyError(RuntimeError):
 
 
 class StageCAgentContractError(RuntimeError):
-    """The model tried to finalize an invalid event projection."""
+    """The model tried to commit an invalid event plan."""
 
 
 class StageCLeaseLostError(RuntimeError):
@@ -147,12 +142,55 @@ def canonical_event_url(value: Any) -> str | None:
     return urlunsplit((scheme, netloc, path, urlencode(query_items, doseq=True), ""))
 
 
+def _normalize_external_id(value: Any) -> str | None:
+    text = re.sub(r"\s+", "", str(value).strip()).casefold() if value is not None else ""
+    return text or None
+
+
+def _is_github_repo_root_url(url: str | None) -> bool:
+    if not url:
+        return False
+    return bool(_GITHUB_REPO_ROOT_RE.match(url.rstrip("/")))
+
+
 def exact_identity_keys(value: Any) -> tuple[str, ...]:
+    """Strong exact-identity keys used for forced merge / history matching.
+
+    GitHub Release items are identified by ``github_release:*`` external IDs.
+    A shared repository homepage URL is not treated as the same exact identity
+    across different releases or repo cards.
+    """
+
     values = _mapping(value)
-    url = canonical_event_url(values.get("canonical_url") or values.get("url") or values.get("source_url"))
     external_id = _normalize_external_id(values.get("external_id") or values.get("guid"))
-    values = [value for value in (f"url:{url}" if url else None, f"external:{external_id}" if external_id else None) if value]
-    return tuple(dict.fromkeys(values))
+    url = canonical_event_url(values.get("canonical_url") or values.get("url") or values.get("source_url"))
+    keys: list[str] = []
+    if external_id:
+        keys.append(f"external:{external_id}")
+        if external_id.startswith("github_release:"):
+            return tuple(keys)
+        if external_id.startswith("github_repo:"):
+            return tuple(keys)
+    if url and not _is_github_repo_root_url(url):
+        keys.append(f"url:{url}")
+    elif url and not external_id:
+        # Non-GitHub-identified rows may still use a bare repo root URL.
+        keys.append(f"url:{url}")
+    return tuple(dict.fromkeys(keys))
+
+
+def related_identity_hints(value: Any) -> tuple[str, ...]:
+    """Soft relatedness hints that never force cross-event merges alone."""
+
+    values = _mapping(value)
+    external_id = _normalize_external_id(values.get("external_id") or values.get("guid"))
+    url = canonical_event_url(values.get("canonical_url") or values.get("url") or values.get("source_url"))
+    hints: list[str] = []
+    if url and _is_github_repo_root_url(url):
+        hints.append(f"github_repo_root:{url.rstrip('/').casefold()}")
+    if external_id and external_id.startswith("github_release:") and url:
+        hints.append(f"url:{url}")
+    return tuple(dict.fromkeys(hints))
 
 
 def canonical_event_key(value: Any) -> str:
@@ -229,7 +267,7 @@ def run_event_cluster_job(
             config_fingerprint=config_fingerprint,
             reference_time=current,
             metadata={
-                "aggregation_mode": "responses_agent_tools_v4",
+                "aggregation_mode": "responses_agent_plan_commit_v1",
                 "agent_version": STAGE_C_AGENT_VERSION,
                 "prompt_version": STAGE_C_AGENT_PROMPT_VERSION,
                 "candidate_contract_version": STAGE_C_CANDIDATE_CONTRACT_VERSION,
@@ -323,6 +361,7 @@ def run_event_cluster_job(
                     "search_provider": "tavily" if search_client is not None and search_client.is_configured else "disabled",
                     "reference_time": current.isoformat(),
                     "lease_seconds": lease_seconds,
+                    "protocol": "plan_commit_v1",
                 },
                 reset=reset_agent,
             )
@@ -348,7 +387,7 @@ def run_event_cluster_job(
                 stage="cluster",
                 data={
                     "total": len(admissions["active"]),
-                    "current": _covered_active_count(repo, int(agent_session.id), tools.active_ids),
+                    "current": _covered_active_count_from_plan(tools.accepted_plan, tools.active_ids),
                     "metrics": {
                         "input_items": len(admissions["active"]),
                         "reserve_items": len(admissions["reserve"]),
@@ -390,7 +429,7 @@ def run_event_cluster_job(
                     input_value=arguments,
                     output_value=output,
                     status="success" if output.get("ok", True) else "error",
-                    error_message=_text(output.get("error")),
+                    error_message=_text(output.get("error")) or _join_errors(output.get("errors")),
                 )
                 agent_session.tool_call_count += 1
                 if str(call.get("name") or "") == "search_web":
@@ -401,9 +440,7 @@ def run_event_cluster_job(
                     "stage_c_tool",
                     stage="cluster",
                     data=_stage_c_tool_progress(
-                        repo,
-                        int(agent_session.id),
-                        tools.active_ids,
+                        tools,
                         tool_name=_text(call.get("name")),
                         arguments=arguments,
                         output=output,
@@ -418,10 +455,12 @@ def run_event_cluster_job(
                         "active_candidate_count": len(admissions["active"]),
                         "reserve_candidate_count": len(admissions["reserve"]),
                         "history_window_days": DAILY_HISTORY_DAYS,
+                        "protocol": "plan_commit_v1",
                         "instructions": (
-                            "Use local tools to aggregate every active candidate. Keep follow-up events separate, compare only "
-                            "the previous three published editions for novelty, and use search_web for material uncertainty "
-                            "before retaining an event as needs_review. Finalize after all active candidates are covered."
+                            "Use local read-only tools to inspect every active candidate. Compare only the previous "
+                            "three published editions for novelty. Use search_web for material uncertainty on "
+                            "needs_review events. Submit one complete event plan with submit_event_plan that covers "
+                            "every active candidate. If validation fails, resubmit the full corrected plan."
                         ),
                     },
                     function_tools=tools.function_tools,
@@ -436,7 +475,12 @@ def run_event_cluster_job(
             if repo.heartbeat_stage_task(task, owner=owner, lease_seconds=lease_seconds) is None:
                 raise StageCLeaseLostError("Stage C task lease was lost before event materialization")
             if not agent_session.finalization_requested:
-                raise AgentProtocolError("C agent did not finalize its event drafts")
+                raise AgentProtocolError("C agent did not submit an accepted event plan")
+            _ensure_committed_drafts(
+                repo=repo,
+                agent_session=agent_session,
+                tools=tools,
+            )
 
             _materialize_agent_events(
                 session=session,
@@ -469,13 +513,8 @@ def run_event_cluster_job(
         except AgentBudgetExceeded as exc:
             # Budget exhaustion is uncertainty, not a reason to lose a
             # qualified source. Close the uncovered active set into explicit
-            # needs-review singleton drafts, then commit a valid projection.
-            _ensure_unresolved_drafts(
-                repo=repo,
-                agent_session=agent_session,
-                admissions=admissions,
-                reason="agent_budget_exhausted",
-            )
+            # needs-review singleton events, then commit a valid projection.
+            tools.commit_fallback_plan(reason="agent_budget_exhausted")
             _materialize_agent_events(
                 session=session,
                 repo=repo,
@@ -571,7 +610,7 @@ class _StageCAgentTools:
         self.search_client = search_client
         self.max_web_searches = max_web_searches
         self.search_results: dict[str, TavilySearchResult] = {}
-        self.search_attempted_draft_keys: set[str] = set()
+        self.search_attempted_event_keys: set[str] = set()
         self.search_calls = 0
         self.admissions = {key: list(value) for key, value in admissions.items()}
         self.by_item_id = {
@@ -580,21 +619,22 @@ class _StageCAgentTools:
             for row in rows
         }
         self.active_ids = {int(row.item_id) for row in self.admissions.get("active", ())}
+        self.accepted_plan: list[dict[str, Any]] = []
+        self.last_validation: dict[str, Any] = {"errors": [], "events": [], "missing_active_ids": []}
         self._restore_search_state()
+        self._restore_plan_state()
 
     @property
     def function_tools(self) -> list[FunctionTool]:
         return [
             FunctionTool("list_candidates", "分页列出 B 已准入的 active 或 reserve 候选概要。", LIST_CANDIDATES_SCHEMA, self.list_candidates),
-            FunctionTool("list_event_drafts", "列出当前会话已持久化的事件草稿，供失败恢复时继续。", LIST_DRAFTS_SCHEMA, self.list_event_drafts),
+            FunctionTool("list_plan_snapshot", "列出最近一次校验或已接受的事件方案快照。", LIST_PLAN_SNAPSHOT_SCHEMA, self.list_plan_snapshot),
             FunctionTool("read_items", "读取候选的完整原文、B 分析和来源元数据。", READ_ITEMS_SCHEMA, self.read_items),
             FunctionTool("search_candidates", "在 B 准入候选内按词检索相关内容。", SEARCH_CANDIDATES_SCHEMA, self.search_candidates),
             FunctionTool("read_recent_history", "查询过去三天的已发布日报事件，判断重复或更新。", READ_HISTORY_SCHEMA, self.read_recent_history),
-            FunctionTool("save_event_drafts", "批量保存或更新 1–8 个事件聚合草稿。", SAVE_DRAFTS_SCHEMA, self.save_event_drafts),
             FunctionTool("search_web", "通过 Tavily 搜索公开网页并返回可审计的来源结果。", SEARCH_WEB_SCHEMA, self.search_web),
-            FunctionTool("attach_search_evidence", "把 Tavily 结果绑定到草稿和具体核验 claim。", ATTACH_SEARCH_EVIDENCE_SCHEMA, self.attach_search_evidence),
-            FunctionTool("mark_unresolved", "把无法可靠聚合的 active 候选显式放入待审事件。", MARK_UNRESOLVED_SCHEMA, self.mark_unresolved),
-            FunctionTool("finalize_event_drafts", "检查 active 覆盖并提交事件草稿。", FINALIZE_DRAFTS_SCHEMA, self.finalize_event_drafts),
+            FunctionTool("attach_search_evidence", "把 Tavily 结果绑定到 event_key 和具体核验 claim。", ATTACH_SEARCH_EVIDENCE_SCHEMA, self.attach_search_evidence),
+            FunctionTool("submit_event_plan", "提交覆盖全部 active 的完整事件方案，由本地校验并原子落库。", SUBMIT_EVENT_PLAN_SCHEMA, self.submit_event_plan),
         ]
 
     def list_candidates(self, args: dict[str, Any]) -> Mapping[str, Any]:
@@ -612,15 +652,24 @@ class _StageCAgentTools:
             "items": [_compact_admission(row) for row in rows[offset : offset + limit]],
         }
 
-    def list_event_drafts(self, args: dict[str, Any]) -> Mapping[str, Any]:
+    def list_plan_snapshot(self, args: dict[str, Any]) -> Mapping[str, Any]:
         del args
-        drafts = self.repo.list_agent_drafts(int(self.agent_session.id))
+        events = self.accepted_plan or self.last_validation.get("events") or []
         return {
             "ok": True,
-            "drafts": [
-                _draft_tool_view(draft)
-                for draft in drafts
-            ],
+            "accepted": bool(self.accepted_plan),
+            "event_count": len(events),
+            "covered_active_ids": sorted(
+                {
+                    int(item_id)
+                    for event in events
+                    for item_id in event.get("item_ids") or ()
+                    if int(item_id) in self.active_ids
+                }
+            ),
+            "missing_active_ids": list(self.last_validation.get("missing_active_ids") or []),
+            "errors": list(self.last_validation.get("errors") or []),
+            "events": [_plan_event_view(event) for event in events],
         }
 
     def read_items(self, args: dict[str, Any]) -> Mapping[str, Any]:
@@ -650,106 +699,10 @@ class _StageCAgentTools:
         rows = [row for row in self.history if _history_matches(row, tokens)] if tokens else self.history
         return {"ok": True, "total": len(rows), "events": rows[:limit]}
 
-    def save_event_drafts(self, args: dict[str, Any]) -> Mapping[str, Any]:
-        raw_drafts = args.get("drafts")
-        if not isinstance(raw_drafts, list) or not 1 <= len(raw_drafts) <= 8:
-            return {"ok": False, "error": "drafts must contain between 1 and 8 objects"}
-        if not all(isinstance(value, Mapping) for value in raw_drafts):
-            return {"ok": False, "error": "every draft must be an object"}
-
-        prepared: list[tuple[dict[str, Any], list[int], dict[str, Any], dict[str, Any]]] = []
-        assigned: dict[int, str] = {}
-        keys: set[str] = set()
-        for raw_value in raw_drafts:
-            draft_args = dict(raw_value)
-            draft_key = str(draft_args.get("draft_key") or "").strip()
-            if not draft_key:
-                return {"ok": False, "error": "draft_key is required"}
-            if draft_key in keys:
-                return {"ok": False, "error": f"duplicate draft_key in batch: {draft_key}"}
-            keys.add(draft_key)
-            ids = _unique_positive_ids(draft_args.get("item_ids"), limit=40)
-            if not ids:
-                return {"ok": False, "error": f"item_ids are required for draft: {draft_key}"}
-            unknown = [item_id for item_id in ids if item_id not in self.by_item_id]
-            if unknown:
-                return {"ok": False, "error": f"item ids are outside the C workbench: {unknown}"}
-            for item_id in ids:
-                prior_key = assigned.get(item_id)
-                if prior_key is not None:
-                    return {"ok": False, "error": f"item {item_id} appears in both {prior_key} and {draft_key}"}
-                assigned[item_id] = draft_key
-            try:
-                history = _prepare_draft_history(
-                    draft_args,
-                    item_ids=ids,
-                    admissions=self.by_item_id,
-                    history_by_key=self.history_by_key,
-                    history_identity_index=self.history_identity_index,
-                )
-                publishability = _prepare_draft_publishability(
-                    draft_args,
-                    item_ids=ids,
-                    novelty_status=str(history["novelty_status"]),
-                )
-            except ValueError as exc:
-                return {"ok": False, "error": str(exc)}
-            prepared.append((draft_args, ids, history, publishability))
-
-        saved: list[dict[str, Any]] = []
-        try:
-            with self.session.begin_nested():
-                for draft_args, ids, history, publishability in prepared:
-                    caveats = _strings(draft_args.get("caveats"))
-                    caveats.extend(value for value in history["risk_flags"] if value not in caveats)
-                    caveats.extend(value for value in publishability["risk_flags"] if value not in caveats)
-                    metadata = {
-                        "saved_by": "responses_agent_batch",
-                        "batch_size": len(prepared),
-                        "event_family_key": _event_family_key(draft_args),
-                        "facts": publishability["facts"],
-                        "history_status": history["history_status"],
-                        "history_guard": history["guard"],
-                        "publishability": publishability["publishability"],
-                        "publishability_guard": publishability["guard"],
-                        "split_reason": _text(draft_args.get("split_reason")),
-                        "caveats": caveats,
-                    }
-                    draft = self.repo.upsert_agent_draft(
-                        int(self.agent_session.id),
-                        draft_key=str(draft_args.get("draft_key") or ""),
-                        item_ids=ids,
-                        title=str(draft_args.get("title") or ""),
-                        summary_cn=_text(draft_args.get("summary_cn")),
-                        topic=str(draft_args.get("topic") or "technology_insight"),
-                        keywords=(),
-                        entities=(),
-                        novelty_status=str(history["novelty_status"]),
-                        prior_event_key=_text(history.get("prior_event_key")),
-                        review_state=str(publishability["review_state"]),
-                        risk_flags=caveats,
-                        metadata=metadata,
-                        allow_member_reassignment=True,
-                    )
-                    saved.append(
-                        {
-                            "draft_key": draft.draft_key,
-                            "draft_id": int(draft.id),
-                            "item_ids": ids,
-                            "review_state": draft.review_state,
-                            "publishability": publishability["publishability"],
-                            "event_family_key": metadata["event_family_key"],
-                        }
-                    )
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-        self.session.commit()
-        return {"ok": True, "drafts": saved}
-
     def search_web(self, args: dict[str, Any]) -> Mapping[str, Any]:
-        draft_key = _text(args.get("draft_key"))
-        if draft_key:
-            self.search_attempted_draft_keys.add(draft_key)
+        event_key = _text(args.get("event_key"))
+        if event_key:
+            self.search_attempted_event_keys.add(event_key)
         if self.search_calls >= self.max_web_searches:
             return {"ok": False, "error": "Stage C Tavily search budget exhausted", "error_code": "search_budget_exhausted"}
         if self.search_client is None or not self.search_client.is_configured:
@@ -774,7 +727,7 @@ class _StageCAgentTools:
         return {
             "ok": True,
             "provider": "tavily",
-            "draft_key": draft_key,
+            "event_key": event_key,
             "claim": _text(args.get("claim")),
             **response.as_dict(),
         }
@@ -788,10 +741,13 @@ class _StageCAgentTools:
         status = {"supports": "verified", "contradicts": "contradicted", "contextual": "recorded"}.get(verdict)
         if status is None:
             return {"ok": False, "error": "invalid evidence verdict"}
+        event_key = _text(args.get("event_key"))
+        if not event_key:
+            return {"ok": False, "error": "event_key is required"}
         try:
             evidence = self.repo.record_agent_evidence(
                 int(self.agent_session.id),
-                draft_key=str(args.get("draft_key") or ""),
+                event_key=event_key,
                 url=row.url,
                 final_url=row.url,
                 title=row.title,
@@ -802,25 +758,131 @@ class _StageCAgentTools:
             )
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+        self.search_attempted_event_keys.add(event_key)
         self.session.commit()
         return {
             "ok": True,
             "evidence_id": int(evidence.id),
             "result_id": result_id,
+            "event_key": event_key,
             "host": evidence.host,
             "status": status,
         }
 
+    def submit_event_plan(self, args: dict[str, Any]) -> Mapping[str, Any]:
+        raw_events = args.get("events")
+        if not isinstance(raw_events, list) or not raw_events:
+            return {"ok": False, "error": "events must be a non-empty list", "errors": ["events must be a non-empty list"]}
+
+        prepared, errors = _prepare_event_plan(
+            raw_events,
+            active_ids=self.active_ids,
+            admissions=self.by_item_id,
+            history_by_key=self.history_by_key,
+            history_identity_index=self.history_identity_index,
+            search_attempted_event_keys=self.search_attempted_event_keys,
+            max_web_searches=self.max_web_searches,
+            search_configured=bool(self.search_client is not None and self.search_client.is_configured),
+        )
+        self.last_validation = {
+            "errors": list(errors),
+            "events": [dict(event) for event in prepared],
+            "missing_active_ids": sorted(
+                self.active_ids
+                - {
+                    int(item_id)
+                    for event in prepared
+                    for item_id in event.get("item_ids") or ()
+                }
+            ),
+        }
+        if errors:
+            return {
+                "ok": False,
+                "errors": errors,
+                "missing_active_ids": self.last_validation["missing_active_ids"],
+                "event_count": len(prepared),
+                "next_action": (
+                    "Fix the listed validation errors and resubmit one complete event plan covering every active item."
+                ),
+            }
+
+        try:
+            with self.session.begin_nested():
+                self.repo.replace_agent_drafts(
+                    int(self.agent_session.id),
+                    [_draft_persistence_spec(event) for event in prepared],
+                )
+                self.repo.reattach_agent_evidence_by_event_keys(int(self.agent_session.id))
+            self.session.commit()
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "errors": [str(exc)]}
+
+        self.accepted_plan = [dict(event) for event in prepared]
+        self.last_validation = {
+            "errors": [],
+            "events": self.accepted_plan,
+            "missing_active_ids": [],
+        }
+        self.agent_session.finalization_requested = True
+        self.agent_session.status = "finalizing"
+        state = dict(self.agent_session.state or {})
+        state["accepted_plan"] = self.accepted_plan
+        state["search_attempted_event_keys"] = sorted(self.search_attempted_event_keys)
+        self.agent_session.state_json = json.dumps(state, ensure_ascii=False)
+        self.session.commit()
+        return {
+            "ok": True,
+            "event_count": len(self.accepted_plan),
+            "covered_active_count": len(self.active_ids),
+            "_finalized": True,
+        }
+
+    def commit_fallback_plan(self, *, reason: str) -> None:
+        """Build a valid plan from accepted events plus unresolved gaps."""
+
+        seed = [dict(event) for event in self.accepted_plan]
+        prepared, _errors = _prepare_event_plan(
+            seed,
+            active_ids=self.active_ids,
+            admissions=self.by_item_id,
+            history_by_key=self.history_by_key,
+            history_identity_index=self.history_identity_index,
+            search_attempted_event_keys=self.search_attempted_event_keys,
+            max_web_searches=0,
+            search_configured=False,
+            auto_fill_missing=True,
+            unresolved_reason=reason,
+        )
+        self.repo.replace_agent_drafts(
+            int(self.agent_session.id),
+            [_draft_persistence_spec(event) for event in prepared],
+        )
+        self.repo.reattach_agent_evidence_by_event_keys(int(self.agent_session.id))
+        self.accepted_plan = prepared
+        self.agent_session.finalization_requested = True
+        self.agent_session.status = "finalizing"
+        state = dict(self.agent_session.state or {})
+        state["accepted_plan"] = prepared
+        state["fallback_reason"] = reason
+        self.agent_session.state_json = json.dumps(state, ensure_ascii=False)
+        self.session.commit()
+
     def _restore_search_state(self) -> None:
+        state = dict(self.agent_session.state or {})
+        for key in state.get("search_attempted_event_keys") or ():
+            text = _text(key)
+            if text:
+                self.search_attempted_event_keys.add(text)
         for step in self.agent_session.steps:
             if step.kind != "tool_call" or step.tool_name != "search_web":
                 continue
             self.search_calls += 1
             input_value = _json_mapping(step.input_json)
             output_value = _json_mapping(step.output_json)
-            draft_key = _text(input_value.get("draft_key") or output_value.get("draft_key"))
-            if draft_key:
-                self.search_attempted_draft_keys.add(draft_key)
+            event_key = _text(input_value.get("event_key") or output_value.get("event_key") or input_value.get("draft_key"))
+            if event_key:
+                self.search_attempted_event_keys.add(event_key)
             for raw in output_value.get("results") or ():
                 if not isinstance(raw, Mapping):
                     continue
@@ -837,56 +899,377 @@ class _StageCAgentTools:
                     published_date=_text(raw.get("published_date")),
                 )
 
-    def mark_unresolved(self, args: dict[str, Any]) -> Mapping[str, Any]:
-        ids = _unique_positive_ids(args.get("item_ids"), limit=40)
-        unknown = [item_id for item_id in ids if item_id not in self.active_ids]
-        if unknown:
-            return {"ok": False, "error": f"unresolved items must be active candidates: {unknown}"}
-        return _save_unresolved_draft(self.repo, self.agent_session, self.by_item_id, ids, str(args.get("reason") or "needs_review"))
+    def _restore_plan_state(self) -> None:
+        state = dict(self.agent_session.state or {})
+        plan = state.get("accepted_plan")
+        if isinstance(plan, list) and plan and self.agent_session.finalization_requested:
+            self.accepted_plan = [dict(row) for row in plan if isinstance(row, Mapping)]
+            self.last_validation = {"errors": [], "events": self.accepted_plan, "missing_active_ids": []}
 
-    def finalize_event_drafts(self, args: dict[str, Any]) -> Mapping[str, Any]:
-        del args
-        validation = _validate_agent_drafts(
-            self.repo,
-            self.agent_session,
-            self.active_ids,
-            admissions=self.admissions,
-        )
-        review_drafts = [
-            draft
-            for draft in self.repo.list_agent_drafts(int(self.agent_session.id))
-            if str(draft.review_state or "").casefold() == "needs_review"
-        ]
-        verification_pending = [
-            draft
-            for draft in review_drafts
-            if self.max_web_searches > 0
-            and self.search_client is not None
-            and self.search_client.is_configured
-            and draft.draft_key not in self.search_attempted_draft_keys
-        ]
-        errors = list(validation["errors"])
-        if verification_pending:
-            errors.append("each needs_review draft requires its own Tavily verification pass before finalization")
-        if errors:
-            return {
-                "ok": False,
-                "errors": errors,
-                "missing_active_ids": validation["missing_active_ids"],
-                "verification_pending": [_pending_verification_view(draft) for draft in verification_pending]
-                if verification_pending
-                else [],
-                "next_action": (
-                    "Use search_web for each unresolved draft, attach returned sources to its claims, and revise the draft. "
-                    "Keep publishability=needs_review only when the research pass still cannot resolve it."
-                    if verification_pending
-                    else None
-                ),
+
+def _prepare_event_plan(
+    raw_events: Sequence[Any],
+    *,
+    active_ids: set[int],
+    admissions: Mapping[int, IntelCandidateAdmission],
+    history_by_key: Mapping[str, Mapping[str, Any]],
+    history_identity_index: Mapping[str, Sequence[str]],
+    search_attempted_event_keys: set[str],
+    max_web_searches: int,
+    search_configured: bool,
+    auto_fill_missing: bool = False,
+    unresolved_reason: str = "needs_review",
+) -> tuple[list[dict[str, Any]], list[str]]:
+    errors: list[str] = []
+    prepared: list[dict[str, Any]] = []
+    assigned: dict[int, str] = {}
+    keys: set[str] = set()
+
+    for index, raw_value in enumerate(raw_events):
+        if not isinstance(raw_value, Mapping):
+            errors.append(f"events[{index}] must be an object")
+            continue
+        event_args = dict(raw_value)
+        event_key = _text(event_args.get("event_key") or event_args.get("draft_key"))
+        if not event_key:
+            errors.append(f"events[{index}] is missing event_key")
+            continue
+        if event_key in keys:
+            errors.append(f"duplicate event_key in plan: {event_key}")
+            continue
+        keys.add(event_key)
+        ids = _unique_positive_ids(event_args.get("item_ids"), limit=40)
+        if not ids:
+            errors.append(f"event {event_key} requires item_ids")
+            continue
+        unknown = [item_id for item_id in ids if item_id not in admissions]
+        if unknown:
+            errors.append(f"event {event_key} references items outside the C workbench: {unknown}")
+            continue
+        conflict = False
+        for item_id in ids:
+            prior_key = assigned.get(item_id)
+            if prior_key is not None:
+                errors.append(f"item {item_id} appears in both {prior_key} and {event_key}")
+                conflict = True
+                break
+            assigned[item_id] = event_key
+        if conflict:
+            continue
+        try:
+            history = _prepare_draft_history(
+                event_args,
+                item_ids=ids,
+                admissions=admissions,
+                history_by_key=history_by_key,
+                history_identity_index=history_identity_index,
+            )
+            publishability = _prepare_draft_publishability(
+                event_args,
+                item_ids=ids,
+                novelty_status=str(history["novelty_status"]),
+            )
+        except ValueError as exc:
+            errors.append(f"event {event_key}: {exc}")
+            continue
+        caveats = _strings(event_args.get("caveats"))
+        caveats.extend(value for value in history["risk_flags"] if value not in caveats)
+        caveats.extend(value for value in publishability["risk_flags"] if value not in caveats)
+        prepared.append(
+            {
+                "event_key": event_key,
+                "draft_key": event_key,
+                "item_ids": ids,
+                "title": str(event_args.get("title") or "").strip() or f"event-{event_key}",
+                "summary_cn": _text(event_args.get("summary_cn")),
+                "topic": str(event_args.get("topic") or "technology_insight"),
+                "facts": publishability["facts"],
+                "history_status": history["history_status"],
+                "novelty_status": history["novelty_status"],
+                "prior_event_key": history.get("prior_event_key"),
+                "publishability": publishability["publishability"],
+                "review_state": publishability["review_state"],
+                "split_reason": _text(event_args.get("split_reason")),
+                "caveats": caveats,
+                "event_family_key": _event_family_key(event_args),
+                "history_guard": history["guard"],
+                "publishability_guard": publishability["guard"],
             }
-        self.agent_session.finalization_requested = True
-        self.agent_session.status = "finalizing"
-        self.session.commit()
-        return {"ok": True, "draft_count": validation["draft_count"], "_finalized": True}
+        )
+
+    prepared = _merge_exact_identity_events(prepared, admissions=admissions)
+    prepared, identity_notes = _dedupe_item_assignments(prepared)
+    for note in identity_notes:
+        if note not in errors and not auto_fill_missing:
+            # Notes are informational after automatic merge; only surface as
+            # soft caveats on the surviving events.
+            pass
+
+    covered = {
+        int(item_id)
+        for event in prepared
+        for item_id in event.get("item_ids") or ()
+    }
+    missing = sorted(active_ids - covered)
+    if missing and not auto_fill_missing:
+        errors.append(f"active candidates are not covered: {missing}")
+    if missing and auto_fill_missing:
+        for item_id in missing:
+            prepared.append(_unresolved_event_spec(admissions[item_id], reason=unresolved_reason))
+
+    family_errors = _event_family_split_errors_from_plan(prepared)
+    errors.extend(family_errors)
+
+    if max_web_searches > 0 and search_configured and not auto_fill_missing:
+        pending = [
+            event["event_key"]
+            for event in prepared
+            if str(event.get("publishability") or "").casefold() == "needs_review"
+            and event["event_key"] not in search_attempted_event_keys
+        ]
+        if pending:
+            errors.append(
+                "each needs_review event requires its own Tavily verification pass before commit: "
+                + ", ".join(pending)
+            )
+
+    # Exact-identity splits across publishable events should already be merged.
+    # Keep a final guard that only fails if merge could not collapse them.
+    identity_errors = _publishable_identity_split_errors(prepared, admissions=admissions, active_ids=active_ids)
+    errors.extend(identity_errors)
+
+    if errors and not auto_fill_missing:
+        return prepared, errors
+    if auto_fill_missing:
+        # Fallback path must always produce a commitable projection.
+        return prepared, []
+    return prepared, errors
+
+
+def _merge_exact_identity_events(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    admissions: Mapping[int, IntelCandidateAdmission],
+) -> list[dict[str, Any]]:
+    """Force-merge publishable events that share a strong exact identity."""
+
+    working = [dict(event) for event in events]
+    if len(working) <= 1:
+        return working
+
+    def event_identities(event: Mapping[str, Any]) -> set[str]:
+        if str(event.get("publishability") or event.get("review_state") or "").casefold() == "rejected":
+            return set()
+        keys: set[str] = set()
+        for item_id in event.get("item_ids") or ():
+            row = admissions.get(int(item_id))
+            if row is None:
+                continue
+            keys.update(exact_identity_keys(_item_mapping(row.item)))
+        return keys
+
+    changed = True
+    while changed and len(working) > 1:
+        changed = False
+        identity_owner: dict[str, int] = {}
+        merge_pair: tuple[int, int] | None = None
+        for index, event in enumerate(working):
+            for identity in event_identities(event):
+                owner = identity_owner.get(identity)
+                if owner is None:
+                    identity_owner[identity] = index
+                    continue
+                if owner != index:
+                    merge_pair = (owner, index)
+                    break
+            if merge_pair is not None:
+                break
+        if merge_pair is None:
+            break
+        left_idx, right_idx = merge_pair
+        left = working[left_idx]
+        right = working[right_idx]
+        survivor, absorbed = _prefer_event(left, right)
+        left_ids = list(survivor.get("item_ids") or ())
+        right_ids = list(absorbed.get("item_ids") or ())
+        survivor = dict(survivor)
+        survivor["item_ids"] = list(dict.fromkeys([*left_ids, *right_ids]))
+        survivor_facts = list(survivor.get("facts") or [])
+        for fact in list(absorbed.get("facts") or ()):
+            if fact not in survivor_facts:
+                survivor_facts.append(fact)
+        survivor["facts"] = survivor_facts
+        caveats = list(survivor.get("caveats") or [])
+        for value in list(absorbed.get("caveats") or ()):
+            if value not in caveats:
+                caveats.append(value)
+        note = f"merged exact-identity event {absorbed.get('event_key')} into {survivor.get('event_key')}"
+        if note not in caveats:
+            caveats.append(note)
+        survivor["caveats"] = caveats
+        if str(survivor.get("publishability")).casefold() == "rejected" and str(absorbed.get("publishability")).casefold() != "rejected":
+            survivor["publishability"] = absorbed.get("publishability")
+            survivor["review_state"] = absorbed.get("review_state")
+        next_events = [event for idx, event in enumerate(working) if idx not in {left_idx, right_idx}]
+        next_events.insert(min(left_idx, right_idx), survivor)
+        working = next_events
+        changed = True
+    return working
+
+
+def _prefer_event(left: Mapping[str, Any], right: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    rank = {"candidate": 0, "needs_review": 1, "rejected": 2}
+    left_rank = rank.get(str(left.get("publishability") or "").casefold(), 9)
+    right_rank = rank.get(str(right.get("publishability") or "").casefold(), 9)
+    left_size = len(left.get("item_ids") or ())
+    right_size = len(right.get("item_ids") or ())
+    if (left_rank, -left_size, str(left.get("event_key") or "")) <= (right_rank, -right_size, str(right.get("event_key") or "")):
+        return dict(left), dict(right)
+    return dict(right), dict(left)
+
+
+def _dedupe_item_assignments(events: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    notes: list[str] = []
+    claimed: dict[int, str] = {}
+    result: list[dict[str, Any]] = []
+    for event in events:
+        row = dict(event)
+        kept: list[int] = []
+        for item_id in row.get("item_ids") or ():
+            item_id = int(item_id)
+            owner = claimed.get(item_id)
+            if owner is None:
+                claimed[item_id] = str(row.get("event_key"))
+                kept.append(item_id)
+                continue
+            notes.append(f"item {item_id} dropped from {row.get('event_key')} because it already belongs to {owner}")
+        if not kept:
+            notes.append(f"event {row.get('event_key')} removed because it lost all members")
+            continue
+        row["item_ids"] = kept
+        result.append(row)
+    return result, notes
+
+
+def _publishable_identity_split_errors(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    admissions: Mapping[int, IntelCandidateAdmission],
+    active_ids: set[int],
+) -> list[str]:
+    identity_owner: dict[str, str] = {}
+    errors: list[str] = []
+    for event in events:
+        publishability = str(event.get("publishability") or event.get("review_state") or "").casefold()
+        if publishability not in {"candidate", "needs_review"}:
+            continue
+        event_key = str(event.get("event_key") or "")
+        for item_id in event.get("item_ids") or ():
+            item_id = int(item_id)
+            if item_id not in active_ids or item_id not in admissions:
+                continue
+            for identity in exact_identity_keys(_item_mapping(admissions[item_id].item)):
+                owner = identity_owner.setdefault(identity, event_key)
+                if owner != event_key:
+                    errors.append(
+                        f"active candidates with exact identity {identity} are split across {owner} and {event_key}"
+                    )
+    return errors
+
+
+def _event_family_split_errors_from_plan(events: Sequence[Mapping[str, Any]]) -> list[str]:
+    by_family: dict[str, list[Mapping[str, Any]]] = {}
+    for event in events:
+        if str(event.get("publishability") or event.get("review_state") or "").casefold() not in {"candidate", "needs_review"}:
+            continue
+        family = _normalize_event_family_key(event.get("event_family_key") or event.get("event_key"))
+        if not family:
+            continue
+        by_family.setdefault(family, []).append(event)
+
+    errors: list[str] = []
+    for family, rows in sorted(by_family.items()):
+        if len(rows) <= 1:
+            continue
+        missing_or_invalid: list[str] = []
+        for event in rows:
+            reason = str(event.get("split_reason") or "").strip()
+            if reason not in _ALLOWED_STAGE_C_SPLIT_REASONS:
+                missing_or_invalid.append(str(event.get("event_key")))
+        if missing_or_invalid:
+            errors.append(
+                "event_family_key "
+                f"{family} has multiple publishable events without allowed split_reason: {missing_or_invalid}. "
+                "Merge them into one event package, or use one allowed split_reason per remaining event."
+            )
+    return errors
+
+
+def _unresolved_event_spec(admission: IntelCandidateAdmission, *, reason: str) -> dict[str, Any]:
+    item = admission.item
+    item_id = int(item.id)
+    key = f"unresolved-{item_id}"
+    title = item.title or f"unresolved-{item_id}"
+    summary = (item.ai_review.summary_cn if item.ai_review is not None else item.summary) or title
+    topic = (item.ai_review.topic if item.ai_review is not None else "technology_insight") or "technology_insight"
+    return {
+        "event_key": key,
+        "draft_key": key,
+        "item_ids": [item_id],
+        "title": title,
+        "summary_cn": summary,
+        "topic": topic,
+        "facts": [],
+        "history_status": "uncertain",
+        "novelty_status": "uncertain",
+        "prior_event_key": None,
+        "publishability": "needs_review",
+        "review_state": "needs_review",
+        "split_reason": None,
+        "caveats": ["needs_review", reason],
+        "event_family_key": _normalize_event_family_key(key),
+        "history_guard": {"policy": "fallback_unresolved"},
+        "publishability_guard": {"policy": "fallback_unresolved", "reason": reason},
+    }
+
+
+def _draft_persistence_spec(event: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "draft_key": event["event_key"],
+        "item_ids": list(event.get("item_ids") or ()),
+        "title": event.get("title"),
+        "summary_cn": event.get("summary_cn"),
+        "topic": event.get("topic") or "technology_insight",
+        "keywords": (),
+        "entities": (),
+        "novelty_status": event.get("novelty_status") or "uncertain",
+        "prior_event_key": event.get("prior_event_key"),
+        "review_state": event.get("review_state") or event.get("publishability") or "candidate",
+        "risk_flags": list(event.get("caveats") or ()),
+        "metadata": {
+            "saved_by": "responses_agent_plan_commit",
+            "event_family_key": event.get("event_family_key"),
+            "facts": list(event.get("facts") or ()),
+            "history_status": event.get("history_status"),
+            "history_guard": event.get("history_guard") or {},
+            "publishability": event.get("publishability"),
+            "publishability_guard": event.get("publishability_guard") or {},
+            "split_reason": event.get("split_reason"),
+            "caveats": list(event.get("caveats") or ()),
+        },
+    }
+
+
+def _plan_event_view(event: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "event_key": event.get("event_key"),
+        "title": event.get("title"),
+        "item_ids": list(event.get("item_ids") or ()),
+        "event_family_key": event.get("event_family_key"),
+        "history_status": event.get("history_status"),
+        "publishability": event.get("publishability"),
+        "caveats": list(event.get("caveats") or ()),
+    }
 
 
 def _load_admissions(
@@ -937,28 +1320,26 @@ def _load_published_daily_history(
     return result
 
 
-def _draft_tool_view(draft: IntelEventDraft) -> dict[str, Any]:
-    metadata = _json_mapping(draft.metadata_json)
-    return {
-        "draft_key": draft.draft_key,
-        "title": draft.title,
-        "item_ids": [int(member.item_id) for member in draft.members],
-        "event_family_key": metadata.get("event_family_key"),
-        "history_status": metadata.get("history_status") or draft.novelty_status,
-        "publishability": metadata.get("publishability") or draft.review_state,
-        "caveats": metadata.get("caveats") or _json_strings(draft.risk_flags_json),
-        "metadata": metadata,
-    }
+def _ensure_committed_drafts(
+    *,
+    repo: IntelRepository,
+    agent_session: IntelAgentSession,
+    tools: _StageCAgentTools,
+) -> None:
+    """Rewrite drafts from the accepted in-memory plan when resume left them empty."""
 
-
-def _pending_verification_view(draft: IntelEventDraft) -> dict[str, Any]:
-    view = _draft_tool_view(draft)
-    return {
-        "draft_key": view["draft_key"],
-        "title": view["title"],
-        "event_family_key": view.get("event_family_key"),
-        "caveats": view.get("caveats") or [],
-    }
+    drafts = repo.list_agent_drafts(int(agent_session.id))
+    if drafts:
+        return
+    plan = tools.accepted_plan or list((agent_session.state or {}).get("accepted_plan") or [])
+    if not plan:
+        raise StageCAgentContractError("Stage C finalized without a committed event plan")
+    repo.replace_agent_drafts(
+        int(agent_session.id),
+        [_draft_persistence_spec(event) for event in plan if isinstance(event, Mapping)],
+    )
+    repo.reattach_agent_evidence_by_event_keys(int(agent_session.id))
+    tools.session.commit()
 
 
 def _materialize_agent_events(
@@ -972,7 +1353,8 @@ def _materialize_agent_events(
     result: EventClusterResult,
 ) -> None:
     active_ids = {int(row.item_id) for row in admissions["active"]}
-    validation = _validate_agent_drafts(repo, agent_session, active_ids, admissions=admissions)
+    drafts = repo.list_agent_drafts(int(agent_session.id))
+    validation = _validate_committed_drafts(drafts, active_ids=active_ids, admissions=admissions)
     if validation["errors"]:
         raise StageCAgentContractError("; ".join(validation["errors"]))
     all_admissions = {int(row.item_id): row for rows in admissions.values() for row in rows}
@@ -983,10 +1365,10 @@ def _materialize_agent_events(
     seen_keys: set[str] = set()
     assigned_ids = {
         int(member.item_id)
-        for draft in repo.list_agent_drafts(int(agent_session.id))
+        for draft in drafts
         for member in draft.members
     }
-    for draft in repo.list_agent_drafts(int(agent_session.id)):
+    for draft in drafts:
         member_ids = [int(member.item_id) for member in draft.members]
         draft_identities = {
             key
@@ -1002,7 +1384,9 @@ def _materialize_agent_events(
                 assigned_ids.add(reserve_id)
         members = [all_admissions[item_id].item for item_id in member_ids]
         primary = _select_primary_item(members)
-        event_key = canonical_event_key(_item_mapping(primary))
+        # Prefer the committed draft key so distinct plan events stay distinct
+        # even when members share a weak repository homepage URL.
+        event_key = str(draft.draft_key or "").strip() or canonical_event_key(_item_mapping(primary))
         if event_key in seen_keys:
             event_key = f"agent:{int(agent_session.id)}:{int(draft.id)}"
         seen_keys.add(event_key)
@@ -1034,10 +1418,11 @@ def _materialize_agent_events(
             novelty_status=draft.novelty_status,
             state="candidate",
             review_state=draft.review_state,
-            resolution_method="responses_agent",
+            resolution_method="responses_agent_plan_commit",
             resolution_raw={
                 "agent_session_id": int(agent_session.id),
                 "draft_key": draft.draft_key,
+                "event_key": draft.draft_key,
                 "prompt_version": agent_session.prompt_version,
                 "prior_event_key": draft.prior_event_key,
                 "draft_metadata": _json_mapping(draft.metadata_json),
@@ -1081,8 +1466,6 @@ def _materialize_agent_events(
             else:
                 result.events += 1
                 result.event_ids.append(int(event.id))
-        # Keep every materialized event in the C audit pool, but only pass the
-        # two reviewable states downstream. Rejected rows remain traceable in C.
         if str(draft.review_state or "").casefold() in {"candidate", "needs_review"}:
             result.candidate_event_ids.append(int(event.id))
         if draft.review_state == "needs_review":
@@ -1090,67 +1473,12 @@ def _materialize_agent_events(
     session.flush()
 
 
-def _ensure_unresolved_drafts(
+def _validate_committed_drafts(
+    drafts: Sequence[IntelEventDraft],
     *,
-    repo: IntelRepository,
-    agent_session: IntelAgentSession,
-    admissions: Mapping[str, Sequence[IntelCandidateAdmission]],
-    reason: str,
-) -> None:
-    all_rows = {int(row.item_id): row for rows in admissions.values() for row in rows}
-    active_ids = {int(row.item_id) for row in admissions["active"]}
-    validation = _validate_agent_drafts(repo, agent_session, active_ids)
-    for item_id in validation["missing_active_ids"]:
-        _save_unresolved_draft(repo, agent_session, all_rows, [item_id], reason)
-
-
-def _save_unresolved_draft(
-    repo: IntelRepository,
-    agent_session: IntelAgentSession,
-    rows_by_item: Mapping[int, IntelCandidateAdmission],
-    item_ids: Sequence[int],
-    reason: str,
-) -> Mapping[str, Any]:
-    ids = [int(value) for value in item_ids]
-    primary = rows_by_item[ids[0]].item
-    key = "unresolved-" + "-".join(str(value) for value in ids)
-    try:
-        draft = repo.upsert_agent_draft(
-            int(agent_session.id),
-            draft_key=key,
-            item_ids=ids,
-            title=primary.title,
-            summary_cn=(primary.ai_review.summary_cn if primary.ai_review is not None else primary.summary) or primary.title,
-            topic=(primary.ai_review.topic if primary.ai_review is not None else "technology_insight") or "technology_insight",
-            keywords=(primary.ai_review.keywords if primary.ai_review is not None else ()),
-            entities=(primary.ai_review.entities if primary.ai_review is not None else ()),
-            novelty_status="uncertain",
-            prior_event_key=None,
-            review_state="needs_review",
-            risk_flags=["needs_review", reason],
-            metadata={
-                "event_family_key": _normalize_event_family_key(key),
-                "facts": [],
-                "history_status": "uncertain",
-                "publishability": "needs_review",
-                "split_reason": None,
-                "caveats": [reason],
-                "reason": reason,
-            },
-        )
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-    return {"ok": True, "draft_key": draft.draft_key, "draft_id": int(draft.id), "_finalized": False}
-
-
-def _validate_agent_drafts(
-    repo: IntelRepository,
-    agent_session: IntelAgentSession,
     active_ids: set[int],
-    *,
-    admissions: Mapping[str, Sequence[IntelCandidateAdmission]] | None = None,
+    admissions: Mapping[str, Sequence[IntelCandidateAdmission]],
 ) -> dict[str, Any]:
-    drafts = repo.list_agent_drafts(int(agent_session.id))
     seen: set[int] = set()
     errors: list[str] = []
     for draft in drafts:
@@ -1163,23 +1491,23 @@ def _validate_agent_drafts(
             seen.add(item_id)
     missing = sorted(active_ids - seen)
     if missing:
-        errors.append("active candidates are not covered")
-    if admissions is not None:
-        rows = {int(row.item_id): row for values in admissions.values() for row in values}
-        identity_owner: dict[str, str] = {}
-        for draft in drafts:
-            for member in draft.members:
-                item_id = int(member.item_id)
-                if item_id not in active_ids or item_id not in rows:
-                    continue
-                for identity in exact_identity_keys(_item_mapping(rows[item_id].item)):
-                    owner = identity_owner.setdefault(identity, draft.draft_key)
-                    if owner != draft.draft_key:
-                        errors.append(
-                            f"active candidates with exact identity {identity} are split across {owner} and {draft.draft_key}"
-                        )
-    family_errors = _event_family_split_errors(drafts)
-    errors.extend(family_errors)
+        errors.append(f"active candidates are not covered: {missing}")
+    rows = {int(row.item_id): row for values in admissions.values() for row in values}
+    plan_events = []
+    for draft in drafts:
+        metadata = _json_mapping(draft.metadata_json)
+        plan_events.append(
+            {
+                "event_key": draft.draft_key,
+                "item_ids": [int(member.item_id) for member in draft.members],
+                "publishability": metadata.get("publishability") or draft.review_state,
+                "review_state": draft.review_state,
+                "split_reason": metadata.get("split_reason"),
+                "event_family_key": metadata.get("event_family_key") or draft.draft_key,
+            }
+        )
+    errors.extend(_publishable_identity_split_errors(plan_events, admissions=rows, active_ids=active_ids))
+    errors.extend(_event_family_split_errors_from_plan(plan_events))
     return {"errors": errors, "missing_active_ids": missing, "draft_count": len(drafts)}
 
 
@@ -1190,36 +1518,6 @@ _ALLOWED_STAGE_C_SPLIT_REASONS = frozenset({
     "platform_released_independent_product",
     "standalone_pricing_quota_access_change",
 })
-
-
-def _event_family_split_errors(drafts: Sequence[IntelEventDraft]) -> list[str]:
-    by_family: dict[str, list[IntelEventDraft]] = {}
-    for draft in drafts:
-        if str(draft.review_state or "").casefold() not in {"candidate", "needs_review"}:
-            continue
-        metadata = _json_mapping(draft.metadata_json)
-        family = _normalize_event_family_key(metadata.get("event_family_key") or draft.draft_key)
-        if not family:
-            continue
-        by_family.setdefault(family, []).append(draft)
-
-    errors: list[str] = []
-    for family, rows in sorted(by_family.items()):
-        if len(rows) <= 1:
-            continue
-        missing_or_invalid: list[str] = []
-        for draft in rows:
-            metadata = _json_mapping(draft.metadata_json)
-            reason = str(metadata.get("split_reason") or "").strip()
-            if reason not in _ALLOWED_STAGE_C_SPLIT_REASONS:
-                missing_or_invalid.append(draft.draft_key)
-        if missing_or_invalid:
-            errors.append(
-                "event_family_key "
-                f"{family} has multiple publishable drafts without allowed split_reason: {missing_or_invalid}. "
-                "Merge them into one event package, or use one allowed split_reason per remaining draft."
-            )
-    return errors
 
 
 def _clear_build_events(session: Session, *, run_id: int) -> None:
@@ -1318,39 +1616,37 @@ def _emit_progress(
 
 
 def _stage_c_tool_progress(
-    repo: IntelRepository,
-    session_id: int,
-    active_ids: set[int],
+    tools: _StageCAgentTools,
     *,
     tool_name: str | None,
     arguments: Mapping[str, Any],
     output: Mapping[str, Any],
 ) -> dict[str, Any]:
-    drafts = repo.list_agent_drafts(int(session_id))
+    events = tools.accepted_plan or tools.last_validation.get("events") or []
     title = _stage_c_current_title(tool_name, arguments, output)
     return {
         "tool": tool_name,
         "ok": bool(output.get("ok", True)),
-        "error": _text(output.get("error")),
+        "error": _text(output.get("error")) or _join_errors(output.get("errors")),
         "title": title,
-        "active_total": len(active_ids),
-        "covered_items": _covered_active_count_from_drafts(drafts, active_ids),
-        "draft_count": len(drafts),
-        "needs_review": sum(1 for draft in drafts if str(draft.review_state or "").casefold() == "needs_review"),
-        "rejected": sum(1 for draft in drafts if str(draft.review_state or "").casefold() == "rejected"),
+        "active_total": len(tools.active_ids),
+        "covered_items": _covered_active_count_from_plan(events, tools.active_ids),
+        "event_count": len(events),
+        "needs_review": sum(
+            1 for event in events if str(event.get("publishability") or "").casefold() == "needs_review"
+        ),
+        "rejected": sum(1 for event in events if str(event.get("publishability") or "").casefold() == "rejected"),
     }
 
 
-def _covered_active_count(repo: IntelRepository, session_id: int, active_ids: set[int]) -> int:
-    return _covered_active_count_from_drafts(repo.list_agent_drafts(int(session_id)), active_ids)
-
-
-def _covered_active_count_from_drafts(drafts: Sequence[IntelEventDraft], active_ids: set[int]) -> int:
+def _covered_active_count_from_plan(events: Sequence[Mapping[str, Any]] | None, active_ids: set[int]) -> int:
+    if not events:
+        return 0
     covered = {
-        int(member.item_id)
-        for draft in drafts
-        for member in draft.members
-        if int(member.item_id) in active_ids
+        int(item_id)
+        for event in events
+        for item_id in event.get("item_ids") or ()
+        if int(item_id) in active_ids
     }
     return len(covered)
 
@@ -1366,18 +1662,14 @@ def _stage_c_current_title(
             first = items[0]
             if isinstance(first, Mapping):
                 return _text(first.get("title"))
-    if tool_name == "save_event_drafts":
-        drafts = output.get("drafts")
-        if isinstance(drafts, list) and drafts:
-            first = drafts[0]
-            if isinstance(first, Mapping):
-                return _text(first.get("draft_key"))
+    if tool_name == "submit_event_plan":
+        return _text(output.get("event_count")) and f"events={output.get('event_count')}"
     if tool_name == "search_web":
         return _text(arguments.get("claim")) or _text(arguments.get("query"))
     if tool_name == "attach_search_evidence":
-        return _text(arguments.get("claim")) or _text(arguments.get("draft_key"))
-    if tool_name == "mark_unresolved":
-        return _text(arguments.get("reason"))
+        return _text(arguments.get("claim")) or _text(arguments.get("event_key"))
+    if tool_name == "list_plan_snapshot":
+        return f"events={output.get('event_count')}"
     return None
 
 
@@ -1395,6 +1687,9 @@ def _compact_admission(admission: IntelCandidateAdmission) -> dict[str, Any]:
         "keywords": review.keywords if review is not None else [],
         "entities": review.entities if review is not None else [],
         "canonical_url": item.canonical_url or item.source_url,
+        "external_id": item.external_id,
+        "identity_keys": list(exact_identity_keys(_item_mapping(item))),
+        "related_identity_hints": list(related_identity_hints(_item_mapping(item))),
         "published_at": _iso_datetime(item.published_at or item.captured_at),
         "source": {
             "id": item.source_id,
@@ -1409,7 +1704,6 @@ def _full_admission(admission: IntelCandidateAdmission) -> dict[str, Any]:
     item = admission.item
     compact["content_text"] = (item.content_text or item.summary or item.title or "")[:16_000]
     compact["source_url"] = item.source_url
-    compact["external_id"] = item.external_id
     compact["content_class"] = item.content_class
     compact["metrics"] = _json_mapping(item.metrics_json)
     return compact
@@ -1636,6 +1930,7 @@ def _stage_c_config_fingerprint(
         "max_web_searches": max_web_searches,
         "lease_seconds": lease_seconds,
         "search_provider": search_provider,
+        "protocol": "plan_commit_v1",
     }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -1671,17 +1966,12 @@ def _item_mapping(item: IntelItem) -> dict[str, Any]:
 
 
 def _event_family_key(draft: Mapping[str, Any]) -> str:
-    return _normalize_event_family_key(draft.get("event_family_key") or draft.get("draft_key"))
+    return _normalize_event_family_key(draft.get("event_family_key") or draft.get("event_key") or draft.get("draft_key"))
 
 
 def _normalize_event_family_key(value: Any) -> str:
     text = re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().casefold()).strip("_")
     return text[:120] or "other"
-
-
-def _normalize_external_id(value: Any) -> str | None:
-    text = re.sub(r"\s+", "", str(value).strip()).casefold() if value is not None else ""
-    return text or None
 
 
 def _parse_call_arguments(value: Any) -> dict[str, Any]:
@@ -1730,15 +2020,6 @@ def _json_strings(value: Any) -> list[str]:
             return []
         value = parsed
     return _strings(value)
-
-
-def _json_objects(value: Any) -> list[dict[str, Any]]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return []
-    return [dict(row) for row in value if isinstance(row, Mapping)] if isinstance(value, list) else []
 
 
 def _json_mapping(value: Any) -> dict[str, Any]:
@@ -1791,11 +2072,11 @@ def _text(value: Any) -> str | None:
     return text or None
 
 
-def _bounded_score(value: Any, default: int) -> int:
-    try:
-        return max(0, min(100, int(value)))
-    except (TypeError, ValueError, OverflowError):
-        return default
+def _join_errors(value: Any) -> str | None:
+    if not isinstance(value, list) or not value:
+        return None
+    parts = [str(item).strip() for item in value if str(item).strip()]
+    return "; ".join(parts) if parts else None
 
 
 def _bounded_int(value: Any) -> int:
@@ -1857,6 +2138,7 @@ __all__ = [
     "canonical_event_url",
     "exact_identity_keys",
     "normalize_event_title",
+    "related_identity_hints",
     "run_event_cluster_from_settings",
     "run_event_cluster_job",
 ]

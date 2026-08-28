@@ -22,13 +22,13 @@ STAGE_B_ADMISSION_POLICY_VERSION = "stage_b_admission_v6"
 DEFAULT_AI_REVIEW_CONCURRENCY = 4
 """Maximum concurrent provider calls for Stage A or Stage B."""
 
-STAGE_C_AGENT_VERSION = "stage_c_agent_v8"
+STAGE_C_AGENT_VERSION = "stage_c_agent_v9"
 # These are deliberately roomy defaults for the agent verification flow.
 # Operators can configure a larger value when a run needs it; web search uses
 # 0 as its explicit disable switch.
 DEFAULT_STAGE_C_AGENT_MAX_TURNS = 32
-DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS = 120
-DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES = 16
+DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS = 240
+DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES = 50
 DEFAULT_STAGE_C_AGENT_HISTORY_DAYS = 3
 DEFAULT_STAGE_D_MAX_WEB_SEARCHES = 6
 

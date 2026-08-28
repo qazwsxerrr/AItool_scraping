@@ -14,7 +14,6 @@ from app.config.settings import Settings
 from .models import StageDSelectionResponse
 from .parser import strict_parse_stage_d_selection
 from .prompts import (
-    STAGE_D_SELECTION_JSON_SCHEMA,
     STAGE_D_SELECTION_PROMPT_VERSION,
     build_stage_d_provider_payload,
     preflight_stage_d_selection_schema,
@@ -143,23 +142,32 @@ class StageDSelectionClient:
         self.last_request_metadata = request_metadata
         self.last_raw_response = None
         self.last_error_metadata = None
-        call = None
-        for retry in range(self.max_retries + 1):
+        last_error: StageDSelectionProviderError | None = None
+        repair_attempts = 0
+        for attempt in range(self.max_retries + 1):
+            raw_payload: Any | None = None
+            schema_repair_scheduled = False
             try:
-                call = self._responses.create_structured(
-                    payload=payload,
-                    schema=STAGE_D_SELECTION_JSON_SCHEMA,
-                    validate=lambda value: strict_parse_stage_d_selection(
-                        value,
-                        candidate_event_ids=candidate_ids,
-                        max_selected=max_selected,
-                    ),
+                raw_payload = self._responses.create(payload)
+                parsed = strict_parse_stage_d_selection(
+                    raw_payload,
+                    candidate_event_ids=candidate_ids,
+                    max_selected=max_selected,
                 )
-                break
+                completed = dict(request_metadata)
+                completed["provider_attempts"] = attempt + 1
+                if repair_attempts:
+                    completed["schema_repair_attempts"] = repair_attempts
+                self.last_raw_response = raw_payload
+                return StageDSelectionCallResult(
+                    parsed=parsed,
+                    raw_response=raw_payload,
+                    request_metadata=completed,
+                )
+            except StageDSelectionProviderError as exc:
+                last_error = exc
             except ResponsesProviderError as exc:
-                if exc.retryable and exc.error_code != "schema_validation_failed" and retry < self.max_retries:
-                    continue
-                error = StageDSelectionProviderError(
+                last_error = StageDSelectionProviderError(
                     str(exc),
                     status_code=exc.status_code,
                     error_code=exc.error_code or "provider_error",
@@ -167,31 +175,40 @@ class StageDSelectionClient:
                     request_metadata=request_metadata,
                     cause=exc,
                 )
-                self.last_raw_response = error.raw_response
-                self.last_error_metadata = error.audit_payload()
-                raise error from exc
-        if call is None:
-            exc = ResponsesProviderError("Stage D provider request failed")
-            error = StageDSelectionProviderError(
-                str(exc),
-                error_code="provider_error",
-                request_metadata=request_metadata,
-                cause=exc,
-            )
-            self.last_raw_response = error.raw_response
-            self.last_error_metadata = error.audit_payload()
-            raise error from exc
-
-        completed = dict(request_metadata)
-        completed["provider_attempts"] = call.attempts + retry
-        if call.validation_failures:
-            completed["schema_repair_attempts"] = call.validation_failures
-        completed["structured_output_mode"] = call.mode
-        self.last_raw_response = call.raw_response
-        return StageDSelectionCallResult(
-            parsed=call.value,
-            raw_response=call.raw_response,
-            request_metadata=completed,
+            except (TypeError, ValueError) as exc:
+                repair_attempts += 1
+                last_error = StageDSelectionProviderError(
+                    f"Stage D response failed schema validation: {exc}",
+                    error_code="schema_validation_failed",
+                    raw_response=raw_payload,
+                    request_metadata=request_metadata,
+                    cause=exc,
+                )
+                if attempt < self.max_retries:
+                    payload = _schema_repair_payload(
+                        payload,
+                        candidate_event_ids=candidate_ids,
+                        validation_error=str(exc),
+                        invalid_response=raw_payload,
+                    )
+                    schema_repair_scheduled = True
+            except BaseException as exc:
+                last_error = StageDSelectionProviderError(
+                    str(exc),
+                    error_code="provider_error",
+                    request_metadata=request_metadata,
+                    cause=exc,
+                )
+            if schema_repair_scheduled:
+                continue
+            if not last_error.retryable or attempt >= self.max_retries:
+                self.last_raw_response = last_error.raw_response
+                self.last_error_metadata = last_error.audit_payload()
+                raise last_error
+        raise last_error or StageDSelectionProviderError(
+            "Stage D provider request failed",
+            error_code="provider_error",
+            request_metadata=request_metadata,
         )
 
 
@@ -226,6 +243,48 @@ def _safe_url(value: str) -> str:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
     except ValueError:
         return str(value or "").strip()[:512]
+
+
+def _schema_repair_payload(
+    payload: Mapping[str, Any],
+    *,
+    candidate_event_ids: Sequence[int],
+    validation_error: str,
+    invalid_response: Any,
+) -> dict[str, Any]:
+    repaired = dict(payload)
+    base_input = repaired.get("input")
+    messages = [dict(item) for item in base_input if isinstance(item, Mapping)] if isinstance(base_input, list) else []
+    feedback = {
+        "repair_instruction": (
+            "上一轮 Stage D 输出未通过本地契约校验。请重新返回完整 JSON。"
+            "每个 candidate_event_id 必须且只能出现在 selected 或 unselected 之一；"
+            "不要返回候选池外 event_id；selected 数量不得超过 max_selected。"
+        ),
+        "validation_error": validation_error,
+        "candidate_event_ids": [int(event_id) for event_id in candidate_event_ids],
+        "previous_invalid_response": _compact_json_value(invalid_response, limit=12_000),
+    }
+    messages.append(
+        {
+            "role": "user",
+            "content": json.dumps(feedback, ensure_ascii=False, default=str),
+        }
+    )
+    repaired["input"] = messages
+    return repaired
+
+
+def _compact_json_value(value: Any, *, limit: int) -> Any:
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key in ("output_text", "output", "result", "data", "response", "id"):
+            if key in value:
+                result[key] = value[key]
+        if result:
+            return result
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= limit else text[:limit] + "...[truncated]"
 
 
 __all__ = [

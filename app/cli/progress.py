@@ -60,7 +60,6 @@ STAGE_METRIC_LABELS = {
         "updated": "更新",
         "needs_review": "需要复核",
         "rejected": "历史重复/拒绝",
-        "draft_count": "事件草稿",
         "turns": "模型调用",
         "tool_calls": "工具调用",
         "web_searches": "联网搜索",
@@ -267,10 +266,10 @@ class PipelineConsoleReporter:
             snapshot.current_task = title
         if tool_name == "search_web":
             snapshot.metrics["web_searches"] = _int(snapshot.metrics.get("web_searches")) + 1
-        if tool_name == "save_event_drafts":
-            saved = _optional_int(event.data.get("draft_count"))
+        if tool_name in {"submit_event_plan", "list_plan_snapshot"}:
+            saved = _optional_int(event.data.get("event_count"))
             if saved is not None:
-                snapshot.metrics["draft_count"] = saved
+                snapshot.metrics["event_count"] = saved
             covered = _optional_int(event.data.get("covered_items"))
             if covered is not None:
                 snapshot.current = covered
@@ -283,10 +282,6 @@ class PipelineConsoleReporter:
             rejected = _optional_int(event.data.get("rejected"))
             if rejected is not None:
                 snapshot.metrics["rejected"] = rejected
-        if tool_name == "finalize_event_drafts":
-            draft_count = _optional_int(event.data.get("draft_count"))
-            if draft_count is not None:
-                snapshot.metrics["draft_count"] = draft_count
         if event.data.get("ok") is False:
             snapshot.warning = _text(event.data.get("error")) or "工具返回失败"
 
@@ -357,15 +352,13 @@ class PipelineConsoleReporter:
 def _stage_c_action(tool_name: str) -> str:
     return {
         "list_candidates": "读取候选列表",
-        "list_event_drafts": "读取事件草稿",
+        "list_plan_snapshot": "读取事件方案快照",
         "read_items": "读取资讯正文",
         "search_candidates": "检索候选池",
         "read_recent_history": "比对近三期日报",
-        "save_event_drafts": "保存事件草稿",
         "search_web": "搜索补充证据（Tavily）",
         "attach_search_evidence": "绑定搜索证据",
-        "mark_unresolved": "标记待复核",
-        "finalize_event_drafts": "提交事件草稿",
+        "submit_event_plan": "提交完整事件方案",
     }.get(tool_name, tool_name or "工具执行")
 
 
