@@ -38,7 +38,7 @@ STAGE_METRIC_LABELS = {
     "screen": {
         "processed": "待初筛",
         "time_filtered": "时间过滤",
-        "screened": "初筛保留",
+        "screened": "完成初筛",
         "screened_out": "初筛拒绝",
         "screen_failed": "失败",
     },
