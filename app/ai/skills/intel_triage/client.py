@@ -1,17 +1,26 @@
-"""Responses-only client and per-item failure isolation for Stage A/B."""
+"""Structured-output client and per-item failure isolation for Stage A/B."""
 
 from __future__ import annotations
 
 import logging
 from typing import Any, Iterable, Mapping
 
-from app.ai.responses import ResponsesClient, SupportsPost
+from app.ai.structured import StructuredApiStyle, StructuredClient, SupportsPost
 from app.config.settings import Settings
 
 from .guards import apply_analysis_guards, apply_screen_guard
 from .models import AnalysisResult, RawIntelEnvelope, ScreenResult
 from .parser import strict_parse_analysis, strict_parse_screen
-from .prompts import build_analysis_provider_payload, build_screen_provider_payload, preflight_intel_triage_schemas
+from .prompts import (
+    INTEL_ANALYSIS_JSON_SCHEMA,
+    INTEL_ANALYSIS_SYSTEM_PROMPT,
+    INTEL_ANALYSIS_TASK,
+    INTEL_SCREEN_JSON_SCHEMA,
+    INTEL_SCREEN_SYSTEM_PROMPT,
+    INTEL_SCREEN_TASK,
+    coerce_intel_envelope,
+    preflight_intel_triage_schemas,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -28,9 +37,7 @@ class IntelTriageResponseParseError(ValueError):
 
 
 class IntelTriageClient:
-    """The sole Responses transport used by Stage A and Stage B."""
-
-    transport = "responses"
+    """The sole structured-output business client used by Stage A and Stage B."""
 
     def __init__(
         self,
@@ -38,11 +45,13 @@ class IntelTriageClient:
         api_url: str | None,
         api_key: str | None,
         model: str | None = None,
+        api_style: StructuredApiStyle = "responses",
         timeout_seconds: float = 30.0,
         http_client: SupportsPost | None = None,
     ) -> None:
         self.model = model
-        self._responses = ResponsesClient(
+        self._structured = StructuredClient(
+            api_style=api_style,
             api_url=api_url,
             api_key=api_key,
             model=model,
@@ -56,36 +65,51 @@ class IntelTriageClient:
             api_url=settings.ai_review_api_url,
             api_key=settings.ai_review_api_key,
             model=settings.ai_review_model,
+            api_style=settings.ai_structured_api_style,
             timeout_seconds=settings.ai_review_timeout_seconds,
             http_client=http_client,
         )
 
     @property
     def is_configured(self) -> bool:
-        return self._responses.is_configured
+        return self._structured.is_configured
+
+    @property
+    def transport(self) -> StructuredApiStyle:
+        return self._structured.transport
 
     def screen(self, envelope: RawIntelEnvelope | dict[str, Any]) -> ScreenResult:
-        item = _as_envelope(envelope)
+        item = coerce_intel_envelope(envelope)
         preflight_intel_triage_schemas()
-        response = self._responses.create(build_screen_provider_payload(item, model=self.model))
+        result = self._structured.structured(
+            instructions=INTEL_SCREEN_SYSTEM_PROMPT,
+            input_value=item.to_provider_dict(),
+            schema_name=INTEL_SCREEN_TASK,
+            schema=INTEL_SCREEN_JSON_SCHEMA,
+        )
         try:
-            return strict_parse_screen(response, envelope=item)
+            return strict_parse_screen(result.data, envelope=item, raw_response=result.raw_response)
         except Exception as exc:
             raise IntelTriageResponseParseError(
                 f"Stage A response failed schema validation: {exc}",
-                raw_response=response,
+                raw_response=result.raw_response,
             ) from exc
 
     def analyze(self, envelope: RawIntelEnvelope | dict[str, Any]) -> AnalysisResult:
-        item = _as_envelope(envelope)
+        item = coerce_intel_envelope(envelope)
         preflight_intel_triage_schemas()
-        response = self._responses.create(build_analysis_provider_payload(item, model=self.model))
+        result = self._structured.structured(
+            instructions=INTEL_ANALYSIS_SYSTEM_PROMPT,
+            input_value=item.to_provider_dict(),
+            schema_name=INTEL_ANALYSIS_TASK,
+            schema=INTEL_ANALYSIS_JSON_SCHEMA,
+        )
         try:
-            return strict_parse_analysis(response, envelope=item)
+            return strict_parse_analysis(result.data, envelope=item, raw_response=result.raw_response)
         except Exception as exc:
             raise IntelTriageResponseParseError(
                 f"Stage B response failed schema validation: {exc}",
-                raw_response=response,
+                raw_response=result.raw_response,
             ) from exc
 
     def screen_batch(self, envelopes: Iterable[RawIntelEnvelope | dict[str, Any]]) -> list[ScreenResult]:
@@ -132,7 +156,7 @@ def _analysis_failure(item: RawIntelEnvelope, exc: BaseException) -> AnalysisRes
         keywords=[],
         entities=[],
         b1_priority=0,
-        score_components={},
+        score_components=_zero_score_components(),
         status=ANALYSIS_FAILURE_STATUS,
         error_code=exc.__class__.__name__,
         error_message=message,
@@ -191,6 +215,16 @@ def run_analysis_isolated(client: Any, envelopes: Iterable[RawIntelEnvelope | di
 def _raw_response_from_exception(exc: BaseException) -> dict[str, Any] | None:
     value = getattr(exc, "raw_response", None)
     return dict(value) if isinstance(value, Mapping) else None
+
+
+def _zero_score_components() -> dict[str, int]:
+    return {
+        "audience_relevance": 0,
+        "material_change": 0,
+        "impact_scope": 0,
+        "independent_news_value": 0,
+        "specificity": 0,
+    }
 
 
 __all__ = [

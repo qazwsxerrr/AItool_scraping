@@ -1,4 +1,4 @@
-"""Responses-only AI contracts used by the intelligence pipeline."""
+"""AI contracts used by the intelligence pipeline."""
 
 from app.ai.responses import (
     AgentBudgetExceeded,
@@ -6,8 +6,14 @@ from app.ai.responses import (
     FunctionTool,
     ResponsesClient,
     ResponsesProviderError,
-    extract_json_output,
     hosted_web_search_tool,
+)
+from app.ai.structured import (
+    ChatAdapter,
+    ResponsesAdapter,
+    StructuredClient,
+    StructuredProviderError,
+    StructuredResult,
 )
 from app.ai.skills.intel_triage import (
     ANALYSIS_FAILURE_STATUS,
@@ -21,8 +27,6 @@ from app.ai.skills.intel_triage import (
     ScreenResult,
     apply_analysis_guards,
     apply_screen_guard,
-    build_analysis_provider_payload,
-    build_screen_provider_payload,
     normalize_content_class,
     normalize_entity_type,
     normalize_html,
@@ -39,6 +43,7 @@ __all__ = [
     "AgentBudgetExceeded",
     "AgentProtocolError",
     "AnalysisResult",
+    "ChatAdapter",
     "FunctionTool",
     "IntelEntity",
     "IntelEntityType",
@@ -46,14 +51,15 @@ __all__ = [
     "RawIntelEnvelope",
     "ResponsesClient",
     "ResponsesProviderError",
+    "ResponsesAdapter",
     "SCREEN_FAILURE_STATUS",
     "ScoreComponents",
     "ScreenResult",
+    "StructuredClient",
+    "StructuredProviderError",
+    "StructuredResult",
     "apply_analysis_guards",
     "apply_screen_guard",
-    "build_analysis_provider_payload",
-    "build_screen_provider_payload",
-    "extract_json_output",
     "hosted_web_search_tool",
     "normalize_content_class",
     "normalize_entity_type",

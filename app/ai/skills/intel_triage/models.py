@@ -251,26 +251,21 @@ class ScoreComponents(BaseModel):
     """B1 content-value components, each represented on the 0–100 scale."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
-    audience_relevance: int = Field(default=0, ge=0, le=100, description="0–100 的整数分数")
-    material_change: int = Field(default=0, ge=0, le=100, description="0–100 的整数分数")
-    impact_scope: int = Field(default=0, ge=0, le=100, description="0–100 的整数分数")
-    independent_news_value: int = Field(default=0, ge=0, le=100, description="0–100 的整数分数")
-    specificity: int = Field(default=0, ge=0, le=100, description="0–100 的整数分数")
-
-    @field_validator("audience_relevance", "material_change", "impact_scope", "independent_news_value", "specificity", mode="before")
-    @classmethod
-    def _clamp_fields(cls, value: Any) -> int:
-        return _clamp_score(value)
+    audience_relevance: int = Field(ge=0, le=100, description="0–100 的整数分数")
+    material_change: int = Field(ge=0, le=100, description="0–100 的整数分数")
+    impact_scope: int = Field(ge=0, le=100, description="0–100 的整数分数")
+    independent_news_value: int = Field(ge=0, le=100, description="0–100 的整数分数")
+    specificity: int = Field(ge=0, le=100, description="0–100 的整数分数")
 
 class ScreenResult(BaseModel):
     """Strict Stage A response and auditable failure projection."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
     item_id: int | str | None = None
-    decision: Literal["pass", "reject", "uncertain"] = "uncertain"
-    reason_code: str = ""
-    reason: str = ""
-    confidence: int = 0
+    decision: Literal["pass", "reject", "uncertain"]
+    reason_code: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    confidence: int = Field(ge=0, le=100)
     risk_flags: list[str] = Field(default_factory=list)
     status: Literal["success", "screen_failed"] = "success"
     error_code: str | None = None
@@ -285,11 +280,14 @@ class ScreenResult(BaseModel):
         if not isinstance(value, Mapping):
             raise TypeError("ScreenResult must be a mapping")
         data = dict(value)
-        data["decision"] = _normalize_decision(data.get("decision"))
-        data["reason_code"] = normalize_text(data.get("reason_code"), preserve_newlines=False)
-        data["reason"] = normalize_text(data.get("reason"), preserve_newlines=False)
-        data["risk_flags"] = _clean_list(data.get("risk_flags"), limit=32)
-        data["confidence"] = _clamp_score(data.get("confidence"))
+        if "decision" in data:
+            data["decision"] = _normalize_decision(data["decision"])
+        if "reason_code" in data:
+            data["reason_code"] = normalize_text(data["reason_code"], preserve_newlines=False)
+        if "reason" in data:
+            data["reason"] = normalize_text(data["reason"], preserve_newlines=False)
+        if "risk_flags" in data and data["risk_flags"] is not None:
+            data["risk_flags"] = _clean_list(data["risk_flags"], limit=32)
         return data
 
     @field_validator("decision", mode="before")
@@ -307,11 +305,6 @@ class ScreenResult(BaseModel):
     def _clean_risks(cls, value: Any) -> list[str]:
         return _clean_list(value, limit=32)
 
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _clamp_confidence(cls, value: Any) -> int:
-        return _clamp_score(value)
-
     def with_item(self, envelope: RawIntelEnvelope) -> "ScreenResult":
         if self.item_id is None and envelope.item_id is not None:
             return self.model_copy(update={"item_id": envelope.item_id})
@@ -323,13 +316,13 @@ class AnalysisResult(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
     item_id: int | str | None = None
-    topic: IntelTopic = TOPIC_TECHNOLOGY_INSIGHT
-    topics: list[IntelTopic] = Field(default_factory=list)
-    summary_cn: str = ""
-    keywords: list[str] = Field(default_factory=list)
-    entities: list[IntelEntity] = Field(default_factory=list)
-    b1_priority: int = Field(default=0, ge=0, le=100, description="0–100 的整数分数")
-    score_components: ScoreComponents = Field(default_factory=ScoreComponents)
+    topic: IntelTopic
+    topics: list[IntelTopic]
+    summary_cn: str
+    keywords: list[str]
+    entities: list[IntelEntity]
+    b1_priority: int = Field(ge=0, le=100, description="0–100 的整数分数")
+    score_components: ScoreComponents
     status: Literal["success", "analysis_failed"] = "success"
     error_code: str | None = None
     error_message: str | None = None
@@ -343,23 +336,27 @@ class AnalysisResult(BaseModel):
         if not isinstance(value, Mapping):
             raise TypeError("AnalysisResult must be a mapping")
         data = dict(value)
-        topic_values = data.get("topics")
-        topic_value = data.get("topic")
-        normalized_topic = normalize_topic(topic_value)
-        if normalized_topic is None:
-            raise ValueError("topic must be one of: " + ", ".join(INTEL_TOPICS))
-        normalized_topics: list[IntelTopic] = [normalized_topic]
-        if isinstance(topic_values, (list, tuple, set)):
-            for raw_topic in topic_values:
-                normalized = normalize_topic(raw_topic)
-                if normalized is not None and normalized not in normalized_topics:
-                    normalized_topics.append(normalized)
-        data["topic"] = normalized_topic
-        data["topics"] = normalized_topics
-        data["summary_cn"] = normalize_text(data.get("summary_cn"), preserve_newlines=False)
-        data["keywords"] = _clean_list(data.get("keywords"), limit=4)
-        data["entities"] = data.get("entities") or []
-        data["b1_priority"] = _clamp_score(data.get("b1_priority", 0))
+        if "topic" in data:
+            normalized_topic = normalize_topic(data["topic"])
+            if normalized_topic is None:
+                raise ValueError("topic must be one of: " + ", ".join(INTEL_TOPICS))
+            data["topic"] = normalized_topic
+            if "topics" in data:
+                topic_values = data["topics"]
+                if not isinstance(topic_values, (list, tuple, set)):
+                    raise TypeError("topics must be an array")
+                normalized_topics: list[IntelTopic] = [normalized_topic]
+                for raw_topic in topic_values:
+                    normalized = normalize_topic(raw_topic)
+                    if normalized is None:
+                        raise ValueError("topics must contain only supported topic values")
+                    if normalized not in normalized_topics:
+                        normalized_topics.append(normalized)
+                data["topics"] = normalized_topics
+        if "summary_cn" in data:
+            data["summary_cn"] = normalize_text(data["summary_cn"], preserve_newlines=False)
+        if "keywords" in data and data["keywords"] is not None:
+            data["keywords"] = _clean_list(data["keywords"], limit=4)
         return data
 
     @field_validator("topic", mode="before")
@@ -380,11 +377,6 @@ class AnalysisResult(BaseModel):
     def _clean_lists(cls, value: Any) -> list[str]:
         return _clean_list(value, limit=4)
 
-    @field_validator("b1_priority", mode="before")
-    @classmethod
-    def _clamp_scores(cls, value: Any) -> int:
-        return _clamp_score(value)
-
     def with_item(self, envelope: RawIntelEnvelope) -> "AnalysisResult":
         updates: dict[str, Any] = {}
         if self.item_id is None and envelope.item_id is not None:
@@ -392,7 +384,7 @@ class AnalysisResult(BaseModel):
         return self.model_copy(update=updates) if updates else self
 
 def _normalize_decision(value: Any) -> Literal["pass", "reject", "uncertain"]:
-    text = str(value or "uncertain").strip().casefold()
+    text = str(value).strip().casefold()
     if text not in {"pass", "reject", "uncertain"}:
         raise ValueError("decision must be pass, reject, or uncertain")
     return text  # type: ignore[return-value]

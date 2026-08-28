@@ -17,7 +17,7 @@ from .prompts import (
     STAGE_D_SELECTION_PROMPT_VERSION,
     STAGE_D_SELECTION_SYSTEM_PROMPT,
     STAGE_D_SELECTION_TASK,
-    build_stage_d_provider_payload,
+    build_stage_d_selection_request,
     build_stage_d_selection_input,
     preflight_stage_d_selection_schema,
 )
@@ -34,8 +34,8 @@ __all__ = [
     "StageDSelectionClient",
     "StageDSelectionProviderError",
     "StageDSelectionResponse",
-    "build_stage_d_provider_payload",
     "build_stage_d_selection_input",
+    "build_stage_d_selection_request",
     "preflight_stage_d_selection_schema",
     "strict_parse_stage_d_selection",
 ]

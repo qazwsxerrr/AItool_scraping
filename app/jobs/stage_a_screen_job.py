@@ -184,6 +184,7 @@ def run_stage_a_screen_job(
     config_fingerprint = _config_fingerprint(
         stage="screen",
         model=getattr(ai_client, "model", None),
+        transport=getattr(ai_client, "transport", None),
         reject_threshold=reject_threshold,
         freshness_policy=STAGE_A_FRESHNESS_POLICY_VERSION,
         freshness_cutoff_mode=STAGE_A_FRESHNESS_CUTOFF_MODE,
@@ -928,12 +929,18 @@ def _config_fingerprint(
     *,
     stage: str,
     model: Any,
+    transport: Any = None,
     reject_threshold: int,
     freshness_policy: str | None = None,
     freshness_cutoff_mode: str | None = None,
     freshness_timezone: str | None = None,
 ) -> str:
-    payload = {"stage": stage, "model": str(model or ""), "reject_threshold": int(reject_threshold)}
+    payload = {
+        "stage": stage,
+        "model": str(model or ""),
+        "transport": str(transport or ""),
+        "reject_threshold": int(reject_threshold),
+    }
     if freshness_policy:
         payload["freshness_policy"] = freshness_policy
     if freshness_cutoff_mode:

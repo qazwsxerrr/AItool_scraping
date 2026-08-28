@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from app.config.limits import (
     DEFAULT_AI_REVIEW_CONCURRENCY,
@@ -17,6 +18,7 @@ from app.config.limits import (
 
 DEFAULT_DATABASE_URL = "sqlite:///./data/ai_tool_intel.db"
 DEFAULT_USER_AGENT = "AItool_scraping/0.1 (+https://example.local)"
+DEFAULT_AI_STRUCTURED_API_STYLE = "responses"
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -50,6 +52,7 @@ class Settings:
     ai_review_api_key: str | None = field(default=None, repr=False)
     ai_review_model: str | None = None
     ai_review_timeout_seconds: float = 30.0
+    ai_structured_api_style: Literal["responses", "chat_completions"] = DEFAULT_AI_STRUCTURED_API_STYLE
     ai_screen_reject_threshold: int = DEFAULT_AI_SCREEN_REJECT_THRESHOLD
     ai_review_concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY
     stage_b_reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT
@@ -81,6 +84,7 @@ class Settings:
             ai_review_api_key=os.getenv("AI_REVIEW_API_KEY") or None,
             ai_review_model=ai_review_model,
             ai_review_timeout_seconds=float(os.getenv("AI_REVIEW_TIMEOUT_SECONDS", "30")),
+            ai_structured_api_style=_structured_api_style(os.getenv("AI_STRUCTURED_API_STYLE")),
             ai_screen_reject_threshold=_bounded_int(
                 os.getenv("AI_SCREEN_REJECT_THRESHOLD"), DEFAULT_AI_SCREEN_REJECT_THRESHOLD
             ),
@@ -113,6 +117,13 @@ class Settings:
 def _env_value(name: str) -> str | None:
     value = os.getenv(name)
     return value.strip() if value and value.strip() else None
+
+
+def _structured_api_style(value: str | None) -> Literal["responses", "chat_completions"]:
+    style = str(value or DEFAULT_AI_STRUCTURED_API_STYLE).strip().casefold()
+    if style not in {"responses", "chat_completions"}:
+        raise ValueError("AI_STRUCTURED_API_STYLE must be responses or chat_completions")
+    return style  # type: ignore[return-value]
 
 
 def _bounded_int(value: str | None, default: int) -> int:

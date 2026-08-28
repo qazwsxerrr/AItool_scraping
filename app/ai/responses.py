@@ -153,29 +153,6 @@ class ResponsesClient:
             raise ResponsesProviderError("Responses API returned a non-object payload", status_code=status_code, raw_response=data)
         return dict(data)
 
-    def structured(
-        self,
-        *,
-        instructions: str,
-        input_value: Mapping[str, Any] | Sequence[Any] | str,
-        schema_name: str,
-        schema: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        response = self.create(
-            {
-                "input": _initial_input(instructions, input_value),
-                "text": {
-                    "format": {
-                        "type": "json_schema",
-                        "name": schema_name,
-                        "strict": True,
-                        "schema": dict(schema),
-                    }
-                },
-            }
-        )
-        return extract_json_output(response)
-
     def run_function_agent(
         self,
         *,
@@ -335,19 +312,6 @@ def hosted_web_search_tool(*, allowed_domains: Sequence[str]) -> dict[str, Any]:
     return tool
 
 
-def extract_json_output(response: Mapping[str, Any]) -> dict[str, Any]:
-    text = _response_output_text(response)
-    if not text:
-        raise ResponsesProviderError("Responses API returned no output_text", raw_response=dict(response))
-    try:
-        value = json.loads(text)
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ResponsesProviderError("Responses API output is not valid JSON", raw_response=dict(response)) from exc
-    if not isinstance(value, Mapping):
-        raise ResponsesProviderError("Responses API JSON output must be an object", raw_response=dict(response))
-    return dict(value)
-
-
 def _initial_input(instructions: str, value: Mapping[str, Any] | Sequence[Any] | str) -> list[dict[str, str]]:
     content = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     return [
@@ -359,24 +323,6 @@ def _initial_input(instructions: str, value: Mapping[str, Any] | Sequence[Any] |
 def _output_items(response: Mapping[str, Any]) -> list[dict[str, Any]]:
     value = response.get("output")
     return [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
-
-
-def _response_output_text(response: Mapping[str, Any]) -> str:
-    direct = _text(response.get("output_text"))
-    if direct:
-        return direct
-    for item in _output_items(response):
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, Mapping):
-                continue
-            if str(part.get("type") or "") in {"output_text", "text"}:
-                text = _text(part.get("text"))
-                if text:
-                    return text
-    return ""
 
 
 def _arguments(value: Any) -> dict[str, Any]:
@@ -423,6 +369,5 @@ __all__ = [
     "ResponsesClient",
     "ResponsesProviderError",
     "SupportsPost",
-    "extract_json_output",
     "hosted_web_search_tool",
 ]

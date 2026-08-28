@@ -1,4 +1,4 @@
-"""Responses-only adapter for the Stage-D event-selection skill."""
+"""Structured-output adapter for the Stage-D event-selection skill."""
 
 from __future__ import annotations
 
@@ -8,14 +8,16 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
-from app.ai.responses import ResponsesClient, ResponsesProviderError, SupportsPost
+from app.ai.structured import StructuredApiStyle, StructuredClient, StructuredProviderError, SupportsPost
 from app.config.settings import Settings
 
 from .models import StageDSelectionResponse
 from .parser import strict_parse_stage_d_selection
 from .prompts import (
+    STAGE_D_SELECTION_JSON_SCHEMA,
     STAGE_D_SELECTION_PROMPT_VERSION,
-    build_stage_d_provider_payload,
+    STAGE_D_SELECTION_TASK,
+    build_stage_d_selection_request,
     preflight_stage_d_selection_schema,
 )
 
@@ -68,9 +70,7 @@ class StageDSelectionCallResult:
 
 
 class StageDSelectionClient:
-    """One strict JSON selection call through the shared Responses client."""
-
-    transport = "responses"
+    """One strict JSON selection call through the shared structured client."""
 
     def __init__(
         self,
@@ -78,6 +78,7 @@ class StageDSelectionClient:
         api_url: str | None,
         api_key: str | None,
         model: str | None = None,
+        api_style: StructuredApiStyle = "responses",
         timeout_seconds: float = MIN_STAGE_D_TIMEOUT_SECONDS,
         max_retries: int = 2,
         http_client: SupportsPost | None = None,
@@ -85,7 +86,8 @@ class StageDSelectionClient:
         self.model = model
         self.timeout_seconds = float(timeout_seconds)
         self.max_retries = max(0, int(max_retries))
-        self._responses = ResponsesClient(
+        self._structured = StructuredClient(
+            api_style=api_style,
             api_url=api_url,
             api_key=api_key,
             model=model,
@@ -106,6 +108,7 @@ class StageDSelectionClient:
             api_url=settings.ai_review_api_url,
             api_key=settings.ai_review_api_key,
             model=settings.ai_review_model,
+            api_style=settings.ai_structured_api_style,
             timeout_seconds=max(float(settings.ai_review_timeout_seconds), MIN_STAGE_D_TIMEOUT_SECONDS),
             max_retries=settings.request_retries,
             http_client=http_client,
@@ -113,7 +116,11 @@ class StageDSelectionClient:
 
     @property
     def is_configured(self) -> bool:
-        return self._responses.is_configured
+        return self._structured.is_configured
+
+    @property
+    def transport(self) -> StructuredApiStyle:
+        return self._structured.transport
 
     def select(
         self,
@@ -123,18 +130,18 @@ class StageDSelectionClient:
         max_selected: int,
     ) -> StageDSelectionCallResult:
         if not self.is_configured:
-            raise RuntimeError("Responses API is not configured")
+            raise RuntimeError("Structured API is not configured")
         preflight_stage_d_selection_schema()
         candidate_ids = [int(event["event_id"]) for event in events]
-        payload = build_stage_d_provider_payload(
+        instructions, input_value = build_stage_d_selection_request(
             events,
             edition=edition or {},
-            model=self.model,
             max_selected=max_selected,
         )
         request_metadata = _request_metadata(
-            self._responses.endpoint_url,
-            payload,
+            self._structured.endpoint_url,
+            {"instructions": instructions, "input": input_value, "schema": "stage_d_selection_v1"},
+            transport=self.transport,
             model=self.model,
             event_count=len(candidate_ids),
             max_selected=max_selected,
@@ -146,11 +153,18 @@ class StageDSelectionClient:
         repair_attempts = 0
         for attempt in range(self.max_retries + 1):
             raw_payload: Any | None = None
+            structured_result = None
             schema_repair_scheduled = False
             try:
-                raw_payload = self._responses.create(payload)
+                structured_result = self._structured.structured(
+                    instructions=instructions,
+                    input_value=input_value,
+                    schema_name=STAGE_D_SELECTION_TASK,
+                    schema=STAGE_D_SELECTION_JSON_SCHEMA,
+                )
+                raw_payload = structured_result.raw_response
                 parsed = strict_parse_stage_d_selection(
-                    raw_payload,
+                    structured_result.data,
                     candidate_event_ids=candidate_ids,
                     max_selected=max_selected,
                 )
@@ -166,7 +180,7 @@ class StageDSelectionClient:
                 )
             except StageDSelectionProviderError as exc:
                 last_error = exc
-            except ResponsesProviderError as exc:
+            except StructuredProviderError as exc:
                 last_error = StageDSelectionProviderError(
                     str(exc),
                     status_code=exc.status_code,
@@ -185,11 +199,11 @@ class StageDSelectionClient:
                     cause=exc,
                 )
                 if attempt < self.max_retries:
-                    payload = _schema_repair_payload(
-                        payload,
+                    input_value = _schema_repair_input(
+                        input_value,
                         candidate_event_ids=candidate_ids,
                         validation_error=str(exc),
-                        invalid_response=raw_payload,
+                        invalid_response=structured_result.data if structured_result is not None else None,
                     )
                     schema_repair_scheduled = True
             except BaseException as exc:
@@ -216,6 +230,7 @@ def _request_metadata(
     endpoint: str,
     payload: Mapping[str, Any],
     *,
+    transport: StructuredApiStyle,
     model: str | None,
     event_count: int,
     max_selected: int,
@@ -224,7 +239,7 @@ def _request_metadata(
     digest = hashlib.sha256(serialized).hexdigest()
     return {
         "endpoint": _safe_url(endpoint),
-        "transport": "responses",
+        "transport": transport,
         "model": model,
         "event_count": int(event_count),
         "max_selected": int(max_selected),
@@ -245,17 +260,15 @@ def _safe_url(value: str) -> str:
         return str(value or "").strip()[:512]
 
 
-def _schema_repair_payload(
-    payload: Mapping[str, Any],
+def _schema_repair_input(
+    input_value: Mapping[str, Any],
     *,
     candidate_event_ids: Sequence[int],
     validation_error: str,
     invalid_response: Any,
 ) -> dict[str, Any]:
-    repaired = dict(payload)
-    base_input = repaired.get("input")
-    messages = [dict(item) for item in base_input if isinstance(item, Mapping)] if isinstance(base_input, list) else []
-    feedback = {
+    repaired = dict(input_value)
+    repaired["validation_feedback"] = {
         "repair_instruction": (
             "上一轮 Stage D 输出未通过本地契约校验。请重新返回完整 JSON。"
             "每个 candidate_event_id 必须且只能出现在 selected 或 unselected 之一；"
@@ -265,24 +278,10 @@ def _schema_repair_payload(
         "candidate_event_ids": [int(event_id) for event_id in candidate_event_ids],
         "previous_invalid_response": _compact_json_value(invalid_response, limit=12_000),
     }
-    messages.append(
-        {
-            "role": "user",
-            "content": json.dumps(feedback, ensure_ascii=False, default=str),
-        }
-    )
-    repaired["input"] = messages
     return repaired
 
 
 def _compact_json_value(value: Any, *, limit: int) -> Any:
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        for key in ("output_text", "output", "result", "data", "response", "id"):
-            if key in value:
-                result[key] = value[key]
-        if result:
-            return result
     text = json.dumps(value, ensure_ascii=False, default=str)
     return text if len(text) <= limit else text[:limit] + "...[truncated]"
 

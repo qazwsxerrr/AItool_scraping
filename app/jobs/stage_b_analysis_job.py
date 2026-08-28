@@ -161,6 +161,7 @@ def run_stage_b_analysis_job(
     config_fingerprint = _config_fingerprint(
         stage="analyze_b1_content_value_v2",
         model=getattr(ai_client, "model", None),
+        transport=getattr(ai_client, "transport", None),
         reject_threshold=STAGE_B_ANALYSIS_MIN_SCORE,
     )
     contexts: list[_AnalysisContext] = []
@@ -885,7 +886,13 @@ def _analysis_failure(
         keywords=[],
         entities=[],
         b1_priority=0,
-        score_components={},
+        score_components={
+            "audience_relevance": 0,
+            "material_change": 0,
+            "impact_scope": 0,
+            "independent_news_value": 0,
+            "specificity": 0,
+        },
         status="analysis_failed",
         error_code=getattr(exc, "error_code", None) or exc.__class__.__name__,
         error_message=message[:4000],

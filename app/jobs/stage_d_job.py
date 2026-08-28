@@ -23,7 +23,7 @@ from app.ai.skills.stage_d_selection import (
     StageDSelectionClient,
     StageDSelectionProviderError,
     StageDSelectionResponse,
-    build_stage_d_provider_payload,
+    build_stage_d_selection_request,
     strict_parse_stage_d_selection,
 )
 from app.ai.skills.event_package import build_candidate_event_package
@@ -149,15 +149,14 @@ def run_stage_d_job(
                 "max_selected": policy.max_selected,
                 "soft_selected_target": min(policy.max_selected, STAGE_D_SOFT_SELECTED_TARGET),
             }
-            provider_payload = build_stage_d_provider_payload(
+            structured_request = build_stage_d_selection_request(
                 event_payload,
                 edition=edition,
-                model=getattr(ai_client, "model", None),
                 max_selected=policy.max_selected,
             )
             input_fingerprint = _response_hash(
                 {
-                    "provider_payload": provider_payload,
+                    "structured_request": structured_request,
                     "withheld_needs_review_event_ids": withheld_needs_review_ids,
                 }
             )
@@ -705,7 +704,7 @@ def _stage_d_config_fingerprint(
             "prompt_version": STAGE_D_SELECTION_PROMPT_VERSION,
             "schema_version": STAGE_D_SELECTION_SCHEMA_VERSION,
             "model": getattr(ai_client, "model", None),
-            "transport": "responses",
+            "transport": getattr(ai_client, "transport", None),
             "max_selected": policy.max_selected,
             "search_provider": "tavily" if search_client is not None and search_client.is_configured else "disabled",
             "max_web_searches": max_web_searches,

@@ -56,7 +56,6 @@ from .parser import (
     parse_screen_result,
     strict_parse_analysis,
     strict_parse_screen,
-    unwrap_provider_response,
 )
 from .prompts import (
     INTEL_ANALYSIS_JSON_SCHEMA,
@@ -67,10 +66,7 @@ from .prompts import (
     INTEL_SCREEN_RESPONSE_SCHEMA,
     INTEL_SCREEN_SYSTEM_PROMPT,
     INTEL_SCREEN_TASK,
-    build_analysis_provider_payload,
-    build_openai_responses_analysis_payload,
-    build_openai_responses_screen_payload,
-    build_screen_provider_payload,
+    coerce_intel_envelope,
     preflight_intel_triage_schemas,
     preflight_strict_schema,
 )
@@ -87,12 +83,10 @@ __all__ = [
     "SCREEN_FAILURE_STATUS", "SCREEN_HARD_REJECT_REASON_CODES", "ScoreComponents", "ScreenResult",
     "TOPIC_DEVELOPER_ECOSYSTEM", "TOPIC_INDUSTRY_DYNAMICS", "TOPIC_MODEL_RELEASE", "TOPIC_OUTLOOK_RUMOR",
     "TOPIC_PRODUCT_APPLICATION", "TOPIC_TECHNOLOGY_INSIGHT", "analysis_guard_failure", "recompute_analysis_score", "SCORE_WEIGHTS", "analyze_item", "apply_analysis_guards",
-    "apply_screen_guard", "build_analysis_provider_payload",
-    "build_openai_responses_analysis_payload", "build_openai_responses_screen_payload",
-    "build_screen_provider_payload", "canonical_screen_reason_code",
+    "apply_screen_guard", "canonical_screen_reason_code", "coerce_intel_envelope",
     "preflight_intel_triage_schemas", "preflight_strict_schema",
     "normalize_content_class", "normalize_entity_type", "normalize_html",
     "normalize_text", "normalize_topic", "normalize_url", "parse_analysis_result", "parse_screen_result",
     "run_analysis_isolated", "run_screen_isolated", "screen_item",
-    "strict_parse_analysis", "strict_parse_screen", "unwrap_provider_response",
+    "strict_parse_analysis", "strict_parse_screen",
 ]

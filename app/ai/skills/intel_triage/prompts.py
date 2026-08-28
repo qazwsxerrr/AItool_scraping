@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any, Mapping
 
 from .models import ENTITY_TYPES, INTEL_TOPICS, RawIntelEnvelope
@@ -185,46 +184,13 @@ def preflight_intel_triage_schemas() -> bool:
 preflight_intel_triage_schemas()
 
 
-def _coerce_envelope(envelope: RawIntelEnvelope | dict[str, Any]) -> RawIntelEnvelope:
+def coerce_intel_envelope(envelope: RawIntelEnvelope | dict[str, Any]) -> RawIntelEnvelope:
     return envelope if isinstance(envelope, RawIntelEnvelope) else RawIntelEnvelope.model_validate(envelope)
-
-
-def _openai_responses_payload(envelope: RawIntelEnvelope, *, model: str | None, name: str, instructions: str, schema: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "model": model,
-        "input": [
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(envelope.to_provider_dict(), ensure_ascii=False, default=str)},
-        ],
-        "text": {"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}},
-    }
-
-
-def build_openai_responses_screen_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
-    return _openai_responses_payload(_coerce_envelope(envelope), model=model, name=INTEL_SCREEN_TASK, instructions=INTEL_SCREEN_SYSTEM_PROMPT, schema=INTEL_SCREEN_JSON_SCHEMA)
-
-
-def build_openai_responses_analysis_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
-    return _openai_responses_payload(_coerce_envelope(envelope), model=model, name=INTEL_ANALYSIS_TASK, instructions=INTEL_ANALYSIS_SYSTEM_PROMPT, schema=INTEL_ANALYSIS_JSON_SCHEMA)
-
-
-def build_screen_provider_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
-    """Build the sole supported transport payload: OpenAI Responses."""
-
-    return build_openai_responses_screen_payload(envelope, model=model)
-
-
-def build_analysis_provider_payload(envelope: RawIntelEnvelope | dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
-    """Build the sole supported transport payload: OpenAI Responses."""
-
-    return build_openai_responses_analysis_payload(envelope, model=model)
 
 
 __all__ = [
     "INTEL_ANALYSIS_JSON_SCHEMA", "INTEL_ANALYSIS_RESPONSE_SCHEMA", "INTEL_ANALYSIS_SYSTEM_PROMPT", "INTEL_ANALYSIS_TASK",
     "INTEL_SCREEN_JSON_SCHEMA", "INTEL_SCREEN_RESPONSE_SCHEMA", "INTEL_SCREEN_SYSTEM_PROMPT", "INTEL_SCREEN_TASK",
-    "build_analysis_provider_payload",
-    "build_openai_responses_analysis_payload",
-    "build_openai_responses_screen_payload", "build_screen_provider_payload",
+    "coerce_intel_envelope",
     "preflight_intel_triage_schemas", "preflight_strict_schema",
 ]

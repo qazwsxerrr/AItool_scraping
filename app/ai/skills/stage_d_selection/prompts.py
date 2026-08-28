@@ -92,14 +92,13 @@ STAGE_D_SELECTION_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
-def build_openai_responses_stage_d_selection_payload(
+def build_stage_d_selection_request(
     events: Sequence[Mapping[str, Any]],
     *,
     edition: Mapping[str, Any] | None = None,
     max_selected: int = 15,
-    model: str | None = None,
     profile: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> tuple[str, dict[str, Any]]:
     instructions = STAGE_D_SELECTION_SYSTEM_PROMPT
     if profile:
         profile_text = json.dumps(profile, ensure_ascii=False, indent=2)
@@ -110,21 +109,7 @@ def build_openai_responses_stage_d_selection_payload(
         "max_selected": max_selected,
         "candidate_events": events,
     }
-    return {
-        "model": model,
-        "input": [
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, default=str)},
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": STAGE_D_SELECTION_TASK,
-                "strict": True,
-                "schema": STAGE_D_SELECTION_JSON_SCHEMA,
-            }
-        },
-    }
+    return instructions, user_payload
 
 
 def preflight_stage_d_selection_schema() -> bool:
@@ -144,16 +129,12 @@ def build_stage_d_selection_input(
     return json.dumps(user_payload, ensure_ascii=False, default=str)
 
 
-build_stage_d_provider_payload = build_openai_responses_stage_d_selection_payload
-
-
 __all__ = [
     "STAGE_D_SELECTION_JSON_SCHEMA",
     "STAGE_D_SELECTION_PROMPT_VERSION",
     "STAGE_D_SELECTION_SYSTEM_PROMPT",
     "STAGE_D_SELECTION_TASK",
-    "build_openai_responses_stage_d_selection_payload",
-    "build_stage_d_provider_payload",
+    "build_stage_d_selection_request",
     "build_stage_d_selection_input",
     "preflight_stage_d_selection_schema",
 ]
