@@ -21,7 +21,24 @@ def index(
 ):
     active_edition = repo.resolve_edition(edition_date=edition_date)
     stats = repo.get_dashboard_stats(edition=active_edition)
-    cards = repo.list_featured_cards(
+    all_editions = repo.list_daily_editions()
+    
+    edition_groups: list[dict[str, object]] = []
+    for ed in all_editions[:7]:
+        ed_cards = repo.list_featured_cards(
+            category=category,
+            source_group=source_group,
+            edition=ed,
+            limit=30,
+        )
+        is_open = (active_edition is not None and ed.edition_date == active_edition.edition_date)
+        edition_groups.append({
+            "edition": ed,
+            "cards": ed_cards,
+            "is_open": is_open,
+        })
+
+    active_cards = repo.list_featured_cards(
         category=category,
         source_group=source_group,
         edition=active_edition,
@@ -30,11 +47,12 @@ def index(
     github_projects = github_reader.list_projects(limit=5)
     grouped_cards: list[dict[str, object]] = []
     buckets: dict[str, list[object]] = {}
-    for card in cards:
+    for card in active_cards:
         key = card.topic_category or card.content_class or "未分类"
         buckets.setdefault(key, []).append(card)
     for key, rows in buckets.items():
         grouped_cards.append({"name": key, "cards": rows})
+
     return templates.TemplateResponse(
         request=request,
         name="home.html",
@@ -42,13 +60,14 @@ def index(
             "request": request,
             "active_nav": "home",
             "stats": stats,
-            "cards": cards,
+            "cards": active_cards,
             "grouped_cards": grouped_cards,
+            "edition_groups": edition_groups,
             "category": category,
             "source_group": source_group,
             "active_edition": active_edition,
             "active_edition_date": active_edition.edition_date if active_edition else None,
-            "edition_options": repo.list_daily_editions(),
+            "edition_options": all_editions,
             "category_options": stats.category_counts,
             "source_options": stats.source_counts,
             "github_projects": github_projects.rows,

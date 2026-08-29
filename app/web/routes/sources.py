@@ -22,5 +22,6 @@ def sources_page(
             "request": request,
             "active_nav": "sources",
             "sources": rows,
+            "edition_options": repo.list_daily_editions(),
         },
     )

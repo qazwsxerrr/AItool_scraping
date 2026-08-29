@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.storage.read_repository import UIReadRepository
-from app.web.deps import get_repository, templates
+from app.web.deps import get_repository, is_historical_edition, templates
 
 
 router = APIRouter()
@@ -63,9 +63,11 @@ def _navigation_context(
     if origin == "search" and return_q:
         params["q"] = return_q
     back_url = f"{destination}?{urlencode(params)}" if params else destination
+    is_hist = is_historical_edition(edition_date)
     labels = {
-        "home": "返回今日精选",
-        "all": "返回本期精选",
+        "home": f"返回 {edition_date} 精选" if is_hist and edition_date else "返回今日精选",
+        "all": f"返回 {edition_date} 精选" if is_hist and edition_date else "返回本期精选",
         "search": "返回热点搜索",
     }
-    return origin, back_url, labels.get(origin, "返回本期精选")
+    default_label = f"返回 {edition_date} 精选" if is_hist and edition_date else "返回本期精选"
+    return origin, back_url, labels.get(origin, default_label)

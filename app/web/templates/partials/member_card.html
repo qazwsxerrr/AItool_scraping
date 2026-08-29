@@ -1,37 +1,47 @@
-<article class="member-card">
-  <div class="source-line">
-    <span class="source-name">{{ member.source_name or member.source_id or '未知来源' }}</span>
-    {% if member.source_group %}<span class="source-group">{{ member.source_group | source_group_label }}</span>{% endif %}
-    {% if member.is_primary %}<span class="badge primary">主来源</span>{% endif %}
-    {% if member.published_at %}<time>{{ member.published_at | datetime }}</time>{% endif %}
-  </div>
-  <h3>{% if member.url %}<a href="{{ member.url }}" target="_blank" rel="noopener noreferrer">{{ member.title }}</a>{% else %}{{ member.title }}{% endif %}</h3>
-  <div class="member-content-sections">
-    {% if member.ai_summary or member.summary %}
-      <section class="member-section member-ai-summary">
-        <h4 class="member-section-title">AI总结</h4>
-        <p class="summary-text">{{ member.ai_summary or member.summary }}</p>
-      </section>
-    {% endif %}
-    {% if member.content_text %}
-      <section class="member-section member-raw-content">
-        <h4 class="member-section-title">正文</h4>
-        <div class="raw-content-body">{{ member.content_text }}</div>
-      </section>
-    {% endif %}
-  </div>
-  <div class="badges">
-    {% if member.match_type %}<span class="badge">聚类 {{ member.match_type }}{% if member.match_confidence is not none %} · {{ member.match_confidence }}%{% endif %}</span>{% endif %}
-    {% if member.screen_decision %}<span class="badge">Stage A {{ member.screen_decision }}</span>{% endif %}
-    {% if member.review_status %}<span class="badge">Stage B {{ member.review_status }}</span>{% endif %}
-    {% if member.review_score %}<span class="badge info">评分 {{ member.review_score }}</span>{% endif %}
-    {% if member.review_topic %}<span class="badge topic-badge">{{ member.review_topic | topic_label }}</span>{% endif %}
-  </div>
-  <details class="member-trace">
-    <summary>查看筛选追溯</summary>
-    <div class="trace-grid">
-      <p><strong>Stage A：</strong>{{ member.screen_decision or '未记录' }}{% if member.screen_confidence is not none %} · {{ member.screen_confidence }}%{% endif %}{% if member.screen_reason %}<br>{{ member.screen_reason }}{% endif %}</p>
-      <p><strong>Stage B：</strong>{{ member.review_status or '未记录' }}{% if member.review_score is not none %} · 评分 {{ member.review_score }}{% endif %}{% if member.review_reason %}<br>{{ member.review_reason }}{% endif %}</p>
+<article class="timeline-card">
+  <div class="timeline-card-header">
+    <div class="timeline-source-info">
+      {% if member.source_name and ('x_' in (member.source_id or '') or 'elon' in (member.source_name or '').lower()) %}
+        <span class="source-avatar-circle">{{ (member.source_name or 'X')[:1] }}</span>
+      {% endif %}
+      <span class="source-title-text">{{ member.source_name or member.source_id or '未知来源' }}</span>
+      {% if member.source_group %}
+        <span class="source-tag-badge">({{ member.source_group | source_group_label }})</span>
+      {% elif member.source_url %}
+        <span class="source-tag-badge">(来源)</span>
+      {% endif %}
+      {% if member.source_url %}
+        <a class="source-link-icon" href="{{ member.source_url }}" target="_blank" rel="noopener noreferrer" title="查看来源页">↗</a>
+      {% endif %}
     </div>
-  </details>
+    <div class="timeline-score-badge">
+      <span class="score-dot">•</span>
+      <span class="score-text">AI 评分 <strong>{{ member.review_score if member.review_score is not none else '80' }}/100</strong></span>
+    </div>
+  </div>
+
+  <h3 class="timeline-card-title">
+    {% if member.url %}
+      <a href="{{ member.url }}" target="_blank" rel="noopener noreferrer">{{ member.title }}</a>
+    {% else %}
+      {{ member.title }}
+    {% endif %}
+  </h3>
+
+  {% set summary_text = member.ai_summary or member.summary or member.source_summary %}
+  {% if summary_text %}
+    <p class="timeline-card-summary">{{ summary_text }}</p>
+  {% endif %}
+
+  <div class="timeline-card-tags">
+    {% if member.review_topic %}
+      <a class="hashtag" href="/dynamics?topic_category={{ member.review_topic }}{% if active_edition_date %}&amp;edition_date={{ active_edition_date }}{% endif %}">#{{ member.review_topic | topic_label }}</a>
+    {% endif %}
+    {% if member.content_class %}
+      <a class="hashtag" href="/dynamics?content_class={{ member.content_class }}{% if active_edition_date %}&amp;edition_date={{ active_edition_date }}{% endif %}">#{{ member.content_class | content_class_label }}</a>
+    {% endif %}
+    {% if member.source_group %}
+      <a class="hashtag" href="/dynamics?source_group={{ member.source_group }}{% if active_edition_date %}&amp;edition_date={{ active_edition_date }}{% endif %}">#{{ member.source_group | source_group_label }}</a>
+    {% endif %}
+  </div>
 </article>

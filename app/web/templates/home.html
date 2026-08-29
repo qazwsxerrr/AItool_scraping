@@ -28,7 +28,7 @@
   <div class="hot-ticker-head">
     <h3>
       <svg class="icon icon-sm" viewBox="0 0 24 24"><path fill="var(--flame)" d="M12 23c-4.97 0-9-3.58-9-8 0-4.19 3.42-7.86 6.54-11.23.53-.57 1.46-.22 1.46.56v1.94c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V3.33c0-.78.93-1.13 1.46-.56C20.58 6.14 24 9.81 24 14c0 4.42-4.03 8-9 8h-3z"/></svg>
-      今日 AI 焦点榜
+      {{ '本期 AI 焦点榜' if is_historical_edition(active_edition_date) else '今日 AI 焦点榜' }}
     </h3>
     <a href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">查看完整榜单 ›</a>
   </div>
@@ -37,7 +37,7 @@
       <div class="hot-ticker-item">
         <span class="hot-rank-num top-{{ loop.index }}">{{ loop.index }}</span>
         <a class="hot-ticker-title" href="/events/{{ card.id }}?{% if active_edition_date %}edition_date={{ active_edition_date }}&amp;{% endif %}origin=home">{{ card.title }}</a>
-        <span class="hot-score-tag">🔥 {{ card.display_score }}</span>
+        <span class="hot-score-tag">🔥 综合评分 {{ card.display_score }}/100</span>
       </div>
     {% endfor %}
   </div>
@@ -89,24 +89,29 @@
       </section>
     {% endif %}
 
-    {% if grouped_cards %}
-      {% for group in grouped_cards %}
-        <section class="feed-section">
-          <div class="section-heading">
-            <h2>{{ group.name | topic_label }}</h2>
-            <span class="section-count">{{ group.cards | length }} 条</span>
-          </div>
-          {% for card in group.cards %}
-            {% include "partials/recommendation_card.html" %}
-          {% endfor %}
-        </section>
+    {% if edition_groups %}
+      {% for eg in edition_groups %}
+        {% if eg.cards %}
+          <details class="timeline-date-group" {% if eg.is_open %}open{% endif %}>
+            <summary class="timeline-date-toggle">
+              <span class="timeline-toggle-chevron">▾</span>
+              <span class="timeline-date-label">{{ eg.edition.edition_date | chinese_month_day }}</span>
+              <span class="timeline-count-badge">· {{ eg.cards | length }} 条精选</span>
+            </summary>
+            <div class="edition-cards-feed">
+              {% for card in eg.cards %}
+                {% include "partials/recommendation_card.html" %}
+              {% endfor %}
+            </div>
+          </details>
+        {% endif %}
       {% endfor %}
     {% else %}
       <section class="empty-state">
         <div class="empty-icon">✦</div>
         <h3>暂无精选动态</h3>
         <p>当前日报尚无可展示的最终入选事件。</p>
-        <a class="button button-solid" href="/all{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">查看本期精选</a>
+        <a class="button button-solid" href="/all">查看全部精选</a>
       </section>
     {% endif %}
   </div>

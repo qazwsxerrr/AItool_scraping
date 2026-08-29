@@ -2,68 +2,76 @@
 {% block title %}全部 AI 动态 — AIHOT{% endblock %}
 
 {% block content %}
-<section class="page-head">
+<section class="dynamics-head">
   <div>
-    <p class="eyebrow">ALL AI DYNAMICS / STAGE B OUTPUTS</p>
-    <h1>全部 AI 动态</h1>
-    <p class="muted-text">展示 {{ active_edition_date or '当前' }} 日报所处理的所有 AI 资讯评估结果。</p>
+    <h1 class="dynamics-title">全部 AI 动态</h1>
+    <p class="dynamics-subtitle">AI 相关资讯全量信息流与实时动态追踪</p>
   </div>
-  <a class="button button-quiet" href="/sources">来源目录 →</a>
 </section>
 
-<form class="filters" action="/dynamics" method="get">
-  <select name="edition_date" aria-label="日报">
-    {% for option in edition_options %}
-      <option value="{{ option.edition_date }}" {{ 'selected' if active_edition_date == option.edition_date else '' }}>{{ option.edition_date }}</option>
+<section class="dynamics-toolbar" aria-label="动态筛选工具栏">
+  <div class="dynamics-topic-tabs">
+    <a class="dynamics-tab {{ 'active' if not filters.topic_category else '' }}" href="/dynamics?edition_date={{ active_edition_date or '' }}{% if filters.source_group %}&amp;source_group={{ filters.source_group }}{% endif %}{% if filters.query %}&amp;q={{ filters.query | urlencode }}{% endif %}">
+      <span>全部</span>
+    </a>
+    {% for topic in filter_options.topic_categories %}
+      <a class="dynamics-tab {{ 'active' if filters.topic_category == topic else '' }}" href="/dynamics?edition_date={{ active_edition_date or '' }}&amp;topic_category={{ topic }}{% if filters.source_group %}&amp;source_group={{ filters.source_group }}{% endif %}{% if filters.query %}&amp;q={{ filters.query | urlencode }}{% endif %}">
+        <span>{{ topic | topic_label }}</span>
+      </a>
     {% endfor %}
-  </select>
-  <label class="sr-only" for="all-query">搜索动态</label>
-  <input id="all-query" name="q" type="search" placeholder="搜索标题、摘要..." value="{{ filters.query or '' }}">
-  <select name="source_group">
-    <option value="">全部来源</option>
-    {% for group in filter_options.source_groups %}
-      <option value="{{ group }}" {{ 'selected' if filters.source_group == group else '' }}>{{ group }}</option>
-    {% endfor %}
-  </select>
-  <select name="content_class">
-    <option value="">全部类别</option>
-    {% for value in filter_options.content_classes %}
-      <option value="{{ value }}" {{ 'selected' if filters.content_class == value else '' }}>{{ value | content_class_label }}</option>
-    {% endfor %}
-  </select>
-  <select name="topic_category">
-    <option value="">全部主题</option>
-    {% for value in filter_options.topic_categories %}
-      <option value="{{ value }}" {{ 'selected' if filters.topic_category == value else '' }}>{{ value | topic_label }}</option>
-    {% endfor %}
-  </select>
-  <button type="submit">应用筛选</button>
-  {% if filters.query or filters.source_group or filters.content_class or filters.topic_category %}
-    <a class="button secondary" href="/dynamics{% if active_edition_date %}?edition_date={{ active_edition_date }}{% endif %}">清除</a>
-  {% endif %}
-</form>
+  </div>
 
-<section class="timeline">
-  {% if items %}
-    <div class="member-list">
-    {% for item in items %}
-      {% with member=item %}{% include "partials/member_card.html" %}{% endwith %}
-    {% endfor %}
+  <form class="dynamics-search-form" action="/dynamics" method="get">
+    {% if active_edition_date %}<input type="hidden" name="edition_date" value="{{ active_edition_date }}">{% endif %}
+    {% if filters.topic_category %}<input type="hidden" name="topic_category" value="{{ filters.topic_category }}">{% endif %}
+    <div class="dynamics-select-wrap">
+      <select name="source_group" onchange="this.form.submit()" aria-label="来源筛选">
+        <option value="">来源: 全部</option>
+        {% for group in filter_options.source_groups %}
+          <option value="{{ group }}" {{ 'selected' if filters.source_group == group else '' }}>{{ group | source_group_label }}</option>
+        {% endfor %}
+      </select>
     </div>
-    <nav class="pagination">
-      {% if page > 1 %}
-        <a class="button secondary" href="{{ request.url.include_query_params(page=page - 1) }}">上一页</a>
+    <div class="dynamics-search-input-wrap">
+      <input type="search" name="q" placeholder="搜索标题、摘要..." value="{{ filters.query or '' }}">
+    </div>
+    <button type="submit" class="dynamics-search-btn">搜索</button>
+  </form>
+</section>
+
+<div class="dynamics-timeline-container">
+  {% if edition_groups %}
+    {% for group in edition_groups %}
+      {% if group.members %}
+        <details class="timeline-date-group" {% if group.is_open %}open{% endif %}>
+          <summary class="timeline-date-toggle">
+            <span class="timeline-toggle-chevron">▾</span>
+            <span class="timeline-date-label">{{ group.edition.edition_date | chinese_month_day }}</span>
+            <span class="timeline-count-badge">· {{ group.total_count }} 条</span>
+          </summary>
+          <div class="timeline-stream">
+            {% for item in group.members %}
+              <div class="timeline-item">
+                <div class="timeline-time-col">
+                  <span class="timeline-time-text">{{ item.published_at | time_hm }}</span>
+                  <span class="timeline-time-dot"></span>
+                </div>
+                <div class="timeline-content-col">
+                  {% with member=item %}{% include "partials/member_card.html" %}{% endwith %}
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        </details>
       {% endif %}
-      <span>第 {{ page }} 页 (共 {{ total_count }} 条)</span>
-      {% if has_next_page %}
-        <a class="button secondary" href="{{ request.url.include_query_params(page=page + 1) }}">下一页</a>
-      {% endif %}
-    </nav>
+    {% endfor %}
   {% else %}
     <div class="empty-state">
+      <div class="empty-icon">✦</div>
       <h3>暂无符合条件的动态</h3>
-      <p>可以调整日期或筛选条件。</p>
+      <p>可以调整日期或清除筛选条件。</p>
+      <a class="button secondary" href="/dynamics">清除筛选</a>
     </div>
   {% endif %}
-</section>
+</div>
 {% endblock %}

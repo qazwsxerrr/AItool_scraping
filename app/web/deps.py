@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterator
@@ -108,18 +108,69 @@ def topic_label(value: str | None) -> str:
     return INTEL_TOPIC_LABELS.get(value, value)
 
 
+_CHINESE_WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+
+
 def current_date() -> str:
     return datetime.now(DISPLAY_TIMEZONE).strftime("%Y.%m.%d")
 
 
+def time_hm(value: datetime | None) -> str:
+    if value is None:
+        return "--:--"
+    return value.astimezone(DISPLAY_TIMEZONE).strftime("%H:%M")
+
+
+def chinese_full_date(value: str | date | datetime | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        try:
+            d = date.fromisoformat(value.strip())
+        except ValueError:
+            return value
+    elif isinstance(value, datetime):
+        d = value.astimezone(DISPLAY_TIMEZONE).date()
+    else:
+        d = value
+    weekday = _CHINESE_WEEKDAYS[d.weekday()]
+    return f"{d.year}年{d.month}月{d.day}日 {weekday}"
+
+
+def chinese_month_day(value: str | date | datetime | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        try:
+            d = date.fromisoformat(value.strip())
+        except ValueError:
+            return value
+    elif isinstance(value, datetime):
+        d = value.astimezone(DISPLAY_TIMEZONE).date()
+    else:
+        d = value
+    weekday = _CHINESE_WEEKDAYS[d.weekday()]
+    return f"{d.month}月{d.day}日 {weekday}"
+
+
+def is_historical_edition(value: str | None) -> bool:
+    if not value:
+        return False
+    return value.strip() != datetime.now(DISPLAY_TIMEZONE).strftime("%Y-%m-%d")
+
+
 templates.env.filters["datetime"] = format_datetime
 templates.env.filters["relative_time"] = relative_time
+templates.env.filters["time_hm"] = time_hm
+templates.env.filters["chinese_full_date"] = chinese_full_date
+templates.env.filters["chinese_month_day"] = chinese_month_day
 templates.env.filters["content_class_label"] = content_class_label
 templates.env.filters["status_label"] = status_label
 templates.env.filters["source_group_label"] = source_group_label
 templates.env.filters["transport_label"] = transport_label
 templates.env.filters["topic_label"] = topic_label
 templates.env.globals["current_date"] = current_date
+templates.env.globals["is_historical_edition"] = is_historical_edition
 
 
 @lru_cache(maxsize=1)
