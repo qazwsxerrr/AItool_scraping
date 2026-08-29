@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
 import feedparser
+from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,6 +24,7 @@ class ParsedFeedItem(BaseModel):
     published_at: datetime | None = None
     raw_summary: str | None = None
     raw_content: str | None = None
+    content_depth: str = "missing"
     raw_payload: dict[str, Any] = Field(default_factory=dict)
     content_hash: str
 
@@ -56,7 +60,8 @@ def parse_feed(
         link = _first_link(entry)
         external_id = _as_text(entry.get("id") or entry.get("guid") or link)
         raw_summary = _as_text(entry.get("summary") or entry.get("description"))
-        raw_content = _extract_content(entry) or raw_summary
+        raw_content = _extract_content(entry)
+        content_depth = "full" if raw_content else ("summary" if raw_summary else "missing")
         author = _extract_author(entry)
         published_at = _extract_datetime(entry)
         raw_payload = _jsonable(dict(entry))
@@ -72,11 +77,56 @@ def parse_feed(
                 published_at=published_at,
                 raw_summary=raw_summary,
                 raw_content=raw_content,
+                content_depth=content_depth,
                 raw_payload=raw_payload,
                 content_hash=content_hash,
             )
         )
     return items
+
+
+def html_to_text(value: str | None) -> str | None:
+    if not value:
+        return None
+    # RSSHub/X descriptions are often plain text rather than HTML.  Do not
+    # pass those values through BeautifulSoup.get_text(" "), which turns the
+    # intentional line and paragraph breaks in a post into one long sentence.
+    # Normalize whitespace within each line while retaining the source line
+    # structure for the UI's ``white-space: pre-wrap`` renderer.
+    if not re.search(r"<\s*/?[A-Za-z][^>]*>", value):
+        text = html.unescape(value).replace("\r\n", "\n").replace("\r", "\n")
+        lines = [re.sub(r"[ \t\f\v]+", " ", line).strip() for line in text.split("\n")]
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        if not lines:
+            return None
+        # Keep at most one blank line between paragraphs.  This preserves X
+        # post formatting without allowing feed noise to create huge gaps.
+        result: list[str] = []
+        blank = False
+        for line in lines:
+            if line:
+                result.append(line)
+                blank = False
+            elif not blank:
+                result.append("")
+                blank = True
+        return "\n".join(result).strip() or None
+    node = BeautifulSoup(value, "html.parser")
+    for child in node.select("script, style, noscript"):
+        child.decompose()
+    blocks: list[str] = []
+    for child in node.select("h1, h2, h3, p, li, blockquote, pre"):
+        text = re.sub(r"\s+", " ", child.get_text(" ", strip=True)).strip()
+        text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+        if text:
+            blocks.append(text)
+    if blocks:
+        return "\n\n".join(blocks)
+    text = re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+    return text or None
 
 
 def _as_text(value: Any) -> str | None:

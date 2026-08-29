@@ -1,29 +1,103 @@
 {% extends "base.html" %}
 
 {% block content %}
-  <header class="page-head event-detail-head">
-    <div>
+<div class="event-article-container">
+  <header class="event-detail-head">
+    <div class="event-head-main">
       <p class="eyebrow">SELECTED EVENT · {{ active_edition_date or 'CURRENT EDITION' }}</p>
-      <h1>{{ detail.event.title }}</h1>
-      {% if detail.event.original_title and detail.event.original_title != detail.event.title %}<p class="muted-text">原始标题：{{ detail.event.original_title }}</p>{% endif %}
-      {% if detail.event.summary %}<p class="muted-text">{{ detail.event.summary }}</p>{% endif %}
+      <h1 class="event-main-title">{{ detail.event.title }}</h1>
+      {% if detail.event.original_title and detail.event.original_title != detail.event.title %}
+        <p class="event-orig-title">原始标题：{{ detail.event.original_title }}</p>
+      {% endif %}
+      {% if detail.event.summary %}
+        <p class="event-lead-summary">{{ detail.event.summary }}</p>
+      {% endif %}
     </div>
-    <a class="button secondary" href="{{ back_url }}">{{ back_label }}</a>
+    <div class="event-head-action">
+      <a class="button secondary" href="{{ back_url }}">{{ back_label }}</a>
+    </div>
   </header>
 
-  <section class="detail-panel event-overview">
-    <div class="detail-metric"><span>展示顺序</span><strong>#{{ detail.event.display_order }}</strong></div>
-    <div class="detail-metric"><span>热度评分</span><strong>🔥 {{ '%.0f' | format(detail.event.display_score) }}</strong></div>
-    <div class="detail-metric"><span>发布时间</span><strong>{{ detail.event.published_at | datetime }}</strong></div>
-    <div class="detail-metric"><span>聚类成员</span><strong>{{ detail.members | length }} 条</strong></div>
-  </section>
+  <hr class="article-divider">
 
-  <section class="detail-panel">
-    <div class="section-heading">
-      <div>
-        <h2>来源、编辑提示与关联标签</h2>
+  {% set primary = detail.primary_member %}
+  {% if primary %}
+    <section class="article-reading-section">
+      <div class="article-meta-line">
+        <span class="article-source-name">{{ primary.source_name or primary.source_id or '未知来源' }}</span>
+        {% if primary.source_group %}
+          <span class="meta-dot">·</span>
+          <span class="article-source-group">{{ primary.source_group | source_group_label }}</span>
+        {% endif %}
+        {% if primary.published_at %}
+          <span class="meta-dot">·</span>
+          <time class="article-time">{{ primary.published_at | datetime }}</time>
+        {% endif %}
       </div>
-    </div>
+
+      <h2 class="article-source-title">{{ primary.title }}</h2>
+
+      {% if primary.content_text and primary.content_depth == 'full' %}
+        {% if primary.url %}
+          <div class="article-action-bar">
+            <a class="inline-link" href="{{ primary.url }}" target="_blank" rel="noopener noreferrer">阅读原文 ↗</a>
+          </div>
+        {% endif %}
+        <div class="article-body">{{ primary.content_text }}</div>
+      {% elif primary.content_text %}
+        <div class="article-notice-bar">
+          当前仅获取到来源摘要{% if primary.url %} · <a class="inline-link" href="{{ primary.url }}" target="_blank" rel="noopener noreferrer">阅读完整原文 ↗</a>{% endif %}
+        </div>
+        <div class="article-body summary-body">{{ primary.content_text }}</div>
+      {% elif primary.source_summary %}
+        <div class="article-notice-bar">
+          当前仅获取到来源摘要{% if primary.url %} · <a class="inline-link" href="{{ primary.url }}" target="_blank" rel="noopener noreferrer">阅读完整原文 ↗</a>{% endif %}
+        </div>
+        <div class="article-body summary-body">{{ primary.source_summary }}</div>
+      {% else %}
+        <div class="article-notice-bar">
+          暂未获取到正文，请前往原始来源阅读。{% if primary.url %} <a class="inline-link" href="{{ primary.url }}" target="_blank" rel="noopener noreferrer">阅读原文 ↗</a>{% endif %}
+        </div>
+      {% endif %}
+    </section>
+  {% else %}
+    <section class="article-reading-section">
+      <p class="muted-text">本事件没有可公开展示的主来源。</p>
+    </section>
+  {% endif %}
+
+  {% if detail.related_members %}
+    <hr class="article-divider">
+    <section class="related-reports-section">
+      <div class="related-section-head">
+        <h2>其他相关报道</h2>
+        <span class="section-count">{{ detail.related_members | length }} 条</span>
+      </div>
+      <div class="related-source-list">
+        {% for member in detail.related_members %}
+          <article class="related-source-row">
+            <div class="related-source-meta">
+              <span class="source-name">{{ member.source_name or member.source_id or '未知来源' }}</span>
+              {% if member.source_group %}
+                <span class="meta-dot">·</span>
+                <span>{{ member.source_group | source_group_label }}</span>
+              {% endif %}
+              {% if member.published_at %}
+                <span class="meta-dot">·</span>
+                <time>{{ member.published_at | datetime }}</time>
+              {% endif %}
+            </div>
+            <h3 class="related-article-title">
+              {% if member.url %}<a href="{{ member.url }}" target="_blank" rel="noopener noreferrer">{{ member.title }} ↗</a>{% else %}{{ member.title }}{% endif %}
+            </h3>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  <details class="event-trace-details">
+    <summary>编辑信息与筛选追溯</summary>
     <div class="event-detail-grid">
       <div>
         <h3>关联来源</h3>
@@ -48,28 +122,23 @@
         </ul>
       </div>
       <div>
-        <h3>数据分析与追溯</h3>
+        <h3>数据分析</h3>
         {% if detail.event.keywords %}<div class="badges" style="margin-bottom: 12px;">{% for keyword in detail.event.keywords %}<span class="badge">{{ keyword }}</span>{% endfor %}</div>{% endif %}
         <p class="detail-copy">聚类方式：{{ detail.resolution_method or '未知' }}{% if detail.resolution_confidence is not none %} · 置信度 {{ detail.resolution_confidence }}%{% endif %}</p>
         {% if detail.selection_reason %}<p class="detail-copy"><strong>选稿依据：</strong>{{ detail.selection_reason }}</p>{% endif %}
         <p class="detail-copy">日报期数：{{ active_edition_date or '当前版本' }}</p>
       </div>
-    </div>
-  </section>
-
-  <section class="detail-panel">
-    <div class="section-heading">
       <div>
-        <h2>关联资讯与筛选追溯</h2>
+        <h3>成员追溯</h3>
+        {% for member in detail.members %}
+          <p class="detail-copy">
+            <strong>{{ member.source_name or member.source_id or '未知来源' }}：</strong>
+            聚类 {{ member.match_type or '未记录' }}{% if member.match_confidence is not none %} · {{ member.match_confidence }}%{% endif %}；
+            Stage A {{ member.screen_decision or '未记录' }}；Stage B {{ member.review_status or '未记录' }}
+          </p>
+        {% endfor %}
       </div>
-      <span class="section-count">{{ detail.members | length }} 条可公开成员</span>
     </div>
-    <div class="member-list">
-      {% for member in detail.members %}
-        {% include "partials/member_card.html" %}
-      {% else %}
-        <p class="empty-state">本事件没有可公开展示的聚类成员。</p>
-      {% endfor %}
-    </div>
-  </section>
+  </details>
+</div>
 {% endblock %}

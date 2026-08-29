@@ -46,6 +46,8 @@ class CollectorRouter:
                 return self.direct_feed if getattr(source, "bypass_proxy", False) else self.feed
             if feed.adapter == "producthunt":
                 return self.producthunt
+            if feed.adapter == "anthropic_research":
+                return self.feed
             raise ValueError(f"unsupported feed adapter for {source.id}: {feed.adapter}")
         if source.transport == "rsshub":
             # Do not duplicate RSSHub parsing/transport behavior.

@@ -86,7 +86,7 @@ def content_class_for_source(
 Transport: TypeAlias = Literal["feed", "rsshub", "github"]
 SourceTransport: TypeAlias = Transport
 FeedFormat: TypeAlias = Literal["rss", "atom"]
-FeedAdapter: TypeAlias = Literal["generic", "producthunt"]
+FeedAdapter: TypeAlias = Literal["generic", "producthunt", "anthropic_research"]
 GitHubMode: TypeAlias = Literal["search", "releases", "trending"]
 GitHubSort: TypeAlias = Literal["stars", "forks", "help-wanted-issues", "updated"]
 TrendingPeriod: TypeAlias = Literal["daily", "weekly"]
@@ -110,6 +110,8 @@ class FeedOptions(BaseModel):
     def _validate_adapter(self) -> "FeedOptions":
         if self.adapter == "producthunt" and self.format != "atom":
             raise ValueError("producthunt feed adapter requires feed.format=atom")
+        if self.adapter == "anthropic_research" and self.format != "rss":
+            raise ValueError("anthropic_research feed adapter requires feed.format=rss")
         return self
 
 
@@ -287,6 +289,7 @@ class FetchItem(BaseModel):
     captured_at: datetime | None = None
     summary: str | None = None
     content: str | None = None
+    content_depth: str | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
     kind: str = "unknown"
@@ -315,6 +318,7 @@ class FetchItem(BaseModel):
                 "raw_summary",
                 "content",
                 "raw_content",
+                "content_depth",
                 "metrics",
                 "raw_payload",
                 "kind",

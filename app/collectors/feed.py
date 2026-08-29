@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import json
 import time
+import re
+from urllib.parse import urljoin
 from typing import Any, Mapping
 
 from app.config.settings import DEFAULT_USER_AGENT
+from app.content_extraction import _block_text
 from app.domain.models import FetchBatch, FetchItem, SourceSpec
-from app.parsers.feed_parser import parse_feed
+from app.parsers.feed_parser import html_to_text, parse_feed
+from bs4 import BeautifulSoup
 
 from .base import Collector
 from .common import (
@@ -60,6 +64,8 @@ class FeedCollector(Collector):
     ) -> FetchBatch:
         if not source.url:
             return failed_batch(source, "missing_url", "source has no URL")
+        if source.feed and source.feed.adapter == "anthropic_research":
+            return self._collect_anthropic_research(source, limit, request_headers)
         # Keep the registry URL unchanged. Reddit's standard ``.rss`` route
         # already returns Atom XML; query-string workarounds such as
         # ``raw_json=1`` can trigger a different 403/429 edge path.
@@ -142,6 +148,42 @@ class FeedCollector(Collector):
             error_message=error_message,
         )
 
+    def _collect_anthropic_research(self, source, limit, request_headers):
+        response, retry_count, error = request_with_retry(
+            self.client, source.url, retries=self.retries, user_agent=self.user_agent,
+            extra_headers={"Accept": "text/html,application/xhtml+xml", **dict(request_headers or {})},
+            timeout_seconds=self.timeout_seconds, sleeper=self.sleeper,
+        )
+        if error is not None or response is None:
+            return failed_batch(source, error[0], error[1], http_status=error[2], retry_count=retry_count)
+        listing = BeautifulSoup(bytes(response.content), "html.parser")
+        items = []
+        for anchor in listing.select('a[href*="/research/"]')[:limit]:
+            url = urljoin(source.url, anchor.get("href", ""))
+            article_response, _, article_error = request_with_retry(
+                self.client, url, retries=self.retries, user_agent=self.user_agent,
+                extra_headers={"Accept": "text/html,application/xhtml+xml"},
+                timeout_seconds=self.timeout_seconds, sleeper=self.sleeper,
+            )
+            if article_error or article_response is None:
+                continue
+            page = BeautifulSoup(bytes(article_response.content), "html.parser")
+            content = _block_text(page.select_one("main") or page.select_one("article"))
+            if content:
+                items.append(FetchItem(
+                    source_id=source.id,
+                    external_id=url,
+                    title=re.sub(r"\s+", " ", anchor.get_text(" ", strip=True)).strip(),
+                    url=url,
+                    canonical_url=url,
+                    summary=content,
+                    content=content,
+                    content_depth="full",
+                    raw_payload={"listing_url": source.url},
+                    kind="feed",
+                ))
+        return FetchBatch(source=source, items=items, status="success", retry_count=retry_count, transport="httpx")
+
 
 class ProductHuntCollector(FeedCollector):
     """Map Product Hunt's public Atom feed without API or GraphQL fallback."""
@@ -220,6 +262,21 @@ class ProductHuntCollector(FeedCollector):
 
 def _feed_item_to_domain(item: Any, source: SourceSpec) -> FetchItem:
     payload = dict(getattr(item, "raw_payload", {}) or {})
+    summary = getattr(item, "raw_summary", None)
+    content = getattr(item, "raw_content", None)
+    content_depth = getattr(item, "content_depth", None)
+    if content:
+        content = html_to_text(content)
+        content_depth = "full" if content else ("summary" if summary else "missing")
+    if source.id == "google_blog_ai":
+        content = None
+        content_depth = "summary" if summary else "missing"
+    if source.id == "openai_news":
+        content = None
+        content_depth = "summary" if summary else "missing"
+    if source.transport == "rsshub" or source.id == "linux_do_hot":
+        content = html_to_text(summary)
+        content_depth = "full" if content else "missing"
     metrics: dict[str, Any] = {}
     for target, aliases in {
         "stars": ("stars", "stargazers", "stargazers_count", "star_count", "github_stars"),
@@ -244,8 +301,9 @@ def _feed_item_to_domain(item: Any, source: SourceSpec) -> FetchItem:
         url=getattr(item, "link", None),
         author=getattr(item, "author", None),
         published_at=getattr(item, "published_at", None),
-        summary=getattr(item, "raw_summary", None),
-        content=getattr(item, "raw_content", None),
+        summary=summary,
+        content=content,
+        content_depth=content_depth,
         metrics=metrics,
         raw_payload=payload,
         kind="feed",

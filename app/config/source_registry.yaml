@@ -1106,15 +1106,15 @@ sources:
   source_group: official_blog
   default_limit: 10
 - id: anthropic_research_rsshub
-  name: Anthropic Research via RSSHub
-  transport: rsshub
-  url: ${RSSHUB_BASE_URL}/anthropic/research?limit=6
+  name: Anthropic Research
+  transport: feed
+  url: https://www.anthropic.com/research
   enabled: true
   priority: 120
   fetch_interval: 3600
   feed:
     format: rss
-    adapter: generic
+    adapter: anthropic_research
   source_group: official_research
   default_limit: 6
 - id: anthropic_engineering_rsshub

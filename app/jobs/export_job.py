@@ -622,7 +622,9 @@ def _serialize_event(
                 "is_primary": bool(relation.is_primary),
                 "lineage": _public_value(_json(relation.lineage_json, {})),
                 "ai_summary": ai_summary,
+                "source_summary": normalize_text(item.summary) if item is not None and item.summary else None,
                 "content_text": content_text,
+                "content_depth": item.content_depth if item is not None else None,
             }
         )
     risk_flags = _json_list(event.risk_flags_json)

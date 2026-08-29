@@ -32,6 +32,7 @@ from app.config.limits import (
     DEFAULT_AI_REVIEW_CONCURRENCY,
     DEFAULT_AI_SCREEN_REJECT_THRESHOLD,
 )
+from app.content_extraction import extract_article_text, extracts_article
 from app.domain.models import SourceSpec
 from app.domain.recency import (
     STAGE_A_FRESHNESS_CUTOFF_MODE,
@@ -533,8 +534,40 @@ def _prepare_scope(
                 reference_time,
                 cutoff_at,
             )
+        _enrich_article_content(repo, eligible)
+        session.commit()
+        eligible = repo.list_run_items(run_id, role=None)
+        eligible = [item for item in eligible if any(int(item.id) == int(current.id) for current in candidates)]
+        eligible, _ = _filter_recent_items(
+            eligible,
+            source_specs=source_specs,
+            reference_time=reference_time,
+            edition_date=edition_date,
+        )
         contexts = [_context_from_item(item, source_specs) for item in eligible]
         return run_id, contexts, filtered, truncated_by_limit, edition_date, reference_time, cutoff_at
+
+
+def _enrich_article_content(repo: IntelRepository, items: Iterable[IntelItem]) -> None:
+    targets = [
+        item
+        for item in items
+        if item.content_depth != "full" and extracts_article(item.source_id) and item.canonical_url
+    ]
+    if not targets:
+        return
+    with httpx.Client(timeout=20, follow_redirects=True, http2=True, trust_env=True) as client:
+        for item in targets:
+            content = extract_article_text(
+                client,
+                source_id=item.source_id,
+                url=item.canonical_url,
+                external_id=item.external_id,
+                raw_payload=_json_dict(item.raw_payload_json),
+                timeout_seconds=20,
+            )
+            if content:
+                repo.update_item_content(int(item.id), content)
 
 
 def _filter_recent_items(

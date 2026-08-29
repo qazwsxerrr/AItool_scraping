@@ -19,6 +19,7 @@ data/editions/
 output/
 output/BACKUP/
 /reference
+/test
 # Local user workspace artifacts
 / - 副本.env
 /.cursor/

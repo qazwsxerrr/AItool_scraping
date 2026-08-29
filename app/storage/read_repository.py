@@ -133,7 +133,9 @@ class EventMemberRow:
     review_confidence: int | None = None
     review_risk_flags: tuple[str, ...] = ()
     ai_summary: str | None = None
+    source_summary: str | None = None
     content_text: str | None = None
+    content_depth: str | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +145,15 @@ class EventDetailRow:
     resolution_method: str | None
     resolution_confidence: int | None
     members: tuple[EventMemberRow, ...]
+
+    @property
+    def primary_member(self) -> EventMemberRow | None:
+        return next((member for member in self.members if member.is_primary), self.members[0] if self.members else None)
+
+    @property
+    def related_members(self) -> tuple[EventMemberRow, ...]:
+        primary = self.primary_member
+        return tuple(member for member in self.members if member is not primary)
 
 
 @dataclass(frozen=True)
@@ -569,10 +580,13 @@ class UIReadRepository:
     def _members_from_entry(entry: DailyEditionReportEntry) -> tuple[EventMemberRow, ...]:
         rows: list[EventMemberRow] = []
         for position, ref in enumerate(entry.source_refs, start=1):
-            raw_summary = _text(ref.get("ai_summary")) or _text(ref.get("summary")) or entry.summary
+            raw_summary = _text(ref.get("ai_summary"))
             ai_summary = normalize_text(raw_summary) if raw_summary else None
+            raw_source_summary = _text(ref.get("source_summary")) or _text(ref.get("summary"))
+            source_summary = normalize_text(raw_source_summary) if raw_source_summary else None
             raw_content = _text(ref.get("content_text"))
             content_text = normalize_text(raw_content) if raw_content else None
+            content_depth = _text(ref.get("content_depth"))
             rows.append(EventMemberRow(
                 item_id=_int(ref.get("item_id")) or -(int(entry.id) * 1000 + position),
                 title=_text(ref.get("title")) or entry.original_title or entry.title,
@@ -583,7 +597,9 @@ class UIReadRepository:
                 match_type=_text(ref.get("match_type")), match_confidence=_int(ref.get("match_confidence")),
                 review_topic=entry.topic, review_summary=entry.summary,
                 ai_summary=ai_summary,
+                source_summary=source_summary,
                 content_text=content_text,
+                content_depth=content_depth,
             ))
         return tuple(sorted(rows, key=lambda row: (not row.is_primary, row.item_id)))
 

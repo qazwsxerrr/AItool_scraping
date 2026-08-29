@@ -462,6 +462,7 @@ def _release_to_item(source: SourceSpec, release: dict[str, Any]) -> FetchItem:
         published_at=_parse_dt(release.get("published_at") or release.get("created_at")),
         summary=body,
         content=body,
+        content_depth="full" if body else "missing",
         metrics={"tag_name": release.get("tag_name"), "draft": bool(release.get("draft")), "prerelease": bool(release.get("prerelease"))},
         raw_payload={"github_item_type": "release", **release},
         kind="github_release",

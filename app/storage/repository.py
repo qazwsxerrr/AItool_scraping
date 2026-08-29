@@ -821,13 +821,13 @@ class IntelRepository:
             )
             existing.title = fields["title"] or existing.title
             existing.summary = fields["summary"] or existing.summary
-            existing.content_text = fields["content_text"] or existing.content_text
+            existing.content_text = fields["content_text"]
+            existing.content_depth = fields["content_depth"]
             existing.canonical_url = fields["canonical_url"] or existing.canonical_url
             existing.published_at = fields["published_at"] or existing.published_at
             existing.discovered_at = fields["discovered_at"] or existing.discovered_at
             existing.original_title = fields["original_title"] or existing.original_title
             existing.source_url = fields["source_url"] or existing.source_url
-            existing.content_depth = fields["content_depth"] or existing.content_depth
             existing.content_class = fields["content_class"]
             existing.metrics_json = new_metrics
             existing.raw_payload_json = new_payload
@@ -954,6 +954,17 @@ class IntelRepository:
             "errors": [str(error) for error in enrichment.get("errors", []) if error],
         }
         item.raw_payload_json = _dump_json(raw_payload)
+        item.updated_at = utcnow()
+        self.session.flush()
+        return item
+
+    def update_item_content(self, item_id: int, content_text: str) -> IntelItem | None:
+        item = self.session.get(IntelItem, int(item_id))
+        if item is None:
+            return None
+        item.content_text = content_text
+        item.content_depth = "full"
+        item.content_hash = _identity_hash(item.external_id, item.canonical_url, item.title, content_text)
         item.updated_at = utcnow()
         self.session.flush()
         return item
@@ -2987,7 +2998,7 @@ def _item_fields(item: Any) -> dict[str, Any]:
     canonical_url = _canonical_url(values.get("canonical_url") or values.get("link") or values.get("url"))
     title = _text(values.get("title")) or "(untitled)"
     summary = _text(values.get("summary") or values.get("raw_summary"))
-    content_text = _text(values.get("content_text") or values.get("content") or values.get("raw_content") or summary)
+    content_text = _text(values.get("content_text") or values.get("content") or values.get("raw_content"))
     content_class = _text(values.get("content_class"))
     if content_class == "project_tool":
         github_url = _canonical_github_url(canonical_url)
@@ -3011,7 +3022,9 @@ def _item_fields(item: Any) -> dict[str, Any]:
     discovered_at = _as_utc(values.get("discovered_at")) or captured_at
     original_title = _text(values.get("original_title") or values.get("title"))
     source_url = _canonical_url(values.get("source_url") or values.get("url") or values.get("link"))
-    content_depth = _text(values.get("content_depth")) or ("full" if values.get("content_text") or values.get("content") else "summary")
+    content_depth = _text(values.get("content_depth")) or (
+        "full" if content_text else ("summary" if summary else "missing")
+    )
     content_hash = _text(values.get("content_hash")) or _identity_hash(external_id, canonical_url, title, content_text)
     # Keep GitHub repository identity stable as star/description metrics change.
     if external_id and external_id.startswith("github_repo:"):
