@@ -28,7 +28,7 @@ from app.domain.recency import StageAFreshnessDecision, stage_a_time_decision
 from app.github.report import write_github_trending_report
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
 from app.storage.repository import IntelRepository
-from app.storage.models import IntelEvent, IntelEventItem, IntelItem, IntelRun, IntelRunItem
+from app.storage.models import IntelEvent, IntelEventItem, IntelItem, IntelRun
 from app.storage.daily_build_summary import build_daily_build_summary
 
 

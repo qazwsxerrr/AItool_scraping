@@ -7,7 +7,6 @@ from typing import Mapping
 from app.domain.models import FetchBatch, SourceSpec
 
 from .base import Collector
-from .github import GitHubCollector, GitHubTrendingCollector
 
 
 class CollectorRouter:

@@ -115,10 +115,8 @@ def run_stage_a_screen_job(
     ai_client: Any | None = None,
     run_id: int,
     limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
-    ai_limit: int | None = None,
     force: bool = False,
     retry_failed: bool = False,
-    retry: bool | None = None,
     include_blocked: bool = False,
     item_ids: Iterable[int] | None = None,
     task_ids: Iterable[int] | None = None,
@@ -128,7 +126,6 @@ def run_stage_a_screen_job(
     now: Any | None = None,
     owner: str | None = None,
     progress: ProgressCallback | None = None,
-    **_: Any,
 ) -> StageAScreenResult:
     """Run Stage A with durable per-item state.
 
@@ -137,9 +134,7 @@ def run_stage_a_screen_job(
     """
 
     max_workers = _bounded_concurrency(concurrency)
-    if retry is not None:
-        retry_failed = bool(retry)
-    selected_limit = _normalise_limit(ai_limit if ai_limit is not None else limit)
+    selected_limit = _normalise_limit(limit)
     reject_threshold = _bounded_score(screen_reject_threshold, DEFAULT_AI_SCREEN_REJECT_THRESHOLD)
     result = StageAScreenResult(run_id=run_id)
     owner = owner or f"stage-a-{uuid4().hex}"

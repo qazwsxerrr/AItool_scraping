@@ -22,33 +22,21 @@ from app.domain.models import FetchBatch, SourceSpec
 class HTTPClient(Protocol):
     def get(self, url: str, **kwargs: Any): ...
 
-    def post(self, url: str, **kwargs: Any): ...
-
 
 @dataclass(frozen=True)
 class RequestFailure:
-    """Failure telemetry with tuple-style access for collector callers."""
+    """Failure telemetry returned by the shared request helper."""
 
     code: str
     message: str
     status: int | None
     response_bytes: int = 0
 
-    def __iter__(self):
-        yield self.code
-        yield self.message
-        yield self.status
-
-    def __getitem__(self, index: int):
-        return (self.code, self.message, self.status)[index]
-
 
 def request_with_retry(
     client: HTTPClient,
     url: str,
     *,
-    method: str = "get",
-    json_body: dict[str, Any] | None = None,
     retries: int,
     user_agent: str = DEFAULT_USER_AGENT,
     max_response_bytes: int | None = None,
@@ -72,19 +60,9 @@ def request_with_retry(
             request_kwargs: dict[str, Any] = {"headers": headers}
             if params is not None:
                 request_kwargs["params"] = params
-            if json_body is not None:
-                request_kwargs["json"] = json_body
             if timeout_seconds is not None:
                 request_kwargs["timeout"] = timeout_seconds
-            requester = getattr(client, method.casefold(), None)
-            if not callable(requester):
-                raise TypeError(f"HTTP client does not support {method.upper()}")
-            try:
-                response = requester(url, **request_kwargs)
-            except TypeError:
-                # Tiny injected clients often expose only ``url`` and headers.
-                request_kwargs.pop("timeout", None)
-                response = requester(url, **request_kwargs)
+            response = client.get(url, **request_kwargs)
             status = int(getattr(response, "status_code", 0) or 0)
             body = response_bytes(response)
             if max_response_bytes is not None and body > max_response_bytes:

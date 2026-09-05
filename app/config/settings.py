@@ -8,7 +8,6 @@ from typing import Literal
 from app.config.limits import (
     DEFAULT_AI_REVIEW_CONCURRENCY,
     DEFAULT_AI_SCREEN_REJECT_THRESHOLD,
-    DEFAULT_STAGE_B_RESERVE_LIMIT,
     DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS,
     DEFAULT_STAGE_C_AGENT_MAX_TURNS,
     DEFAULT_STAGE_C_AGENT_MAX_WEB_SEARCHES,
@@ -55,7 +54,6 @@ class Settings:
     ai_structured_api_style: Literal["responses", "chat_completions"] = DEFAULT_AI_STRUCTURED_API_STYLE
     ai_screen_reject_threshold: int = DEFAULT_AI_SCREEN_REJECT_THRESHOLD
     ai_review_concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY
-    stage_b_reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT
     stage_c_timeout_seconds: float = 120.0
     stage_c_agent_max_turns: int = DEFAULT_STAGE_C_AGENT_MAX_TURNS
     stage_c_agent_max_tool_calls: int = DEFAULT_STAGE_C_AGENT_MAX_TOOL_CALLS
@@ -91,9 +89,6 @@ class Settings:
             ai_review_concurrency=max(
                 1,
                 _bounded_int(os.getenv("AI_REVIEW_CONCURRENCY"), DEFAULT_AI_REVIEW_CONCURRENCY),
-            ),
-            stage_b_reserve_limit=_positive_int(
-                os.getenv("AI_STAGE_B_RESERVE_LIMIT"), DEFAULT_STAGE_B_RESERVE_LIMIT, maximum=100
             ),
             stage_c_timeout_seconds=float(os.getenv("AI_STAGE_C_TIMEOUT_SECONDS", "120")),
             stage_c_agent_max_turns=_positive_int(

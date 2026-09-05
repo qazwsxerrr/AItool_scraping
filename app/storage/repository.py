@@ -12,7 +12,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.domain.models import SourceSpec

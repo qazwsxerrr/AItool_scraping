@@ -6,7 +6,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -210,7 +210,7 @@ def run_intel_fetch_job(
                 if limit_per_source is None
                 else max(1, int(limit_per_source))
             )
-            batch = _router_collect(router, spec, effective_limit, request_headers)
+            batch = router.collect(spec, effective_limit, request_headers=request_headers)
             _apply_batch_stats(stats, batch)
             stats.etag = batch.etag
             stats.last_modified = batch.last_modified
@@ -508,10 +508,6 @@ def _conditional_headers(source: Source | None) -> dict[str, str]:
     if source.last_modified:
         headers["If-Modified-Since"] = source.last_modified
     return headers
-
-
-def _router_collect(router: Any, source: SourceSpec, limit: int, request_headers: dict[str, str]) -> FetchBatch:
-    return router.collect(source, limit, request_headers=request_headers)
 
 
 def _as_utc(value: datetime | None) -> datetime | None:

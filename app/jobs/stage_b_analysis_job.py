@@ -15,9 +15,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
-from pydantic import ValidationError
 from sqlalchemy import select
-from sqlalchemy.orm import Session, joinedload, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.ai.skills.intel_triage import (
     AnalysisResult,
@@ -30,14 +29,13 @@ from app.ai.skills.intel_triage import (
 from app.config.limits import (
     DEFAULT_AI_REVIEW_CONCURRENCY,
     DEFAULT_AI_REVIEW_LIMIT,
-    DEFAULT_STAGE_B_RESERVE_LIMIT,
     STAGE_B_ANALYSIS_MIN_SCORE,
     STAGE_B_ADMISSION_POLICY_VERSION,
     STAGE_B_AUDIENCE_RELEVANCE_MIN,
 )
 from app.domain.models import SourceSpec
 from app.jobs.provider_retry import ProviderResponseFailure, call_with_provider_retries
-from app.storage.models import IntelCandidateAdmission, IntelItem, IntelRun, IntelRunStage, IntelRunStageTask
+from app.storage.models import IntelCandidateAdmission, IntelItem, IntelRun, IntelRunStageTask
 from app.storage.repository import IntelRepository
 
 from .stage_a_screen_job import (
@@ -45,7 +43,6 @@ from .stage_a_screen_job import (
     _config_fingerprint,
     _item_fingerprint,
     _item_to_envelope,
-    _json_dict,
     _normalise_limit,
     _spec_from_row,
 )
@@ -125,16 +122,11 @@ def run_stage_b_analysis_job(
     ai_client: Any | None = None,
     run_id: int,
     limit: int | None = DEFAULT_AI_REVIEW_LIMIT,
-    ai_limit: int | None = None,
-    source_filter: str | None = None,
-    content_class: str | None = None,
     force: bool = False,
     retry_failed: bool = False,
-    retry: bool | None = None,
     include_blocked: bool = False,
     item_ids: Iterable[int] | None = None,
     task_ids: Iterable[int] | None = None,
-    reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT,
     concurrency: int = DEFAULT_AI_REVIEW_CONCURRENCY,
     owner: str | None = None,
     progress: ProgressCallback | None = None,
@@ -142,11 +134,8 @@ def run_stage_b_analysis_job(
     """Run only persisted Stage-A eligible work for ``run_id``."""
 
     max_workers = _bounded_concurrency(concurrency)
-    if retry is not None:
-        retry_failed = bool(retry)
-    selected_limit = _normalise_limit(ai_limit if ai_limit is not None else limit)
+    selected_limit = _normalise_limit(limit)
     result = StageBAnalysisResult(run_id=run_id)
-    del reserve_limit
     owner = owner or f"stage-b1-{uuid4().hex}"
     specs = dict(source_specs or {})
     requested_ids = {int(value) for value in item_ids} if item_ids is not None else None
@@ -179,8 +168,6 @@ def run_stage_b_analysis_job(
             force
             and requested_ids is None
             and requested_task_ids is None
-            and source_filter is None
-            and content_class is None
         )
         stage = repo.ensure_stage(
             run_id,
@@ -257,10 +244,6 @@ def run_stage_b_analysis_job(
             if screen_task.input_fingerprint and screen_task.input_fingerprint != _item_fingerprint(item):
                 # A changed item invalidates the prior Stage-A decision; do
                 # not let Stage B analyze stale content or silently rerun A.
-                continue
-            if source_filter and item.source_id != source_filter:
-                continue
-            if content_class and item.content_class != content_class:
                 continue
             if not _screen_task_is_eligible(screen_task, run_id=run_id, session=session):
                 continue
@@ -567,16 +550,13 @@ def materialize_stage_b_admission(
     *,
     session_factory: sessionmaker[Session],
     run_id: int,
-    reserve_limit: int = DEFAULT_STAGE_B_RESERVE_LIMIT,
 ) -> StageBAdmissionResult | None:
     """Project structurally valid B analyses into the C workbench.
 
-    The admission never asks a model.  It keeps the fixed score and
-    AI-relevance gates, and no longer applies quota, diversity, or reserve
-    cuts.  ``reserve_limit`` is accepted only so existing callers keep working.
+    The admission never asks a model. It keeps the fixed score and
+    AI-relevance gates; every item over both thresholds goes to Stage C.
     """
 
-    del reserve_limit
     with session_factory() as session:
         repo = IntelRepository(session)
         run = session.get(IntelRun, int(run_id))

@@ -33,22 +33,26 @@ class FeedParseError(ValueError):
     pass
 
 
+def block_text(node: Any) -> str | None:
+    """Extract readable block text from a selected HTML node."""
+    if node is None:
+        return None
+    for child in node.select("script, style, noscript"):
+        child.decompose()
+    blocks: list[str] = []
+    for child in node.select("h1, h2, h3, p, li, blockquote, pre"):
+        text = re.sub(r"\s+", " ", child.get_text(" ", strip=True)).strip()
+        text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+        if text:
+            blocks.append(text)
+    return "\n\n".join(blocks) or None
+
+
 def parse_feed(
     content: bytes | str,
     source_id: str,
-    *,
-    feed_format: str | None = None,
 ) -> list[ParsedFeedItem]:
-    """Parse an RSS/Atom document into canonical raw feed items.
-
-    ``feed_format`` is supplied by the resolved ``SourceSpec`` so callers can
-    keep the configured format visible at the boundary.  ``feedparser`` is
-    deliberately still responsible for tolerant XML parsing; many real-world
-    feeds advertise a slightly different MIME/version string than their
-    registry entry.
-    """
-    if feed_format is not None and feed_format not in {"rss", "atom"}:
-        raise FeedParseError(f"unsupported feed format: {feed_format}")
+    """Parse an RSS/Atom document into canonical raw feed items."""
     parsed = feedparser.parse(content)
     entries = list(parsed.get("entries", []))
     if parsed.get("bozo") and not entries:
@@ -205,3 +209,6 @@ def _content_hash(*, title: str, link: str | None, summary: str | None, content:
     parts = [title.strip().lower(), link or "", summary or "", content or ""]
     canonical = "\n".join(parts)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+__all__ = ["FeedParseError", "ParsedFeedItem", "block_text", "html_to_text", "parse_feed"]

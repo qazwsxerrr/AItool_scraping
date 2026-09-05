@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from bs4 import BeautifulSoup
 
 from app.collectors.http import HTTPClient, request_with_retry
+from app.parsers.feed_parser import block_text
 
 
 ARTICLE_SELECTORS: dict[str, str] = {
@@ -70,19 +70,7 @@ def extract_article_text(
         node = max(candidates, key=lambda value: len(value.get_text(" ", strip=True)), default=None)
     else:
         node = soup.select_one(ARTICLE_SELECTORS[source_id])
-    return _block_text(node) if node is not None else None
-
-
-def _block_text(node: Any) -> str | None:
-    for child in node.select("script, style, noscript"):
-        child.decompose()
-    blocks: list[str] = []
-    for child in node.select("h1, h2, h3, p, li, blockquote, pre"):
-        text = re.sub(r"\s+", " ", child.get_text(" ", strip=True)).strip()
-        text = re.sub(r"\s+([,.;:!?])", r"\1", text)
-        if text:
-            blocks.append(text)
-    return "\n\n".join(blocks) or None
+    return block_text(node)
 
 
 def _techcrunch_post_id(external_id: str | None, raw_payload: dict[str, Any]) -> int | None:
@@ -104,7 +92,7 @@ def _techcrunch_content_text(content: bytes | str) -> str | None:
     node = BeautifulSoup(rendered, "html.parser")
     for child in node.select(".ad-unit, .jw-player-inline-promo, script, style, noscript"):
         child.decompose()
-    return _block_text(node)
+    return block_text(node)
 
 
 __all__ = ["ARTICLE_SELECTORS", "extract_article_text", "extracts_article"]

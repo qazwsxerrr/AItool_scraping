@@ -14,9 +14,8 @@ from urllib.parse import urljoin
 from typing import Any, Mapping
 
 from app.config.settings import DEFAULT_USER_AGENT
-from app.content_extraction import _block_text
 from app.domain.models import FetchBatch, FetchItem, SourceSpec
-from app.parsers.feed_parser import html_to_text, parse_feed
+from app.parsers.feed_parser import block_text, html_to_text, parse_feed
 from bs4 import BeautifulSoup
 
 from .base import Collector
@@ -62,8 +61,6 @@ class FeedCollector(Collector):
         limit: int,
         request_headers: Mapping[str, str] | None = None,
     ) -> FetchBatch:
-        if not source.url:
-            return failed_batch(source, "missing_url", "source has no URL")
         if source.feed and source.feed.adapter == "anthropic_research":
             return self._collect_anthropic_research(source, limit, request_headers)
         # Keep the registry URL unchanged. Reddit's standard ``.rss`` route
@@ -83,9 +80,9 @@ class FeedCollector(Collector):
         if error is not None:
             return failed_batch(
                 source,
-                error[0],
-                error[1],
-                http_status=error[2],
+                error.code,
+                error.message,
+                http_status=error.status,
                 response_bytes=getattr(error, "response_bytes", 0),
                 retry_count=retry_count,
                 request_url=request_url,
@@ -111,8 +108,7 @@ class FeedCollector(Collector):
             )
         body = bytes(getattr(response, "content", b""))
         try:
-            feed_format = source.feed.format if source.feed is not None else None
-            parsed = parse_feed(body, source_id=source.id, feed_format=feed_format)
+            parsed = parse_feed(body, source_id=source.id)
         except Exception as exc:
             return failed_batch(
                 source,
@@ -155,7 +151,7 @@ class FeedCollector(Collector):
             timeout_seconds=self.timeout_seconds, sleeper=self.sleeper,
         )
         if error is not None or response is None:
-            return failed_batch(source, error[0], error[1], http_status=error[2], retry_count=retry_count)
+            return failed_batch(source, error.code, error.message, http_status=error.status, retry_count=retry_count)
         listing = BeautifulSoup(bytes(response.content), "html.parser")
         items = []
         for anchor in listing.select('a[href*="/research/"]')[:limit]:
@@ -168,7 +164,7 @@ class FeedCollector(Collector):
             if article_error or article_response is None:
                 continue
             page = BeautifulSoup(bytes(article_response.content), "html.parser")
-            content = _block_text(page.select_one("main") or page.select_one("article"))
+            content = block_text(page.select_one("main") or page.select_one("article"))
             if content:
                 items.append(FetchItem(
                     source_id=source.id,

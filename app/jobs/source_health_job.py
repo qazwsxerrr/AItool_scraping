@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 from app.config.settings import Settings
 from app.storage.db import create_engine_from_url, create_session_factory, init_db
-from app.storage.models import Source
 from app.storage.repository import IntelRepository
 
 

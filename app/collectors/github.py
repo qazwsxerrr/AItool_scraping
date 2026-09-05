@@ -30,21 +30,6 @@ GITHUB_METADATA_MAX_RESPONSE_BYTES = 512 * 1024
 GITHUB_README_MAX_RESPONSE_BYTES = 1 * 1024 * 1024
 GITHUB_README_MAX_CHARS = 16_000
 
-# Keep private aliases local to this module while preserving the compact
-# implementation names used by the original collector code below.
-_absolute_url = absolute_url
-_failed_batch = failed_batch
-_request_with_retry = request_with_retry
-_response_bytes = response_bytes
-_response_final_url = response_final_url
-_response_request_url = response_request_url
-_canonical_github_repo_url = canonical_github_repo_url
-_number = number
-_owner_repo = owner_repo
-_parse_dt = parse_dt
-_text = text
-
-
 class GitHubCollector(Collector):
     """GitHub REST API collector for repository search and releases."""
 
@@ -73,25 +58,21 @@ class GitHubCollector(Collector):
         limit: int,
         request_headers: Mapping[str, str] | None = None,
     ) -> FetchBatch:
-        if not source.url:
-            return _failed_batch(source, "missing_url", "source has no URL")
         if source.transport != "github" or source.github is None or source.github.mode not in {"search", "releases"}:
-            return _failed_batch(source, "invalid_source", "GitHub REST collector requires github.mode=search or releases")
+            return failed_batch(source, "invalid_source", "GitHub REST collector requires github.mode=search or releases")
         params: dict[str, str] = {"per_page": str(max(1, min(int(limit), 100)))}
         options = source.github
-        if options is None:
-            return _failed_batch(source, "invalid_source", "GitHub source requires github options")
         mode = options.mode
         if mode == "search":
             query = _build_search_query(options.query, options.pushed_days)
             if not query:
-                return _failed_batch(source, "missing_query", "GitHub search mode requires github.query")
+                return failed_batch(source, "missing_query", "GitHub search mode requires github.query")
             params.update({"q": query, "sort": options.sort, "order": options.order})
         elif mode != "releases":
-            return _failed_batch(source, "invalid_mode", f"GitHub REST collector does not support mode={mode}")
-        response, retry_count, error = _request_with_retry(
+            return failed_batch(source, "invalid_mode", f"GitHub REST collector does not support mode={mode}")
+        response, retry_count, error = request_with_retry(
             self.client,
-            _absolute_url(source.url, self.base_url),
+            absolute_url(source.url, self.base_url),
             retries=self.retries,
             user_agent=self.user_agent,
             extra_headers={
@@ -104,25 +85,25 @@ class GitHubCollector(Collector):
             timeout_seconds=self.timeout_seconds,
         )
         if error is not None:
-            return _failed_batch(
+            return failed_batch(
                 source,
-                error[0],
-                error[1],
-                http_status=error[2],
+                error.code,
+                error.message,
+                http_status=error.status,
                 response_bytes=getattr(error, "response_bytes", 0),
                 retry_count=retry_count,
                 request_url=source.url,
             )
         assert response is not None
         status_code = int(getattr(response, "status_code", 0) or 0)
-        final_url = _response_final_url(response, source.url)
-        request_url = _response_request_url(response, source.url)
+        final_url = response_final_url(response, source.url)
+        request_url = response_request_url(response, source.url)
         if status_code == 304:
             return FetchBatch(source=source, status="not_modified", http_status=304, request_url=request_url, final_url=final_url, transport="github_api", retry_count=retry_count)
         try:
             payload = response.json()
         except (TypeError, ValueError) as exc:
-            return _failed_batch(
+            return failed_batch(
                 source,
                 "invalid_json",
                 str(exc),
@@ -130,11 +111,11 @@ class GitHubCollector(Collector):
                 retry_count=retry_count,
                 request_url=request_url,
                 final_url=final_url,
-                response_bytes=_response_bytes(response),
+                response_bytes=response_bytes(response),
             )
         if mode == "releases":
             if not isinstance(payload, list):
-                return _failed_batch(
+                return failed_batch(
                     source,
                     "invalid_payload",
                     "GitHub releases response must be a list",
@@ -142,12 +123,12 @@ class GitHubCollector(Collector):
                     retry_count=retry_count,
                     request_url=request_url,
                     final_url=final_url,
-                    response_bytes=_response_bytes(response),
+                    response_bytes=response_bytes(response),
                 )
             items = [_release_to_item(source, value) for value in payload[:limit] if isinstance(value, dict)]
         else:
             if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
-                return _failed_batch(
+                return failed_batch(
                     source,
                     "invalid_payload",
                     "GitHub search response must contain items",
@@ -155,7 +136,7 @@ class GitHubCollector(Collector):
                     retry_count=retry_count,
                     request_url=request_url,
                     final_url=final_url,
-                    response_bytes=_response_bytes(response),
+                    response_bytes=response_bytes(response),
                 )
             items = [_repo_to_item(source, value, query=params.get("q")) for value in payload["items"][:limit] if isinstance(value, dict)]
         return FetchBatch(
@@ -174,7 +155,7 @@ class GitHubCollector(Collector):
         """Fetch one repository metadata object for a Product Hunt link."""
 
         url = f"{self.base_url}/repos/{owner}/{repo}"
-        response, _, error = _request_with_retry(
+        response, _, error = request_with_retry(
             self.client,
             url,
             retries=self.retries,
@@ -227,7 +208,7 @@ class GitHubCollector(Collector):
 
         headers = self._github_headers()
         metadata_url = f"{self.base_url}/repos/{owner_text}/{repo_text}"
-        response, retry_count, error = _request_with_retry(
+        response, retry_count, error = request_with_retry(
             self.client,
             metadata_url,
             retries=self.retries,
@@ -238,7 +219,7 @@ class GitHubCollector(Collector):
         )
         result["metadata_retry_count"] = retry_count
         if error is not None or response is None:
-            result["errors"].append(f"metadata:{error[0] if error else 'request_error'}")
+            result["errors"].append(f"metadata:{error.code if error else 'request_error'}")
         else:
             try:
                 payload = response.json()
@@ -250,7 +231,7 @@ class GitHubCollector(Collector):
                 result["errors"].append("metadata:invalid_json")
 
         readme_url = f"{self.base_url}/repos/{owner_text}/{repo_text}/readme"
-        response, retry_count, error = _request_with_retry(
+        response, retry_count, error = request_with_retry(
             self.client,
             readme_url,
             retries=self.retries,
@@ -262,8 +243,8 @@ class GitHubCollector(Collector):
         result["readme_retry_count"] = retry_count
         result["readme_checked"] = True
         if error is not None or response is None:
-            result["readme_present"] = False if error and error[2] == 404 else None
-            result["errors"].append(f"readme:{error[0] if error else 'request_error'}")
+            result["readme_present"] = False if error and error.status == 404 else None
+            result["errors"].append(f"readme:{error.code if error else 'request_error'}")
             return result
 
         text = _decode_github_readme_response(response, max_chars=max_readme_chars)
@@ -305,11 +286,9 @@ class GitHubTrendingCollector(Collector):
         limit: int,
         request_headers: Mapping[str, str] | None = None,
     ) -> FetchBatch:
-        if not source.url:
-            return _failed_batch(source, "missing_url", "source has no URL")
         if source.transport != "github" or source.github is None or source.github.mode != "trending":
-            return _failed_batch(source, "invalid_source", "GitHub Trending collector requires github.mode=trending")
-        response, retry_count, error = _request_with_retry(
+            return failed_batch(source, "invalid_source", "GitHub Trending collector requires github.mode=trending")
+        response, retry_count, error = request_with_retry(
             self.client,
             source.url,
             retries=self.retries,
@@ -322,19 +301,19 @@ class GitHubTrendingCollector(Collector):
             sleeper=self.sleeper,
         )
         if error is not None:
-            return _failed_batch(
+            return failed_batch(
                 source,
-                error[0],
-                error[1],
-                http_status=error[2],
+                error.code,
+                error.message,
+                http_status=error.status,
                 response_bytes=getattr(error, "response_bytes", 0),
                 retry_count=retry_count,
                 request_url=source.url,
                 transport="github_trending_html",
             )
         assert response is not None
-        request_url = _response_request_url(response, source.url)
-        final_url = _response_final_url(response, source.url)
+        request_url = response_request_url(response, source.url)
+        final_url = response_final_url(response, source.url)
         body = bytes(getattr(response, "content", b"") or b"")
         try:
             html = body.decode("utf-8", errors="replace")
@@ -345,7 +324,7 @@ class GitHubTrendingCollector(Collector):
                 source_id=source.id,
             )
         except (TypeError, ValueError) as exc:
-            return _failed_batch(
+            return failed_batch(
                 source,
                 "invalid_html",
                 str(exc),
@@ -370,7 +349,7 @@ class GitHubTrendingCollector(Collector):
                     retry_count=retry_count,
                     transport="github_trending_html",
                 )
-            return _failed_batch(
+            return failed_batch(
                 source,
                 "trending_parse_empty",
                 "GitHub Trending HTML contained no repository rows",
@@ -395,14 +374,14 @@ class GitHubTrendingCollector(Collector):
 
 
 def _repo_to_item(source: SourceSpec, repo: dict[str, Any], *, query: str | None) -> FetchItem:
-    full_name = _text(repo.get("full_name") or repo.get("name")) or "unknown/repository"
-    url = _text(repo.get("html_url"))
-    canonical_url = _canonical_github_repo_url(full_name) or url
-    description = _text(repo.get("description"))
+    full_name = text(repo.get("full_name") or repo.get("name")) or "unknown/repository"
+    url = text(repo.get("html_url"))
+    canonical_url = canonical_github_repo_url(full_name) or url
+    description = text(repo.get("description"))
     topics = repo.get("topics") if isinstance(repo.get("topics"), list) else []
     metrics = {
-        "stars": _number(repo.get("stargazers_count")),
-        "forks": _number(repo.get("forks_count")),
+        "stars": number(repo.get("stargazers_count")),
+        "forks": number(repo.get("forks_count")),
         "language": repo.get("language"),
         "topics": topics,
         "full_name": full_name,
@@ -427,7 +406,7 @@ def _repo_to_item(source: SourceSpec, repo: dict[str, Any], *, query: str | None
         "query": query,
     }
     owner = repo.get("owner") if isinstance(repo.get("owner"), dict) else {}
-    author = _text(owner.get("login")) if isinstance(owner, dict) else None
+    author = text(owner.get("login")) if isinstance(owner, dict) else None
     raw = {"github_item_type": "repository", **repo}
     return FetchItem(
         source_id=source.id,
@@ -438,7 +417,7 @@ def _repo_to_item(source: SourceSpec, repo: dict[str, Any], *, query: str | None
         url=url,
         canonical_url=canonical_url,
         author=author,
-        published_at=_parse_dt(repo.get("pushed_at") or repo.get("updated_at") or repo.get("created_at")),
+        published_at=parse_dt(repo.get("pushed_at") or repo.get("updated_at") or repo.get("created_at")),
         summary=description,
         content=json.dumps(metrics, ensure_ascii=False, default=str),
         metrics=metrics,
@@ -448,18 +427,18 @@ def _repo_to_item(source: SourceSpec, repo: dict[str, Any], *, query: str | None
 
 
 def _release_to_item(source: SourceSpec, release: dict[str, Any]) -> FetchItem:
-    owner, repo = _owner_repo(source.url or "")
+    owner, repo = owner_repo(source.url or "")
     repo_name = f"{owner}/{repo}" if owner and repo else "GitHub repository"
-    name = _text(release.get("name") or release.get("tag_name") or release.get("id")) or "release"
-    body = _text(release.get("body"))
+    name = text(release.get("name") or release.get("tag_name") or release.get("id")) or "release"
+    body = text(release.get("body"))
     author_data = release.get("author") if isinstance(release.get("author"), dict) else {}
     return FetchItem(
         source_id=source.id,
         external_id=f"github_release:{release.get('id') or release.get('tag_name') or release.get('html_url')}",
         title=f"{repo_name} release: {name}",
-        url=_text(release.get("html_url")),
-        author=_text(author_data.get("login")) if isinstance(author_data, dict) else None,
-        published_at=_parse_dt(release.get("published_at") or release.get("created_at")),
+        url=text(release.get("html_url")),
+        author=text(author_data.get("login")) if isinstance(author_data, dict) else None,
+        published_at=parse_dt(release.get("published_at") or release.get("created_at")),
         summary=body,
         content=body,
         content_depth="full" if body else "missing",
@@ -482,7 +461,7 @@ def _parse_github_trending_html(
     captured_at = datetime.now(timezone.utc)
     for rank, row in enumerate(rows[:limit], start=1):
         link = row.select_one("h2 a, h3 a")
-        href = _text(link.get("href") if link else None)
+        href = text(link.get("href") if link else None)
         full_name = _github_trending_full_name(href)
         if not full_name:
             continue
@@ -491,8 +470,8 @@ def _parse_github_trending_html(
         language_node = row.select_one("[itemprop='programmingLanguage']")
         stars_node = _find_github_trending_link(row, "stargazers")
         forks_node = _find_github_trending_link(row, "forks")
-        stars = _number(stars_node.get_text(" ", strip=True) if stars_node else None) or 0
-        forks = _number(forks_node.get_text(" ", strip=True) if forks_node else None) or 0
+        stars = number(stars_node.get_text(" ", strip=True) if stars_node else None) or 0
+        forks = number(forks_node.get_text(" ", strip=True) if forks_node else None) or 0
         stars_since = _github_trending_stars_since(row, period)
         owner = full_name.split("/", 1)[0]
         metrics = {
@@ -507,10 +486,10 @@ def _parse_github_trending_html(
             "canonical_project_key": full_name,
             "github_owner": owner,
             "github_repo": full_name.split("/", 1)[1],
-            "language": _text(language_node.get_text(" ", strip=True) if language_node else None),
+            "language": text(language_node.get_text(" ", strip=True) if language_node else None),
         }
         url = f"https://github.com/{full_name}"
-        canonical_url = _canonical_github_repo_url(full_name) or url
+        canonical_url = canonical_github_repo_url(full_name) or url
         raw_payload = {
             "github_item_type": "repository",
             "full_name": full_name,
@@ -530,7 +509,7 @@ def _parse_github_trending_html(
                 author=owner,
                 published_at=captured_at,
                 captured_at=captured_at,
-                summary=_text(description_node.get_text(" ", strip=True) if description_node else None),
+                summary=text(description_node.get_text(" ", strip=True) if description_node else None),
                 content=json.dumps(metrics, ensure_ascii=False, default=str),
                 metrics=metrics,
                 raw_payload=raw_payload,
@@ -592,9 +571,9 @@ def _github_trending_stars_since(row: Any, period: str) -> int:
     }
     match = re.search(period_pattern.get(period, period_pattern["daily"]), text, flags=re.IGNORECASE)
     if match:
-        return int(_number(match.group(1)) or 0)
+        return int(number(match.group(1)) or 0)
     for node in row.select(".float-sm-right"):
-        value = _number(node.get_text(" ", strip=True))
+        value = number(node.get_text(" ", strip=True))
         if value is not None:
             return int(value)
     return 0
