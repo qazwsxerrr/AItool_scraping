@@ -2,6 +2,15 @@
 
 项目从配置的信息源抓取 AI 资讯，经过多阶段筛选生成待审核日报，并通过 Web UI 展示已发布结果。以下命令均在项目根目录执行，并默认已完成依赖安装和 `.env` 配置。
 
+## 技术栈
+
+- **后端**：FastAPI + Pydantic + SQLAlchemy + Typer + Rich + Uvicorn
+- **LLM / Agent**：OpenAI API（双协议结构化输出：Responses & Chat Completions）+ Stage C 自研 ReAct 智能体（多轮 Tool-Calling）
+- **数据抓取与解析**：Feedparser + BeautifulSoup4 + HTTPX（支持 HTTP/2 & SOCKS 代理）
+- **外部服务**：Tavily Search API（联网事实核验）+ GitHub REST API（Trending 趋势与 Release 追踪）+ RSSHub
+- **前端**：Jinja2（服务端渲染 SSR）+ 现代 CSS3（流式去框化排版）+ 原生 JavaScript
+- **数据库与配置**：SQLite + PyYAML（数据源规范与流水线配置管理）
+
 ## 启动 RSSHub
 
 RSSHub 用于抓取 X 等 RSSHub 来源。默认读取同级目录 `../RSSHub`，也可以用 `RSSHUB_DIR` 指定仓库位置；端口、Token 和代理从项目根目录的 `.env` 读取。
