@@ -11,6 +11,19 @@
 - **前端**：Jinja2（服务端渲染 SSR）+ 现代 CSS3（流式去框化排版）+ 原生 JavaScript
 - **数据库与配置**：SQLite + PyYAML（数据源规范与流水线配置管理）
 
+### 各技术栈在项目中的职责划分
+
+| 层次 / 模块 | 使用技术 | 在本项目中的具体作用 |
+| :--- | :--- | :--- |
+| **后端 API & CLI** | FastAPI, Uvicorn, Typer, Rich | 提供 Web 浏览界面路由与 JSON API，同时通过 Typer + Rich 提供多阶段流水线执行的富文本终端 CLI 工具。 |
+| **数据建模与校验** | Pydantic v2 | 严格约束四阶段流水线（Stage A 准入、Stage B1 打分、Stage C 聚合、Stage D 选稿）的输入输出契约。 |
+| **持久化存储** | SQLite, SQLAlchemy 2.0 | 维护资讯抓取历史、多阶段审查记录、事件聚类表以及流水线运行审计追踪。 |
+| **AI 审查与智能体** | OpenAI API, 自研 Agent 架构 | 支持 Responses 和 Chat Completions 双协议，利用 JSON Schema 强类型结构化输出；Stage C 具备多轮 Tool-Calling、历史对比及争议事实查证能力。 |
+| **联网检索与事实核验** | Tavily Search API | Stage C 审查智能体调用 Tavily 进行网络实时搜索与二次交叉信源核验。 |
+| **多源资讯抓取** | HTTPX, Feedparser, BeautifulSoup4 | 支持高并发 HTTP/2 抓取与 SOCKS 代理，解析 RSS/Atom 提要，并对网页正文进行块级清洗与提取。 |
+| **前端展示** | Jinja2, HTML5, CSS3, Vanilla JS | 采用轻量化 SSR 服务端渲染，配合现代化去框化流式信息流排版，支持多日期折叠、来源归因与事件详情展示。 |
+| **规则配置驱动** | PyYAML | 以 `source_registry.yaml` 为核心抓取清单，声明式管理信源分级、路由和抓取参数。 |
+
 ## 启动 RSSHub
 
 RSSHub 用于抓取 X 等 RSSHub 来源。默认读取同级目录 `../RSSHub`，也可以用 `RSSHUB_DIR` 指定仓库位置；端口、Token 和代理从项目根目录的 `.env` 读取。
